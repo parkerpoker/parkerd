@@ -1,0 +1,19 @@
+{
+  "name": "@parker/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@parker/game-engine": "file:../../packages/game-engine",
+    "@parker/protocol": "file:../../packages/protocol",
+    "@parker/settlement": "file:../../packages/settlement",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}
+
