@@ -4,6 +4,7 @@ import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 
 import type {
   EscrowState,
+  Network,
   SettlementInstruction,
   SwapJobStatus,
   SwapQuote,
@@ -13,6 +14,30 @@ import type {
 
 export const MUTINYNET_ARK_SERVER_URL = "https://mutinynet.arkade.sh";
 export const MUTINYNET_BOLTZ_URL = "https://api.boltz.mutinynet.arkade.sh";
+export const REGTEST_ARK_SERVER_URL = "http://127.0.0.1:7070";
+export const REGTEST_BOLTZ_URL = "http://127.0.0.1:9069";
+
+export interface ParkerNetworkConfig {
+  network: Network;
+  arkServerUrl: string;
+  boltzApiUrl: string;
+  arkadeNetworkName: "mutinynet" | "regtest";
+}
+
+export const PARKER_NETWORK_CONFIGS: Record<Network, ParkerNetworkConfig> = {
+  mutinynet: {
+    network: "mutinynet",
+    arkServerUrl: MUTINYNET_ARK_SERVER_URL,
+    boltzApiUrl: MUTINYNET_BOLTZ_URL,
+    arkadeNetworkName: "mutinynet",
+  },
+  regtest: {
+    network: "regtest",
+    arkServerUrl: REGTEST_ARK_SERVER_URL,
+    boltzApiUrl: REGTEST_BOLTZ_URL,
+    arkadeNetworkName: "regtest",
+  },
+};
 
 export interface LocalIdentity {
   playerId: string;
@@ -29,6 +54,7 @@ export interface WalletSummary {
 
 export interface TableEscrowRequest {
   tableId: string;
+  network: Network;
   participantPubkeys: [string, string];
   watchtowerPubkey: string;
   totalLockedSats: number;
@@ -52,9 +78,30 @@ export interface SettlementProvider {
 
 export interface ArkadeWalletConnectionConfig {
   privateKeyHex: string;
+  network?: Network;
   arkServerUrl?: string;
   boltzApiUrl?: string;
-  networkName?: string;
+  arkadeNetworkName?: "mutinynet" | "regtest";
+}
+
+export function resolveParkerNetworkConfig(
+  config: Pick<ArkadeWalletConnectionConfig, "network" | "arkServerUrl" | "boltzApiUrl" | "arkadeNetworkName">,
+): ParkerNetworkConfig {
+  const defaults = PARKER_NETWORK_CONFIGS[config.network ?? "mutinynet"];
+  return {
+    network: config.network ?? defaults.network,
+    arkServerUrl: config.arkServerUrl ?? defaults.arkServerUrl,
+    boltzApiUrl: config.boltzApiUrl ?? defaults.boltzApiUrl,
+    arkadeNetworkName: config.arkadeNetworkName ?? defaults.arkadeNetworkName,
+  };
+}
+
+function mockArkAddress(playerId: string) {
+  return `tark1${playerId.slice(-16)}`;
+}
+
+function mockBoardingAddress(playerId: string) {
+  return `bcrt1q${playerId.slice(-20).padEnd(20, "0")}`;
 }
 
 function stableStringify(input: unknown): string {
@@ -160,7 +207,7 @@ export function buildEscrowDescriptor(request: TableEscrowRequest): EscrowState 
   return {
     escrowId: crypto.randomUUID(),
     tableId: request.tableId,
-    network: "mutinynet",
+    network: request.network,
     contractAddress: `descriptor:${scriptFingerprint.slice(0, 24)}`,
     totalLockedSats: request.totalLockedSats,
     participantPubkeys: [...request.participantPubkeys, request.watchtowerPubkey],
@@ -180,11 +227,12 @@ export function randomHex(byteLength: number): string {
 }
 
 export async function connectArkadeWallet(config: ArkadeWalletConnectionConfig) {
+  const networkConfig = resolveParkerNetworkConfig(config);
   const sdk = await import("@arkade-os/sdk");
   const identity = (sdk as any).SingleKey.fromHex(config.privateKeyHex);
   return await (sdk as any).Wallet.create({
     identity,
-    arkServerUrl: config.arkServerUrl ?? MUTINYNET_ARK_SERVER_URL,
+    arkServerUrl: networkConfig.arkServerUrl,
   });
 }
 
@@ -205,16 +253,35 @@ export async function getArkadeWalletSummary(config: ArkadeWalletConnectionConfi
 }
 
 async function createArkadeLightningClient(config: ArkadeWalletConnectionConfig) {
+  const networkConfig = resolveParkerNetworkConfig(config);
   const wallet = await connectArkadeWallet(config);
   const swaps = await import("@arkade-os/boltz-swap");
   const swapProvider = new (swaps as any).BoltzSwapProvider({
-    apiUrl: config.boltzApiUrl ?? MUTINYNET_BOLTZ_URL,
-    network: (config.networkName ?? "mutinynet") as never,
+    apiUrl: networkConfig.boltzApiUrl,
+    network: networkConfig.arkadeNetworkName as never,
   });
   return new (swaps as any).ArkadeLightning({
     wallet,
     swapProvider,
   });
+}
+
+export async function onboardArkadeFunds(config: ArkadeWalletConnectionConfig): Promise<string> {
+  const sdk = await import("@arkade-os/sdk");
+  const wallet = await connectArkadeWallet(config);
+  const ramps = new (sdk as any).Ramps(wallet);
+  const info = await wallet.arkProvider.getInfo();
+  return await ramps.onboard(info.fees);
+}
+
+export async function offboardArkadeFunds(
+  args: ArkadeWalletConnectionConfig & { address: string; amountSats?: number },
+): Promise<string> {
+  const sdk = await import("@arkade-os/sdk");
+  const wallet = await connectArkadeWallet(args);
+  const ramps = new (sdk as any).Ramps(wallet);
+  const info = await wallet.arkProvider.getInfo();
+  return await ramps.offboard(args.address, info.fees, args.amountSats);
 }
 
 export async function createArkadeDepositQuote(args: ArkadeWalletConnectionConfig & { amountSats: number }): Promise<SwapQuote> {
@@ -253,6 +320,7 @@ export async function submitArkadeWithdrawal(args: ArkadeWalletConnectionConfig 
 
 class MockSettlementProvider implements SettlementProvider {
   private readonly balances = new Map<string, number>();
+  constructor(private readonly network: Network) {}
 
   createLocalIdentity(seedHex?: string): LocalIdentity {
     const identity = createLocalIdentity(seedHex);
@@ -265,8 +333,8 @@ class MockSettlementProvider implements SettlementProvider {
     return {
       availableSats: balance,
       totalSats: balance,
-      arkAddress: `tark1${identity.playerId.slice(-16)}`,
-      boardingAddress: `tb1q${identity.playerId.slice(-20)}`,
+      arkAddress: mockArkAddress(identity.playerId),
+      boardingAddress: mockBoardingAddress(identity.playerId),
     };
   }
 
@@ -277,7 +345,7 @@ class MockSettlementProvider implements SettlementProvider {
       direction: "deposit",
       amountSats,
       feeSats: Math.max(5, Math.floor(amountSats * 0.0025)),
-      invoice: `lnmutiny${identity.playerId}${amountSats}`,
+      invoice: `ln${this.network}${identity.playerId}${amountSats}`,
       paymentHash: bytesToHex(sha256(utf8ToBytes(`${identity.playerId}:${amountSats}:${now.toISOString()}`))),
       expiresAt: new Date(now.getTime() + 5 * 60_000).toISOString(),
     };
@@ -319,6 +387,6 @@ class MockSettlementProvider implements SettlementProvider {
   }
 }
 
-export function createMockSettlementProvider(): SettlementProvider {
-  return new MockSettlementProvider();
+export function createMockSettlementProvider(network: Network = "mutinynet"): SettlementProvider {
+  return new MockSettlementProvider(network);
 }

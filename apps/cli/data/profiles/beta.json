@@ -1,0 +1,19 @@
+{
+  "handSeeds": {
+    "b538f029-7c2c-413b-88c0-d87c96787bf1:1": "199700b54086aab706781070e485b131cd0a5a9ddde673cb401bd8980bf025f1"
+  },
+  "nickname": "Beta",
+  "privateKeyHex": "50bc51dace4d8f26db4eab000ea72e0d63e2c4332fdc22adec7df0a9ef4c86a1",
+  "profileName": "beta",
+  "mockWallet": {
+    "availableSats": 50000,
+    "totalSats": 50000,
+    "arkAddress": "tark116c1742062d9d7e9",
+    "boardingAddress": "bcrt1q340116c1742062d9d7e9"
+  },
+  "currentTable": {
+    "inviteCode": "2BE65F72",
+    "seatIndex": 1,
+    "tableId": "b538f029-7c2c-413b-88c0-d87c96787bf1"
+  }
+}

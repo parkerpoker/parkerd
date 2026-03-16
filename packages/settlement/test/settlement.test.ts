@@ -76,6 +76,7 @@ describe("settlement helpers", () => {
   it("builds deterministic escrow descriptors", () => {
     const descriptor = buildEscrowDescriptor({
       tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
+      network: "regtest",
       participantPubkeys: ["02".repeat(33), "03".repeat(33)],
       watchtowerPubkey: "04".repeat(33),
       totalLockedSats: 8_000,
@@ -85,6 +86,7 @@ describe("settlement helpers", () => {
 
     expect(descriptor.contractAddress.startsWith("descriptor:")).toBe(true);
     expect(descriptor.status).toBe("funded");
+    expect(descriptor.network).toBe("regtest");
   });
 
   it("supports mock deposit and withdrawal flows", async () => {

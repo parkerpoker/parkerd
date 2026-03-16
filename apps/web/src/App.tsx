@@ -16,7 +16,6 @@ import type {
 import { randomHex, type LocalIdentity, type WalletSummary } from "@parker/settlement";
 
 import { PokerCard } from "./components/PokerCard.js";
-import { usePeerConnection } from "./hooks/usePeerConnection.js";
 import { useTableSocket } from "./hooks/useTableSocket.js";
 import {
   WEBSOCKET_URL,
@@ -109,7 +108,8 @@ export function App() {
   const [swapQuote, setSwapQuote] = useState<SwapQuote | null>(null);
   const [withdrawalStatus, setWithdrawalStatus] = useState<SwapJobStatus | null>(null);
   const [statusMessage, setStatusMessage] = useState("Bootstrapping Parker wallet...");
-  const [lastSignal, setLastSignal] = useState<ClientSocketEvent | null>(null);
+  const [peerMessages, setPeerMessages] = useState<string[]>([]);
+  const [peerStatus, setPeerStatus] = useState("offline");
   const autoDelegationCheckpointRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -141,6 +141,12 @@ export function App() {
     onEvent: (event: ServerSocketEvent) => {
       if (event.type === "table-snapshot") {
         setTableSnapshot(event.snapshot);
+        if (identity) {
+          const remoteSeat = event.snapshot.seats.find((candidate) => candidate.player.playerId !== identity.playerId);
+          if (!remoteSeat || remoteSeat.player.playerId === "open-seat") {
+            setPeerStatus("offline");
+          }
+        }
       }
       if (event.type === "checkpoint" && tableSnapshot) {
         setTableSnapshot((previous) =>
@@ -152,16 +158,13 @@ export function App() {
             : previous,
         );
       }
-      if (event.type === "signal") {
-        setLastSignal({
-          type: "signal",
-          tableId: event.tableId,
-          fromPlayerId: event.fromPlayerId,
-          targetPlayerId: identity?.playerId ?? "",
-          payload: event.payload,
-        });
+      if (event.type === "peer-message") {
+        setPeerMessages((messages) => [event.message, ...messages].slice(0, 12));
       }
       if (event.type === "presence") {
+        if (event.playerId !== identity?.playerId) {
+          setPeerStatus(event.status === "online" ? "relay" : "offline");
+        }
         setStatusMessage(`${event.playerId} is ${event.status}`);
       }
       if (event.type === "error") {
@@ -169,31 +172,6 @@ export function App() {
       }
     },
   });
-
-  const peer = usePeerConnection({
-    enabled: Boolean(tableSnapshot && opponentSeat && identity),
-    isOfferer: seat?.seatIndex === 0,
-    localPlayerId: identity?.playerId,
-    remotePlayerId: opponentSeat?.player.playerId,
-    sendSignal: (payload) => {
-      if (!tableSnapshot || !identity || !opponentSeat) {
-        return;
-      }
-      sendEvent({
-        type: "signal",
-        tableId: tableSnapshot.table.tableId,
-        fromPlayerId: identity.playerId,
-        targetPlayerId: opponentSeat.player.playerId,
-        payload,
-      });
-    },
-  });
-
-  useEffect(() => {
-    if (lastSignal?.type === "signal") {
-      void peer.handleSignal(lastSignal.payload);
-    }
-  }, [lastSignal, peer]);
 
   useEffect(() => {
     if (
@@ -327,7 +305,20 @@ export function App() {
       type: "signed-action",
       action,
     });
-    peer.sendPeerMessage(JSON.stringify({ type: "mirror-action", action }));
+    sendPeerMessage(JSON.stringify({ type: "mirror-action", action }));
+  }
+
+  function sendPeerMessage(message: string) {
+    if (!tableSnapshot || !identity || !opponentSeat) {
+      return;
+    }
+    sendEvent({
+      type: "peer-message",
+      tableId: tableSnapshot.table.tableId,
+      fromPlayerId: identity.playerId,
+      targetPlayerId: opponentSeat.player.playerId,
+      message,
+    } satisfies ClientSocketEvent);
   }
 
   async function handleDeposit() {
@@ -366,7 +357,7 @@ export function App() {
         <div className="status-row">
           <span className="pill">{MOCK_MODE ? "Mock settlement mode" : "Live Arkade mode"}</span>
           <span className="pill">{connected ? "WebSocket live" : "WebSocket idle"}</span>
-          <span className="pill">Peer: {peer.status}</span>
+          <span className="pill">Relay: {peerStatus}</span>
         </div>
       </section>
 
@@ -483,7 +474,7 @@ export function App() {
                 Commitments: {tableSnapshot.commitments.length}/2. Reveals:{" "}
                 {tableSnapshot.commitments.filter((commitment) => commitment.revealSeed).length}/2.
               </p>
-              <p className="muted">Peer messages mirrored: {peer.peerMessages.length}</p>
+              <p className="muted">Relayed peer messages: {peerMessages.length}</p>
             </>
           ) : (
             <p className="muted">Create or join a table to begin the commitment flow.</p>

@@ -12,8 +12,8 @@ import {
 import {
   createTableRequestSchema,
   joinTableRequestSchema,
-  type ClientSocketEvent,
   type DeckCommitment,
+  type Network,
   type SignedGameAction,
   type TableCheckpoint,
   type TableConfig,
@@ -30,6 +30,7 @@ import { ParkerDatabase } from "./db.js";
 
 export interface ParkerTableServiceConfig {
   websocketUrl: string;
+  network?: Network;
   refundDelayBlocks?: number;
   settlementProvider?: SettlementProvider;
 }
@@ -64,14 +65,16 @@ function actionToEngineAction(action: SignedGameAction): HoldemAction {
 export class ParkerTableService {
   readonly db: ParkerDatabase;
   private readonly websocketUrl: string;
+  private readonly network: Network;
   private readonly refundDelayBlocks: number;
   private readonly settlementProvider: SettlementProvider;
 
   constructor(db: ParkerDatabase, config: ParkerTableServiceConfig) {
     this.db = db;
     this.websocketUrl = config.websocketUrl;
+    this.network = config.network ?? "mutinynet";
     this.refundDelayBlocks = config.refundDelayBlocks ?? 12;
-    this.settlementProvider = config.settlementProvider ?? createMockSettlementProvider();
+    this.settlementProvider = config.settlementProvider ?? createMockSettlementProvider(this.network);
   }
 
   createTable(input: unknown) {
@@ -84,7 +87,7 @@ export class ParkerTableService {
       tableId,
       inviteCode,
       hostPlayerId: request.host.playerId,
-      network: "mutinynet",
+      network: this.network,
       variant: "holdem-heads-up",
       smallBlindSats: request.smallBlindSats,
       bigBlindSats: request.bigBlindSats,
@@ -166,6 +169,7 @@ export class ParkerTableService {
     const totalLocked = snapshot.seats.reduce((total, seat) => total + seat.buyInSats, 0);
     snapshot.escrow = buildEscrowDescriptor({
       tableId: snapshot.table.tableId,
+      network: this.network,
       participantPubkeys: [
         snapshot.seats[0]!.player.pubkeyHex,
         snapshot.seats[1]!.player.pubkeyHex,
@@ -401,8 +405,4 @@ export class ParkerTableService {
       }),
     };
   }
-}
-
-export function isSocketSignal(event: ClientSocketEvent): boolean {
-  return event.type === "signal";
 }

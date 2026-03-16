@@ -4,6 +4,7 @@ import fastifyWebsocket from "@fastify/websocket";
 import {
   clientSocketEventSchema,
   deckCommitmentSchema,
+  type Network,
   parseClientSocketEvent,
   serverSocketEventSchema,
   timeoutDelegationSchema,
@@ -14,6 +15,7 @@ import { ParkerTableService } from "./service.js";
 
 export interface CreateAppOptions {
   database?: ParkerDatabase;
+  network?: Network;
   websocketUrl?: string;
 }
 
@@ -22,9 +24,18 @@ export async function createApp(options: CreateAppOptions = {}) {
   await app.register(fastifyWebsocket);
 
   const db = options.database ?? new ParkerDatabase();
-  const service = new ParkerTableService(db, {
+  const serviceConfig = {
     websocketUrl: options.websocketUrl ?? "ws://localhost:3020/ws",
-  });
+  } as const;
+  const service = new ParkerTableService(
+    db,
+    options.network
+      ? {
+          ...serviceConfig,
+          network: options.network,
+        }
+      : serviceConfig,
+  );
 
   type LiveSocket = { send: (payload: string) => void };
   const sockets = new Map<string, Map<string, LiveSocket>>();
@@ -39,6 +50,11 @@ export async function createApp(options: CreateAppOptions = {}) {
     for (const socket of tableSockets.values()) {
       socket.send(serialized);
     }
+  }
+
+  function sendTo(socket: LiveSocket, payload: unknown) {
+    const parsed = serverSocketEventSchema.parse(payload);
+    socket.send(JSON.stringify(parsed));
   }
 
   app.get("/health", async () => ({ ok: true }));
@@ -106,12 +122,21 @@ export async function createApp(options: CreateAppOptions = {}) {
           const tableSockets = sockets.get(parsed.tableId) ?? new Map<string, LiveSocket>();
           tableSockets.set(parsed.playerId, socket as unknown as LiveSocket);
           sockets.set(parsed.tableId, tableSockets);
-          socket.send(
-            JSON.stringify({
-              type: "table-snapshot",
-              snapshot: service.getSnapshot(parsed.tableId),
-            }),
-          );
+          sendTo(socket as unknown as LiveSocket, {
+            type: "table-snapshot",
+            snapshot: service.getSnapshot(parsed.tableId),
+          });
+          for (const connectedPlayerId of tableSockets.keys()) {
+            if (connectedPlayerId === parsed.playerId) {
+              continue;
+            }
+            sendTo(socket as unknown as LiveSocket, {
+              type: "presence",
+              tableId: parsed.tableId,
+              playerId: connectedPlayerId,
+              status: "online",
+            });
+          }
           broadcast(parsed.tableId, {
             type: "presence",
             tableId: parsed.tableId,
@@ -120,14 +145,14 @@ export async function createApp(options: CreateAppOptions = {}) {
           });
           break;
         }
-        case "signal": {
+        case "peer-message": {
           const targetSocket = sockets.get(parsed.tableId)?.get(parsed.targetPlayerId);
           targetSocket?.send(
             JSON.stringify({
-              type: "signal",
+              type: "peer-message",
               tableId: parsed.tableId,
               fromPlayerId: parsed.fromPlayerId,
-              payload: parsed.payload,
+              message: parsed.message,
             }),
           );
           break;

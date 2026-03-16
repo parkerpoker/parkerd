@@ -1,0 +1,21 @@
+{
+  "name": "@parker/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "parker-cli": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/daemonEntry.ts --format esm --dts --clean",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@parker/game-engine": "file:../../packages/game-engine",
+    "@parker/protocol": "file:../../packages/protocol",
+    "@parker/settlement": "file:../../packages/settlement",
+    "ws": "^8.18.3"
+  }
+}

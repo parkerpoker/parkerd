@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   clientSocketEventSchema,
   createTableRequestSchema,
+  networkSchema,
   parseServerSocketEvent,
   serverSocketEventSchema,
 } from "../src/index.js";
@@ -23,18 +24,20 @@ describe("protocol schemas", () => {
     expect(parsed.smallBlindSats).toBe(50);
   });
 
-  it("accepts signal events", () => {
+  it("accepts peer relay events", () => {
     const parsed = clientSocketEventSchema.parse({
-      type: "signal",
+      type: "peer-message",
       tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
       fromPlayerId: "player-alpha",
       targetPlayerId: "player-beta",
-      payload: {
-        candidate: "candidate:1 1 udp 1 10.0.0.1 1234 typ host",
-      },
+      message: "hello-beta",
     });
 
-    expect(parsed.type).toBe("signal");
+    expect(parsed.type).toBe("peer-message");
+  });
+
+  it("accepts regtest networks", () => {
+    expect(networkSchema.parse("regtest")).toBe("regtest");
   });
 
   it("parses server snapshot events", () => {

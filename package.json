@@ -11,17 +11,19 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @parker/protocol && npm run build -w @parker/game-engine && npm run build -w @parker/settlement && npm run build -w @parker/server && npm run build -w @parker/web",
+    "build": "npm run build -w @parker/protocol && npm run build -w @parker/game-engine && npm run build -w @parker/settlement && npm run build -w @parker/server && npm run build -w @parker/cli && npm run build -w @parker/web",
+    "dev:cli": "npm run dev -w @parker/cli",
     "dev:server": "npm run dev -w @parker/server",
     "dev:web": "npm run dev -w @parker/web",
-    "test": "npm run test -w @parker/protocol && npm run test -w @parker/game-engine && npm run test -w @parker/settlement && npm run test -w @parker/server",
-    "typecheck": "npm run typecheck -w @parker/protocol && npm run typecheck -w @parker/game-engine && npm run typecheck -w @parker/settlement && npm run typecheck -w @parker/server && npm run typecheck -w @parker/web"
+    "test": "npm run test -w @parker/protocol && npm run test -w @parker/game-engine && npm run test -w @parker/settlement && npm run test -w @parker/server && npm run test -w @parker/cli",
+    "typecheck": "npm run typecheck -w @parker/protocol && npm run typecheck -w @parker/game-engine && npm run typecheck -w @parker/settlement && npm run typecheck -w @parker/server && npm run typecheck -w @parker/cli && npm run typecheck -w @parker/web"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.13.1",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
+    "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.4.1",
     "rimraf": "^6.0.1",
     "tsup": "^8.3.5",

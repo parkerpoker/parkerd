@@ -1,7 +1,6 @@
 import type { SwapJobStatus, SwapQuote, TimeoutDelegation } from "@parker/protocol";
 import {
-  MUTINYNET_ARK_SERVER_URL,
-  MUTINYNET_BOLTZ_URL,
+  PARKER_NETWORK_CONFIGS,
   createLocalIdentity,
   createTimeoutDelegation,
   randomHex,
@@ -11,6 +10,8 @@ import {
 } from "@parker/settlement";
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK_SETTLEMENT !== "false";
+const LIVE_NETWORK = import.meta.env.VITE_NETWORK === "regtest" ? "regtest" : "mutinynet";
+const LIVE_NETWORK_CONFIG = PARKER_NETWORK_CONFIGS[LIVE_NETWORK];
 const LIVE_DB_NAME = "parker-live-wallet";
 const LIVE_DB_VERSION = 1;
 const LIVE_KEY_STORAGE_KEY = "parker-live-private-key";
@@ -145,21 +146,21 @@ async function buildLiveRuntime(registration: ServiceWorkerRegistration): Promis
   const wallet = await (sdk as any).ServiceWorkerWallet.create({
     serviceWorker,
     identity,
-    arkServerUrl: import.meta.env.VITE_ARK_SERVER_URL ?? MUTINYNET_ARK_SERVER_URL,
+    arkServerUrl: import.meta.env.VITE_ARK_SERVER_URL ?? LIVE_NETWORK_CONFIG.arkServerUrl,
     dbName: LIVE_DB_NAME,
     dbVersion: LIVE_DB_VERSION,
   });
   const lightning = new (swaps as any).ArkadeLightning({
     wallet,
     arkProvider: new (sdk as any).RestArkProvider(
-      import.meta.env.VITE_ARK_SERVER_URL ?? MUTINYNET_ARK_SERVER_URL,
+      import.meta.env.VITE_ARK_SERVER_URL ?? LIVE_NETWORK_CONFIG.arkServerUrl,
     ),
     indexerProvider: new (sdk as any).RestIndexerProvider(
-      import.meta.env.VITE_ARK_SERVER_URL ?? MUTINYNET_ARK_SERVER_URL,
+      import.meta.env.VITE_ARK_SERVER_URL ?? LIVE_NETWORK_CONFIG.arkServerUrl,
     ),
     swapProvider: new (swaps as any).BoltzSwapProvider({
-      apiUrl: import.meta.env.VITE_BOLTZ_URL ?? MUTINYNET_BOLTZ_URL,
-      network: "mutinynet",
+      apiUrl: import.meta.env.VITE_BOLTZ_URL ?? LIVE_NETWORK_CONFIG.boltzApiUrl,
+      network: LIVE_NETWORK_CONFIG.arkadeNetworkName,
       referralId: "parker",
     }),
   });

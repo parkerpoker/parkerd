@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const networkSchema = z.enum(["mutinynet"]);
+export const networkSchema = z.enum(["mutinynet", "regtest"]);
 export type Network = z.infer<typeof networkSchema>;
 
 export const gameVariantSchema = z.enum(["holdem-heads-up"]);
@@ -277,14 +277,6 @@ export const joinTableResponseSchema = z.object({
 });
 export type JoinTableResponse = z.infer<typeof joinTableResponseSchema>;
 
-export const signalPayloadSchema = z.object({
-  description: z.string().optional(),
-  candidate: z.string().optional(),
-  sdpMid: z.string().optional(),
-  sdpMLineIndex: z.number().int().optional(),
-});
-export type SignalPayload = z.infer<typeof signalPayloadSchema>;
-
 export const clientSocketEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("identify"),
@@ -292,11 +284,11 @@ export const clientSocketEventSchema = z.discriminatedUnion("type", [
     playerId: z.string().min(8).max(96),
   }),
   z.object({
-    type: z.literal("signal"),
+    type: z.literal("peer-message"),
     tableId: z.string().uuid(),
     fromPlayerId: z.string().min(8).max(96),
     targetPlayerId: z.string().min(8).max(96),
-    payload: signalPayloadSchema,
+    message: z.string().min(1),
   }),
   z.object({
     type: z.literal("signed-action"),
@@ -321,10 +313,10 @@ export const serverSocketEventSchema = z.discriminatedUnion("type", [
     snapshot: tableSnapshotSchema,
   }),
   z.object({
-    type: z.literal("signal"),
+    type: z.literal("peer-message"),
     tableId: z.string().uuid(),
     fromPlayerId: z.string().min(8).max(96),
-    payload: signalPayloadSchema,
+    message: z.string().min(1),
   }),
   z.object({
     type: z.literal("presence"),

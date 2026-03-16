@@ -1,0 +1,53 @@
+{
+  "network": "regtest",
+  "mock": false,
+  "players": [
+    {
+      "profile": "alpha",
+      "nickname": "Alpha",
+      "steps": [
+        { "type": "bootstrap" },
+        {
+          "type": "create-table",
+          "table": {
+            "smallBlindSats": 50,
+            "bigBlindSats": 100,
+            "buyInMinSats": 4000,
+            "buyInMaxSats": 4000,
+            "actionTimeoutSeconds": 25,
+            "commitmentDeadlineSeconds": 20
+          }
+        },
+        { "type": "connect-table" },
+        { "type": "wait-for", "condition": "peer-relay", "timeoutMs": 30000 },
+        { "type": "commit-seed" },
+        { "type": "wait-for", "condition": "all-committed", "timeoutMs": 30000 },
+        { "type": "reveal-seed" },
+        { "type": "wait-for", "condition": "all-revealed", "timeoutMs": 30000 },
+        { "type": "wait-for", "condition": "my-turn", "timeoutMs": 30000 },
+        { "type": "action", "action": "call" },
+        { "type": "transcript" }
+      ]
+    },
+    {
+      "profile": "beta",
+      "nickname": "Beta",
+      "steps": [
+        { "type": "bootstrap" },
+        { "type": "join-table", "buyInSats": 4000 },
+        { "type": "connect-table" },
+        { "type": "wait-for", "condition": "peer-relay", "timeoutMs": 30000 },
+        { "type": "commit-seed" },
+        { "type": "wait-for", "condition": "all-committed", "timeoutMs": 30000 },
+        { "type": "reveal-seed" },
+        { "type": "wait-for", "condition": "all-revealed", "timeoutMs": 30000 },
+        { "type": "wait-for", "condition": "my-turn", "timeoutMs": 30000 },
+        { "type": "action", "action": "call" },
+        { "type": "transcript" }
+      ]
+    }
+  ],
+  "serverPort": 3020,
+  "startNigiri": false,
+  "startServer": false
+}

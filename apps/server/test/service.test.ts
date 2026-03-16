@@ -14,6 +14,7 @@ describe("ParkerTableService", () => {
   function createService() {
     db = new ParkerDatabase(":memory:");
     return new ParkerTableService(db, {
+      network: "regtest",
       websocketUrl: "ws://localhost:3020/ws",
     });
   }
@@ -31,6 +32,7 @@ describe("ParkerTableService", () => {
     });
 
     expect(created.table.inviteCode).toHaveLength(8);
+    expect(created.table.network).toBe("regtest");
 
     const joined = service.joinTable({
       inviteCode: created.table.inviteCode,
@@ -45,6 +47,7 @@ describe("ParkerTableService", () => {
     });
 
     expect(joined.table.status).toBe("seeding");
+    expect(service.getSnapshot(created.table.tableId).escrow?.network).toBe("regtest");
 
     const commitA = service.buildClientCommitment({
       tableId: created.table.tableId,
