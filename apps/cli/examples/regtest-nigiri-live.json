@@ -1,0 +1,65 @@
+{
+  "network": "regtest",
+  "mock": false,
+  "players": [
+    {
+      "profile": "alpha-live",
+      "nickname": "Alpha Live",
+      "steps": [
+        { "type": "bootstrap" },
+        { "type": "nigiri-faucet", "amountSats": 100000 },
+        { "type": "sleep", "ms": 2000 },
+        { "type": "onboard" },
+        { "type": "wait-for-wallet", "availableSatsAtLeast": 20000, "timeoutMs": 120000 },
+        {
+          "type": "create-table",
+          "table": {
+            "smallBlindSats": 50,
+            "bigBlindSats": 100,
+            "buyInMinSats": 4000,
+            "buyInMaxSats": 4000,
+            "actionTimeoutSeconds": 25,
+            "commitmentDeadlineSeconds": 20
+          }
+        },
+        { "type": "connect-table" },
+        { "type": "wait-for", "condition": "peer-relay", "timeoutMs": 30000 },
+        { "type": "commit-seed" },
+        { "type": "wait-for", "condition": "all-committed", "timeoutMs": 30000 },
+        { "type": "reveal-seed" },
+        { "type": "wait-for", "condition": "all-revealed", "timeoutMs": 30000 },
+        { "type": "wait-for", "condition": "my-turn", "timeoutMs": 30000 },
+        { "type": "action", "action": "raise", "amountSats": 200 },
+        { "type": "wait-for", "condition": "phase", "value": "settled", "timeoutMs": 30000 },
+        { "type": "assert-my-stack", "amountSats": 4100 },
+        { "type": "transcript", "fileName": "alpha-live-transcript.json" }
+      ]
+    },
+    {
+      "profile": "beta-live",
+      "nickname": "Beta Live",
+      "steps": [
+        { "type": "bootstrap" },
+        { "type": "nigiri-faucet", "amountSats": 100000 },
+        { "type": "sleep", "ms": 2000 },
+        { "type": "onboard" },
+        { "type": "wait-for-wallet", "availableSatsAtLeast": 20000, "timeoutMs": 120000 },
+        { "type": "join-table", "buyInSats": 4000 },
+        { "type": "connect-table" },
+        { "type": "wait-for", "condition": "peer-relay", "timeoutMs": 30000 },
+        { "type": "commit-seed" },
+        { "type": "wait-for", "condition": "all-committed", "timeoutMs": 30000 },
+        { "type": "reveal-seed" },
+        { "type": "wait-for", "condition": "all-revealed", "timeoutMs": 30000 },
+        { "type": "wait-for", "condition": "my-turn", "timeoutMs": 30000 },
+        { "type": "action", "action": "fold" },
+        { "type": "wait-for", "condition": "phase", "value": "settled", "timeoutMs": 30000 },
+        { "type": "assert-my-stack", "amountSats": 3900 },
+        { "type": "transcript", "fileName": "beta-live-transcript.json" }
+      ]
+    }
+  ],
+  "serverPort": 3020,
+  "startNigiri": true,
+  "startServer": true
+}

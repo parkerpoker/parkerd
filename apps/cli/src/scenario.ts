@@ -20,7 +20,9 @@ export type ScenarioStep =
   | { type: "reveal-seed" }
   | { type: "sleep"; ms: number }
   | { type: "snapshot" }
+  | { type: "wait-for-wallet"; availableSatsAtLeast: number; timeoutMs?: number }
   | { type: "transcript"; fileName?: string }
+  | { type: "assert-my-stack"; amountSats: number }
   | {
       type: "wait-for";
       condition:
@@ -158,6 +160,15 @@ async function runScenarioStep(args: {
       args.logger.info("snapshot", await args.client.getSnapshot());
       return;
     }
+    case "wait-for-wallet": {
+      const wallet = await waitForWalletAvailable(
+        args.client,
+        args.step.availableSatsAtLeast,
+        args.step.timeoutMs,
+      );
+      args.logger.info("wallet funded", wallet);
+      return;
+    }
     case "transcript": {
       const transcript = await args.client.getTranscript();
       if (args.runDir) {
@@ -223,6 +234,11 @@ async function runScenarioStep(args: {
       args.logger.info("withdrawal submitted", status);
       return;
     }
+    case "assert-my-stack": {
+      await assertMyStack(args.client, args.step.amountSats);
+      args.logger.info("stack assertion passed", { amountSats: args.step.amountSats });
+      return;
+    }
   }
 }
 
@@ -247,6 +263,31 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+async function waitForWalletAvailable(client: DaemonRpcClient, availableSatsAtLeast: number, timeoutMs = 60_000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const wallet = await client.walletSummary();
+    if (wallet.availableSats >= availableSatsAtLeast) {
+      return wallet;
+    }
+    await delay(1_000);
+  }
+  throw new Error(`timed out waiting for wallet available balance >= ${availableSatsAtLeast}`);
+}
+
+async function assertMyStack(client: DaemonRpcClient, amountSats: number) {
+  const snapshot = await client.getSnapshot();
+  const identity = client.currentState().identity;
+  const seat = snapshot.seats.find((candidate) => candidate.player.playerId === identity?.playerId);
+  if (!identity || !seat) {
+    throw new Error("player is not seated at the current table");
+  }
+  const current = snapshot.checkpoint?.playerStacks[identity.playerId] ?? seat.buyInSats;
+  if (current !== amountSats) {
+    throw new Error(`expected stack ${amountSats}, received ${current}`);
+  }
 }
 
 async function waitForSharedInviteCode(runDir: string, timeoutMs = 30_000) {
