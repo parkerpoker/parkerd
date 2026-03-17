@@ -4,6 +4,7 @@ import type {
   DeckCommitment,
   JoinTableRequest,
   JoinTableResponse,
+  PublicTableView,
   TableSnapshot,
   TimeoutDelegation,
 } from "@parker/protocol";
@@ -50,6 +51,14 @@ export function getTableByInvite(inviteCode: string) {
   return fetchJson<TableSnapshot>(`/api/tables/by-invite/${inviteCode}`);
 }
 
+export function getPublicTable(tableId: string) {
+  return fetchJson<PublicTableView>(`/api/public/tables/${tableId}`);
+}
+
+export function listPublicTables() {
+  return fetchJson<PublicTableView[]>("/api/public/tables");
+}
+
 export function postCommitment(tableId: string, commitment: DeckCommitment) {
   return fetchJson<TableSnapshot>(`/api/tables/${tableId}/commitments`, {
     method: "POST",
@@ -63,4 +72,3 @@ export function postDelegation(tableId: string, delegation: TimeoutDelegation) {
     body: JSON.stringify(delegation),
   });
 }
-

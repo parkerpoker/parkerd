@@ -54,6 +54,75 @@ async function main(argv: string[]) {
   const profile = requireFlag(flags, "profile", "player1");
   const client = new DaemonRpcClient(profile, config);
   try {
+    if (command === "network") {
+      switch (positionals[0]) {
+        case "peers":
+          logger.result(await client.meshNetworkPeers());
+          return;
+        case "bootstrap":
+          if (positionals[1] !== "add") {
+            throw new Error("network bootstrap requires the `add` subcommand");
+          }
+          logger.result(await client.meshBootstrapPeer(requirePositional(positionals[2], "peerUrl"), positionals[3]));
+          return;
+        default:
+          throw new Error(`unknown network subcommand ${positionals[0] ?? ""}`.trim());
+      }
+    }
+
+    if (command === "table") {
+      switch (positionals[0]) {
+        case "create":
+          logger.result(
+            await client.meshCreateTable({
+              ...(flags.name ? { name: requireFlag(flags, "name") } : {}),
+              ...(flags.public ? { public: true } : {}),
+            }),
+          );
+          return;
+        case "announce":
+          logger.result(await client.meshTableAnnounce(positionals[1]));
+          return;
+        case "join":
+          logger.result(await client.meshTableJoin(requirePositional(positionals[1], "inviteCode"), parseOptionalNumber(positionals[2], 4_000)));
+          return;
+        case "watch":
+          if (positionals[1]) {
+            logger.result(await client.meshGetTable(positionals[1]));
+            return;
+          }
+          await runDaemonWatch(client, logger);
+          return;
+        case "rotate-host":
+          logger.result(await client.meshRotateHost(positionals[1]));
+          return;
+        case "action":
+          logger.result(await client.meshSendAction(parseMeshActionPayload(positionals.slice(1))));
+          return;
+        default:
+          throw new Error(`unknown table subcommand ${positionals[0] ?? ""}`.trim());
+      }
+    }
+
+    if (command === "funds") {
+      switch (positionals[0]) {
+        case "buy-in":
+          logger.result(await client.meshTableJoin(requirePositional(positionals[1], "inviteCode"), parseOptionalNumber(positionals[2], 4_000)));
+          return;
+        case "cashout":
+          logger.result(await client.meshCashOut(positionals[1]));
+          return;
+        case "renew":
+          logger.result(await client.meshRenew(positionals[1]));
+          return;
+        case "exit":
+          logger.result(await client.meshExit(positionals[1]));
+          return;
+        default:
+          throw new Error(`unknown funds subcommand ${positionals[0] ?? ""}`.trim());
+      }
+    }
+
     switch (command) {
       case "interactive":
         await runInteractive(client, logger);
@@ -126,6 +195,23 @@ async function main(argv: string[]) {
   } finally {
     client.close();
   }
+}
+
+async function runDaemonWatch(client: DaemonRpcClient, logger: CliLogger) {
+  await client.ensureRunning();
+  const stopWatching = await client.watch((event) => {
+    logger.result(event);
+  });
+  await new Promise<void>((resolve) => {
+    const onSignal = () => {
+      stopWatching();
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      resolve();
+    };
+    process.on("SIGINT", onSignal);
+    process.on("SIGTERM", onSignal);
+  });
 }
 
 async function runInteractive(client: DaemonRpcClient, logger: CliLogger) {
@@ -272,6 +358,20 @@ function parseActionPayload(positionals: string[]): SignedActionPayload {
   throw new Error(`unsupported action ${type}`);
 }
 
+function parseMeshActionPayload(positionals: string[]) {
+  const type = requirePositional(positionals[0], "actionType");
+  if (type === "bet" || type === "raise") {
+    return {
+      type,
+      totalSats: parseRequiredNumber(positionals[1], "totalSats"),
+    } as const;
+  }
+  if (type === "fold" || type === "check" || type === "call") {
+    return { type } as const;
+  }
+  throw new Error(`unsupported mesh action ${type}`);
+}
+
 function parseArgv(argv: string[]) {
   const [command, ...rest] = argv;
   const flags: CliFlagMap = {};
@@ -346,15 +446,18 @@ function printHelp() {
   process.stdout.write(
     [
       "parker-cli commands:",
+      "  network peers|bootstrap add <peerUrl> [alias] --profile <name>",
+      "  table create [--name <name>] [--public] | announce [tableId] | join <invite> [buyIn] | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] --profile <name>",
+      "  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
       "  bootstrap [nickname] --profile <name>",
       "  wallet|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats] --profile <name>",
       "  create-table|join-table <invite> [buyIn]|connect|snapshot|transcript|commit|reveal|action <fold|check|call|bet|raise> [sats]|peer-send <message> --profile <name>",
       "  interactive --profile <name>",
-      "  daemon <start|status|stop|watch> --profile <name>",
+      "  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
       "  play-scenario --scenario-file <path> [--run-dir <path>]",
       "  run-harness --scenario-file <path>",
       "Shared flags:",
-      "  --network <regtest|mutinynet> --server-url <url> --websocket-url <url> --ark-server-url <url> --boltz-url <url> --mock --json",
+      "  --network <regtest|mutinynet> --server-url <url> --indexer-url <url> --websocket-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --mock --json",
       "",
     ].join("\n"),
   );

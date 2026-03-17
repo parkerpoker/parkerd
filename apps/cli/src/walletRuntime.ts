@@ -35,7 +35,10 @@ export class CliWalletRuntime {
 
   async bootstrap(profileName: string, nickname?: string): Promise<BootstrapResult> {
     const existing = await this.store.load(profileName);
-    const identity = existing ? createLocalIdentity(existing.privateKeyHex) : createLocalIdentity();
+    const walletPrivateKeyHex = existing?.walletPrivateKeyHex ?? existing?.privateKeyHex;
+    const identity = walletPrivateKeyHex
+      ? createLocalIdentity(walletPrivateKeyHex)
+      : createLocalIdentity();
     const state: PlayerProfileState = existing ?? {
       handSeeds: {},
       nickname: nickname ?? profileName,
@@ -43,6 +46,8 @@ export class CliWalletRuntime {
       profileName,
     };
     state.nickname = nickname ?? state.nickname;
+    state.privateKeyHex = state.walletPrivateKeyHex ?? state.privateKeyHex ?? identity.privateKeyHex;
+    state.walletPrivateKeyHex = state.walletPrivateKeyHex ?? state.privateKeyHex;
     if (this.config.useMockSettlement && !state.mockWallet) {
       state.mockWallet = createMockWallet(identity.playerId);
     }
@@ -185,8 +190,9 @@ export class CliWalletRuntime {
     if (!state) {
       throw new Error(`profile ${profileName} is not initialized; run bootstrap first`);
     }
+    const walletPrivateKeyHex = state.walletPrivateKeyHex ?? state.privateKeyHex;
     return {
-      identity: createLocalIdentity(state.privateKeyHex),
+      identity: createLocalIdentity(walletPrivateKeyHex),
       state,
     };
   }

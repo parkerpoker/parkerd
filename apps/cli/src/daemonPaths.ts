@@ -4,6 +4,7 @@ export interface ProfileDaemonPaths {
   logPath: string;
   metadataPath: string;
   socketPath: string;
+  stateDir: string;
 }
 
 export function buildProfileDaemonPaths(daemonDir: string, profileName: string): ProfileDaemonPaths {
@@ -12,5 +13,6 @@ export function buildProfileDaemonPaths(daemonDir: string, profileName: string):
     logPath: join(daemonDir, `${slug}.log`),
     metadataPath: join(daemonDir, `${slug}.json`),
     socketPath: join(daemonDir, `${slug}.sock`),
+    stateDir: join(daemonDir, `${slug}.state`),
   };
 }

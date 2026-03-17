@@ -11,9 +11,15 @@ import type {
   CommitSeedParams,
   CreateTableParams,
   DaemonEventEnvelope,
+  DaemonRuntimeState,
   DaemonRequestEnvelope,
   DaemonResponseEnvelope,
   JoinTableParams,
+  MeshActionParams,
+  MeshBootstrapPeerParams,
+  MeshCreateTableParams,
+  MeshJoinTableParams,
+  MeshTableParams,
   ProfileDaemonMetadata,
   SendActionParams,
   SendPeerMessageParams,
@@ -23,12 +29,15 @@ import type {
   WalletWithdrawParams,
 } from "./daemonProtocol.js";
 import { CliLogger, type LogEnvelope } from "./logger.js";
+import { MeshRuntime } from "./meshRuntime.js";
+import type { MeshRuntimeMode } from "./meshTypes.js";
 import { ParkerPlayerClient } from "./playerClient.js";
 import { ProfileStore } from "./profileStore.js";
 
 export class ProfileDaemon {
   private readonly paths: ReturnType<typeof buildProfileDaemonPaths>;
   private heartbeatTimer: NodeJS.Timeout | undefined;
+  private readonly mesh: MeshRuntime;
   private metadata: ProfileDaemonMetadata | null = null;
   private readonly player: ParkerPlayerClient;
   private readonly server = net.createServer((socket) => {
@@ -40,6 +49,7 @@ export class ProfileDaemon {
   constructor(
     private readonly profileName: string,
     private readonly config: CliRuntimeConfig,
+    private readonly mode: MeshRuntimeMode = "player",
   ) {
     this.paths = buildProfileDaemonPaths(this.config.daemonDir, this.profileName);
     const logger = new CliLogger(config.outputJson, profileName, {
@@ -55,14 +65,13 @@ export class ProfileDaemon {
       undefined,
       undefined,
       undefined,
-      (state) => {
-        void this.broadcast({
-          event: "state",
-          payload: state,
-          type: "event",
-        });
+      () => {
+        void this.broadcastState();
       },
     );
+    this.mesh = new MeshRuntime(profileName, config, logger, undefined, undefined, () => {
+      void this.broadcastState();
+    });
     this.readyPromise = this.restoreExistingSession();
   }
 
@@ -99,6 +108,18 @@ export class ProfileDaemon {
       if (!this.metadata) {
         return;
       }
+      await this.mesh.start(this.mode);
+      const state = this.currentState();
+      this.metadata.mode = this.mode;
+      if (state.mesh?.peer.peerId) {
+        this.metadata.peerId = state.mesh.peer.peerId;
+      }
+      if (state.mesh?.peer.peerUrl) {
+        this.metadata.peerUrl = state.mesh.peer.peerUrl;
+      }
+      if (state.mesh?.peer.protocolId) {
+        this.metadata.protocolId = state.mesh.peer.protocolId;
+      }
       this.metadata.status = "running";
       this.metadata.lastHeartbeat = new Date().toISOString();
       await writeProfileDaemonMetadata(this.paths, this.metadata);
@@ -123,6 +144,7 @@ export class ProfileDaemon {
       this.heartbeatTimer = undefined;
     }
     this.player.close();
+    this.mesh.close();
     for (const watcher of this.watchers) {
       watcher.end();
     }
@@ -159,15 +181,15 @@ export class ProfileDaemon {
           socket.once("close", () => {
             this.watchers.delete(socket);
           });
-          return okResponse(request.id, this.player.currentState());
+          return okResponse(request.id, this.currentState());
         }
         case "status":
-          return okResponse(request.id, this.player.currentState());
+          return okResponse(request.id, this.currentState());
         case "bootstrap":
-          return okResponse(
-            request.id,
-            await this.player.bootstrap(((request.params ?? {}) as unknown as BootstrapParams).nickname),
-          );
+          return okResponse(request.id, {
+            legacy: await this.player.bootstrap(((request.params ?? {}) as unknown as BootstrapParams).nickname),
+            mesh: await this.mesh.bootstrap(((request.params ?? {}) as unknown as BootstrapParams).nickname),
+          });
         case "walletSummary":
           return okResponse(request.id, await this.player.walletSummary());
         case "walletDeposit": {
@@ -202,7 +224,7 @@ export class ProfileDaemon {
         }
         case "connectCurrentTable":
           await this.player.connectCurrentTable();
-          return okResponse(request.id, this.player.currentState());
+          return okResponse(request.id, this.currentState());
         case "getSnapshot":
           return okResponse(request.id, await this.player.getSnapshot());
         case "getTranscript":
@@ -214,10 +236,68 @@ export class ProfileDaemon {
           );
         case "sendAction":
           await this.player.sendAction(((request.params ?? {}) as unknown as SendActionParams).payload as SignedActionPayload);
-          return okResponse(request.id, this.player.currentState());
+          return okResponse(request.id, this.currentState());
         case "sendPeerMessage":
           await this.player.sendPeerMessage(((request.params ?? {}) as unknown as SendPeerMessageParams).message);
-          return okResponse(request.id, this.player.currentState());
+          return okResponse(request.id, this.currentState());
+        case "meshNetworkPeers":
+          return okResponse(request.id, await this.mesh.networkPeers());
+        case "meshBootstrapPeer": {
+          const params = (request.params ?? {}) as unknown as MeshBootstrapPeerParams;
+          return okResponse(
+            request.id,
+            await this.mesh.addBootstrapPeer(params.peerUrl, params.alias, params.roles),
+          );
+        }
+        case "meshCreateTable":
+          return okResponse(
+            request.id,
+            await this.mesh.createTable(((request.params ?? {}) as unknown as MeshCreateTableParams).table),
+          );
+        case "meshTableAnnounce":
+          return okResponse(
+            request.id,
+            await this.mesh.announceTable(((request.params ?? {}) as unknown as MeshTableParams).tableId),
+          );
+        case "meshTableJoin": {
+          const params = (request.params ?? {}) as unknown as MeshJoinTableParams;
+          return okResponse(request.id, await this.mesh.joinTable(params.inviteCode, params.buyInSats));
+        }
+        case "meshGetTable":
+          return okResponse(
+            request.id,
+            await this.mesh.getTableState(((request.params ?? {}) as unknown as MeshTableParams).tableId),
+          );
+        case "meshSendAction":
+          return okResponse(
+            request.id,
+            await this.mesh.sendAction(
+              ((request.params ?? {}) as unknown as MeshActionParams).payload,
+              ((request.params ?? {}) as unknown as MeshActionParams).tableId,
+            ),
+          );
+        case "meshRotateHost":
+          return okResponse(
+            request.id,
+            await this.mesh.rotateHost(((request.params ?? {}) as unknown as MeshTableParams).tableId),
+          );
+        case "meshCashOut":
+          return okResponse(
+            request.id,
+            await this.mesh.cashOut(((request.params ?? {}) as unknown as MeshTableParams).tableId),
+          );
+        case "meshRenew":
+          return okResponse(
+            request.id,
+            await this.mesh.renewFunds(((request.params ?? {}) as unknown as MeshTableParams).tableId),
+          );
+        case "meshExit":
+          return okResponse(
+            request.id,
+            await this.mesh.emergencyExit(((request.params ?? {}) as unknown as MeshTableParams).tableId),
+          );
+        case "meshPublicTables":
+          return okResponse(request.id, await this.mesh.listPublicTables());
         case "stop":
           setTimeout(() => {
             void this.stop();
@@ -284,6 +364,21 @@ export class ProfileDaemon {
         });
       }
     }
+  }
+
+  private async broadcastState() {
+    await this.broadcast({
+      event: "state",
+      payload: this.currentState(),
+      type: "event",
+    });
+  }
+
+  private currentState(): DaemonRuntimeState {
+    return {
+      ...this.player.currentState(),
+      mesh: this.mesh.currentState(),
+    };
   }
 
   private async writeHeartbeat() {

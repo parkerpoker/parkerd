@@ -1,13 +1,16 @@
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
-import { bytesToHex, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
+import { bytesToHex, concatBytes, hexToBytes, utf8ToBytes } from "@noble/hashes/utils";
 
 import type {
   EscrowState,
+  IdentityBinding,
   Network,
+  PrivateCardEnvelope,
   SettlementInstruction,
   SwapJobStatus,
   SwapQuote,
+  TableFundsOperation,
   TableCheckpoint,
   TimeoutDelegation,
 } from "@parker/protocol";
@@ -45,6 +48,13 @@ export interface LocalIdentity {
   publicKeyHex: string;
 }
 
+export interface ScopedIdentity {
+  id: string;
+  privateKeyHex: string;
+  publicKeyHex: string;
+  scope: "peer" | "protocol" | "wallet";
+}
+
 export interface WalletSummary {
   availableSats: number;
   totalSats: number;
@@ -76,6 +86,38 @@ export interface SettlementProvider {
   }): SettlementInstruction;
 }
 
+export interface TableFundsProvider {
+  prepareBuyIn(tableId: string, playerId: string, amountSats: number): Promise<TableFundsOperation>;
+  confirmBuyIn(
+    tableId: string,
+    playerId: string,
+    preparedLock: TableFundsOperation,
+  ): Promise<TableFundsOperation>;
+  recordCheckpoint(
+    tableId: string,
+    checkpointHash: string,
+    balances: Record<string, number>,
+  ): Promise<TableFundsOperation>;
+  cooperativeCashOut(
+    tableId: string,
+    playerId: string,
+    balance: number,
+    checkpointHash: string,
+  ): Promise<TableFundsOperation>;
+  cooperativeCloseTable(
+    tableId: string,
+    balances: Record<string, number>,
+    checkpointHash: string,
+  ): Promise<TableFundsOperation[]>;
+  renewTablePositions(tableId: string): Promise<TableFundsOperation[]>;
+  emergencyExit(
+    tableId: string,
+    playerId: string,
+    lastCheckpointHash: string,
+    amountSats: number,
+  ): Promise<TableFundsOperation>;
+}
+
 export interface ArkadeWalletConnectionConfig {
   privateKeyHex: string;
   network?: Network;
@@ -104,7 +146,7 @@ function mockBoardingAddress(playerId: string) {
   return `bcrt1q${playerId.slice(-20).padEnd(20, "0")}`;
 }
 
-function stableStringify(input: unknown): string {
+export function stableStringify(input: unknown): string {
   if (Array.isArray(input)) {
     return `[${input.map((value) => stableStringify(value)).join(",")}]`;
   }
@@ -129,6 +171,36 @@ export function hashMessage(message: string): Uint8Array {
   return sha256(utf8ToBytes(message));
 }
 
+function hashStructuredPayload(input: unknown): Uint8Array {
+  return sha256(utf8ToBytes(stableStringify(input)));
+}
+
+function deriveScopedId(scope: ScopedIdentity["scope"], publicKeyHex: string) {
+  const digest = bytesToHex(sha256(hexToBytes(publicKeyHex))).slice(0, 20);
+  switch (scope) {
+    case "wallet":
+      return `player-${digest}`;
+    case "protocol":
+      return `proto-${digest}`;
+    case "peer":
+      return `peer-${digest}`;
+  }
+}
+
+export function createScopedIdentity(
+  scope: ScopedIdentity["scope"],
+  seedHex = randomHex(32),
+): ScopedIdentity {
+  const publicKey = secp256k1.getPublicKey(hexToBytes(seedHex), true);
+  const publicKeyHex = bytesToHex(publicKey);
+  return {
+    id: deriveScopedId(scope, publicKeyHex),
+    privateKeyHex: seedHex,
+    publicKeyHex,
+    scope,
+  };
+}
+
 export function createLocalIdentity(seedHex = randomHex(32)): LocalIdentity {
   const publicKey = secp256k1.getPublicKey(hexToBytes(seedHex), true);
   const publicKeyHex = bytesToHex(publicKey);
@@ -144,8 +216,29 @@ export function signMessage(identity: LocalIdentity, message: string): string {
   return secp256k1.sign(hashMessage(message), hexToBytes(identity.privateKeyHex)).toCompactHex();
 }
 
+export function signStructuredData(
+  identity: Pick<LocalIdentity | ScopedIdentity, "privateKeyHex">,
+  input: unknown,
+): string {
+  return secp256k1
+    .sign(hashStructuredPayload(input), hexToBytes(identity.privateKeyHex))
+    .toCompactHex();
+}
+
 export function verifyMessage(publicKeyHex: string, message: string, signatureHex: string): boolean {
   return secp256k1.verify(hexToBytes(signatureHex), hashMessage(message), hexToBytes(publicKeyHex));
+}
+
+export function verifyStructuredData(
+  publicKeyHex: string,
+  input: unknown,
+  signatureHex: string,
+): boolean {
+  return secp256k1.verify(
+    hexToBytes(signatureHex),
+    hashStructuredPayload(input),
+    hexToBytes(publicKeyHex),
+  );
 }
 
 export function signCheckpoint(identity: LocalIdentity, checkpoint: Omit<TableCheckpoint, "signatures">): string {
@@ -186,6 +279,120 @@ export function createTimeoutDelegation(args: {
     ...delegationBase,
     signatureHex: signMessage(args.signer, stableStringify(delegationBase)),
   };
+}
+
+export function buildIdentityBinding(args: {
+  tableId: string;
+  peerId: string;
+  protocolIdentity: ScopedIdentity;
+  walletIdentity: LocalIdentity;
+  signedAt?: string;
+}): IdentityBinding {
+  const bindingBase = {
+    tableId: args.tableId,
+    peerId: args.peerId,
+    protocolId: args.protocolIdentity.id,
+    protocolPubkeyHex: args.protocolIdentity.publicKeyHex,
+    walletPlayerId: args.walletIdentity.playerId,
+    walletPubkeyHex: args.walletIdentity.publicKeyHex,
+    signedAt: args.signedAt ?? new Date().toISOString(),
+  };
+
+  return {
+    ...bindingBase,
+    signatureHex: signStructuredData(args.walletIdentity, bindingBase),
+  };
+}
+
+export function verifyIdentityBinding(binding: IdentityBinding): boolean {
+  const unsigned = {
+    tableId: binding.tableId,
+    peerId: binding.peerId,
+    protocolId: binding.protocolId,
+    protocolPubkeyHex: binding.protocolPubkeyHex,
+    walletPlayerId: binding.walletPlayerId,
+    walletPubkeyHex: binding.walletPubkeyHex,
+    signedAt: binding.signedAt,
+  };
+  return verifyStructuredData(binding.walletPubkeyHex, unsigned, binding.signatureHex);
+}
+
+function deriveCipherKey(args: {
+  senderPrivateKeyHex: string;
+  recipientPublicKeyHex: string;
+  scope: string;
+  nonceHex: string;
+}) {
+  const sharedSecret = secp256k1.getSharedSecret(
+    hexToBytes(args.senderPrivateKeyHex),
+    hexToBytes(args.recipientPublicKeyHex),
+    true,
+  );
+  return sha256(
+    concatBytes(sharedSecret, utf8ToBytes(args.scope), hexToBytes(args.nonceHex)),
+  );
+}
+
+function xorWithKeyStream(key: Uint8Array, payload: Uint8Array) {
+  const output = new Uint8Array(payload.length);
+  let offset = 0;
+  let counter = 0;
+  while (offset < payload.length) {
+    const block = sha256(concatBytes(key, utf8ToBytes(String(counter))));
+    const length = Math.min(block.length, payload.length - offset);
+    for (let index = 0; index < length; index += 1) {
+      output[offset + index] = payload[offset + index]! ^ block[index]!;
+    }
+    offset += length;
+    counter += 1;
+  }
+  return output;
+}
+
+export function encryptScopedPayload(args: {
+  senderPrivateKeyHex: string;
+  recipientPublicKeyHex: string;
+  scope: string;
+  payload: unknown;
+}): PrivateCardEnvelope {
+  const nonceHex = randomHex(16);
+  const key = deriveCipherKey({
+    senderPrivateKeyHex: args.senderPrivateKeyHex,
+    recipientPublicKeyHex: args.recipientPublicKeyHex,
+    scope: args.scope,
+    nonceHex,
+  });
+  const plaintext = utf8ToBytes(stableStringify(args.payload));
+  const ciphertext = xorWithKeyStream(key, plaintext);
+  const ciphertextHex = bytesToHex(ciphertext);
+  const authTagHex = bytesToHex(sha256(concatBytes(key, hexToBytes(ciphertextHex))));
+  return {
+    authTagHex,
+    ciphertextHex,
+    nonceHex,
+  };
+}
+
+export function decryptScopedPayload<T>(args: {
+  recipientPrivateKeyHex: string;
+  senderPublicKeyHex: string;
+  scope: string;
+  envelope: PrivateCardEnvelope;
+}): T {
+  const key = deriveCipherKey({
+    senderPrivateKeyHex: args.recipientPrivateKeyHex,
+    recipientPublicKeyHex: args.senderPublicKeyHex,
+    scope: args.scope,
+    nonceHex: args.envelope.nonceHex,
+  });
+  const expectedTag = bytesToHex(
+    sha256(concatBytes(key, hexToBytes(args.envelope.ciphertextHex))),
+  );
+  if (expectedTag !== args.envelope.authTagHex) {
+    throw new Error("invalid encrypted payload tag");
+  }
+  const plaintext = xorWithKeyStream(key, hexToBytes(args.envelope.ciphertextHex));
+  return JSON.parse(new TextDecoder().decode(plaintext)) as T;
 }
 
 export function buildEscrowDescriptor(request: TableEscrowRequest): EscrowState {
@@ -389,4 +596,198 @@ class MockSettlementProvider implements SettlementProvider {
 
 export function createMockSettlementProvider(network: Network = "mutinynet"): SettlementProvider {
   return new MockSettlementProvider(network);
+}
+
+class SignedTableFundsProvider implements TableFundsProvider {
+  private readonly positions = new Map<string, TableFundsOperation>();
+
+  constructor(
+    private readonly signer: LocalIdentity,
+    private readonly networkId: string,
+    private readonly providerName: string,
+    private readonly defaultExpiryMs: number,
+  ) {}
+
+  async prepareBuyIn(
+    tableId: string,
+    playerId: string,
+    amountSats: number,
+  ): Promise<TableFundsOperation> {
+    return this.createOperation({
+      amountSats,
+      kind: "buy-in-prepared",
+      playerId,
+      status: "prepared",
+      tableId,
+      vtxoExpiry: new Date(Date.now() + this.defaultExpiryMs).toISOString(),
+    });
+  }
+
+  async confirmBuyIn(
+    tableId: string,
+    playerId: string,
+    preparedLock: TableFundsOperation,
+  ): Promise<TableFundsOperation> {
+    const operation = this.createOperation({
+      amountSats: preparedLock.amountSats,
+      kind: "buy-in-locked",
+      playerId,
+      status: "locked",
+      tableId,
+      vtxoExpiry: new Date(Date.now() + this.defaultExpiryMs).toISOString(),
+    });
+    this.positions.set(tableId, operation);
+    return operation;
+  }
+
+  async recordCheckpoint(
+    tableId: string,
+    checkpointHash: string,
+    balances: Record<string, number>,
+  ): Promise<TableFundsOperation> {
+    const amountSats = Object.values(balances).reduce((total, amount) => total + amount, 0);
+    return this.createOperation({
+      amountSats,
+      checkpointHash,
+      kind: "checkpoint-recorded",
+      playerId: this.signer.playerId,
+      status: "recorded",
+      tableId,
+      ...(this.positions.get(tableId)?.vtxoExpiry
+        ? { vtxoExpiry: this.positions.get(tableId)!.vtxoExpiry }
+        : {}),
+    });
+  }
+
+  async cooperativeCashOut(
+    tableId: string,
+    playerId: string,
+    balance: number,
+    checkpointHash: string,
+  ): Promise<TableFundsOperation> {
+    return this.createOperation({
+      amountSats: balance,
+      checkpointHash,
+      kind: "cashout",
+      playerId,
+      status: "completed",
+      tableId,
+      ...(this.positions.get(tableId)?.vtxoExpiry
+        ? { vtxoExpiry: this.positions.get(tableId)!.vtxoExpiry }
+        : {}),
+    });
+  }
+
+  async cooperativeCloseTable(
+    tableId: string,
+    balances: Record<string, number>,
+    checkpointHash: string,
+  ): Promise<TableFundsOperation[]> {
+    return Object.entries(balances).map(([playerId, amountSats]) =>
+      this.createOperation({
+        amountSats,
+        checkpointHash,
+        kind: "close-table",
+        playerId,
+        status: "completed",
+        tableId,
+        ...(this.positions.get(tableId)?.vtxoExpiry
+          ? { vtxoExpiry: this.positions.get(tableId)!.vtxoExpiry }
+          : {}),
+      }),
+    );
+  }
+
+  async renewTablePositions(tableId: string): Promise<TableFundsOperation[]> {
+    const current = this.positions.get(tableId);
+    if (!current) {
+      return [];
+    }
+    const renewed = this.createOperation({
+      amountSats: current.amountSats,
+      kind: "renewal",
+      playerId: current.playerId,
+      status: "renewed",
+      tableId,
+      vtxoExpiry: new Date(Date.now() + this.defaultExpiryMs).toISOString(),
+      ...(current.checkpointHash ? { checkpointHash: current.checkpointHash } : {}),
+    });
+    this.positions.set(tableId, renewed);
+    return [renewed];
+  }
+
+  async emergencyExit(
+    tableId: string,
+    playerId: string,
+    lastCheckpointHash: string,
+    amountSats: number,
+  ): Promise<TableFundsOperation> {
+    return this.createOperation({
+      amountSats,
+      checkpointHash: lastCheckpointHash,
+      kind: "emergency-exit",
+      playerId,
+      status: "exited",
+      tableId,
+      ...(this.positions.get(tableId)?.vtxoExpiry
+        ? { vtxoExpiry: this.positions.get(tableId)!.vtxoExpiry }
+        : {}),
+    });
+  }
+
+  private createOperation(args: {
+    amountSats: number;
+    checkpointHash?: string | undefined;
+    kind: TableFundsOperation["kind"];
+    playerId: string;
+    status: TableFundsOperation["status"];
+    tableId: string;
+    vtxoExpiry?: string | undefined;
+  }): TableFundsOperation {
+    const base = {
+      operationId: crypto.randomUUID(),
+      kind: args.kind,
+      provider: this.providerName,
+      tableId: args.tableId,
+      playerId: args.playerId,
+      networkId: this.networkId,
+      amountSats: args.amountSats,
+      ...(args.checkpointHash ? { checkpointHash: args.checkpointHash } : {}),
+      ...(args.vtxoExpiry ? { vtxoExpiry: args.vtxoExpiry } : {}),
+      createdAt: new Date().toISOString(),
+      status: args.status,
+      signerPubkeyHex: this.signer.publicKeyHex,
+    } satisfies Omit<TableFundsOperation, "signatureHex">;
+
+    return {
+      ...base,
+      signatureHex: signStructuredData(this.signer, base),
+    };
+  }
+}
+
+export function createMockTableFundsProvider(args: {
+  signer: LocalIdentity;
+  networkId: string;
+  expiryMs?: number;
+}): TableFundsProvider {
+  return new SignedTableFundsProvider(
+    args.signer,
+    args.networkId,
+    "mock-table-funds/v1",
+    args.expiryMs ?? 15 * 60_000,
+  );
+}
+
+export function createArkadeTableFundsProvider(args: {
+  signer: LocalIdentity;
+  networkId: string;
+  expiryMs?: number;
+}): TableFundsProvider {
+  return new SignedTableFundsProvider(
+    args.signer,
+    args.networkId,
+    "arkade-table-funds/v1",
+    args.expiryMs ?? 45 * 60_000,
+  );
 }

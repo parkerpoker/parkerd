@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type {
   CreateTableRequest,
   CreateTableResponse,
+  MeshPlayerActionPayload,
   SignedActionPayload,
   SwapJobStatus,
   SwapQuote,
@@ -17,23 +18,23 @@ import type { CliRuntimeConfig } from "./config.js";
 import { cleanupProfileDaemonArtifacts, isPidAlive, readProfileDaemonMetadata } from "./daemonFiles.js";
 import { buildProfileDaemonPaths } from "./daemonPaths.js";
 import type {
+  DaemonRuntimeState,
   DaemonEventEnvelope,
   DaemonRequestEnvelope,
   DaemonResponseEnvelope,
   ProfileDaemonMetadata,
 } from "./daemonProtocol.js";
 import type { LogEnvelope } from "./logger.js";
-import type { PlayerRuntimeState } from "./playerClient.js";
 import type { BootstrapResult } from "./walletRuntime.js";
 
 export interface ProfileDaemonStatus {
   metadata: ProfileDaemonMetadata | null;
   reachable: boolean;
-  state: PlayerRuntimeState | null;
+  state: DaemonRuntimeState | null;
 }
 
 export class DaemonRpcClient {
-  private cachedState: PlayerRuntimeState = {
+  private cachedState: DaemonRuntimeState = {
     identity: undefined,
     peerMessages: [],
     peerStatus: "offline",
@@ -84,9 +85,9 @@ export class DaemonRpcClient {
   async inspect(autoStart = false): Promise<ProfileDaemonStatus> {
     const metadata = await readProfileDaemonMetadata(this.paths);
     const reachable = autoStart ? (await this.isReachable(true)) : await this.isReachable();
-    let state: PlayerRuntimeState | null = null;
+    let state: DaemonRuntimeState | null = null;
     if (reachable) {
-      state = (await this.request("status", undefined, autoStart)) as PlayerRuntimeState;
+      state = (await this.request("status", undefined, autoStart)) as DaemonRuntimeState;
     }
     return { metadata, reachable, state };
   }
@@ -114,7 +115,7 @@ export class DaemonRpcClient {
   ) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      const state = (await this.request("status")) as PlayerRuntimeState;
+      const state = (await this.request("status")) as DaemonRuntimeState;
       this.cachedState = state;
       if (predicate(state.snapshot, state.peerStatus)) {
         return state.snapshot;
@@ -175,7 +176,7 @@ export class DaemonRpcClient {
         }
         if (parsed.type === "event") {
           if (parsed.event === "state") {
-            this.cachedState = parsed.payload as PlayerRuntimeState;
+            this.cachedState = parsed.payload as DaemonRuntimeState;
           }
           onEvent(parsed);
         }
@@ -198,6 +199,64 @@ export class DaemonRpcClient {
 
   async commitSeed(reveal = false): Promise<TableSnapshot> {
     return (await this.request("commitSeed", { reveal })) as TableSnapshot;
+  }
+
+  async meshBootstrapPeer(peerUrl: string, alias?: string, roles?: string[]) {
+    return await this.request("meshBootstrapPeer", {
+      ...(alias ? { alias } : {}),
+      peerUrl,
+      ...(roles ? { roles } : {}),
+    });
+  }
+
+  async meshCashOut(tableId?: string) {
+    return await this.request("meshCashOut", tableId ? { tableId } : undefined);
+  }
+
+  async meshCreateTable(table?: Record<string, unknown>) {
+    return await this.request("meshCreateTable", table ? { table } : undefined);
+  }
+
+  async meshExit(tableId?: string) {
+    return await this.request("meshExit", tableId ? { tableId } : undefined);
+  }
+
+  async meshGetTable(tableId?: string) {
+    return await this.request("meshGetTable", tableId ? { tableId } : undefined);
+  }
+
+  async meshNetworkPeers() {
+    return await this.request("meshNetworkPeers");
+  }
+
+  async meshPublicTables() {
+    return await this.request("meshPublicTables");
+  }
+
+  async meshRenew(tableId?: string) {
+    return await this.request("meshRenew", tableId ? { tableId } : undefined);
+  }
+
+  async meshRotateHost(tableId?: string) {
+    return await this.request("meshRotateHost", tableId ? { tableId } : undefined);
+  }
+
+  async meshSendAction(payload: MeshPlayerActionPayload, tableId?: string) {
+    return await this.request("meshSendAction", {
+      payload,
+      ...(tableId ? { tableId } : {}),
+    });
+  }
+
+  async meshTableAnnounce(tableId?: string) {
+    return await this.request("meshTableAnnounce", tableId ? { tableId } : undefined);
+  }
+
+  async meshTableJoin(inviteCode: string, buyInSats?: number) {
+    return await this.request("meshTableJoin", {
+      inviteCode,
+      ...(buyInSats === undefined ? {} : { buyInSats }),
+    });
   }
 
   private get paths() {
@@ -259,7 +318,7 @@ export class DaemonRpcClient {
           const parsed = JSON.parse(line) as DaemonResponseEnvelope | DaemonEventEnvelope;
           if (parsed.type === "event") {
             if (parsed.event === "state") {
-              this.cachedState = parsed.payload as PlayerRuntimeState;
+              this.cachedState = parsed.payload as DaemonRuntimeState;
             }
             continue;
           }
@@ -295,12 +354,15 @@ export class DaemonRpcClient {
         ...process.env,
         PARKER_NETWORK: this.config.network,
         PARKER_SERVER_URL: this.config.serverUrl,
+        PARKER_INDEXER_URL: this.config.indexerUrl,
         PARKER_WEBSOCKET_URL: this.config.websocketUrl,
         PARKER_ARK_SERVER_URL: this.config.arkServerUrl,
         PARKER_BOLTZ_URL: this.config.boltzApiUrl,
         PARKER_USE_MOCK_SETTLEMENT: String(this.config.useMockSettlement),
         PARKER_PROFILE_DIR: this.config.profileDir,
         PARKER_DAEMON_DIR: this.config.daemonDir,
+        PARKER_PEER_HOST: this.config.peerHost,
+        PARKER_PEER_PORT: String(this.config.peerPort),
         PARKER_RUN_DIR: this.config.runDir,
       },
       stdio: "ignore",
@@ -312,8 +374,18 @@ export class DaemonRpcClient {
     if (!result || typeof result !== "object") {
       return;
     }
-    if ("peerStatus" in (result as Record<string, unknown>) && "peerMessages" in (result as Record<string, unknown>)) {
-      this.cachedState = result as PlayerRuntimeState;
+    if (
+      "peerStatus" in (result as Record<string, unknown>) &&
+      "peerMessages" in (result as Record<string, unknown>)
+    ) {
+      this.cachedState = result as DaemonRuntimeState;
+      return;
+    }
+    if ("mesh" in (result as Record<string, unknown>)) {
+      this.cachedState = {
+        ...this.cachedState,
+        ...(result as Partial<DaemonRuntimeState>),
+      };
     }
   }
 

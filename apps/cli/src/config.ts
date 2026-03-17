@@ -10,7 +10,10 @@ import {
 
 export interface CliRuntimeConfig extends ParkerNetworkConfig {
   daemonDir: string;
+  indexerUrl?: string;
   profileDir: string;
+  peerHost: string;
+  peerPort: number;
   runDir: string;
   serverUrl: string;
   websocketUrl: string;
@@ -88,6 +91,19 @@ export function resolveCliRuntimeConfig(flags: CliFlagMap): CliRuntimeConfig {
       : process.env.PARKER_WEBSOCKET_URL ??
         process.env.WEBSOCKET_URL ??
         `${serverUrl.replace(/^http/, "ws")}/ws`;
+  const indexerUrl =
+    typeof flags["indexer-url"] === "string"
+      ? flags["indexer-url"]
+      : process.env.PARKER_INDEXER_URL ?? serverUrl;
+  const peerHost =
+    typeof flags["peer-host"] === "string"
+      ? flags["peer-host"]
+      : process.env.PARKER_PEER_HOST ?? "127.0.0.1";
+  const peerPortValue =
+    typeof flags["peer-port"] === "string"
+      ? Number(flags["peer-port"])
+      : Number(process.env.PARKER_PEER_PORT ?? 0);
+  const peerPort = Number.isFinite(peerPortValue) ? peerPortValue : 0;
   const profileDir = resolve(
     typeof flags["profile-dir"] === "string"
       ? flags["profile-dir"]
@@ -111,7 +127,10 @@ export function resolveCliRuntimeConfig(flags: CliFlagMap): CliRuntimeConfig {
   return {
     ...networkConfig,
     daemonDir,
+    indexerUrl,
     profileDir,
+    peerHost,
+    peerPort,
     runDir,
     serverUrl,
     websocketUrl,

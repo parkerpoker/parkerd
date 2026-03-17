@@ -1,5 +1,6 @@
 import { resolveCliRuntimeConfig, type CliFlagMap } from "./config.js";
 import { ProfileDaemon } from "./daemonProcess.js";
+import type { MeshRuntimeMode } from "./meshTypes.js";
 
 function parseFlags(argv: string[]) {
   const flags: CliFlagMap = {};
@@ -33,7 +34,12 @@ async function main(argv: string[]) {
     throw new Error("--profile is required for daemon startup");
   }
   const config = resolveCliRuntimeConfig(flags);
-  const daemon = new ProfileDaemon(profileValue, config);
+  const modeValue = flags.mode;
+  const mode =
+    modeValue === "host" || modeValue === "witness" || modeValue === "indexer" || modeValue === "player"
+      ? (modeValue as MeshRuntimeMode)
+      : "player";
+  const daemon = new ProfileDaemon(profileValue, config, mode);
   await daemon.start();
 }
 
