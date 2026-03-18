@@ -10,7 +10,7 @@
     "build": "tsup src/index.ts src/daemonEntry.ts --format esm --dts --clean",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "test:live-regtest": "tsx src/liveRegtestHarness.ts",
+    "test:live-regtest": "node --import tsx ../../integration/mesh-regtest.ts --start-nigiri",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "dependencies": {

@@ -1,46 +1,37 @@
-# Protocol
+# Poker Mesh Protocol
 
-This document describes the current daemon-first poker protocol implemented in this repo.
+This document describes the protocol that is implemented today in this repository. It is intentionally implementation-accurate and anchored to the current runtime rather than an aspirational design.
 
-It is a v1 implementation document, not a future-looking idealized spec. Where the code is intentionally incomplete, this doc says so directly.
+Primary implementation units:
+
+- `packages/protocol/src/index.ts`
+- `apps/cli/src/meshRuntime.ts`
+- `apps/cli/src/peerTransport.ts`
+- `packages/settlement/src/index.ts`
+- `apps/cli/src/tableFundsStateStore.ts`
+- `integration/mesh-regtest.ts`
 
 ## Scope
 
-- protocol version: `poker/v1`
-- canonical gameplay transport today: direct daemon-to-daemon WebSocket connections on `/mesh`
-- canonical state model: signed, append-only table events plus signed cooperative snapshots
-- public read path: optional indexer HTTP ingest plus read-only website APIs
+- Protocol version: `poker/v1`
+- Canonical gameplay transport: direct daemon-to-daemon WebSockets on `/mesh`
+- Canonical state: signed `SignedTableEvent` history plus signed cooperative settlement-boundary snapshots
+- Settlement layer: Arkade-backed `TableFundsProvider` using wallet-local custody
+- Game variant: heads-up Texas Hold'em
 
-This is the protocol implemented by:
-
-- [index.ts](/Users/danieldresner/src/arkade_fun/packages/protocol/src/index.ts)
-- [meshRuntime.ts](/Users/danieldresner/src/arkade_fun/apps/cli/src/meshRuntime.ts)
-- [peerTransport.ts](/Users/danieldresner/src/arkade_fun/apps/cli/src/peerTransport.ts)
-- [index.ts](/Users/danieldresner/src/arkade_fun/packages/settlement/src/index.ts)
-
-## Goals
-
-- keep wallet custody local to each daemon
-- make gameplay reconstructable from persisted local state
-- let hosts sequence hands without becoming custodians
-- allow witnesses to preserve liveness and auditability
-- keep website and public indexers outside consensus
+Although some shared schemas permit more seats, the current runtime only starts hands when exactly two bankroll participants are seated. The end-to-end harness uses two seated players, one host daemon, and at least one witness daemon.
 
 ## Identity Model
 
-Each daemon uses three identities.
+Each daemon uses three identities:
 
-
-| Identity          | Purpose                                        | Signs                                                                                                             |
-| ----------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| peer identity     | network addressability and transport handshake | `hello` wire frames                                                                                               |
-| protocol identity | poker protocol participation                   | signed table events, join intents, action intents, snapshot/lease/failover signatures, advertisements, heartbeats |
-| wallet identity   | funds and custody binding                      | identity bindings and table funds operations                                                                      |
-
+- Peer identity: transport handshake and peer addressability
+- Protocol identity: poker participation, canonical events, auxiliary protocol signatures
+- Wallet identity: funds ownership, identity binding, and table-funds receipts
 
 ### Identity binding
 
-`IdentityBinding` explicitly ties a wallet identity to a peer/protocol identity for one table:
+`IdentityBinding` binds one wallet identity to one peer/protocol identity for one table:
 
 - `tableId`
 - `peerId`
@@ -51,88 +42,232 @@ Each daemon uses three identities.
 - `signedAt`
 - `signatureHex`
 
-The wallet key signs this binding. Hosts verify it during `join-request`.
+The wallet identity signs the unsigned binding body. Hosts verify this binding when handling `join-request`.
 
-### Signature primitive
+## Canonical Structured Signing
 
-Unless noted otherwise, protocol signatures use the same structured-data rule:
+All structured signatures in the poker protocol use the same canonicalization and hashing rules from `packages/settlement/src/index.ts`.
 
-- serialize the unsigned payload with `stableStringify()`
-- hash the serialized bytes with SHA-256
-- sign the digest with compact secp256k1
-- carry the signature as hex plus the signer public key in the object or enclosing envelope
+### Canonicalization
 
-This is the signing path implemented by `signStructuredData()` and `verifyStructuredData()` in [index.ts](/Users/danieldresner/src/arkade_fun/packages/settlement/src/index.ts).
+`stableStringify()` first canonicalizes input data, then `JSON.stringify()` is applied to the canonical form.
 
-### Signer matrix
+Canonicalization rules:
 
+- `null` stays `null`
+- strings and booleans stay unchanged
+- finite numbers stay numeric
+- non-finite numbers become `null`
+- `bigint` becomes a base-10 string
+- `Date` becomes an ISO-8601 string
+- arrays preserve order; `undefined`, functions, and symbols inside arrays become `null`
+- typed-array views become lowercase hex strings
+- objects drop keys whose values are `undefined`, functions, or symbols
+- remaining object keys are sorted lexicographically before serialization
 
-| Object                     | Signed by                                         | Verified by                     | Current behavior                                                                                                    |
-| -------------------------- | ------------------------------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `hello`                    | peer identity                                     | transport                       | required before a provisional peer becomes confirmed                                                                |
-| `IdentityBinding`          | wallet identity                                   | host on `join-request`          | binds wallet identity to peer and protocol identity for one table                                                   |
-| `PlayerJoinIntent`         | protocol identity                                 | host                            | proves the joiner controls the advertised protocol key                                                              |
-| `BuyInConfirm`             | protocol identity                                 | host                            | signs `{ tableId, playerId, confirmedAt, receipt-without-signature }`                                               |
-| `PlayerActionIntent`       | protocol identity                                 | host                            | host accepts or rejects the action, then emits canonical events                                                     |
-| `SignedTableEvent`         | protocol identity                                 | every receiver                  | this is the canonical state-changing signature path                                                                 |
-| `TableSnapshotSignature`   | protocol identity of host, players, and witnesses | host/witness collector          | signatures are gathered and counted for completeness; received signatures are not yet re-verified cryptographically |
-| `HostLeaseSignature`       | protocol identity                                 | host/witness collector          | collected best-effort and carried in the lease                                                                      |
-| `HostFailoverAcceptance`   | protocol identity                                 | witness/host collector          | carried into failover events; not yet re-verified on receipt                                                        |
-| `SignedTableAdvertisement` | host protocol identity                            | public readers/indexers         | used for public table discovery                                                                                     |
-| `TableFundsOperation`      | wallet identity used by the funds provider        | currently the local daemon path | signed money receipt for buy-in, renewal, cashout, and exit operations                                              |
-| `heartbeat`                | host protocol identity                            | receivers                       | carried today, but not yet signature-checked on receipt                                                             |
+### Hash and signature primitive
 
+For any structured payload:
+
+1. Build the unsigned payload by removing the signature field or signature collection.
+2. Serialize with `stableStringify()`.
+3. Hash the UTF-8 bytes with SHA-256.
+4. Sign the digest with compact secp256k1.
+5. Encode the signature as hex.
+
+Verification repeats the same canonicalization and hashing steps. Any post-sign mutation of the signed body invalidates the signature.
+
+### Exact unsigned payloads
+
+The runtime signs and verifies these exact bodies:
+
+- `hello`: `{ alias, peerId, peerPubkeyHex, peerUrl, protocolId, protocolPubkeyHex, roles, sentAt }`
+- `heartbeat`: `{ epoch, hostPeerId, leaseExpiry, sentAt, tableId }`
+- `SignedTableAdvertisement`: advertisement object without `hostSignatureHex`
+- `IdentityBinding`: binding object without `signatureHex`
+- `PlayerJoinIntent`: all intent fields except `signatureHex`
+- `BuyInConfirm`: `{ confirmedAt, playerId, receipt: unsignedFundsOperation(receipt), tableId }`
+- `PlayerActionIntent`: all intent fields except `signatureHex`
+- `TableFundsOperation`: operation object without `signatureHex`
+- `SignedTableEvent`: event envelope without `signature`
+- `CooperativeTableSnapshot`: snapshot without `signatures`
+- `HostLease`: lease without `signatures`
+- `HostFailoverAcceptance`: acceptance without `signatureHex`
+
+`unsignedFundsOperation()` canonicalizes the receipt after removing `signatureHex`. Hosts use this exact form when verifying `buy-in-confirm`.
 
 ## Transport
 
-### Current transport
+### WebSocket mesh
 
-Today the mesh uses direct WebSocket connections. Each daemon listens on:
+Each daemon listens on:
 
-- `ws://<peerHost>:<peerPort>/mesh`
+- `ws://<host>:<port>/mesh`
 
-Known peers are persisted locally and can start from bootstrap hints. A provisional peer ID derived from `peerUrl` may be used briefly during bootstrap, then replaced by the real peer ID once a signed `hello` is received.
+Known peers are stored locally. A provisional peer entry may exist before `hello`, but a connection is not considered identified until a valid signed `hello` is received.
 
 ### Wire frames
 
-All peer traffic is wrapped in a `MeshWireFrame`.
+All traffic is a `MeshWireFrame`:
 
+- `hello`
+- `request`
+- `response`
+- `event`
+- `heartbeat`
+- `public-ad`
+- `public-update`
+- `relay-forward`
 
-| Kind            | Purpose                                                              |
-| --------------- | -------------------------------------------------------------------- |
-| `hello`         | signed transport handshake                                           |
-| `request`       | point-to-point RPC request                                           |
-| `response`      | RPC response or error                                                |
-| `event`         | canonical signed table event                                         |
-| `heartbeat`     | host liveness hint                                                   |
-| `public-ad`     | signed public table advertisement                                    |
-| `public-update` | public spectator/update frame; currently reserved in runtime         |
-| `relay-forward` | wrapper for relay forwarding; placeholder for optional relay support |
-
+All inbound frames are schema-parsed before handling.
 
 ### `hello`
 
-`hello` is signed by the peer identity and includes:
+`hello` must be the first meaningful frame received on a socket. Any non-`hello` frame received before peer identification is rejected.
 
-- `peerId`
-- `peerPubkeyHex`
-- `protocolId`
-- `protocolPubkeyHex`
-- `alias`
-- `peerUrl`
-- `roles`
-- `sentAt`
+The receiver verifies the peer-identity signature over the unsigned `hello` payload. On success, the transport:
+
+- marks the peer as confirmed
+- stores `peerId`, `peerUrl`, `alias`, `roles`, and `protocolPubkeyHex`
+- replaces any provisional entry that used the same `peerUrl`
+
+### `heartbeat`
+
+`heartbeat` is not a canonical table event. It is a signed liveness frame from the current host.
+
+Receiver behavior:
+
+- ignore if `tableId` is unknown
+- ignore if `hostPeerId` does not equal `currentHostPeerId`
+- ignore if `epoch` does not equal `currentEpoch`
+- resolve the current host protocol pubkey
+- verify the structured signature over `{ epoch, hostPeerId, leaseExpiry, sentAt, tableId }`
+- update `lastHostHeartbeatAt` only if verification succeeds
+
+Invalid heartbeats are ignored and never affect failover timing.
+
+### Public ads and relay frames
+
+- `public-ad` is verified against `hostProtocolPubkeyHex` and then cached
+- `public-update` is currently ignored by the mesh runtime
+- `relay-forward` is a best-effort forwarder to an already-open target socket and is not part of consensus
+
+## Request / Response Protocol
+
+`request` and `response` frames coordinate side effects that do not themselves define canonical ordering.
+
+### Supported requests
+
+- `join-request`
+- `buy-in-confirm`
+- `action-request`
+- `snapshot-sign-request`
+- `lease-sign-request`
+- `failover-accept-request`
+- `peer-cache-request`
+- `public-table-list-request`
+
+### Join request validation
+
+`join-request` carries:
+
+- `intent: PlayerJoinIntent`
+- `preparedBuyIn: TableFundsOperation`
+
+The host verifies:
+
+- `IdentityBinding.signatureHex`
+- the protocol signature on the join intent
+- the transport peer ID matches `intent.peerId`
+- `preparedBuyIn.signatureHex`
+- `preparedBuyIn.provider === "arkade-table-funds/v1"` in the canonical Arkade path
+- `preparedBuyIn.kind === "buy-in-prepared"`
+- `preparedBuyIn.status === "prepared"`
+- `preparedBuyIn.playerId === intent.player.playerId`
+- `preparedBuyIn.tableId === tableId`
+- `preparedBuyIn.networkId === table.networkId`
+- `preparedBuyIn.signerPubkeyHex === intent.identityBinding.walletPubkeyHex`
+- `preparedBuyIn.amountSats` is inside table buy-in bounds
+
+If accepted, the host appends `JoinRequest`, sends the existing canonical backlog to the joiner, and then appends `JoinAccepted`. If no seat is available, the host appends `JoinRejected`.
+
+### Buy-in confirmation validation
+
+`buy-in-confirm` carries a `BuyInConfirm` with:
+
+- `tableId`
+- `playerId`
+- `confirmedAt`
+- `receipt`
 - `signatureHex`
 
-The transport verifies this signature before accepting the peer as confirmed.
+The host verifies:
+
+- the confirming peer matches the pending seated player
+- the protocol signature over `{ confirmedAt, playerId, receipt: unsignedFundsOperation(receipt), tableId }`
+- `receipt.signatureHex`
+- `receipt.provider === "arkade-table-funds/v1"` in the canonical Arkade path
+- `receipt.kind === "buy-in-locked"`
+- `receipt.status === "locked"`
+- `receipt.signerPubkeyHex === pending.walletPubkeyHex`
+
+On success, the host appends `SeatLocked` and `BuyInLocked`. Once all seats are locked, the host emits `TableReady`, captures a settlement-boundary snapshot, and schedules the first hand.
+
+### Action request validation
+
+Players do not append canonical actions directly. They send `action-request` to the current host.
+
+The host verifies:
+
+- the protocol signature on `PlayerActionIntent`
+- the referenced hand is currently active
+- hand setup is complete (`handSetupInFlight === false`)
+- the transport peer matches the acting seat
+
+The host then appends `PlayerAction`, runs the game engine, and appends either `ActionAccepted` or `ActionRejected`.
+
+### Snapshot sign request validation
+
+The collector sends `snapshot-sign-request` with a candidate `CooperativeTableSnapshot`.
+
+The receiver:
+
+- waits briefly for local replay to reach `snapshot.latestEventHash`
+- recomputes the expected snapshot body from local canonical state
+- verifies every supplied snapshot signature cryptographically
+- requires the collector's own signature to already be present
+- signs the unsigned snapshot only if the snapshot body exactly matches local state
+
+### Lease sign request validation
+
+For a known table, the signer verifies the lease body and all supplied signatures before adding its own signature.
+
+For an unknown table, only the epoch-1 bootstrap lease can be signed, and only if:
+
+- the signer is included in `lease.witnessSet`
+- the request contains a valid host signature
+- the host signature matches a known host peer's protocol pubkey
+
+During bootstrap, a witness may still be referenced by a provisional peer ID. The lease builder resolves that provisional entry to the witness's final signed peer ID and rebuilds the lease before final quorum enforcement.
+
+### Failover acceptance request validation
+
+The responder verifies:
+
+- `currentEpoch === local currentEpoch`
+- `proposedEpoch === local currentEpoch + 1`
+- the local peer is part of the failover quorum
+- the requester is the current host or a configured witness
+
+If valid, the responder returns a signed `HostFailoverAcceptance`.
 
 ## Canonical Event Log
 
-The canonical protocol is the `SignedTableEvent` stream.
+The authoritative protocol history is the `SignedTableEvent` stream.
 
 ### Envelope
 
-Every canonical event includes:
+Every event contains:
 
 - `protocolVersion`
 - `networkId`
@@ -151,237 +286,155 @@ Every canonical event includes:
 
 ### Event hash
 
-The runtime computes the event hash as:
+The canonical event hash is:
 
 - `sha256(stableStringify(unsignedEvent))`
 
-where `unsignedEvent` is the envelope without `signature`.
+where `unsignedEvent` is the event without `signature`.
 
-### Canonicality rules
+### Local append rules
 
-The runtime applies these rules when receiving events:
+When the local daemon appends an event:
 
-- schema must parse
-- signature must verify against `senderProtocolPubkeyHex`
-- duplicate events are ignored by event hash
-- stale epochs are ignored
-- future events are queued if their predecessor has not arrived yet
-- `prevEventHash` must match the last accepted canonical event hash
-- `seq` must be monotonic within an epoch and restart at `1` on a new epoch
+- `epoch` is `body.newEpoch` for `HostRotated`, otherwise `currentEpoch`
+- `seq` is `1` if no event exists yet in that epoch, otherwise `lastSeqInEpoch + 1`
+- `prevEventHash` is the current `lastEventHash`, even across epoch boundaries
 
-Only accepted events become canonical state.
+This means the first event of a new epoch still points back to the last accepted hash from the previous epoch.
 
-## Event Families
+### Acceptance rules
 
-### Table lifecycle
+Inbound event processing is:
 
-Schema supports:
+1. Parse against `signedTableEventSchema`.
+2. Verify the event signature against `senderProtocolPubkeyHex`.
+3. Compute `eventHash`.
+4. Ignore duplicates already in `events` or `pendingEvents`.
+5. Classify ordering:
+   - ignore if `event.epoch < currentEpoch`
+   - ignore if `event.epoch === currentEpoch` and `event.seq < expectedSeq`
+   - queue if `event.epoch === currentEpoch` and `event.seq > expectedSeq`
+   - queue if `event.epoch > currentEpoch` and `event.seq !== 1`
+   - queue if `prevEventHash !== lastEventHash`
+   - otherwise accept
+6. For accepted events, run semantic validation.
+7. Commit the event, update derived state, then repeatedly re-check queued events.
 
-- `TableAnnounce`
-- `TableWithdraw`
-- `JoinRequest`
-- `JoinAccepted`
-- `JoinRejected`
-- `SeatProposal`
-- `SeatLocked`
-- `BuyInRequested`
-- `BuyInLocked`
-- `TableReady`
-- `TableClosed`
+If a queued event later becomes admissible but fails semantic validation, it is discarded and never enters canonical state.
 
-Current runtime actively emits:
+### Semantic validation rules
 
-- `TableAnnounce`
-- `JoinRequest`
-- `JoinAccepted`
-- `JoinRejected`
-- `SeatLocked`
-- `BuyInLocked`
-- `TableReady`
+Additional event-specific rules are enforced before an event becomes canonical:
 
-Reserved but not currently emitted by the mesh runtime:
+- `TableAnnounce`: must be emitted by `table.hostPeerId` as `senderRole: "host"`
+- `JoinRequest`, `JoinAccepted`, `JoinRejected`: must be emitted by the current host and carry a valid signed join intent
+- `SeatLocked`: must be emitted by the current host and match a pending reservation
+- `BuyInLocked`: must be emitted by the current host and carry a valid locked funds receipt
+- Gameplay events (`TableReady`, `HandStart`, `DealerCommit`, `PrivateCardDelivery`, `StreetStart`, `PlayerAction`, `ActionAccepted`, `ActionRejected`, `StreetClosed`, `ShowdownReveal`, `HandResult`, `HandAbort`, `TableClosed`): must be emitted by the current host
+- `HostLeaseGranted`: must be emitted by the lease holder and carry a fully valid lease
+- `WitnessSnapshot`: must be emitted by the current host or a configured witness and carry a fully valid snapshot
+- `HostFailoverProposed`: must be emitted by the current host or a configured witness, and `previousHostPeerId` must equal the current host
+- `HostFailoverAccepted`: must be emitted by a configured witness collector and carry a valid acceptance signature
+- `HostRotated`: must be emitted by the current host or a configured witness, must advance the epoch by exactly one, and must carry a fully valid lease whose `hostPeerId` matches `newHostPeerId`
 
-- `TableWithdraw`
-- `SeatProposal`
-- `BuyInRequested`
-- `TableClosed`
+## Table Lifecycle
 
-### Hand lifecycle
+### Table creation
 
-Schema supports:
+The host emits:
 
-- `HandStart`
-- `DealerCommit`
-- `PrivateCardDelivery`
-- `StreetStart`
-- `PlayerAction`
-- `ActionAccepted`
-- `ActionRejected`
-- `StreetClosed`
-- `ShowdownReveal`
-- `HandResult`
-- `HandAbort`
+1. `TableAnnounce`
+2. `HostLeaseGranted`
 
-Current host flow is:
+The initial lease is signed by the host plus every configured witness.
 
-1. `HandStart`
-2. `DealerCommit`
-3. `PrivateCardDelivery` for each seated player
-4. `StreetStart`
-5. `PlayerAction`
-6. `ActionAccepted` or `ActionRejected`
-7. `StreetClosed` and next `StreetStart` when the phase changes
-8. optional `ShowdownReveal`
-9. `HandResult`
+### Seating and readiness
 
-`HandAbort` is used after host failover if a hand was live and the table must roll back to the last fully signed checkpoint.
+The current table flow is:
 
-### Host and witness lifecycle
+1. player locally prepares buy-in funds
+2. player sends `join-request`
+3. host appends `JoinRequest`
+4. host appends `JoinAccepted` or `JoinRejected`
+5. player locally confirms the prepared buy-in
+6. player sends `buy-in-confirm`
+7. host appends `SeatLocked`
+8. host appends `BuyInLocked`
+9. once all seats are locked, host appends `TableReady`
 
-Schema supports:
-
-- `HostLeaseGranted`
-- `HostHeartbeat`
-- `WitnessSnapshot`
-- `HostFailoverProposed`
-- `HostFailoverAccepted`
-- `HostRotated`
-
-Current runtime actively emits:
-
-- `HostLeaseGranted`
-- `WitnessSnapshot`
-- `HostFailoverProposed`
-- `HostFailoverAccepted`
-- `HostRotated`
-
-Host liveness itself is carried over the separate `heartbeat` wire frame, not the `HostHeartbeat` event body.
-
-### Public data events
-
-Schema supports:
-
-- `PublicTableSnapshot`
-- `PublicHandUpdate`
-- `PublicShowdownReveal`
-
-These exist in the shared schema but are not currently used as canonical table events. Public data is published through indexer HTTP ingest instead.
-
-## Requests and Responses
-
-`request` / `response` frames are used for coordination that does not itself define canonical order.
-
-### Supported requests
-
-
-| Request                     | Purpose                                | Verified by receiver                                                         |
-| --------------------------- | -------------------------------------- | ---------------------------------------------------------------------------- |
-| `join-request`              | ask current host for a seat            | wallet identity binding and protocol signature on the join intent            |
-| `buy-in-confirm`            | confirm local buy-in lock              | protocol signature over unsigned receipt payload                             |
-| `action-request`            | submit a player action                 | protocol signature over the action intent                                    |
-| `snapshot-sign-request`     | ask a peer to co-sign a snapshot       | no prior verification by receiver; receiver signs the supplied snapshot body |
-| `lease-sign-request`        | ask witness/host to sign a host lease  | no prior verification by receiver beyond local availability                  |
-| `failover-accept-request`   | ask peers to acknowledge host rotation | no prior verification by receiver beyond local availability                  |
-| `peer-cache-request`        | fetch known peer hints                 | none                                                                         |
-| `public-table-list-request` | fetch cached advertisements            | none                                                                         |
-
-
-### Supported responses
-
-- `join-response`
-- `buy-in-response`
-- `action-response`
-- `snapshot-sign-response`
-- `lease-sign-response`
-- `failover-accept-response`
-- `peer-cache-response`
-- `public-table-list-response`
-
-Errors are returned as `response` frames with `ok: false` and an `error` string.
-
-## Table Join Protocol
-
-### Private invite
-
-Private table invites carry:
-
-- `protocolVersion`
-- `networkId`
-- `tableId`
-- `hostPeerId`
-- `hostPeerUrl`
-- optional `relayPeerId`
-
-### Join sequence
-
-1. player prepares a local buy-in lock via `TableFundsProvider.prepareBuyIn()`
-2. player sends `join-request` with:
-  - `PlayerJoinIntent`
-  - `preparedBuyIn`
-3. host verifies:
-  - wallet identity binding
-  - protocol signature on the join intent
-4. host appends `JoinRequest`
-5. host chooses a seat and appends `JoinAccepted`, or appends `JoinRejected`
-6. host sends the current canonical backlog to the joiner before `JoinAccepted`
-7. player confirms local buy-in and sends `buy-in-confirm`
-8. host verifies the confirmation signature and appends:
-  - `SeatLocked`
-  - `BuyInLocked`
-9. when all seats are locked, host appends `TableReady`
+The first `TableReady` snapshot is a settlement boundary with `phase: null`.
 
 ## Hand Protocol
 
 ### Dealer mode
 
-The current runtime implements only:
-
-- `host-dealer-v1`
+The implemented dealer mode is `host-dealer-v1`.
 
 The host:
 
 - generates the deck locally
 - commits to the deck root
-- privately sends hole cards to each player
-- reveals public board state through canonical events
-- may reveal full audit material at showdown
+- privately encrypts hole cards to each player
+- sequences all public actions and board state
+- reveals full audit material in `ShowdownReveal` when no player folded before settlement
 
-This is intentionally a trusted-host dealing model. The host should not also play in the same table.
+This is a trusted-host dealing model.
 
 ### Private card delivery
 
-Hole cards are sent in `PrivateCardDelivery` as a `PrivateCardEnvelope`.
+`PrivateCardDelivery` carries a `PrivateCardEnvelope` encrypted with:
 
-The current encryption scheme is:
+- an ECDH-style shared secret between sender protocol private key and recipient protocol public key
+- a scope string of `<tableId>:<handId>:cards`
+- a SHA-256-derived XOR keystream
+- a SHA-256 authenticity tag
 
-- ECDH-style shared secret derived from sender protocol private key and recipient protocol public key
-- scope-bound key derivation using `<tableId>:<handId>:cards`
-- XOR keystream encryption with SHA-256-based blocks
-- SHA-256 authenticity tag
+The recipient decrypts only after the event is canonical.
 
-This is suitable for local/test v1 behavior but should not be treated as a production-audited AEAD design.
+### Hand sequencing
 
-### Action ordering
+The host begins a hand only if:
 
-Players do not append canonical actions directly. They submit `action-request` to the host.
+- it is the current host
+- the table is not closed
+- exactly two players are seated
+- no active unsettled hand is already in progress
 
-The host:
+The canonical sequence is:
 
-- verifies the action signature
-- checks the live hand state
-- appends `PlayerAction`
-- runs the game engine
-- appends `ActionAccepted` or `ActionRejected`
+1. `HandStart`
+2. `DealerCommit`
+3. one `PrivateCardDelivery` per seated player
+4. initial `StreetStart`
+5. repeated `PlayerAction` plus `ActionAccepted` or `ActionRejected`
+6. `StreetClosed` then next `StreetStart` when phase changes
+7. optional `ShowdownReveal`
+8. `HandResult`
 
-The host remains the sequencer, but only signed events become canonical.
+`handSetupInFlight` prevents action acceptance until the initial hand-start sequence is fully emitted.
 
-## Snapshots and Money Checkpoints
+### Settlement completion
 
-The protocol uses `CooperativeTableSnapshot` for durable money-safe checkpoints.
+When the game engine reaches `phase === "settled"`:
 
-### Snapshot fields
+- `ShowdownReveal` is emitted if nobody folded out before settlement
+- `HandResult` is emitted with the final `publicState`
+- a settlement-boundary snapshot is scheduled
+- the next hand is scheduled after a short delay
 
-Each snapshot includes:
+No mid-hand snapshots are currently emitted. Settlement-boundary snapshots are created only after:
+
+- `TableReady`
+- `HandResult`
+- `HandAbort` rollback
+
+## Cooperative Snapshots
+
+`CooperativeTableSnapshot` is the enforceable settlement checkpoint object.
+
+### Snapshot body
+
+The runtime reconstructs snapshot bodies directly from canonical public state:
 
 - `snapshotId`
 - `tableId`
@@ -392,7 +445,7 @@ Each snapshot includes:
 - `seatedPlayers`
 - `chipBalances`
 - `potSats`
-- `sidePots`
+- `sidePots` (currently always `[]`)
 - `turnIndex`
 - `livePlayerIds`
 - `foldedPlayerIds`
@@ -400,148 +453,195 @@ Each snapshot includes:
 - `previousSnapshotHash`
 - `latestEventHash`
 - `createdAt`
-- `signatures`
 
-### Snapshot cadence
+`previousSnapshotHash` is the hash of the last stored snapshot, not merely the last fully signed one.
 
-Current runtime captures snapshots at:
+### Snapshot hash
 
-- `TableReady`
-- hand start
-- street transitions
-- `HandResult`
-- post-abort recovery after failover
+The snapshot hash used as the settlement checkpoint hash is:
 
-### Fully signed snapshot
+- `sha256(stableStringify(unsignedSnapshot))`
 
-A snapshot is considered fully signed when it contains signatures from:
+where `unsignedSnapshot` is the snapshot without `signatures`.
 
-- all seated player peer IDs
-- all witness peer IDs
-- the local non-player host/witness signer when applicable
+### Snapshot signature rules
 
-The last fully signed snapshot is the last enforceable money state for v1.
+Every supplied signature is verified against the unsigned snapshot.
 
-### Funds operations
+Additional signer rules:
 
-The shared protocol defines `TableFundsOperation` for:
+- host signature must come from `currentHostPeerId`
+- player signature must come from a currently seated player peer ID
+- witness signature must come from a peer ID in `witnessSet`
+- duplicate signer peer IDs are forbidden
+- signer pubkeys must match the runtime's resolved protocol pubkeys for those peers
 
-- `buy-in-prepared`
-- `buy-in-locked`
-- `checkpoint-recorded`
-- `cashout`
-- `close-table`
-- `renewal`
-- `emergency-exit`
+### Snapshot quorum
 
-In the current runtime:
+A snapshot is fully signed only if it contains signatures from these exact peer IDs:
 
-- buy-in confirmations are reflected in canonical `BuyInLocked` events
-- `HandResult` may reference a `checkpointHash`
-- cashout, renewal, and emergency exit are executed via `TableFundsProvider` on the local daemon
-- the provider boundary exists for an Arkade-backed implementation, but the current default behavior in local flows is still the signed mock adapter
+- the current host
+- every seated player
+- every configured witness
 
-### Money movement model
+The runtime does not accept "enough witnesses"; it requires the configured witness peer IDs specifically.
 
-The runtime uses a table-balance-lock model, not per-bet Arkade settlement.
+### Settlement boundary
 
-1. each player locks a buy-in into table participation state through `TableFundsProvider`
-2. once a hand begins, betting changes only the app-layer chip ledger in canonical events and snapshots
-3. the latest fully signed cooperative snapshot is the enforceable balance checkpoint for v1
-4. no host-only unsigned decision can directly move funds
+Only snapshots with:
 
-This means the poker rules engine stays in the app protocol, while money safety is anchored to signed cooperative checkpoints and local wallet-controlled cashout or exit flows.
+- `phase === null`, or
+- `phase === "settled"`
 
-### Buy-in flow
+can become `latestFullySignedSnapshot`.
 
-1. Before joining, the player daemon calls `prepareBuyIn(tableId, playerId, amountSats)`.
-2. The provider returns a signed `TableFundsOperation` with `kind: buy-in-prepared`, `provider`, `networkId`, `amountSats`, optional `vtxoExpiry`, `signerPubkeyHex`, and `signatureHex`.
-3. The player includes that receipt in `join-request` together with the signed `PlayerJoinIntent`.
-4. After seat acceptance, the player daemon confirms the lock locally with `confirmBuyIn(...)` and sends `buy-in-confirm`.
-5. `buy-in-confirm` is signed by the player's protocol identity over `{ tableId, playerId, confirmedAt, receipt-without-signature }`.
-6. The host verifies that protocol signature, then appends `SeatLocked` and `BuyInLocked`.
-7. The locked receipt is stored in local `buyInReceipts` and its `amountSats` becomes the player's initial chip balance at `TableReady`.
+`cashOut()` and `emergencyExit()` always use the hash and balances from `latestFullySignedSnapshot`. Unfinished hands therefore never affect settlement.
 
-### In-hand balance updates
+## Arkade Table Funds Model
 
-During a hand there is no Arkade call per bet, raise, or fold.
+The canonical funds provider name is:
 
-1. players submit signed action intents to the host
-2. the host sequences canonical `PlayerAction`, `ActionAccepted`, `ActionRejected`, `StreetClosed`, and `HandResult` events
-3. chip balances, pots, and side-pot state live in the event-derived public state and in cooperative snapshots
-4. `HandResult` may carry a `checkpointHash`, but the authoritative money checkpoint remains the latest fully signed snapshot
+- `arkade-table-funds/v1`
 
-This is why an unfinished hand is rolled back on hard failure instead of trying to force speculative intra-hand balances onto the settlement layer.
+Each seated player daemon controls its own Arkade wallet and local per-table funds state.
 
-### Cooperative checkpoint and cash-out flow
+### Local funds state
 
-1. At `TableReady`, hand start, street transitions, `HandResult`, and post-abort recovery, the host or witness captures a `CooperativeTableSnapshot`.
-2. The collector signs the unsigned snapshot and requests additional snapshot signatures from seated players and witnesses.
-3. The snapshot hash is `sha256(stableStringify(unsignedSnapshot))`.
-4. Once the runtime sees signatures from the required peers, that snapshot becomes `latestFullySignedSnapshot`.
-5. `cashOut()` reads the player's balance from `latestFullySignedSnapshot`, computes `checkpointHash` from that snapshot, and calls `cooperativeCashOut(tableId, playerId, balance, checkpointHash)`.
-6. The returned `TableFundsOperation` has `kind: cashout` and references that `checkpointHash`.
-7. The same interface also supports `cooperativeCloseTable(...)`, although the current runtime path is centered on per-player cashout.
+Per table, the provider stores:
 
-### Renewal and expiry
+- `preparedVtxos`: spendable Arkade VTXOs reserved for a pending buy-in
+- `managedVtxos`: the local live table position
+- `amountSats`: local table balance currently represented by `managedVtxos`
+- `vtxoExpiry`: minimum expiry across the managed position
+- `checkpoint`: latest recorded checkpoint state
+- `cashoutTxid`
+- `emergencyExitTxid`
 
-The funds provider tracks an expiry window per table position using `vtxoExpiry`.
+The CLI persists this state in:
 
-1. prepared and locked buy-in receipts include an expiry timestamp
-2. `renewFunds()` calls `renewTablePositions(tableId)`
-3. the provider returns signed `renewal` operations and extends `vtxoExpiry`
-4. the daemon updates local receipts and can warn before table positions expire
+- `<daemonDir>/<profile>.table-funds.json`
 
-Renewal is local money-state maintenance. It is not currently emitted as a canonical table event.
+### `prepareBuyIn`
 
-### Emergency exit
+The provider:
 
-1. `emergencyExit()` requires a `latestFullySignedSnapshot`
-2. the daemon computes the exiting player's balance and the snapshot hash
-3. it calls `emergencyExit(tableId, playerId, lastCheckpointHash, amountSats)`
-4. the returned `TableFundsOperation` has `kind: emergency-exit` and references the last cooperative checkpoint hash
+1. loads spendable Arkade VTXOs
+2. deterministically selects enough spendable VTXOs to cover the requested amount
+3. stores them in `preparedVtxos`
+4. sets `vtxoExpiry` to the earliest selected expiry
+5. returns a signed `TableFundsOperation` with:
+   - `kind: "buy-in-prepared"`
+   - `status: "prepared"`
+   - `amountSats`
+   - `vtxoExpiry`
 
-The protocol therefore treats the latest fully signed checkpoint as the last enforceable money state. Any hand that never reached that checkpoint boundary is canceled for settlement purposes.
+### `confirmBuyIn`
 
-### Ark / Arkade usage
+The provider:
 
-The codebase uses Arkade in two distinct layers.
+1. verifies the `buy-in-prepared` receipt signature
+2. verifies the reserved VTXO set still covers the prepared amount
+3. rebalances those VTXOs into an exact local table position
+4. moves the position into `managedVtxos`
+5. returns a signed `TableFundsOperation` with:
+   - `kind: "buy-in-locked"`
+   - `status: "locked"`
+   - the live `vtxoExpiry`
 
-1. Wallet and payment flows already integrate with Arkade for wallet summary, boarding, and withdrawals through helpers such as `connectArkadeWallet()`, `getArkadeWalletSummary()`, `onboardArkadeFunds()`, `offboardArkadeFunds()`, `createArkadeDepositQuote()`, and `submitArkadeWithdrawal()`.
-2. Table gameplay uses the `TableFundsProvider` boundary so the poker protocol can lock buy-ins, track cooperative checkpoints, renew positions, cash out, and emergency exit without embedding Arkade calls directly into the game engine.
+The resulting locked receipt is the receipt the host accepts into canonical state.
 
-This matches the intended Ark model in the repo: Arkade is the custody and settlement layer around cooperative checkpoints, not the place where every poker action is adjudicated.
+### `recordCheckpoint`
 
-Today that table-funds boundary is only partially wired to live Arkade behavior:
+This is the bridge between cooperative snapshots and Arkade state.
 
-- `createArkadeTableFundsProvider()` currently returns the same `SignedTableFundsProvider` implementation as the mock path, with provider name `arkade-table-funds/v1` and a longer default expiry window
-- `TableFundsOperation` receipts are real signed protocol objects, but they are not yet backed by live per-table Ark contract execution
-- `recordCheckpoint()` exists on the interface, but the runtime does not yet call it when snapshots are captured
-- current cashout, renewal, and emergency-exit flows therefore produce signed local receipts that reference cooperative checkpoint hashes, rather than driving a full `arkd` table contract lifecycle
+When a fully signed settlement-boundary snapshot is committed, every seated local daemon:
 
-So the protocol already uses Arkade as the architectural money boundary, but the current implementation is still an honest v1 scaffold rather than a production-complete Ark table contract integration.
+1. computes `checkpointHash = snapshotHash(snapshot)`
+2. compares new snapshot balances to the previously recorded balances, or to initial buy-ins if no checkpoint exists yet
+3. derives a deterministic transfer plan sorted by player ID
+4. if the local player is a loser at this checkpoint:
+   - consumes the full current `managedVtxos` set as inputs to an Arkade offchain transfer
+   - emits one output to the winner `arkAddress`
+   - emits one local change output for the loser's new balance
+   - records the returned Arkade transaction ID on the completed transfer entries
+5. if the local player is a winner:
+   - waits for incoming spendable Arkade VTXOs from the losers' checkpoint transfers
+   - accepts both `settled` and `preconfirmed` incoming VTXOs as valid managed table position material
+   - merges those VTXOs into `managedVtxos`
+6. stores the checkpoint record locally with:
+   - `checkpointHash`
+   - `balances`
+   - `participants`
+   - transfer list and status
 
-## Host Lease and Failover
+The local recorded checkpoint must match the latest cooperative snapshot hash before cash-out or emergency exit is allowed.
 
-### Heartbeats
+### `renewTablePositions`
 
-Current timing constants:
+`renewTablePositions(tableId)` rebalances the current local table position to the same amount, refreshing the managed VTXO set and `vtxoExpiry`. It returns a signed `renewal` receipt.
+
+Renewals are local settlement maintenance and are not canonical table events.
+
+### `cooperativeCashOut`
+
+`cashOut()` is only allowed when:
+
+- `latestFullySignedSnapshot` exists
+- the local provider has recorded the same `checkpointHash`
+- the requested amount equals the locally recorded Arkade table balance
+
+If the exact local table position is already present as spendable Arkade VTXOs matching the checkpoint balance, the provider completes cash-out by clearing the table association locally and returns a signed `cashout` receipt. This is the normal path in the regtest integration harness.
+
+If the balance is zero, the provider clears local table state and returns a zero-valued completed receipt without calling Arkade settlement.
+
+If the managed position is not already spendable, the provider falls back to Arkade settlement to the wallet boarding address and retries known transient operator errors before failing.
+
+### `emergencyExit`
+
+`emergencyExit()` uses the same checkpoint hash and balance source as `cashOut()`: the latest fully signed cooperative snapshot.
+
+The provider:
+
+1. verifies the local recorded checkpoint matches `lastCheckpointHash`
+2. if the exact managed position is already present as spendable Arkade VTXOs matching `amountSats`, clears the table association locally and returns a signed `emergency-exit` receipt
+3. otherwise attempts Arkade settlement to the wallet boarding address
+4. retries Arkade settle on known transient errors
+5. otherwise falls back to Arkade VTXO recovery only if the SDK exposes `VtxoManager`
+
+If the balance is zero, the provider clears local state and returns a zero-valued `emergency-exit` receipt.
+
+### Money-safety rule
+
+No bet, raise, fold, or street transition directly changes Arkade custody. Only:
+
+- buy-in lock
+- checkpoint recording
+- renewal
+- cooperative cash-out
+- emergency exit
+
+touch Arkade state.
+
+The enforceable money boundary is therefore the latest fully signed cooperative settlement snapshot.
+
+### Advisory `HandResult.checkpointHash`
+
+`HandResult` may carry a `checkpointHash`, but it is advisory only. The runtime computes settlement from the hash of the latest fully signed settlement-boundary snapshot created after `HandResult` or rollback, not from the `HandResult` field itself.
+
+## Host Lease, Heartbeats, and Failover
+
+### Timing constants
+
+Current runtime constants are:
 
 - heartbeat interval: `1000ms`
-- host failure timeout: `3500ms`
 - lease duration: `4000ms`
+- host-failure timeout: `3500ms`
+- auto-next-hand delay: `1000ms`
 
-The host sends `heartbeat` wire frames to players and witnesses.
+### Lease format and quorum
 
-Important implementation note:
-
-- heartbeats carry a signature today
-- receivers currently use them as liveness hints by `tableId` and `epoch`
-- the runtime does not yet cryptographically verify heartbeat signatures on receipt
-
-### Lease flow
-
-A `HostLease` carries:
+`HostLease` contains:
 
 - `tableId`
 - `epoch`
@@ -551,144 +651,104 @@ A `HostLease` carries:
 - `leaseExpiry`
 - `signatures`
 
-Host creation emits:
+The unsigned lease body is signed by:
 
-- `HostLeaseGranted`
+- the host as `signerRole: "host"`
+- every configured witness as `signerRole: "witness"`
 
-Rotation emits:
+`witnessSet` excludes the host peer ID. Lease quorum is exact: the host plus every peer ID listed in `witnessSet` must sign.
 
-- `HostFailoverProposed`
-- zero or more `HostFailoverAccepted`
-- `HostRotated`
+### Host failover quorum
 
-### Failover behavior
+Failover acceptance quorum is the exact set:
 
-Current v1 policy is:
+- every configured witness
+- every currently seated player
 
-- between hands: witnesses can rotate the host and continue
-- mid-hand: new host aborts the hand and rolls back to the last fully signed snapshot
+The previous host is not part of the acceptance quorum.
 
-The witness runtime triggers failover after missed heartbeats. Failover acknowledgements and witness lease signatures are currently best-effort; the runtime does not enforce a strict quorum before rotating.
+### Failover trigger
 
-## Public Discovery and Spectator Protocol
+Only a witness initiates failover in the current runtime:
 
-### Signed public advertisement
+- automatically after missing signed heartbeats for more than `3500ms`
+- manually via `rotateHost()` when called on a witness daemon
 
-`SignedTableAdvertisement` includes:
+Manual rotation from the current host is rejected so the witness quorum remains mandatory.
 
-- `protocolVersion`
-- `networkId`
-- `tableId`
-- `hostPeerId`
-- optional `hostPeerUrl`
-- `tableName`
-- blind sizes in `stakes`
-- `currency`
-- `seatCount`
-- `occupiedSeats`
-- `spectatorsAllowed`
-- `hostModeCapabilities`
-- `witnessCount`
-- `buyInMinSats`
-- `buyInMaxSats`
-- `visibility`
-- optional geographic / latency hints
-- `adExpiresAt`
-- `hostProtocolPubkeyHex`
-- `hostSignatureHex`
+### Failover sequence
 
-Public advertisements are distributed by:
+The witness proposer:
 
-- `public-ad` wire frames
-- `POST /api/indexer/table-ads`
+1. appends `HostFailoverProposed`
+2. creates and appends its own `HostFailoverAccepted`
+3. requests signed failover acceptances from every other peer in the failover quorum
+4. verifies every returned acceptance cryptographically
+5. requires signatures from every exact quorum peer ID
+6. builds a new host lease for `epoch + 1`
+7. requires the new host lease to be signed by the new host plus every configured witness
+8. appends `HostRotated`
 
-### Public updates
+`HostRotated` is always the first event in the new epoch (`seq = 1`) and keeps `prevEventHash` chained to the last accepted event of the previous epoch.
 
-Public indexer update types are:
+### Mid-hand failover
 
-- `PublicTableSnapshot`
-- `PublicHandUpdate`
-- `PublicShowdownReveal`
+If failover occurs while:
 
-HTTP ingest and read endpoints are:
+- `publicState.phase` is non-null
+- `publicState.phase !== "settled"`
+- `latestFullySignedSnapshot` exists
 
-- `POST /api/indexer/table-updates`
-- `GET /api/public/tables`
-- `GET /api/public/tables/:tableId`
+then the new host:
 
-The website is read-only against these endpoints.
+1. appends `HandAbort`
+2. rolls public state back to `latestFullySignedSnapshot`
+3. clears the active hand
+4. emits a new settlement-boundary snapshot over the rolled-back state
+
+The new host does not auto-start another hand until rollback is complete.
+
+### Between-hand failover
+
+If failover happens at a clean settlement boundary, the new host simply rotates, installs the new lease, and schedules the next hand.
 
 ## Persistence and Replay
 
-Each daemon persists mesh protocol state locally.
-
-### Mesh store
-
-Per-profile mesh state is stored under:
+Per daemon, the mesh runtime persists:
 
 - `tables/<tableId>/events.ndjson`
 - `tables/<tableId>/snapshots.ndjson`
 - `tables/<tableId>/private-state.json`
 - `public-ads.json`
 
-### Profile store
+The profile store also persists:
 
-The profile file stores:
-
-- peer and protocol private keys
-- wallet private key reference
+- peer, protocol, and wallet keys
 - known peers
-- mesh table references
-- current mesh table selection
-
-### Replay
+- mesh table references including table config, host URL, epoch, and local role
+- current selected mesh table
 
 On startup, the runtime:
 
-1. loads persisted tables
+1. loads persisted table references
 2. loads events, snapshots, and private state
-3. replays events in order into a fresh context
-4. reconstructs the latest canonical public state and snapshot pointers
+3. replays events in stored order into a fresh context
+4. reconstructs `currentEpoch`, `lastEventHash`, `publicState`, `witnessSet`, and buy-in receipts
+5. restores `latestFullySignedSnapshot` by scanning persisted snapshots for the newest settlement-boundary snapshot with the full required signer set
 
-This is the basis for restart recovery.
+Because replay uses the same canonical event hashing, signature verification, and semantic rules, it is deterministic across peers that hold the same canonical event history.
 
-## Verification Coverage and Current Gaps
+## Reserved or Non-Canonical Surface
 
-### Verified today
+The shared schema still defines several variants that are not part of the current canonical runtime path, including:
 
-- `hello` signatures
-- canonical `SignedTableEvent` signatures
-- wallet `IdentityBinding` signatures
-- join intent signatures
-- buy-in confirmation signatures
-- player action signatures
-- locally created `TableFundsOperation` signatures
+- `TableWithdraw`
+- `SeatProposal`
+- `BuyInRequested`
+- `TableClosed`
+- `HostHeartbeat` event bodies
+- `PublicTableSnapshot`, `PublicHandUpdate`, and `PublicShowdownReveal` as canonical events
 
-### Not fully verified yet
+Public table discovery uses signed advertisements and indexer HTTP ingest, but public readers are outside consensus.
 
-- heartbeat signatures are not checked on receipt
-- snapshot signatures are counted for completeness, but not cryptographically re-verified when received
-- lease signatures are collected and carried, but not cryptographically re-verified when received
-- failover acceptance signatures are carried into events, but not cryptographically re-verified when received
-- `preparedBuyIn` is carried in `join-request`, but the host does not yet use it as a canonical verified money object
-- hosts verify the player's protocol signature over `buy-in-confirm`, but do not separately verify the underlying `TableFundsOperation.signatureHex`
-- the Arkade-named table funds provider is still the local signed adapter, not a live per-table Ark contract executor
-- `public-update` wire frames and several schema variants remain reserved for future work
-
-### Honest trust statement
-
-The strongest current protocol guarantees come from:
-
-- local wallet custody
-- signed canonical event history
-- fully signed cooperative snapshots
-- host failover bounded by checkpoint rollback
-
-The protocol does not yet claim:
-
-- dealerless hidden-card privacy
-- browser-native peer equivalence
-- libp2p/DHT/NAT traversal in the current implementation
-- production-complete Arkade table contracts
-- full cryptographic validation for every auxiliary signature path
-
+The repository also still contains a separate mock settlement provider for isolated development. It is not part of the Arkade-backed protocol specified here and is not used by the regtest integration harness documented in this file.

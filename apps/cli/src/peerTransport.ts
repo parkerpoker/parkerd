@@ -265,6 +265,7 @@ export class PeerTransport {
         alias: frame.alias,
         peerId: frame.peerId,
         peerUrl: frame.peerUrl,
+        protocolPubkeyHex: frame.protocolPubkeyHex,
         roles: frame.roles,
         lastSeenAt: frame.sentAt,
       };

@@ -390,6 +390,7 @@ export const peerAddressSchema = z.object({
   peerId: z.string().min(8).max(128),
   peerUrl: z.string().url(),
   alias: z.string().min(1).max(64).optional(),
+  protocolPubkeyHex: z.string().regex(/^[0-9a-f]+$/i).optional(),
   relayPeerId: z.string().min(8).max(128).optional(),
   roles: z.array(meshRoleSchema).default([]),
   lastSeenAt: z.string().datetime().optional(),

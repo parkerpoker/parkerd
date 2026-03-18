@@ -43,10 +43,12 @@ import {
   encryptScopedPayload,
   signStructuredData,
   stableStringify,
+  verifyTableFundsOperationSignature,
   verifyIdentityBinding,
   verifyStructuredData,
   type LocalIdentity,
   type ScopedIdentity,
+  type TableCheckpointRecord,
   type TableFundsProvider,
 } from "@parker/settlement";
 
@@ -63,6 +65,7 @@ import type {
 } from "./meshTypes.js";
 import { PeerTransport } from "./peerTransport.js";
 import { ProfileStore, type KnownPeerState, type PlayerProfileState } from "./profileStore.js";
+import { JsonTableFundsStateStore } from "./tableFundsStateStore.js";
 import { CliWalletRuntime } from "./walletRuntime.js";
 
 const HOST_HEARTBEAT_INTERVAL_MS = 1_000;
@@ -96,6 +99,7 @@ export class MeshRuntime {
   private readonly autoHandTimers = new Map<string, NodeJS.Timeout>();
   private readonly contextByTableId = new Map<string, MeshTableContext>();
   private fundsProvider: TableFundsProvider | undefined;
+  private isClosing = false;
   private indexer: IndexerClient | undefined;
   private interval: NodeJS.Timeout | undefined;
   private mode: MeshRuntimeMode = "player";
@@ -137,6 +141,7 @@ export class MeshRuntime {
   }
 
   async start(mode: MeshRuntimeMode) {
+    this.isClosing = false;
     this.mode = mode;
     await this.bootstrap();
     if (!this.peerIdentity || !this.protocolIdentity) {
@@ -148,9 +153,7 @@ export class MeshRuntime {
         onFrame: async (peerId, frame) => {
           await this.handlePeerFrame(peerId, frame);
         },
-        onPeerSeen: (peer) => {
-          void this.rememberPeer(peer);
-        },
+        onPeerSeen: () => {},
         peerIdentity: this.peerIdentity,
         protocolIdentity: this.protocolIdentity,
         roles: [this.mode],
@@ -169,6 +172,7 @@ export class MeshRuntime {
   }
 
   close() {
+    this.isClosing = true;
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = undefined;
@@ -281,7 +285,6 @@ export class MeshRuntime {
     const witnessPeerIds =
       input.witnessPeerIds ??
       (this.transport.listKnownPeers().filter((peer) => peer.roles.includes("witness")).map((peer) => peer.peerId));
-    const lease = await this.buildHostLease(tableId, 1, witnessPeerIds);
     const context = this.createContext({
       config,
       currentEpoch: 1,
@@ -297,7 +300,6 @@ export class MeshRuntime {
       }
     }
     this.contextByTableId.set(tableId, context);
-
     const advertisement = this.buildAdvertisement(context);
     context.advertisement = advertisement;
     await this.appendLocalEvent(context, {
@@ -305,12 +307,14 @@ export class MeshRuntime {
       table: config,
       type: "TableAnnounce",
     });
+    const lease = await this.buildHostLease(tableId, 1, witnessPeerIds);
     await this.appendLocalEvent(context, {
       lease,
       type: "HostLeaseGranted",
     });
     await this.store.upsertPublicAd(advertisement);
     await this.saveMeshTableReference(tableId, {
+      config,
       currentEpoch: 1,
       hostPeerId: this.peerIdentity.id,
       hostPeerUrl: this.transport.getListenUrl(),
@@ -406,6 +410,7 @@ export class MeshRuntime {
       );
     }
     await this.saveMeshTableReference(invite.tableId, {
+      config: this.cloneValue(this.requireContext(invite.tableId).config),
       currentEpoch: 1,
       hostPeerId: invite.hostPeerId,
       hostPeerUrl: invite.hostPeerUrl,
@@ -421,7 +426,7 @@ export class MeshRuntime {
       buyInSats ?? 4_000,
     );
     const profile = await this.ensureProfileState();
-    const joinIntent = this.buildJoinIntent(invite, profile.nickname, preparedBuyIn.amountSats);
+    const joinIntent = await this.buildJoinIntent(invite, profile.nickname, preparedBuyIn.amountSats);
     const joinResponse = await this.transport.request(invite.hostPeerId, {
       intent: joinIntent,
       preparedBuyIn,
@@ -489,14 +494,12 @@ export class MeshRuntime {
   async rotateHost(tableId?: string) {
     await this.ensureStarted();
     const context = this.requireContext(tableId);
-    if (context.role === "host" && context.witnessSet.length > 0) {
-      const targetPeerId = context.witnessSet[0]!;
-      await this.performHostRotation(context, targetPeerId, "manual rotation");
-      return this.currentState();
-    }
     if (context.role === "witness") {
       await this.triggerFailover(context, "manual witness rotation");
       return this.currentState();
+    }
+    if (context.role === "host") {
+      throw new Error("manual host rotation must be initiated by a witness so the failover quorum can be enforced");
     }
     throw new Error("this daemon cannot rotate the host for the requested table");
   }
@@ -547,12 +550,20 @@ export class MeshRuntime {
       throw new Error("cannot emergency exit without a cooperative checkpoint");
     }
     const balance = latestSnapshot.chipBalances[this.walletIdentity.playerId] ?? 0;
-    return await this.createFundsProvider().emergencyExit(
+    const checkpointHash = this.snapshotHash(latestSnapshot);
+    const receipt = await this.createFundsProvider().emergencyExit(
       context.config.tableId,
       this.walletIdentity.playerId,
-      this.snapshotHash(latestSnapshot),
+      checkpointHash,
       balance,
     );
+    context.buyInReceipts.set(this.walletIdentity.playerId, receipt);
+    this.emitState();
+    return {
+      balance,
+      checkpointHash,
+      receipt,
+    };
   }
 
   private async appendLocalEvent(context: MeshTableContext, body: TableEventBody, senderRole: "host" | "witness" = "host") {
@@ -605,6 +616,7 @@ export class MeshRuntime {
       return;
     }
 
+    this.assertEventSemantics(context, parsed);
     await this.commitAcceptedEvent(context, parsed, nextHash, persist);
     await this.flushPendingEvents(context);
   }
@@ -621,6 +633,9 @@ export class MeshRuntime {
     this.applyEventToContext(context, canonicalEvent);
     if (persist) {
       await this.store.appendEvent(context.config.tableId, canonicalEvent);
+      if (canonicalEvent.body.type === "WitnessSnapshot") {
+        await this.store.appendSnapshot(context.config.tableId, canonicalEvent.body.snapshot);
+      }
     }
     if (
       canonicalEvent.body.type === "PrivateCardDelivery" &&
@@ -636,6 +651,12 @@ export class MeshRuntime {
       });
       context.privateState.myHoleCardsByHandId[canonicalEvent.body.handId] = cards;
       await this.store.savePrivateState(context.config.tableId, context.privateState);
+    }
+    if (
+      canonicalEvent.body.type === "WitnessSnapshot" &&
+      this.isSettlementBoundarySnapshot(canonicalEvent.body.snapshot)
+    ) {
+      await this.recordSettlementCheckpoint(context, canonicalEvent.body.snapshot);
     }
     context.lastHostHeartbeatAt = Date.now();
     this.emitState();
@@ -655,12 +676,7 @@ export class MeshRuntime {
           alias: body.intent.player.nickname,
           peerId: body.intent.peerId,
           peerUrl: body.intent.peerUrl,
-          roles: ["player"],
-        });
-        void this.rememberPeer({
-          alias: body.intent.player.nickname,
-          peerId: body.intent.peerId,
-          peerUrl: body.intent.peerUrl,
+          protocolPubkeyHex: body.intent.protocolPubkeyHex,
           roles: ["player"],
         });
         context.pendingPlayers.set(body.intent.player.playerId, {
@@ -678,6 +694,7 @@ export class MeshRuntime {
           alias: body.intent.player.nickname,
           peerId: body.intent.peerId,
           peerUrl: body.intent.peerUrl,
+          protocolPubkeyHex: body.intent.protocolPubkeyHex,
           roles: ["player"],
         });
         break;
@@ -711,7 +728,9 @@ export class MeshRuntime {
         context.config.status = body.publicState.status;
         break;
       case "HandAbort":
+        this.ensureAutoTimerCleared(context.config.tableId);
         context.config.status = "aborted";
+        delete context.privateState.activeHand;
         if (context.latestFullySignedSnapshot) {
           context.publicState = this.publicStateFromSnapshot(context, context.latestFullySignedSnapshot);
           context.config.status = "ready";
@@ -731,11 +750,7 @@ export class MeshRuntime {
           context.snapshots[existingIndex] = snapshot;
         }
         context.latestSnapshot = snapshot;
-        const requiredPeerIds = this.requiredSnapshotPeerIds(context);
-        const signerPeerIds = snapshot.signatures.map((signature) => signature.signerPeerId);
-        const missingPeerIds = requiredPeerIds.filter((peerId) => !signerPeerIds.includes(peerId));
-        const hasRequiredSignatures = missingPeerIds.length === 0;
-        if (hasRequiredSignatures) {
+        if (this.isSettlementBoundarySnapshot(snapshot)) {
           context.latestFullySignedSnapshot = snapshot;
         }
         break;
@@ -743,11 +758,42 @@ export class MeshRuntime {
       case "HostLeaseGranted":
         context.currentEpoch = body.lease.epoch;
         context.currentHostPeerId = body.lease.hostPeerId;
+        {
+          const hostSignature = body.lease.signatures.find(
+            (signature) => signature.signerPeerId === body.lease.hostPeerId,
+          );
+          if (hostSignature) {
+            const existing = context.peerAddresses.get(body.lease.hostPeerId);
+            context.peerAddresses.set(body.lease.hostPeerId, {
+              peerId: body.lease.hostPeerId,
+              peerUrl: existing?.peerUrl ?? context.currentHostPeerUrl,
+              protocolPubkeyHex: hostSignature.signerPubkeyHex,
+              roles: ["host"],
+              ...(existing?.alias ? { alias: existing.alias } : {}),
+            });
+          }
+        }
         context.witnessSet = this.resolveWitnessSet(context, body.lease);
         break;
       case "HostRotated":
         context.currentEpoch = body.newEpoch;
         context.currentHostPeerId = body.newHostPeerId;
+        {
+          const hostSignature = body.lease.signatures.find(
+            (signature) => signature.signerPeerId === body.lease.hostPeerId,
+          );
+          const existing = context.peerAddresses.get(body.newHostPeerId);
+          context.currentHostPeerUrl = existing?.peerUrl ?? context.currentHostPeerUrl;
+          if (hostSignature) {
+            context.peerAddresses.set(body.newHostPeerId, {
+              peerId: body.newHostPeerId,
+              peerUrl: existing?.peerUrl ?? context.currentHostPeerUrl,
+              protocolPubkeyHex: hostSignature.signerPubkeyHex,
+              roles: ["host"],
+              ...(existing?.alias ? { alias: existing.alias } : {}),
+            });
+          }
+        }
         context.witnessSet = this.resolveWitnessSet(context, body.lease);
         if (body.newHostPeerId === this.peerIdentity?.id) {
           context.currentHostPeerUrl = this.transport?.getListenUrl() ?? context.currentHostPeerUrl;
@@ -802,91 +848,89 @@ export class MeshRuntime {
       deckSeedHex,
       revealedAt: new Date().toISOString(),
     };
-    context.privateState.activeHand = hand;
-    context.privateState.auditBundlesByHandId[hand.handId] = auditBundle;
-    await this.store.savePrivateState(context.config.tableId, context.privateState);
+    context.handSetupInFlight = true;
+    try {
+      context.privateState.activeHand = hand;
+      context.privateState.auditBundlesByHandId[hand.handId] = auditBundle;
+      await this.store.savePrivateState(context.config.tableId, context.privateState);
 
-    const publicState = this.publicStateFromHand(context, hand, commitmentRoot);
-    await this.appendLocalEvent(context, {
-      dealerSeatIndex: hand.dealerSeatIndex,
-      handId: hand.handId,
-      handNumber,
-      publicState,
-      type: "HandStart",
-    });
-    await this.appendLocalEvent(context, {
-      commitment: {
-        committedAt: new Date().toISOString(),
-        mode: "host-dealer-v1",
-        rootHash: commitmentRoot,
-      },
-      handId: hand.handId,
-      type: "DealerCommit",
-    });
-
-    for (const player of seats) {
-      const envelope = encryptScopedPayload({
-        payload: hand.players[player.seatIndex]!.holeCards,
-        recipientPublicKeyHex: player.protocolPubkeyHex,
-        scope: `${context.config.tableId}:${hand.handId}:cards`,
-        senderPrivateKeyHex: this.protocolIdentity!.privateKeyHex,
+      const publicState = this.publicStateFromHand(context, hand, commitmentRoot);
+      await this.appendLocalEvent(context, {
+        dealerSeatIndex: hand.dealerSeatIndex,
+        handId: hand.handId,
+        handNumber,
+        publicState,
+        type: "HandStart",
       });
       await this.appendLocalEvent(context, {
-        encryptedPayload: envelope,
+        commitment: {
+          committedAt: new Date().toISOString(),
+          mode: "host-dealer-v1",
+          rootHash: commitmentRoot,
+        },
         handId: hand.handId,
-        proofHash: createHash("sha256")
-          .update(`${commitmentRoot}:${player.playerId}:${hand.players[player.seatIndex]!.holeCards.join(",")}`)
-          .digest("hex"),
-        recipientPeerId: player.peerId,
-        recipientPlayerId: player.playerId,
-        type: "PrivateCardDelivery",
+        type: "DealerCommit",
       });
-    }
 
-    await this.appendLocalEvent(context, {
-      handId: hand.handId,
-      publicState,
-      street: publicState.phase ?? "preflop",
-      type: "StreetStart",
-    });
-    await this.captureSnapshot(context);
+      for (const player of seats) {
+        const envelope = encryptScopedPayload({
+          payload: hand.players[player.seatIndex]!.holeCards,
+          recipientPublicKeyHex: player.protocolPubkeyHex,
+          scope: `${context.config.tableId}:${hand.handId}:cards`,
+          senderPrivateKeyHex: this.protocolIdentity!.privateKeyHex,
+        });
+        await this.appendLocalEvent(context, {
+          encryptedPayload: envelope,
+          handId: hand.handId,
+          proofHash: createHash("sha256")
+            .update(`${commitmentRoot}:${player.playerId}:${hand.players[player.seatIndex]!.holeCards.join(",")}`)
+            .digest("hex"),
+          recipientPeerId: player.peerId,
+          recipientPlayerId: player.playerId,
+          type: "PrivateCardDelivery",
+        });
+      }
+
+      await this.appendLocalEvent(context, {
+        handId: hand.handId,
+        publicState,
+        street: publicState.phase ?? "preflop",
+        type: "StreetStart",
+      });
+    } finally {
+      context.handSetupInFlight = false;
+    }
   }
 
-  private async captureSnapshot(context: MeshTableContext) {
+  private async captureSnapshot(context: MeshTableContext, expectedEventHash = context.lastEventHash) {
     if (!this.protocolIdentity || !this.peerIdentity || !context.publicState) {
       return;
     }
-    const snapshotBase = {
-      createdAt: new Date().toISOString(),
-      dealerCommitmentRoot: context.publicState.dealerCommitment?.rootHash ?? null,
-      epoch: context.currentEpoch,
-      foldedPlayerIds: context.publicState.foldedPlayerIds,
-      handId: context.publicState.handId,
-      handNumber: context.publicState.handNumber,
-      latestEventHash: context.lastEventHash,
-      livePlayerIds: context.publicState.livePlayerIds,
-      phase: context.publicState.phase,
-      potSats: context.publicState.potSats,
-      previousSnapshotHash: context.latestSnapshot ? this.snapshotHash(context.latestSnapshot) : null,
-      seatedPlayers: context.publicState.seatedPlayers,
-      sidePots: [],
-      snapshotId: crypto.randomUUID(),
-      tableId: context.config.tableId,
-      turnIndex: context.publicState.actingSeatIndex,
-      chipBalances: context.publicState.chipBalances,
-      signatures: [] as TableSnapshotSignature[],
-    } satisfies CooperativeTableSnapshot;
+    if (!expectedEventHash || context.lastEventHash !== expectedEventHash || this.hasSnapshotForEventHash(context, expectedEventHash)) {
+      return;
+    }
+    const snapshotBase = this.buildSnapshotBase(context);
+    if (snapshotBase.latestEventHash !== expectedEventHash) {
+      return;
+    }
 
     const selfRole = context.role === "witness" ? "witness" : "host";
+    const selfSignature: TableSnapshotSignature = {
+      signatureHex: signStructuredData(this.protocolIdentity, this.unsignedSnapshot(snapshotBase)),
+      signedAt: new Date().toISOString(),
+      signerPeerId: this.peerIdentity.id,
+      signerPubkeyHex: this.protocolIdentity.publicKeyHex,
+      signerRole: selfRole,
+    };
     const signatures: TableSnapshotSignature[] = [
       {
-        signatureHex: signStructuredData(this.protocolIdentity, this.unsignedSnapshot(snapshotBase)),
-        signedAt: new Date().toISOString(),
-        signerPeerId: this.peerIdentity.id,
-        signerPubkeyHex: this.protocolIdentity.publicKeyHex,
-        signerRole: selfRole,
+        ...selfSignature,
       },
     ];
+    const snapshotCandidate: CooperativeTableSnapshot = {
+      ...snapshotBase,
+      signatures: [selfSignature],
+    };
 
     const remotePeerIds = new Set<string>();
     for (const player of context.publicState.seatedPlayers) {
@@ -901,20 +945,31 @@ export class MeshRuntime {
     }
 
     for (const peerId of remotePeerIds) {
-      try {
-        const response = await this.transport?.request(peerId, {
-          snapshot: snapshotBase,
-          type: "snapshot-sign-request",
-        });
-        if (response?.type === "snapshot-sign-response") {
-          signatures.push(response.signature);
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        try {
+          const response = await this.transport?.request(peerId, {
+            snapshot: snapshotCandidate,
+            type: "snapshot-sign-request",
+          });
+          if (response?.type === "snapshot-sign-response") {
+            if (this.verifySnapshotSignature(context, snapshotCandidate, response.signature)) {
+              signatures.push(response.signature);
+            }
+            break;
+          }
+        } catch (error) {
+          if (attempt === 7) {
+            this.logger.info("snapshot signature request failed", {
+              error: (error as Error).message,
+              peerId,
+              tableId: context.config.tableId,
+            });
+            break;
+          }
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 100);
+          });
         }
-      } catch (error) {
-        this.logger.info("snapshot signature request failed", {
-          error: (error as Error).message,
-          peerId,
-          tableId: context.config.tableId,
-        });
       }
     }
 
@@ -922,13 +977,20 @@ export class MeshRuntime {
       ...snapshotBase,
       signatures,
     };
-    const senderRole = context.role === "witness" ? "witness" : "host";
-    context.snapshots.push(snapshot);
-    context.latestSnapshot = snapshot;
-    if (this.hasRequiredSignatures(context, snapshot)) {
-      context.latestFullySignedSnapshot = snapshot;
+    if (context.lastEventHash !== expectedEventHash || this.hasSnapshotForEventHash(context, expectedEventHash)) {
+      return;
     }
-    await this.store.appendSnapshot(context.config.tableId, snapshot);
+    if (!this.hasRequiredSignatures(context, snapshot)) {
+      const requiredPeerIds = this.requiredSnapshotPeerIds(context);
+      const actualPeerIds = snapshot.signatures.map((signature) => signature.signerPeerId);
+      this.logger.info("snapshot quorum is incomplete", {
+        actualPeerIds,
+        requiredPeerIds,
+        tableId: context.config.tableId,
+      });
+    }
+    this.assertSnapshot(context, snapshot, true);
+    const senderRole = context.role === "witness" ? "witness" : "host";
     await this.appendLocalEvent(
       context,
       {
@@ -939,7 +1001,35 @@ export class MeshRuntime {
     );
   }
 
+  private async captureSnapshotAfterDelay(context: MeshTableContext, delayMs = 150) {
+    const expectedEventHash = context.lastEventHash;
+    if (
+      !expectedEventHash ||
+      context.settlementSnapshotEventHashInFlight === expectedEventHash ||
+      this.hasSnapshotForEventHash(context, expectedEventHash)
+    ) {
+      return;
+    }
+    context.settlementSnapshotEventHashInFlight = expectedEventHash;
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, delayMs);
+    });
+    try {
+      if (context.lastEventHash !== expectedEventHash || this.hasSnapshotForEventHash(context, expectedEventHash)) {
+        return;
+      }
+      await this.captureSnapshot(context, expectedEventHash);
+    } finally {
+      if (context.settlementSnapshotEventHashInFlight === expectedEventHash) {
+        context.settlementSnapshotEventHashInFlight = null;
+      }
+    }
+  }
+
   private async handlePeerFrame(peerId: string, frame: MeshWireFrame) {
+    if (this.isClosing) {
+      return;
+    }
     switch (frame.kind) {
       case "request":
         await this.handlePeerRequest(peerId, frame.requestId, frame.body);
@@ -959,12 +1049,28 @@ export class MeshRuntime {
             role: "witness",
             witnessSet: [],
           });
+          context.peerAddresses.set(frame.event.senderPeerId, {
+            peerId: frame.event.senderPeerId,
+            peerUrl: context.currentHostPeerUrl,
+            protocolPubkeyHex: frame.event.senderProtocolPubkeyHex,
+            roles: ["host"],
+          });
           this.contextByTableId.set(frame.event.tableId, context);
         }
         if (!context) {
           throw new Error(`received event for unknown table ${frame.event.tableId}`);
         }
-        await this.acceptEvent(context, frame.event, true);
+        try {
+          await this.acceptEvent(context, frame.event, true);
+        } catch (error) {
+          this.logger.info("ignoring invalid remote event", {
+            error: (error as Error).message,
+            peerId,
+            tableId: frame.event.tableId,
+            type: frame.event.body.type,
+          });
+          return;
+        }
         if (context.currentHostPeerId === this.peerIdentity?.id && frame.event.body.type === "TableReady") {
           this.scheduleNextHand(context);
         }
@@ -978,12 +1084,33 @@ export class MeshRuntime {
         if (!context) {
           return;
         }
-        if (frame.epoch >= context.currentEpoch) {
-          context.lastHostHeartbeatAt = Date.now();
+        if (frame.hostPeerId !== context.currentHostPeerId || frame.epoch !== context.currentEpoch) {
+          return;
         }
+        const hostPubkey = this.resolvePeerProtocolPubkey(context, frame.hostPeerId);
+        if (!hostPubkey) {
+          return;
+        }
+        const unsignedHeartbeat = {
+          epoch: frame.epoch,
+          hostPeerId: frame.hostPeerId,
+          leaseExpiry: frame.leaseExpiry,
+          sentAt: frame.sentAt,
+          tableId: frame.tableId,
+        };
+        if (!verifyStructuredData(hostPubkey, unsignedHeartbeat, frame.signatureHex)) {
+          return;
+        }
+        context.lastHostHeartbeatAt = Date.now();
         return;
       }
       case "public-ad":
+        {
+          const { hostSignatureHex, ...unsignedAd } = frame.ad;
+          if (!verifyStructuredData(frame.ad.hostProtocolPubkeyHex, unsignedAd, hostSignatureHex)) {
+            return;
+          }
+        }
         await this.store.upsertPublicAd(frame.ad);
         this.emitState();
         return;
@@ -1001,14 +1128,14 @@ export class MeshRuntime {
 
     try {
       const response = await this.handleRequestBody(peerId, body);
-      await this.transport.send(peerId, {
+      await this.transport?.send(peerId, {
         body: response,
         kind: "response",
         ok: true,
         requestId,
       });
     } catch (error) {
-      await this.transport.send(peerId, {
+      await this.transport?.send(peerId, {
         error: (error as Error).message,
         kind: "response",
         ok: false,
@@ -1026,11 +1153,11 @@ export class MeshRuntime {
       case "action-request":
         return await this.handleActionRequest(peerId, body.intent);
       case "snapshot-sign-request":
-        return await this.handleSnapshotSignRequest(body.snapshot);
+        return await this.handleSnapshotSignRequest(peerId, body.snapshot);
       case "lease-sign-request":
-        return await this.handleLeaseSignRequest(body.lease);
+        return await this.handleLeaseSignRequest(peerId, body.lease);
       case "failover-accept-request":
-        return await this.handleFailoverAcceptanceRequest(body.tableId, body.currentEpoch, body.proposedEpoch, body.proposedHostPeerId);
+        return await this.handleFailoverAcceptanceRequest(peerId, body.tableId, body.currentEpoch, body.proposedEpoch, body.proposedHostPeerId);
       case "peer-cache-request":
         return {
           peers: this.transport?.listKnownPeers() ?? [],
@@ -1047,7 +1174,7 @@ export class MeshRuntime {
   }
 
   private async handleJoinRequest(
-    _peerId: string,
+    peerId: string,
     intent: PlayerJoinIntent,
     preparedBuyIn: TableFundsOperation,
   ): Promise<MeshResponseBody> {
@@ -1059,24 +1186,23 @@ export class MeshRuntime {
         type: "join-response",
       };
     }
-    if (!verifyIdentityBinding(intent.identityBinding)) {
-      throw new Error("invalid join identity binding");
+    this.assertJoinIntentSignature(intent);
+    if (intent.peerId !== peerId) {
+      throw new Error("join request peer identity does not match the transport peer");
     }
-    const unsignedIntent = {
-      identityBinding: intent.identityBinding,
-      peerId: intent.peerId,
-      peerUrl: intent.peerUrl,
-      player: intent.player,
-      protocolId: intent.protocolId,
-      protocolPubkeyHex: intent.protocolPubkeyHex,
-      requestedAt: intent.requestedAt,
-      tableId: intent.tableId,
-      ...(intent.requestedSeatIndex !== undefined
-        ? { requestedSeatIndex: intent.requestedSeatIndex }
-        : {}),
-    };
-    if (!verifyStructuredData(intent.protocolPubkeyHex, unsignedIntent, intent.signatureHex)) {
-      throw new Error("invalid join request signature");
+    this.assertFundsReceipt({
+      context,
+      expectedKind: "buy-in-prepared",
+      expectedPlayerId: intent.player.playerId,
+      expectedStatus: "prepared",
+      receipt: preparedBuyIn,
+      walletPubkeyHex: intent.identityBinding.walletPubkeyHex,
+    });
+    if (
+      preparedBuyIn.amountSats < context.config.buyInMinSats ||
+      preparedBuyIn.amountSats > context.config.buyInMaxSats
+    ) {
+      throw new Error("prepared buy-in amount is outside the table limits");
     }
 
     await this.appendLocalEvent(context, {
@@ -1103,6 +1229,7 @@ export class MeshRuntime {
       alias: intent.player.nickname,
       peerId: intent.peerId,
       peerUrl: intent.peerUrl,
+      protocolPubkeyHex: intent.protocolPubkeyHex,
       roles: ["player"],
     });
     for (const existingEvent of context.events) {
@@ -1125,7 +1252,7 @@ export class MeshRuntime {
   }
 
   private async handleBuyInConfirm(
-    _peerId: string,
+    peerId: string,
     confirmation: BuyInConfirm,
   ): Promise<MeshResponseBody> {
     const context = this.requireContext(confirmation.tableId);
@@ -1146,21 +1273,26 @@ export class MeshRuntime {
         type: "buy-in-response",
       };
     }
+    if (pending.peerId !== peerId) {
+      throw new Error("buy-in confirmation peer identity does not match the seated player");
+    }
     const unsignedConfirmation = {
       confirmedAt: confirmation.confirmedAt,
       playerId: confirmation.playerId,
       receipt: this.unsignedFundsOperation(confirmation.receipt),
       tableId: confirmation.tableId,
     };
-    if (
-      !verifyStructuredData(
-        pending.protocolPubkeyHex,
-        unsignedConfirmation,
-        confirmation.signatureHex,
-      )
-    ) {
+    if (!verifyStructuredData(pending.protocolPubkeyHex, unsignedConfirmation, confirmation.signatureHex)) {
       throw new Error("invalid buy-in confirmation signature");
     }
+    this.assertFundsReceipt({
+      context,
+      expectedKind: "buy-in-locked",
+      expectedPlayerId: pending.playerId,
+      expectedStatus: "locked",
+      receipt: confirmation.receipt,
+      walletPubkeyHex: pending.walletPubkeyHex,
+    });
     await this.appendLocalEvent(context, {
       buyInSats: confirmation.receipt.amountSats,
       peerId: pending.peerId,
@@ -1172,15 +1304,24 @@ export class MeshRuntime {
       receipt: confirmation.receipt,
       type: "BuyInLocked",
     });
-    if (context.buyInReceipts.size === context.config.seatCount) {
+    if (
+      context.buyInReceipts.size === context.config.seatCount &&
+      !context.readyTransitionInFlight &&
+      context.config.status !== "ready"
+    ) {
+      context.readyTransitionInFlight = true;
       const readyState = this.buildReadyPublicState(context);
-      await this.appendLocalEvent(context, {
-        balances: readyState.chipBalances,
-        publicState: readyState,
-        type: "TableReady",
-      });
-      await this.captureSnapshot(context);
-      this.scheduleNextHand(context);
+      try {
+        await this.appendLocalEvent(context, {
+          balances: readyState.chipBalances,
+          publicState: readyState,
+          type: "TableReady",
+        });
+        await this.captureSnapshotAfterDelay(context);
+        this.scheduleNextHand(context);
+      } finally {
+        context.readyTransitionInFlight = false;
+      }
     }
     return {
       accepted: true,
@@ -1189,7 +1330,7 @@ export class MeshRuntime {
   }
 
   private async handleActionRequest(
-    _peerId: string,
+    peerId: string,
     intent: PlayerActionIntent,
   ): Promise<MeshResponseBody> {
     const context = this.requireContext(intent.tableId);
@@ -1200,19 +1341,7 @@ export class MeshRuntime {
         type: "action-response",
       };
     }
-    const unsignedIntent = {
-      action: intent.action,
-      epoch: intent.epoch,
-      handId: intent.handId,
-      playerId: intent.playerId,
-      protocolPubkeyHex: intent.protocolPubkeyHex,
-      requestedAt: intent.requestedAt,
-      seatIndex: intent.seatIndex,
-      tableId: intent.tableId,
-    };
-    if (!verifyStructuredData(intent.protocolPubkeyHex, unsignedIntent, intent.signatureHex)) {
-      throw new Error("invalid action signature");
-    }
+    this.assertActionIntentSignature(intent);
 
     const hand = context.privateState.activeHand;
     if (!hand || hand.handId !== intent.handId) {
@@ -1221,6 +1350,17 @@ export class MeshRuntime {
         reason: "hand is not active",
         type: "action-response",
       };
+    }
+    if (context.handSetupInFlight) {
+      return {
+        accepted: false,
+        reason: "hand is still starting",
+        type: "action-response",
+      };
+    }
+    const seat = context.publicState?.seatedPlayers.find((candidate) => candidate.playerId === intent.playerId);
+    if (!seat || seat.peerId !== peerId) {
+      throw new Error("action request peer identity does not match the acting seat");
     }
 
     await this.appendLocalEvent(context, {
@@ -1272,7 +1412,7 @@ export class MeshRuntime {
             seatIndex: winner.seatIndex,
           })),
         });
-        await this.captureSnapshot(context);
+        await this.captureSnapshotAfterDelay(context);
         this.scheduleNextHand(context);
       } else if (previous.phase !== next.phase) {
         await this.appendLocalEvent(context, {
@@ -1281,7 +1421,6 @@ export class MeshRuntime {
           street: previous.phase,
           type: "StreetClosed",
         });
-        await this.captureSnapshot(context);
         await this.appendLocalEvent(context, {
           handId: intent.handId,
           publicState,
@@ -1308,15 +1447,18 @@ export class MeshRuntime {
     }
   }
 
-  private async handleSnapshotSignRequest(snapshot: CooperativeTableSnapshot): Promise<MeshResponseBody> {
+  private async handleSnapshotSignRequest(
+    peerId: string,
+    snapshot: CooperativeTableSnapshot,
+  ): Promise<MeshResponseBody> {
     if (!this.protocolIdentity || !this.peerIdentity) {
       throw new Error("protocol identity is unavailable");
     }
-    await this.store.appendSnapshot(snapshot.tableId, snapshot);
-    const context = this.contextByTableId.get(snapshot.tableId);
-    if (context) {
-      context.snapshots.push(snapshot);
-      context.latestSnapshot = snapshot;
+    const context = this.requireContext(snapshot.tableId);
+    await this.waitForSnapshotState(context, snapshot);
+    this.assertSnapshot(context, snapshot, false);
+    if (!snapshot.signatures.some((signature) => signature.signerPeerId === peerId)) {
+      throw new Error("snapshot sign request is missing the collector signature");
     }
     return {
       signature: {
@@ -1330,9 +1472,40 @@ export class MeshRuntime {
     };
   }
 
-  private async handleLeaseSignRequest(lease: HostLease): Promise<MeshResponseBody> {
+  private async handleLeaseSignRequest(peerId: string, lease: HostLease): Promise<MeshResponseBody> {
     if (!this.protocolIdentity || !this.peerIdentity) {
       throw new Error("protocol identity is unavailable");
+    }
+    const context = this.contextByTableId.get(lease.tableId);
+    if (context) {
+      this.assertLease(context, lease, false);
+    } else {
+      if (lease.epoch !== 1) {
+        throw new Error("cannot sign a lease for an unknown non-genesis table");
+      }
+      if (!lease.witnessSet.includes(this.peerIdentity.id)) {
+        throw new Error("this witness is not part of the requested lease quorum");
+      }
+      const hostSignature = lease.signatures.find(
+        (signature) => signature.signerPeerId === peerId && signature.signerRole === "host",
+      );
+      const knownHost = this.transport?.listKnownPeers().find((candidate) => candidate.peerId === peerId);
+      if (!hostSignature || !knownHost?.protocolPubkeyHex) {
+        throw new Error("cannot verify the initial host lease signature");
+      }
+      if (
+        hostSignature.signerPubkeyHex !== knownHost.protocolPubkeyHex ||
+        !verifyStructuredData(
+          hostSignature.signerPubkeyHex,
+          this.unsignedLease(lease),
+          hostSignature.signatureHex,
+        )
+      ) {
+        throw new Error("initial host lease signature is invalid");
+      }
+    }
+    if (!lease.signatures.some((signature) => signature.signerPeerId === peerId)) {
+      throw new Error("lease sign request is missing the host signature");
     }
     const signature: HostLeaseSignature = {
       signatureHex: signStructuredData(this.protocolIdentity, this.unsignedLease(lease)),
@@ -1348,6 +1521,7 @@ export class MeshRuntime {
   }
 
   private async handleFailoverAcceptanceRequest(
+    peerId: string,
     tableId: string,
     currentEpoch: number,
     proposedEpoch: number,
@@ -1355,6 +1529,16 @@ export class MeshRuntime {
   ): Promise<MeshResponseBody> {
     if (!this.protocolIdentity || !this.peerIdentity) {
       throw new Error("protocol identity is unavailable");
+    }
+    const context = this.requireContext(tableId);
+    if (currentEpoch !== context.currentEpoch || proposedEpoch !== context.currentEpoch + 1) {
+      throw new Error("failover acceptance request does not match the local epoch");
+    }
+    if (!this.requiredFailoverPeerIds(context).includes(this.peerIdentity.id)) {
+      throw new Error("this daemon is not part of the failover quorum");
+    }
+    if (!context.witnessSet.includes(peerId) && peerId !== context.currentHostPeerId) {
+      throw new Error("only the current host or a configured witness may request failover acceptance");
     }
     const acceptanceBase = {
       currentEpoch,
@@ -1410,7 +1594,29 @@ export class MeshRuntime {
         "witness",
       );
 
-      const acceptances: HostFailoverAcceptance[] = [];
+      const selfAcceptanceBase = {
+        currentEpoch: context.currentEpoch,
+        proposedEpoch: context.currentEpoch + 1,
+        proposedHostPeerId: this.peerIdentity.id,
+        signedAt: new Date().toISOString(),
+        signerPeerId: this.peerIdentity.id,
+        signerPubkeyHex: this.protocolIdentity.publicKeyHex,
+        tableId: context.config.tableId,
+      };
+      const acceptances: HostFailoverAcceptance[] = [
+        {
+          ...selfAcceptanceBase,
+          signatureHex: signStructuredData(this.protocolIdentity, selfAcceptanceBase),
+        },
+      ];
+      await this.appendLocalEvent(
+        context,
+        {
+          acceptance: acceptances[0]!,
+          type: "HostFailoverAccepted",
+        },
+        "witness",
+      );
       const peerIds = new Set<string>();
       for (const player of context.publicState?.seatedPlayers ?? []) {
         if (player.peerId !== this.peerIdentity.id) {
@@ -1431,7 +1637,10 @@ export class MeshRuntime {
             tableId: context.config.tableId,
             type: "failover-accept-request",
           });
-          if (response?.type === "failover-accept-response") {
+          if (
+            response?.type === "failover-accept-response" &&
+            this.verifyFailoverAcceptance(context, response.acceptance)
+          ) {
             acceptances.push(response.acceptance);
             await this.appendLocalEvent(
               context,
@@ -1442,8 +1651,19 @@ export class MeshRuntime {
               "witness",
             );
           }
-        } catch {
-          // best-effort; failover still proceeds for surviving peers
+        } catch (error) {
+          this.logger.info("failover acceptance request failed", {
+            error: (error as Error).message,
+            peerId,
+            tableId: context.config.tableId,
+          });
+        }
+      }
+      const quorumPeerIds = new Set(this.requiredFailoverPeerIds(context));
+      const acceptedPeerIds = new Set(acceptances.map((acceptance) => acceptance.signerPeerId));
+      for (const peerId of quorumPeerIds) {
+        if (!acceptedPeerIds.has(peerId)) {
+          throw new Error(`failover quorum is incomplete; missing acceptance from ${peerId}`);
         }
       }
 
@@ -1460,20 +1680,28 @@ export class MeshRuntime {
         type: "HostRotated",
       }, "witness");
 
-      if (context.publicState?.phase && context.publicState.phase !== "settled" && context.latestFullySignedSnapshot) {
+      const activePhase = context.publicState?.phase ?? null;
+      const activeHandId = context.publicState?.handId ?? null;
+      const abortedMidHand =
+        activePhase !== null &&
+        activePhase !== "settled" &&
+        Boolean(context.latestFullySignedSnapshot);
+      if (abortedMidHand && context.latestFullySignedSnapshot) {
         await this.appendLocalEvent(
           context,
           {
-            handId: context.publicState.handId ?? crypto.randomUUID(),
+            handId: activeHandId ?? crypto.randomUUID(),
             reason: "host disappeared mid-hand",
             rollbackSnapshotHash: this.snapshotHash(context.latestFullySignedSnapshot),
             type: "HandAbort",
           },
           "host",
         );
-        await this.captureSnapshot(context);
+        await this.captureSnapshotAfterDelay(context);
       }
-      this.scheduleNextHand(context);
+      if (!abortedMidHand) {
+        this.scheduleNextHand(context);
+      }
     } finally {
       this.activeFailovers.delete(context.config.tableId);
     }
@@ -1544,39 +1772,139 @@ export class MeshRuntime {
     if (!this.protocolIdentity || !this.peerIdentity || !this.transport) {
       throw new Error("protocol identity is unavailable");
     }
-    const leaseBase: HostLease = {
+    const normalizedWitnessSet = [...new Set(witnessSet)].filter((peerId) => peerId !== this.peerIdentity?.id);
+    let leaseBase: HostLease = {
       epoch,
       hostPeerId: this.peerIdentity.id,
       leaseExpiry: new Date(Date.now() + HOST_LEASE_DURATION_MS).toISOString(),
       leaseStart: new Date().toISOString(),
       signatures: [],
       tableId,
-      witnessSet,
+      witnessSet: normalizedWitnessSet,
     };
-    const signatures: HostLeaseSignature[] = [
-      {
+    let hostSignature: HostLeaseSignature = {
+      signatureHex: signStructuredData(this.protocolIdentity, this.unsignedLease(leaseBase)),
+      signedAt: new Date().toISOString(),
+      signerPeerId: this.peerIdentity.id,
+      signerPubkeyHex: this.protocolIdentity.publicKeyHex,
+      signerRole: "host",
+    };
+    let leaseCandidate: HostLease = {
+      ...leaseBase,
+      signatures: [hostSignature],
+    };
+    const context = this.contextByTableId.get(tableId);
+    const firstPass = await this.requestLeaseWitnessSignatures(
+      context,
+      tableId,
+      normalizedWitnessSet,
+      leaseCandidate,
+    );
+    const resolvedWitnessSet = [...new Set(firstPass.resolvedWitnessSet)].filter(
+      (peerId) => peerId !== this.peerIdentity?.id,
+    );
+
+    let signatures: HostLeaseSignature[];
+    if (stableStringify(resolvedWitnessSet) !== stableStringify(normalizedWitnessSet)) {
+      leaseBase = {
+        ...leaseBase,
+        witnessSet: resolvedWitnessSet,
+      };
+      hostSignature = {
         signatureHex: signStructuredData(this.protocolIdentity, this.unsignedLease(leaseBase)),
         signedAt: new Date().toISOString(),
         signerPeerId: this.peerIdentity.id,
         signerPubkeyHex: this.protocolIdentity.publicKeyHex,
         signerRole: "host",
-      },
-    ];
-    for (const witnessPeerId of witnessSet) {
-      try {
-        const response = await this.transport.request(witnessPeerId, {
-          lease: leaseBase,
-          type: "lease-sign-request",
-        });
-        if (response?.type === "lease-sign-response") {
-          signatures.push(response.signature);
+      };
+      leaseCandidate = {
+        ...leaseBase,
+        signatures: [hostSignature],
+      };
+      const secondPass = await this.requestLeaseWitnessSignatures(
+        context,
+        tableId,
+        normalizedWitnessSet,
+        leaseCandidate,
+      );
+      signatures = [{ ...hostSignature }, ...secondPass.signatures];
+    } else {
+      signatures = [{ ...hostSignature }, ...firstPass.signatures];
+    }
+    const lease = {
+      ...leaseBase,
+      signatures,
+    };
+    if (context) {
+      this.assertLease(context, lease, true);
+    }
+    return lease;
+  }
+
+  private async requestLeaseWitnessSignatures(
+    context: MeshTableContext | undefined,
+    tableId: string,
+    witnessPeerIds: string[],
+    leaseCandidate: HostLease,
+  ) {
+    const signatures: HostLeaseSignature[] = [];
+    const resolvedWitnessSet = [...witnessPeerIds];
+    for (const witnessPeerId of witnessPeerIds) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          const response = await this.transport?.request(witnessPeerId, {
+            lease: leaseCandidate,
+            type: "lease-sign-request",
+          });
+          if (response?.type === "lease-sign-response") {
+            const expectedPubkey =
+              (context ? this.resolvePeerProtocolPubkey(context, response.signature.signerPeerId) : null) ??
+              response.signature.signerPubkeyHex;
+            if (
+              expectedPubkey === response.signature.signerPubkeyHex &&
+              verifyStructuredData(
+                response.signature.signerPubkeyHex,
+                this.unsignedLease(leaseCandidate),
+                response.signature.signatureHex,
+              )
+            ) {
+              signatures.push(response.signature);
+              if (response.signature.signerPeerId !== witnessPeerId) {
+                const knownPeer = this.transport
+                  ?.listKnownPeers()
+                  .find((candidate) => candidate.peerId === witnessPeerId);
+                if (knownPeer) {
+                  this.transport?.registerKnownPeer({
+                    ...knownPeer,
+                    peerId: response.signature.signerPeerId,
+                    protocolPubkeyHex: response.signature.signerPubkeyHex,
+                  });
+                }
+              }
+              const resolvedIndex = resolvedWitnessSet.indexOf(witnessPeerId);
+              if (resolvedIndex !== -1) {
+                resolvedWitnessSet[resolvedIndex] = response.signature.signerPeerId;
+              }
+            }
+            break;
+          }
+        } catch (error) {
+          if (attempt === 4) {
+            this.logger.info("lease signature request failed", {
+              error: (error as Error).message,
+              tableId,
+              witnessPeerId,
+            });
+            break;
+          }
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 100);
+          });
         }
-      } catch {
-        // Witness signatures are best-effort in dev/test mode.
       }
     }
     return {
-      ...leaseBase,
+      resolvedWitnessSet,
       signatures,
     };
   }
@@ -1659,12 +1987,13 @@ export class MeshRuntime {
     };
   }
 
-  private buildJoinIntent(invite: PrivateInvite, nickname: string, buyInSats: number): PlayerJoinIntent {
+  private async buildJoinIntent(invite: PrivateInvite, nickname: string, buyInSats: number): Promise<PlayerJoinIntent> {
     if (!this.peerIdentity || !this.protocolIdentity || !this.walletIdentity || !this.transport) {
       throw new Error("mesh identities are unavailable");
     }
+    const wallet = await this.walletRuntime.getWallet(this.profileName);
     const player = {
-      arkAddress: `tark1${this.walletIdentity.playerId.slice(-16)}`,
+      arkAddress: wallet.arkAddress,
       joinedAt: new Date().toISOString(),
       nickname,
       playerId: this.walletIdentity.playerId,
@@ -1682,7 +2011,7 @@ export class MeshRuntime {
       peerUrl: this.transport.getListenUrl(),
       player: {
         ...player,
-        boardingAddress: `bcrt1q${this.walletIdentity.playerId.slice(-20).padEnd(20, "0")}`,
+        boardingAddress: wallet.boardingAddress,
       },
       protocolId: this.protocolIdentity.id,
       protocolPubkeyHex: this.protocolIdentity.publicKeyHex,
@@ -1788,6 +2117,7 @@ export class MeshRuntime {
       currentHostPeerId: args.currentHostPeerId,
       currentHostPeerUrl: args.currentHostPeerUrl,
       events: [],
+      handSetupInFlight: false,
       latestFullySignedSnapshot: null,
       latestSnapshot: null,
       lastEventHash: null,
@@ -1795,12 +2125,14 @@ export class MeshRuntime {
       peerAddresses: new Map(),
       pendingPlayers: new Map(),
       pendingEvents: new Map(),
+      readyTransitionInFlight: false,
       privateState: {
         auditBundlesByHandId: {},
         myHoleCardsByHandId: {},
       },
       publicState: null,
       role: args.role,
+      settlementSnapshotEventHashInFlight: null,
       snapshots: [],
       witnessSet: [...args.witnessSet],
     };
@@ -1817,8 +2149,14 @@ export class MeshRuntime {
             signer: this.walletIdentity,
           })
         : createArkadeTableFundsProvider({
+            arkServerUrl: this.config.arkServerUrl,
+            arkadeNetworkName: this.config.arkadeNetworkName,
+            boltzApiUrl: this.config.boltzApiUrl,
             networkId: this.config.network,
             signer: this.walletIdentity,
+            stateStore: new JsonTableFundsStateStore(
+              `${this.config.daemonDir}/${this.profileName.replace(/[^a-zA-Z0-9_-]/g, "_")}.table-funds.json`,
+            ),
           });
     }
     return this.fundsProvider;
@@ -1904,9 +2242,9 @@ export class MeshRuntime {
 
   private requiredSnapshotPeerIds(context: MeshTableContext) {
     return [...new Set<string>([
+      context.currentHostPeerId,
       ...(context.publicState?.seatedPlayers.map((player) => player.peerId) ?? []),
       ...context.witnessSet,
-      this.peerIdentity?.id ?? "",
     ])].filter(Boolean);
   }
 
@@ -1933,7 +2271,6 @@ export class MeshRuntime {
         context.peerAddresses.delete(provisionalPeerId);
         context.peerAddresses.set(peerId, resolvedPeer);
         this.transport?.registerKnownPeer(resolvedPeer);
-        void this.rememberPeer(resolvedPeer);
       });
       return [...new Set(signerWitnessPeerIds)];
     }
@@ -1941,14 +2278,22 @@ export class MeshRuntime {
   }
 
   private hasRequiredSignatures(context: MeshTableContext, snapshot: CooperativeTableSnapshot) {
-    const requiredPeerIds = new Set(this.requiredSnapshotPeerIds(context));
-    const actual = new Set(snapshot.signatures.map((signature) => signature.signerPeerId));
-    for (const peerId of requiredPeerIds) {
-      if (!actual.has(peerId)) {
+    const actualPeerIds = new Set(snapshot.signatures.map((signature) => signature.signerPeerId));
+    for (const peerId of this.requiredSnapshotPeerIds(context)) {
+      if (!actualPeerIds.has(peerId)) {
         return false;
       }
     }
     return true;
+  }
+
+  private hasSnapshotForEventHash(context: MeshTableContext, eventHash: string) {
+    return context.snapshots.some(
+      (snapshot) =>
+        snapshot.latestEventHash === eventHash &&
+        this.isSettlementBoundarySnapshot(snapshot) &&
+        this.hasRequiredSignatures(context, snapshot),
+    );
   }
 
   private async loadPersistedTables() {
@@ -1972,18 +2317,21 @@ export class MeshRuntime {
     const resolvedProfile = profile ?? (await this.ensureProfileState());
     const tableRef = resolvedProfile.meshTables?.[tableId];
     const events = await this.store.loadEvents(tableId);
-    if (events.length === 0) {
+    const first = events[0];
+    if (events.length === 0 && !tableRef?.config) {
       return;
     }
-    const first = events[0]!;
-    if (first.body.type !== "TableAnnounce") {
+    const bootstrapConfig = first?.body.type === "TableAnnounce" ? first.body.table : tableRef?.config;
+    if (!bootstrapConfig) {
       return;
     }
     const context = this.createContext({
-      ...(first.body.advertisement ? { advertisement: first.body.advertisement } : {}),
-      config: first.body.table,
-      currentEpoch: first.epoch,
-      currentHostPeerId: first.body.table.hostPeerId,
+      ...(first?.body.type === "TableAnnounce" && first.body.advertisement
+        ? { advertisement: first.body.advertisement }
+        : {}),
+      config: this.cloneValue(bootstrapConfig),
+      currentEpoch: first?.epoch ?? tableRef?.currentEpoch ?? 1,
+      currentHostPeerId: bootstrapConfig.hostPeerId,
       currentHostPeerUrl: tableRef?.hostPeerUrl ?? "",
       role: tableRef?.role ?? "player",
       witnessSet: [],
@@ -1999,7 +2347,7 @@ export class MeshRuntime {
     context.latestFullySignedSnapshot =
       [...context.snapshots]
         .reverse()
-        .find((snapshot) => this.hasRequiredSignatures(context, snapshot)) ?? null;
+        .find((snapshot) => this.isSettlementBoundarySnapshot(snapshot) && this.hasRequiredSignatures(context, snapshot)) ?? null;
     this.contextByTableId.set(tableId, context);
   }
 
@@ -2160,6 +2508,7 @@ export class MeshRuntime {
       this.transport.registerKnownPeer({
         peerId: peer.peerId,
         peerUrl: peer.peerUrl,
+        ...(peer.protocolPubkeyHex ? { protocolPubkeyHex: peer.protocolPubkeyHex } : {}),
         roles: peer.roles ?? [],
         ...(peer.alias ? { alias: peer.alias } : {}),
         ...(peer.lastSeenAt ? { lastSeenAt: peer.lastSeenAt } : {}),
@@ -2169,19 +2518,32 @@ export class MeshRuntime {
   }
 
   private async rememberPeer(peer: PeerAddress) {
+    if (this.isClosing) {
+      return;
+    }
     const profile = await this.ensureProfileState();
+    if (this.isClosing) {
+      return;
+    }
     const known = new Map((profile.knownPeers ?? []).map((entry) => [entry.peerId, entry] as const));
     const next: KnownPeerState = {
       lastSeenAt: peer.lastSeenAt ?? new Date().toISOString(),
       peerId: peer.peerId,
       peerUrl: peer.peerUrl,
+      ...(peer.protocolPubkeyHex ? { protocolPubkeyHex: peer.protocolPubkeyHex } : {}),
       roles: peer.roles,
       ...(peer.alias ? { alias: peer.alias } : {}),
       ...(peer.relayPeerId ? { relayPeerId: peer.relayPeerId } : {}),
     };
     known.set(peer.peerId, next);
     profile.knownPeers = [...known.values()];
+    if (this.isClosing) {
+      return;
+    }
     await this.profileStore.save(profile);
+    if (this.isClosing) {
+      return;
+    }
     this.emitState();
   }
 
@@ -2243,7 +2605,17 @@ export class MeshRuntime {
           continue;
         }
         context.pendingEvents.delete(eventHash);
-        await this.commitAcceptedEvent(context, event, eventHash, true);
+        try {
+          this.assertEventSemantics(context, event);
+          await this.commitAcceptedEvent(context, event, eventHash, true);
+        } catch (error) {
+          this.logger.info("discarding invalid queued event", {
+            error: (error as Error).message,
+            eventHash,
+            tableId: context.config.tableId,
+            type: event.body.type,
+          });
+        }
         progressed = true;
         break;
       }
@@ -2283,6 +2655,496 @@ export class MeshRuntime {
   private unsignedSnapshot(snapshot: CooperativeTableSnapshot) {
     const { signatures, ...unsigned } = snapshot;
     return unsigned;
+  }
+
+  private assertEventSemantics(context: MeshTableContext, event: SignedTableEvent) {
+    if (event.protocolVersion !== "poker/v1") {
+      throw new Error(`unexpected protocol version ${event.protocolVersion}`);
+    }
+    if (event.networkId !== context.config.networkId) {
+      throw new Error(`unexpected network id ${event.networkId}`);
+    }
+    if (event.tableId !== context.config.tableId) {
+      throw new Error(`event table id ${event.tableId} does not match context`);
+    }
+    if (event.messageType !== event.body.type) {
+      throw new Error("event messageType does not match the event body type");
+    }
+    if ((event.handId ?? null) !== (this.eventHandId(event.body) ?? null)) {
+      throw new Error("event handId does not match the embedded body hand id");
+    }
+
+    const assertHostEmitter = () => {
+      if (event.senderRole !== "host" || event.senderPeerId !== context.currentHostPeerId) {
+        throw new Error(`${event.body.type} must be emitted by the current host`);
+      }
+    };
+
+    switch (event.body.type) {
+      case "TableAnnounce":
+        if (event.senderRole !== "host" || event.senderPeerId !== event.body.table.hostPeerId) {
+          throw new Error("TableAnnounce must be emitted by the hosting peer");
+        }
+        return;
+      case "JoinRequest":
+        assertHostEmitter();
+        this.assertJoinIntentSignature(event.body.intent);
+        return;
+      case "JoinAccepted":
+      case "JoinRejected":
+        assertHostEmitter();
+        this.assertJoinIntentSignature(event.body.intent);
+        return;
+      case "SeatLocked": {
+        assertHostEmitter();
+        const player = context.pendingPlayers.get(event.body.playerId);
+        if (!player || player.peerId !== event.body.peerId || player.seatIndex !== event.body.seatIndex) {
+          throw new Error("SeatLocked does not match the pending player reservation");
+        }
+        return;
+      }
+      case "BuyInLocked": {
+        assertHostEmitter();
+        const player = context.pendingPlayers.get(event.body.receipt.playerId);
+        if (!player) {
+          throw new Error("BuyInLocked references a player who is not pending at the table");
+        }
+        this.assertFundsReceipt({
+          context,
+          expectedKind: "buy-in-locked",
+          expectedPlayerId: player.playerId,
+          expectedStatus: "locked",
+          receipt: event.body.receipt,
+          walletPubkeyHex: player.walletPubkeyHex,
+        });
+        return;
+      }
+      case "TableReady":
+      case "HandStart":
+      case "DealerCommit":
+      case "PrivateCardDelivery":
+      case "StreetStart":
+      case "PlayerAction":
+      case "ActionAccepted":
+      case "ActionRejected":
+      case "StreetClosed":
+      case "ShowdownReveal":
+      case "HandResult":
+      case "HandAbort":
+      case "TableClosed":
+        assertHostEmitter();
+        if ("intent" in event.body) {
+          this.assertActionIntentSignature(event.body.intent);
+        }
+        return;
+      case "HostLeaseGranted":
+        if (event.senderRole !== "host" || event.senderPeerId !== event.body.lease.hostPeerId) {
+          throw new Error("HostLeaseGranted must be emitted by the lease holder");
+        }
+        this.assertLease(context, event.body.lease, true);
+        return;
+      case "WitnessSnapshot":
+        if (
+          (event.senderRole === "host" && event.senderPeerId !== context.currentHostPeerId) ||
+          (event.senderRole === "witness" && !context.witnessSet.includes(event.senderPeerId))
+        ) {
+          throw new Error("WitnessSnapshot must be emitted by the current host or a configured witness");
+        }
+        this.assertSnapshot(context, event.body.snapshot, true);
+        return;
+      case "HostFailoverProposed":
+        if (
+          !(event.senderRole === "witness" && context.witnessSet.includes(event.senderPeerId)) &&
+          !(event.senderRole === "host" && event.senderPeerId === context.currentHostPeerId)
+        ) {
+          throw new Error("HostFailoverProposed must be emitted by the current host or a configured witness");
+        }
+        if (event.body.previousHostPeerId !== context.currentHostPeerId) {
+          throw new Error("HostFailoverProposed references the wrong previous host");
+        }
+        return;
+      case "HostFailoverAccepted":
+        if (event.senderRole !== "witness" || !context.witnessSet.includes(event.senderPeerId)) {
+          throw new Error("HostFailoverAccepted must be emitted by a witness collector");
+        }
+        if (!this.verifyFailoverAcceptance(context, event.body.acceptance)) {
+          throw new Error("HostFailoverAccepted carries an invalid acceptance signature");
+        }
+        return;
+      case "HostRotated":
+        if (
+          !(event.senderRole === "host" && event.senderPeerId === context.currentHostPeerId) &&
+          !(event.senderRole === "witness" && context.witnessSet.includes(event.senderPeerId))
+        ) {
+          throw new Error("HostRotated must be emitted by the current host or a configured witness");
+        }
+        if (event.body.newEpoch !== context.currentEpoch + 1 || event.body.lease.epoch !== event.body.newEpoch) {
+          throw new Error("HostRotated must advance the epoch by exactly one");
+        }
+        if (event.body.newHostPeerId !== event.body.lease.hostPeerId) {
+          throw new Error("HostRotated lease host does not match the announced new host");
+        }
+        this.assertLease(context, event.body.lease, true);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private expectedFundsProviderName() {
+    return this.config.useMockSettlement ? "mock-table-funds/v1" : "arkade-table-funds/v1";
+  }
+
+  private buildSnapshotBase(
+    context: MeshTableContext,
+    snapshotId: CooperativeTableSnapshot["snapshotId"] = crypto.randomUUID() as CooperativeTableSnapshot["snapshotId"],
+    createdAt = new Date().toISOString(),
+  ): CooperativeTableSnapshot {
+    if (!context.publicState) {
+      throw new Error("cannot build a snapshot without a public table state");
+    }
+    return {
+      createdAt,
+      dealerCommitmentRoot: context.publicState.dealerCommitment?.rootHash ?? null,
+      epoch: context.currentEpoch,
+      foldedPlayerIds: context.publicState.foldedPlayerIds,
+      handId: context.publicState.handId,
+      handNumber: context.publicState.handNumber,
+      latestEventHash: context.lastEventHash,
+      livePlayerIds: context.publicState.livePlayerIds,
+      phase: context.publicState.phase,
+      potSats: context.publicState.potSats,
+      previousSnapshotHash: context.latestSnapshot ? this.snapshotHash(context.latestSnapshot) : null,
+      seatedPlayers: context.publicState.seatedPlayers,
+      sidePots: [],
+      snapshotId,
+      tableId: context.config.tableId,
+      turnIndex: context.publicState.actingSeatIndex,
+      chipBalances: context.publicState.chipBalances,
+      signatures: [],
+    };
+  }
+
+  private isSettlementBoundarySnapshot(snapshot: CooperativeTableSnapshot) {
+    return snapshot.phase === null || snapshot.phase === "settled";
+  }
+
+  private resolvePeerProtocolPubkey(context: MeshTableContext, peerId: string) {
+    if (peerId === this.peerIdentity?.id) {
+      return this.protocolIdentity?.publicKeyHex ?? null;
+    }
+    const seatedPlayer = [...context.pendingPlayers.values()].find((candidate) => candidate.peerId === peerId);
+    if (seatedPlayer) {
+      return seatedPlayer.protocolPubkeyHex;
+    }
+    const knownPeer =
+      context.peerAddresses.get(peerId) ??
+      this.transport?.listKnownPeers().find((candidate) => candidate.peerId === peerId);
+    if (knownPeer?.protocolPubkeyHex) {
+      return knownPeer.protocolPubkeyHex;
+    }
+    if (peerId === context.currentHostPeerId) {
+      return context.advertisement?.hostProtocolPubkeyHex ?? null;
+    }
+    return null;
+  }
+
+  private assertJoinIntentSignature(intent: PlayerJoinIntent) {
+    if (!verifyIdentityBinding(intent.identityBinding)) {
+      throw new Error("invalid join identity binding");
+    }
+    const unsignedIntent = {
+      identityBinding: intent.identityBinding,
+      peerId: intent.peerId,
+      peerUrl: intent.peerUrl,
+      player: intent.player,
+      protocolId: intent.protocolId,
+      protocolPubkeyHex: intent.protocolPubkeyHex,
+      requestedAt: intent.requestedAt,
+      tableId: intent.tableId,
+      ...(intent.requestedSeatIndex !== undefined
+        ? { requestedSeatIndex: intent.requestedSeatIndex }
+        : {}),
+    };
+    if (!verifyStructuredData(intent.protocolPubkeyHex, unsignedIntent, intent.signatureHex)) {
+      throw new Error("invalid join request signature");
+    }
+  }
+
+  private assertActionIntentSignature(intent: PlayerActionIntent) {
+    const unsignedIntent = {
+      action: intent.action,
+      epoch: intent.epoch,
+      handId: intent.handId,
+      playerId: intent.playerId,
+      protocolPubkeyHex: intent.protocolPubkeyHex,
+      requestedAt: intent.requestedAt,
+      seatIndex: intent.seatIndex,
+      tableId: intent.tableId,
+    };
+    if (!verifyStructuredData(intent.protocolPubkeyHex, unsignedIntent, intent.signatureHex)) {
+      throw new Error("invalid action signature");
+    }
+  }
+
+  private assertFundsReceipt(args: {
+    context: MeshTableContext;
+    expectedKind: TableFundsOperation["kind"];
+    expectedPlayerId: string;
+    expectedStatus: TableFundsOperation["status"];
+    receipt: TableFundsOperation;
+    walletPubkeyHex: string;
+  }) {
+    if (!verifyTableFundsOperationSignature(args.receipt)) {
+      throw new Error("table funds receipt signature is invalid");
+    }
+    if (args.receipt.provider !== this.expectedFundsProviderName()) {
+      throw new Error(`unexpected funds provider ${args.receipt.provider}`);
+    }
+    if (args.receipt.kind !== args.expectedKind || args.receipt.status !== args.expectedStatus) {
+      throw new Error(`unexpected funds receipt state ${args.receipt.kind}/${args.receipt.status}`);
+    }
+    if (args.receipt.playerId !== args.expectedPlayerId) {
+      throw new Error("table funds receipt player identity does not match the joiner");
+    }
+    if (args.receipt.tableId !== args.context.config.tableId) {
+      throw new Error("table funds receipt table id does not match the current table");
+    }
+    if (args.receipt.networkId !== args.context.config.networkId) {
+      throw new Error("table funds receipt network does not match the current table");
+    }
+    if (args.receipt.signerPubkeyHex !== args.walletPubkeyHex) {
+      throw new Error("table funds receipt signer does not match the bound wallet identity");
+    }
+  }
+
+  private verifySnapshotSignature(
+    context: MeshTableContext,
+    snapshot: CooperativeTableSnapshot,
+    signature: TableSnapshotSignature,
+  ) {
+    const expectedPubkey =
+      this.resolvePeerProtocolPubkey(context, signature.signerPeerId) ?? signature.signerPubkeyHex;
+    if (expectedPubkey !== signature.signerPubkeyHex) {
+      return false;
+    }
+    if (
+      signature.signerRole === "player" &&
+      !snapshot.seatedPlayers.some((player) => player.peerId === signature.signerPeerId)
+    ) {
+      return false;
+    }
+    if (signature.signerRole === "host" && signature.signerPeerId !== context.currentHostPeerId) {
+      return false;
+    }
+    if (signature.signerRole === "witness" && !context.witnessSet.includes(signature.signerPeerId)) {
+      return false;
+    }
+    if (signature.signerRole !== "player" && signature.signerRole !== "witness" && signature.signerRole !== "host") {
+      return false;
+    }
+    return verifyStructuredData(
+      signature.signerPubkeyHex,
+      this.unsignedSnapshot(snapshot),
+      signature.signatureHex,
+    );
+  }
+
+  private assertSnapshot(context: MeshTableContext, snapshot: CooperativeTableSnapshot, requireQuorum = true) {
+    if (snapshot.tableId !== context.config.tableId) {
+      throw new Error("snapshot table id does not match the active context");
+    }
+    const expected = this.buildSnapshotBase(context, snapshot.snapshotId, snapshot.createdAt);
+    if (
+      stableStringify(this.unsignedSnapshot(snapshot)) !== stableStringify(this.unsignedSnapshot(expected))
+    ) {
+      throw new Error("snapshot body does not match the current canonical public state");
+    }
+    const seenSigners = new Set<string>();
+    for (const signature of snapshot.signatures) {
+      if (seenSigners.has(signature.signerPeerId)) {
+        throw new Error("snapshot contains duplicate signer entries");
+      }
+      if (!this.verifySnapshotSignature(context, snapshot, signature)) {
+        throw new Error(`snapshot signature from ${signature.signerPeerId} is invalid`);
+      }
+      seenSigners.add(signature.signerPeerId);
+    }
+    if (requireQuorum && !this.hasRequiredSignatures(context, snapshot)) {
+      throw new Error("snapshot is missing one or more required signatures");
+    }
+  }
+
+  private async waitForSnapshotState(
+    context: MeshTableContext,
+    snapshot: CooperativeTableSnapshot,
+    timeoutMs = 1_000,
+  ) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (context.publicState && context.lastEventHash === snapshot.latestEventHash) {
+        const expected = this.buildSnapshotBase(context, snapshot.snapshotId, snapshot.createdAt);
+        if (
+          stableStringify(this.unsignedSnapshot(snapshot)) ===
+          stableStringify(this.unsignedSnapshot(expected))
+        ) {
+          return;
+        }
+      }
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 25);
+      });
+    }
+  }
+
+  private requiredLeaseSignerPeerIds(lease: HostLease) {
+    return [...new Set([lease.hostPeerId, ...lease.witnessSet])];
+  }
+
+  private leaseWitnessMatches(
+    context: MeshTableContext,
+    lease: HostLease,
+    signature: Pick<HostLeaseSignature, "signerPeerId" | "signerPubkeyHex">,
+  ) {
+    if (lease.witnessSet.includes(signature.signerPeerId)) {
+      return true;
+    }
+    return lease.witnessSet.some((peerId) => {
+      const knownPeer =
+        context.peerAddresses.get(peerId) ??
+        this.transport?.listKnownPeers().find((candidate) => candidate.peerId === peerId);
+      return knownPeer?.protocolPubkeyHex === signature.signerPubkeyHex;
+    });
+  }
+
+  private leaseHasRequiredSigner(
+    context: MeshTableContext,
+    lease: HostLease,
+    requiredPeerId: string,
+  ) {
+    if (requiredPeerId === lease.hostPeerId) {
+      return lease.signatures.some(
+        (signature) =>
+          signature.signerPeerId === lease.hostPeerId && signature.signerRole === "host",
+      );
+    }
+    return lease.signatures.some(
+      (signature) =>
+        signature.signerRole === "witness" &&
+        this.leaseWitnessMatches(context, lease, signature) &&
+        (signature.signerPeerId === requiredPeerId ||
+          this.resolvePeerProtocolPubkey(context, requiredPeerId) === signature.signerPubkeyHex),
+    );
+  }
+
+  private verifyLeaseSignature(
+    context: MeshTableContext,
+    lease: HostLease,
+    signature: HostLeaseSignature,
+  ) {
+    const expectedPubkey =
+      this.resolvePeerProtocolPubkey(context, signature.signerPeerId) ?? signature.signerPubkeyHex;
+    if (expectedPubkey !== signature.signerPubkeyHex) {
+      return false;
+    }
+    if (signature.signerPeerId === lease.hostPeerId && signature.signerRole !== "host") {
+      return false;
+    }
+    if (signature.signerRole === "witness" && !this.leaseWitnessMatches(context, lease, signature)) {
+      return false;
+    }
+    if (signature.signerRole !== "host" && signature.signerRole !== "witness") {
+      return false;
+    }
+    return verifyStructuredData(
+      signature.signerPubkeyHex,
+      this.unsignedLease(lease),
+      signature.signatureHex,
+    );
+  }
+
+  private assertLease(context: MeshTableContext, lease: HostLease, requireQuorum = true) {
+    if (lease.tableId !== context.config.tableId) {
+      throw new Error("lease table id does not match the active table");
+    }
+    if (Date.parse(lease.leaseExpiry) <= Date.parse(lease.leaseStart)) {
+      throw new Error("lease expiry must be after the lease start");
+    }
+    const seenSigners = new Set<string>();
+    for (const signature of lease.signatures) {
+      if (seenSigners.has(signature.signerPeerId)) {
+        throw new Error("lease contains duplicate signer entries");
+      }
+      if (!this.verifyLeaseSignature(context, lease, signature)) {
+        throw new Error(`lease signature from ${signature.signerPeerId} is invalid`);
+      }
+      seenSigners.add(signature.signerPeerId);
+    }
+    if (requireQuorum) {
+      for (const peerId of this.requiredLeaseSignerPeerIds(lease)) {
+        if (!this.leaseHasRequiredSigner(context, lease, peerId)) {
+          throw new Error("lease quorum is incomplete");
+        }
+      }
+    }
+  }
+
+  private requiredFailoverPeerIds(context: MeshTableContext) {
+    return [...new Set([
+      ...context.witnessSet,
+      ...(context.publicState?.seatedPlayers.map((player) => player.peerId) ?? []),
+    ])];
+  }
+
+  private verifyFailoverAcceptance(context: MeshTableContext, acceptance: HostFailoverAcceptance) {
+    const expectedPubkey = this.resolvePeerProtocolPubkey(context, acceptance.signerPeerId);
+    if (!expectedPubkey || expectedPubkey !== acceptance.signerPubkeyHex) {
+      return false;
+    }
+    if (acceptance.tableId !== context.config.tableId) {
+      return false;
+    }
+    if (acceptance.currentEpoch !== context.currentEpoch) {
+      return false;
+    }
+    if (acceptance.proposedEpoch !== context.currentEpoch + 1) {
+      return false;
+    }
+    if (!this.requiredFailoverPeerIds(context).includes(acceptance.signerPeerId)) {
+      return false;
+    }
+    const { signatureHex, ...acceptanceBase } = acceptance;
+    return verifyStructuredData(acceptance.signerPubkeyHex, acceptanceBase, signatureHex);
+  }
+
+  private async recordSettlementCheckpoint(context: MeshTableContext, snapshot: CooperativeTableSnapshot) {
+    if (!this.walletIdentity) {
+      return;
+    }
+    if (!snapshot.seatedPlayers.some((player) => player.playerId === this.walletIdentity?.playerId)) {
+      return;
+    }
+    const checkpointHash = this.snapshotHash(snapshot);
+    const currentReceipt = context.buyInReceipts.get(this.walletIdentity.playerId);
+    if (
+      currentReceipt?.kind === "checkpoint-recorded" &&
+      currentReceipt.checkpointHash === checkpointHash
+    ) {
+      return;
+    }
+    const record: TableCheckpointRecord = {
+      balances: snapshot.chipBalances,
+      checkpointHash,
+      participants: snapshot.seatedPlayers.map((player) => ({
+        arkAddress: player.arkAddress,
+        buyInSats: player.buyInSats,
+        peerId: player.peerId,
+        playerId: player.playerId,
+      })),
+      tableId: context.config.tableId,
+    };
+    const receipt = await this.createFundsProvider().recordCheckpoint(record);
+    context.buyInReceipts.set(receipt.playerId, receipt);
   }
 
   private async waitForKnownPeer(peerUrl: string, provisionalPeerId: string, timeoutMs: number) {

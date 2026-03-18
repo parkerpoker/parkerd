@@ -27,6 +27,8 @@ import type {
 import type { LogEnvelope } from "./logger.js";
 import type { BootstrapResult } from "./walletRuntime.js";
 
+const DAEMON_REQUEST_TIMEOUT_MS = 60_000;
+
 export interface ProfileDaemonStatus {
   metadata: ProfileDaemonMetadata | null;
   reachable: boolean;
@@ -302,8 +304,20 @@ export class DaemonRpcClient {
     const socket = await this.connectSocket();
     const request = this.buildRequest(method, params);
     return await new Promise<unknown>((resolve, reject) => {
+      let settled = false;
       let buffer = "";
+      const timeout = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        socket.destroy();
+        reject(new Error(`daemon request ${method} timed out after ${DAEMON_REQUEST_TIMEOUT_MS}ms`));
+      }, DAEMON_REQUEST_TIMEOUT_MS);
       socket.on("data", (chunk: Buffer | string) => {
+        if (settled) {
+          return;
+        }
         buffer += chunk.toString();
         for (;;) {
           const newlineIndex = buffer.indexOf("\n");
@@ -325,6 +339,8 @@ export class DaemonRpcClient {
           if (parsed.id !== request.id) {
             continue;
           }
+          settled = true;
+          clearTimeout(timeout);
           socket.end();
           if (!parsed.ok) {
             reject(new Error(parsed.error ?? `daemon request ${method} failed`));
@@ -335,7 +351,14 @@ export class DaemonRpcClient {
           return;
         }
       });
-      socket.once("error", reject);
+      socket.once("error", (error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      });
       socket.write(`${JSON.stringify(request)}\n`);
     });
   }

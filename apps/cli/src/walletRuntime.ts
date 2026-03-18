@@ -114,7 +114,10 @@ export class CliWalletRuntime {
     if (this.config.useMockSettlement) {
       throw new Error("nigiri faucet is not available in mock settlement mode");
     }
-    await execFileAsync("nigiri", ["faucet", wallet.boardingAddress, String(amountSats)]);
+    const args = this.config.nigiriDatadir
+      ? ["--datadir", this.config.nigiriDatadir, "faucet", wallet.boardingAddress, satsToBitcoinString(amountSats)]
+      : ["faucet", wallet.boardingAddress, satsToBitcoinString(amountSats)];
+    await execFileAsync("nigiri", args);
   }
 
   async offboard(profileName: string, address: string, amountSats?: number) {
@@ -205,4 +208,8 @@ function createMockWallet(playerId: string): WalletSummary {
     arkAddress: `tark1${playerId.slice(-16)}`,
     boardingAddress: `bcrt1q${playerId.slice(-20).padEnd(20, "0")}`,
   };
+}
+
+function satsToBitcoinString(amountSats: number) {
+  return (amountSats / 100_000_000).toFixed(8);
 }

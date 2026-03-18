@@ -187,13 +187,30 @@ describe("MeshRuntime", () => {
         )?.seatIndex
           ? alpha
           : beta;
-      await actingPlayer.sendAction({ type: "call" }, created.table.tableId);
+      await sendActionWithRetry(actingPlayer, { type: "call" }, created.table.tableId);
       host.close();
 
       await waitFor(async () => {
         const state = await alpha.getTableState(created.table.tableId);
         return state.events.some((event) => event.body.type === "HandAbort");
       }, 12_000);
+
+      const abortedState = await alpha.getTableState(created.table.tableId);
+      const rollbackSnapshot = abortedState.latestFullySignedSnapshot;
+      const abortIndex = abortedState.events.findIndex((event) => event.body.type === "HandAbort");
+      expect(rollbackSnapshot).not.toBeNull();
+      expect(abortIndex).toBeGreaterThanOrEqual(0);
+      expect(abortedState.publicState?.handNumber).toBe(rollbackSnapshot?.handNumber);
+      expect(abortedState.publicState?.phase ?? null).toBe(rollbackSnapshot?.phase ?? null);
+
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 1_500);
+      });
+
+      const stableRollback = await alpha.getTableState(created.table.tableId);
+      expect(stableRollback.events.slice(abortIndex + 1).some((event) => event.body.type === "HandStart")).toBe(false);
+      expect(stableRollback.publicState?.handNumber).toBe(rollbackSnapshot?.handNumber);
+      expect(stableRollback.publicState?.phase ?? null).toBe(rollbackSnapshot?.phase ?? null);
 
       const cashout = (await alpha.cashOut(created.table.tableId)) as {
         checkpointHash: string;
@@ -264,7 +281,7 @@ async function getPeerPorts(count: number) {
 }
 
 async function playHandUntilSettled(alpha: MeshRuntime, beta: MeshRuntime, tableId: string) {
-  for (let turn = 0; turn < 16; turn += 1) {
+  for (let turn = 0; turn < 24; turn += 1) {
     const state = await alpha.getTableState(tableId);
     const publicState = state.publicState;
     if (!publicState || publicState.phase === "settled") {
@@ -281,14 +298,8 @@ async function playHandUntilSettled(alpha: MeshRuntime, beta: MeshRuntime, table
     const contribution = publicState.roundContributions[actorPlayerId] ?? 0;
     const toCall = Math.max(0, publicState.currentBetSats - contribution);
     try {
-      await actor.sendAction(toCall > 0 ? { type: "call" } : { type: "check" }, tableId);
+      await sendActionWithRetry(actor, toCall > 0 ? { type: "call" } : { type: "check" }, tableId);
     } catch (error) {
-      if ((error as Error).message.includes("cannot act while")) {
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, 100);
-        });
-        continue;
-      }
       throw error;
     }
     await waitFor(async () => {
@@ -300,6 +311,28 @@ async function playHandUntilSettled(alpha: MeshRuntime, beta: MeshRuntime, table
     }
   }
   throw new Error("hand did not settle in time");
+}
+
+async function sendActionWithRetry(runtime: MeshRuntime, payload: { type: "call" } | { type: "check" }, tableId: string) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      await runtime.sendAction(payload, tableId);
+      return;
+    } catch (error) {
+      if (
+        (error as Error).message.includes("cannot act while") ||
+        (error as Error).message.includes("hand is still starting") ||
+        (error as Error).message.includes("hand is not active")
+      ) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 100);
+        });
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("action did not become valid in time");
 }
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000) {

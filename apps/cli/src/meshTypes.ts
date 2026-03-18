@@ -61,6 +61,7 @@ export interface MeshTableContext {
   currentHostPeerId: string;
   currentHostPeerUrl: string;
   events: SignedTableEvent[];
+  handSetupInFlight: boolean;
   pendingEvents: Map<string, SignedTableEvent>;
   buyInReceipts: Map<string, TableFundsOperation>;
   latestFullySignedSnapshot: CooperativeTableSnapshot | null;
@@ -69,9 +70,11 @@ export interface MeshTableContext {
   lastHostHeartbeatAt: number;
   pendingPlayers: Map<string, MeshSeatedPlayer>;
   peerAddresses: Map<string, PeerAddress>;
+  readyTransitionInFlight: boolean;
   privateState: LocalPrivateTableState;
   publicState: PublicTableState | null;
   role: "host" | "player" | "witness";
+  settlementSnapshotEventHashInFlight: string | null;
   snapshots: CooperativeTableSnapshot[];
   witnessSet: string[];
 }

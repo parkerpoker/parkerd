@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import type { MeshTableConfig } from "@parker/protocol";
 import type { WalletSummary } from "@parker/settlement";
 
 export interface TableSessionState {
@@ -14,11 +15,13 @@ export interface KnownPeerState {
   lastSeenAt?: string;
   peerId: string;
   peerUrl: string;
+  protocolPubkeyHex?: string;
   relayPeerId?: string;
   roles?: Array<"player" | "host" | "witness" | "indexer">;
 }
 
 export interface MeshTableReferenceState {
+  config?: MeshTableConfig;
   currentEpoch: number;
   hostPeerId: string;
   hostPeerUrl: string;

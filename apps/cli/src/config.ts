@@ -11,6 +11,7 @@ import {
 export interface CliRuntimeConfig extends ParkerNetworkConfig {
   daemonDir: string;
   indexerUrl?: string;
+  nigiriDatadir?: string;
   profileDir: string;
   peerHost: string;
   peerPort: number;
@@ -95,6 +96,12 @@ export function resolveCliRuntimeConfig(flags: CliFlagMap): CliRuntimeConfig {
     typeof flags["indexer-url"] === "string"
       ? flags["indexer-url"]
       : process.env.PARKER_INDEXER_URL ?? serverUrl;
+  const nigiriDatadir =
+    typeof flags["nigiri-datadir"] === "string"
+      ? resolve(flags["nigiri-datadir"])
+      : process.env.PARKER_NIGIRI_DATADIR
+        ? resolve(process.env.PARKER_NIGIRI_DATADIR)
+        : undefined;
   const peerHost =
     typeof flags["peer-host"] === "string"
       ? flags["peer-host"]
@@ -128,6 +135,7 @@ export function resolveCliRuntimeConfig(flags: CliFlagMap): CliRuntimeConfig {
     ...networkConfig,
     daemonDir,
     indexerUrl,
+    ...(nigiriDatadir ? { nigiriDatadir } : {}),
     profileDir,
     peerHost,
     peerPort,
