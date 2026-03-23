@@ -311,7 +311,8 @@ export class DaemonRpcClient {
     }
 
     const daemonEntryPath = resolveDaemonEntryPath();
-    const args = [...process.execArgv, daemonEntryPath, "--profile", this.profileName];
+    const execArgs = ensureTypeScriptLoader(process.execArgv, daemonEntryPath);
+    const args = [...execArgs, daemonEntryPath, "--profile", this.profileName];
     if (mode) {
       args.push("--mode", mode);
     }
@@ -370,6 +371,16 @@ function resolveDaemonEntryPath() {
       ? new URL("../../../apps/daemon/src/index.ts", import.meta.url)
       : new URL("../../../apps/daemon/dist/index.js", import.meta.url),
   );
+}
+
+function ensureTypeScriptLoader(execArgs: string[], daemonEntryPath: string) {
+  if (!daemonEntryPath.endsWith(".ts")) {
+    return execArgs;
+  }
+  if (execArgs.some((arg) => arg.includes("tsx"))) {
+    return execArgs;
+  }
+  return ["--import", "tsx", ...execArgs];
 }
 
 function sleep(ms: number) {

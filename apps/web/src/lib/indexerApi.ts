@@ -1,6 +1,6 @@
 import type { PublicTableView } from "@parker/protocol";
 
-export const INDEXER_URL = import.meta.env.VITE_INDEXER_URL ?? "http://localhost:3020";
+export const INDEXER_URL = import.meta.env.VITE_INDEXER_URL ?? "";
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${INDEXER_URL}${path}`, {

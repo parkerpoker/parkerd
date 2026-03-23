@@ -6,7 +6,8 @@ The short version is:
 
 - wallet keys stay local to each daemon
 - the daemon mesh, signed event log, and fully signed cooperative snapshots define enforceable money state
-- the indexer and web UI are informational only
+- the indexer is informational only
+- the local browser UI can instruct the daemon through the controller, but it still does not hold keys or sign protocol messages
 - `host-dealer-v1` still places meaningful trust in the host for hidden-card privacy and fair dealing
 
 For wire/state rules, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md).
@@ -14,9 +15,11 @@ For wire/state rules, see [protocol.md](./protocol.md). For component topology, 
 ## Security Boundary Summary
 
 - Consensus lives in the daemon mesh, not in the indexer or UI.
+- The localhost controller is not part of consensus. It is a local control plane for one machine.
 - Money movement is bounded by fully signed settlement snapshots plus each player's local Arkade table-funds state.
 - Unfinished hands are not forced onto Arkade. The last fully signed settlement-boundary snapshot is the last enforceable money state.
-- Public ads, public hand updates, and the web UI can inform humans, but they cannot create, authorize, or finalize bankroll changes.
+- Public ads and public hand updates can inform humans, but they cannot create, authorize, or finalize bankroll changes.
+- The browser UI can trigger local wallet and table actions through the controller, but only the daemon can authorize and execute them with local keys.
 
 ## Assets
 
@@ -130,10 +133,25 @@ The indexer does not participate in consensus, does not hold wallet keys, and ca
 
 The web UI:
 
-- reads the indexer HTTP API
-- renders public table state for spectators
+- reads the indexer HTTP API for public spectator state
+- reads the localhost controller for local profile, wallet, gameplay, and settlement state
+- can instruct the local daemon through the controller
 
-The UI does not join games, sign protocol objects, or talk directly to the daemon mesh.
+The UI still does not:
+
+- hold wallet or protocol private keys
+- sign protocol objects
+- read profile JSON directly
+- talk directly to the daemon mesh
+
+### Local controller
+
+The localhost controller:
+
+- binds to loopback only
+- translates browser-safe HTTP and SSE into daemon RPC
+- enforces browser-origin and custom-header checks
+- does not own money, keys, or consensus state
 
 ### Arkade operator
 
@@ -173,7 +191,16 @@ When witnesses are configured and available, they can preserve canonical history
 
 ### Public surfaces are informational only
 
-The indexer and UI can display stale, missing, or maliciously curated public information without gaining the ability to authorize bankroll changes. They cannot create valid `SignedTableEvent`, `CooperativeTableSnapshot`, or `TableFundsOperation` records on behalf of players.
+The indexer and the public browser view can display stale, missing, or maliciously curated public information without gaining the ability to authorize bankroll changes. They cannot create valid `SignedTableEvent`, `CooperativeTableSnapshot`, or `TableFundsOperation` records on behalf of players.
+
+### Local browser control is still bounded by the daemon
+
+The local browser can ask the controller to move funds, join tables, or submit actions, but:
+
+- the request only reaches `127.0.0.1`
+- the controller only forwards structured routes
+- the daemon still decides whether the action is valid
+- the daemon still owns every signing and persistence step
 
 ## Trust Assumptions
 
@@ -218,6 +245,12 @@ Each daemon is trusted to protect:
 - persisted event and snapshot history
 - local Arkade table-funds state
 
+When the controller UI is in use, the same machine is also trusted to protect:
+
+- allowed local browser origins
+- the loopback controller process
+- the browser tab from malicious local extensions or injected same-origin content
+
 Compromise of a participating machine can compromise that participant's role and secrets.
 
 ## Host-Dealer Privacy Tradeoff
@@ -236,7 +269,8 @@ This is better than pushing hidden-card handling into a browser spectator surfac
 Version 1 does not claim:
 
 - dealerless or trustless hidden-card privacy
-- browser-native gameplay parity with daemon peers
+- browser-native daemon or wallet custody
+- browser-native mesh participation
 - trustless public discovery through the indexer
 - enforceability of unfinished mid-hand state on Arkade
 - that the current Arkade table-funds adapter is hardened for production mainnet use

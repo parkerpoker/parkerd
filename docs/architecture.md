@@ -10,17 +10,20 @@ Parker currently runs as a daemon mesh:
 
 - each participant runs a local daemon process
 - the CLI only controls a local daemon over Unix-socket RPC
+- the local controller only controls a local daemon over HTTP and SSE backed by that same RPC
 - gameplay consensus happens over daemon-to-daemon WebSockets on `/mesh`
 - each player's daemon owns its own Arkade wallet interactions and table-funds state
 - an optional indexer stores signed public ads and public updates for discovery
-- the web app is read-only and only queries the indexer
+- the web app is a hybrid UI:
+  - spectator reads come from the indexer
+  - local player control goes through the localhost controller
 
 The practical boundary is simple:
 
 - `apps/daemon` is the gameplay and settlement runtime
-- `apps/cli` is local control only
+- `apps/cli` and `apps/controller` are local control only
 - `apps/indexer` is optional public ingest/read model only
-- `apps/web` is read-only
+- `apps/web` is a browser UI, not a mesh peer
 
 ## Component Roles
 
@@ -59,6 +62,23 @@ The CLI exposes the current command groups:
 
 It does not participate in the mesh directly, and it does not implement gameplay logic on its own.
 
+### Local controller service
+
+`apps/controller` is a loopback-only Fastify service that adapts the existing Unix-socket daemon RPC into browser-safe routes and an SSE watch stream.
+
+It exposes:
+
+- structured `GET` and `POST` routes under `/api/local`
+- `GET /api/local/profiles/:profile/watch` as an SSE bridge over `DaemonRpcClient.watch()`
+- optional same-origin serving of the built web bundle and proxied public indexer reads
+
+It does not:
+
+- own keys
+- sign protocol objects
+- join the daemon mesh
+- reimplement wallet, table, or settlement logic
+
 ### Host, witness, and player modes
 
 Host, witness, and player are daemon operating modes, not separate binaries.
@@ -87,16 +107,28 @@ And it serves:
 
 The indexer never joins consensus and never authorizes money movement. It only stores and serves public information derived from daemon state.
 
-### Read-only UI
+### Browser UI
 
-`apps/web` polls the indexer and renders public tables, public chip counts, board cards, and recent public updates.
+`apps/web` now runs in two modes:
 
-It is intentionally read-only:
+- public spectator mode from the optional indexer
+- local controller mode from the localhost controller
 
-- no wallet access
-- no mesh connectivity
-- no table joins
-- no action submission
+In controller mode the browser can:
+
+- choose a local profile
+- start and inspect the local daemon
+- request wallet moves
+- create or join tables
+- submit gameplay actions
+- request renewals, cash-out, or emergency exit
+
+Even in controller mode, the browser is still outside consensus:
+
+- it does not hold private keys
+- it does not read profile files or Unix sockets
+- it does not connect to `/mesh`
+- it does not sign protocol messages itself
 
 ### Arkade and Nigiri dependencies
 
@@ -134,7 +166,13 @@ The CLI crosses a local-only boundary:
 - CLI issues commands over the profile socket
 - daemon executes wallet, networking, and table operations
 
-No remote peer ever talks to another peer's CLI.
+The controller crosses the same boundary over localhost HTTP and SSE:
+
+- browser UI issues structured controller requests with origin and header checks
+- controller forwards them to the daemon RPC
+- daemon executes wallet, networking, and table operations
+
+No remote peer ever talks to another peer's CLI or controller.
 
 ### Public read boundary
 
@@ -169,12 +207,16 @@ flowchart LR
 
   subgraph "Player Machine"
     PlayerCLI["apps/cli<br/>local RPC control"]
+    Controller["apps/controller<br/>localhost HTTP + SSE"]
+    BrowserUI["apps/web<br/>public browser + local player UI"]
     PlayerDaemon["apps/daemon<br/>player mode"]
     PlayerCLI -->|"Unix socket RPC"| PlayerDaemon
+    Controller -->|"Unix socket RPC"| PlayerDaemon
+    BrowserUI -->|"HTTP + SSE on localhost"| Controller
   end
 
   Indexer["apps/indexer<br/>optional public ingest + read model"]
-  UI["apps/web<br/>read-only UI"]
+  UI["apps/web<br/>public browser"]
   Arkade["Arkade / Boltz services"]
   Nigiri["Nigiri (regtest only)"]
 
@@ -213,8 +255,9 @@ The current public-facing topology is:
 - one host daemon
 - one or more player daemons
 - at least one witness daemon
+- one optional local controller per player machine
 - optional indexer
-- optional read-only web UI
+- optional browser UI
 
 This gives a public discovery path while keeping gameplay authority in the daemon mesh.
 
@@ -222,6 +265,7 @@ This gives a public discovery path while keeping gameplay authority in the daemo
 
 The repository currently exercises two regtest shapes:
 
+- `npm run dev:local` starts `host`, `witness`, `alice`, and `bob`, plus Nigiri, the controller, the indexer, and the web UI
 - `make poker-regtest-round` starts `host`, `witness`, `alice`, and `bob`, plus Nigiri and the indexer
 - `npm run test:mesh-regtest` starts `host`, `witness`, `alpha`, `beta`, and `gamma`, plus an in-process indexer, to cover failover and public-discovery scenarios
 

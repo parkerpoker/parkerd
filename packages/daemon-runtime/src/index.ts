@@ -4,6 +4,7 @@ export * from "./daemonFiles.js";
 export * from "./daemonPaths.js";
 export * from "./daemonProcess.js";
 export * from "./daemonProtocol.js";
+export * from "./daemonWatchBridge.js";
 export * from "./indexerClient.js";
 export * from "./logger.js";
 export * from "./meshRuntime.js";

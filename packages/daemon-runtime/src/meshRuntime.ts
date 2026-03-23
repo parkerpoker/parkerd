@@ -4,6 +4,7 @@ import {
   applyHoldemAction,
   createDeterministicDeck,
   createHoldemHand,
+  getLegalActions,
   toCheckpointShape,
   type HoldemState,
 } from "@parker/game-engine";
@@ -61,6 +62,7 @@ import type {
   MeshRuntimeMode,
   MeshRuntimeState,
   MeshTableContext,
+  MeshTableView,
   TableSummary,
 } from "./meshTypes.js";
 import { PeerTransport } from "./peerTransport.js";
@@ -82,14 +84,6 @@ interface CreateMeshTableParams {
   smallBlindSats?: number;
   spectatorsAllowed?: boolean;
   witnessPeerIds?: string[];
-}
-
-interface MeshTableView {
-  config: MeshTableConfig;
-  events: SignedTableEvent[];
-  latestSnapshot: CooperativeTableSnapshot | null;
-  latestFullySignedSnapshot: CooperativeTableSnapshot | null;
-  publicState: PublicTableState | null;
 }
 
 type EventDisposition = "accept" | "ignore" | "queue";
@@ -459,11 +453,32 @@ export class MeshRuntime {
       await this.loadPersistedTable(targetTableId);
     }
     const context = this.requireContext(targetTableId);
+    const currentHandId = context.publicState?.handId ?? null;
+    const myPlayerId = this.walletIdentity?.playerId ?? null;
+    const mySeatIndex =
+      myPlayerId === null
+        ? null
+        : (context.publicState?.seatedPlayers.find((player) => player.playerId === myPlayerId)?.seatIndex ?? null);
+    const localHand =
+      context.privateState.activeHand && context.privateState.activeHand.handId === currentHandId
+        ? context.privateState.activeHand
+        : undefined;
+    const legalActions = localHand && mySeatIndex !== null ? getLegalActions(localHand, mySeatIndex) : [];
     return {
       config: context.config,
       events: [...context.events],
       latestFullySignedSnapshot: context.latestFullySignedSnapshot,
       latestSnapshot: context.latestSnapshot,
+      local: {
+        canAct: localHand?.actingSeatIndex === mySeatIndex && legalActions.length > 0,
+        legalActions,
+        myHoleCards:
+          currentHandId && context.privateState.myHoleCardsByHandId[currentHandId]
+            ? context.privateState.myHoleCardsByHandId[currentHandId]
+            : null,
+        myPlayerId,
+        mySeatIndex,
+      },
       publicState: context.publicState,
     };
   }

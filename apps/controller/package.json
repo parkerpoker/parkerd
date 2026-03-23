@@ -1,17 +1,16 @@
 {
-  "name": "@parker/web",
+  "name": "@parker/controller",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
-    "dev": "vite",
+    "build": "tsup src/index.ts --format esm --dts --clean",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "dependencies": {
     "@parker/daemon-runtime": "file:../../packages/daemon-runtime",
-    "@parker/protocol": "file:../../packages/protocol",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "fastify": "^5.2.1"
   }
 }

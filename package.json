@@ -11,14 +11,16 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @parker/protocol && npm run build -w @parker/game-engine && npm run build -w @parker/settlement && npm run build -w @parker/daemon-runtime && npm run build -w @parker/indexer && npm run build -w @parker/daemon && npm run build -w @parker/cli && npm run build -w @parker/web",
+    "build": "npm run build -w @parker/protocol && npm run build -w @parker/game-engine && npm run build -w @parker/settlement && npm run build -w @parker/daemon-runtime && npm run build -w @parker/indexer && npm run build -w @parker/daemon && npm run build -w @parker/controller && npm run build -w @parker/cli && npm run build -w @parker/web",
     "dev:cli": "npm run dev -w @parker/cli",
+    "dev:controller": "npm run dev -w @parker/controller",
     "dev:daemon": "npm run dev -w @parker/daemon",
     "dev:indexer": "npm run dev -w @parker/indexer",
+    "dev:local": "node --import tsx scripts/dev-local.ts",
     "dev:web": "npm run dev -w @parker/web",
     "test:mesh-regtest": "node --import tsx integration/mesh-regtest.ts --start-nigiri",
-    "test": "npm run test -w @parker/protocol && npm run test -w @parker/game-engine && npm run test -w @parker/settlement && npm run test -w @parker/daemon-runtime && npm run test -w @parker/indexer && npm run test -w @parker/daemon && npm run test -w @parker/cli",
-    "typecheck": "npm run typecheck -w @parker/protocol && npm run typecheck -w @parker/game-engine && npm run typecheck -w @parker/settlement && npm run typecheck -w @parker/daemon-runtime && npm run typecheck -w @parker/indexer && npm run typecheck -w @parker/daemon && npm run typecheck -w @parker/cli && npm run typecheck -w @parker/web"
+    "test": "npm run test -w @parker/protocol && npm run test -w @parker/game-engine && npm run test -w @parker/settlement && npm run test -w @parker/daemon-runtime && npm run test -w @parker/indexer && npm run test -w @parker/daemon && npm run test -w @parker/controller && npm run test -w @parker/cli",
+    "typecheck": "npm run typecheck -w @parker/protocol && npm run typecheck -w @parker/game-engine && npm run typecheck -w @parker/settlement && npm run typecheck -w @parker/daemon-runtime && npm run typecheck -w @parker/indexer && npm run typecheck -w @parker/daemon && npm run typecheck -w @parker/controller && npm run typecheck -w @parker/cli && npm run typecheck -w @parker/web"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

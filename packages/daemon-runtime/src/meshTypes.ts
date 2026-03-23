@@ -1,4 +1,5 @@
 import type {
+  CardCode,
   HandAuditBundle,
   MeshRole,
   MeshTableConfig,
@@ -10,7 +11,7 @@ import type {
   TableFundsOperation,
   MeshSeatedPlayer,
 } from "@parker/protocol";
-import type { HoldemState } from "@parker/game-engine";
+import type { HoldemState, LegalAction } from "@parker/game-engine";
 
 export type MeshRuntimeMode = MeshRole;
 
@@ -51,7 +52,24 @@ export interface MeshRuntimeState {
 export interface LocalPrivateTableState {
   activeHand?: HoldemState;
   auditBundlesByHandId: Record<string, HandAuditBundle>;
-  myHoleCardsByHandId: Record<string, [string, string]>;
+  myHoleCardsByHandId: Record<string, [CardCode, CardCode]>;
+}
+
+export interface MeshTableLocalView {
+  canAct: boolean;
+  legalActions: LegalAction[];
+  myHoleCards: [CardCode, CardCode] | null;
+  myPlayerId: string | null;
+  mySeatIndex: number | null;
+}
+
+export interface MeshTableView {
+  config: MeshTableConfig;
+  events: SignedTableEvent[];
+  latestFullySignedSnapshot: CooperativeTableSnapshot | null;
+  latestSnapshot: CooperativeTableSnapshot | null;
+  local: MeshTableLocalView;
+  publicState: PublicTableState | null;
 }
 
 export interface MeshTableContext {

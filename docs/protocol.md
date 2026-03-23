@@ -5,7 +5,9 @@ This document describes the protocol implemented today in this repository. It st
 ## Document Scope
 
 - Protocol consensus lives inside the daemon mesh implemented by [`apps/daemon`](../apps/daemon) and [`packages/daemon-runtime`](../packages/daemon-runtime).
-- [`apps/indexer`](../apps/indexer) is an optional public ingest/read model. [`apps/web`](../apps/web) is a read-only browser for that public read model.
+- [`apps/indexer`](../apps/indexer) is an optional public ingest/read model.
+- [`apps/controller`](../apps/controller) is a local HTTP and SSE control plane for one machine. It is outside consensus.
+- [`apps/web`](../apps/web) is a browser UI that can read either the public indexer or the local controller, but it is not a consensus peer.
 - The indexer and UI are outside consensus. They cannot append canonical gameplay events, sign settlement checkpoints, or finalize money movement.
 - For component topology and runtime boundaries, see [architecture.md](./architecture.md).
 - For guarantees, trust assumptions, and failure consequences, see [trust-model.md](./trust-model.md).
@@ -16,8 +18,9 @@ The protocol described here is exercised through the current runtime split:
 
 - `apps/daemon` owns long-running process behavior, peer transport, canonical event replay, settlement coordination, and local persistence.
 - `apps/cli` only controls the local daemon over profile-local Unix-socket RPC.
+- `apps/controller` only controls the local daemon over localhost HTTP and SSE backed by that same RPC.
 - `apps/indexer` is optional and only ingests signed public advertisements and public updates, then serves a read model over HTTP.
-- `apps/web` is read-only and only queries the indexer HTTP API.
+- `apps/web` is a hybrid UI that can query the public indexer and the local controller, but never joins the mesh.
 
 Primary implementation units:
 
@@ -36,6 +39,8 @@ Primary implementation units:
 - Canonical state: signed `SignedTableEvent` history plus signed cooperative settlement-boundary snapshots
 - Settlement layer: Arkade-backed `TableFundsProvider` with wallet-local custody
 - Implemented game variant: heads-up Texas Hold'em
+
+The localhost controller HTTP and SSE routes are intentionally out of scope for protocol consensus. They are a local control plane, not a protocol wire format between peers.
 
 Although shared schemas allow more seats and more dealer modes, the current runtime only starts hands when exactly two bankroll participants are seated, and it only uses `host-dealer-v1`.
 

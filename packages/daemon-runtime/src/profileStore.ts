@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { MeshTableConfig } from "@parker/protocol";
@@ -45,12 +45,54 @@ export interface PlayerProfileState {
   walletPrivateKeyHex?: string;
 }
 
+export interface LocalProfileSummary {
+  currentMeshTableId?: string;
+  currentTableId?: string;
+  hasPeerIdentity: boolean;
+  hasProtocolIdentity: boolean;
+  hasWalletIdentity: boolean;
+  knownPeerCount: number;
+  meshTableCount: number;
+  nickname: string;
+  profileName: string;
+}
+
 const PROFILE_LOAD_RETRY_MS = 25;
 const PROFILE_LOAD_RETRIES = 3;
 const profileWriteLocks = new Map<string, Promise<void>>();
 
 export class ProfileStore {
   constructor(private readonly profileDir: string) {}
+
+  async listProfileNames(): Promise<string[]> {
+    try {
+      const entries = await readdir(this.profileDir, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => entry.name.slice(0, -".json".length))
+        .sort((left, right) => left.localeCompare(right));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return [];
+      }
+      throw error;
+    }
+  }
+
+  async listProfiles(): Promise<LocalProfileSummary[]> {
+    const profiles = await Promise.all(
+      (await this.listProfileNames()).map(async (profileName) => {
+        const profile = await this.load(profileName);
+        return profile ? toLocalProfileSummary(profile) : null;
+      }),
+    );
+    return profiles.filter((profile): profile is LocalProfileSummary => profile !== null);
+  }
+
+  async loadSummary(profileName: string): Promise<LocalProfileSummary | null> {
+    const profile = await this.load(profileName);
+    return profile ? toLocalProfileSummary(profile) : null;
+  }
 
   async load(profileName: string): Promise<PlayerProfileState | null> {
     for (let attempt = 0; attempt < PROFILE_LOAD_RETRIES; attempt += 1) {
@@ -113,4 +155,18 @@ export class ProfileStore {
       setTimeout(resolve, timeoutMs);
     });
   }
+}
+
+function toLocalProfileSummary(profile: PlayerProfileState): LocalProfileSummary {
+  return {
+    ...(profile.currentMeshTableId ? { currentMeshTableId: profile.currentMeshTableId } : {}),
+    ...(profile.currentTable ? { currentTableId: profile.currentTable.tableId } : {}),
+    hasPeerIdentity: Boolean(profile.peerPrivateKeyHex),
+    hasProtocolIdentity: Boolean(profile.protocolPrivateKeyHex),
+    hasWalletIdentity: Boolean(profile.walletPrivateKeyHex),
+    knownPeerCount: profile.knownPeers?.length ?? 0,
+    meshTableCount: Object.keys(profile.meshTables ?? {}).length,
+    nickname: profile.nickname,
+    profileName: profile.profileName,
+  };
 }
