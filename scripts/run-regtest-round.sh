@@ -4,43 +4,49 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-BASE="${BASE:-/tmp/parker-auto-2p}"
-SERVER_PORT="${SERVER_PORT:-3020}"
-HOST_PORT="${HOST_PORT:-7101}"
-WITNESS_PORT="${WITNESS_PORT:-7102}"
-ALICE_PORT="${ALICE_PORT:-7103}"
-BOB_PORT="${BOB_PORT:-7104}"
+BASE="${BASE:-/tmp/parker-auto-2p-$$}"
+SERVER_PORT="${SERVER_PORT:-}"
+HOST_PORT="${HOST_PORT:-}"
+WITNESS_PORT="${WITNESS_PORT:-}"
+ALICE_PORT="${ALICE_PORT:-}"
+BOB_PORT="${BOB_PORT:-}"
 BUY_IN_SATS="${BUY_IN_SATS:-4000}"
 FAUCET_SATS="${FAUCET_SATS:-100000}"
-
-rm -rf "$BASE"
-mkdir -p "$BASE"/{daemons,profiles,runs}
+NIGIRI_DATADIR="${NIGIRI_DATADIR:-$HOME/Library/Application Support/Nigiri/parker-auto/$(printf '%s' "$BASE" | tr '/:' '__')}"
 
 common_flags=(
   --network regtest
-  --server-url "http://127.0.0.1:${SERVER_PORT}"
-  --indexer-url "http://127.0.0.1:${SERVER_PORT}"
-  --websocket-url "ws://127.0.0.1:${SERVER_PORT}/ws"
+  --server-url ""
+  --indexer-url ""
+  --websocket-url ""
   --ark-server-url http://127.0.0.1:7070
   --boltz-url http://127.0.0.1:9069
-  --daemon-dir "$BASE/daemons"
-  --profile-dir "$BASE/profiles"
-  --run-dir "$BASE/runs"
+  --daemon-dir ""
+  --profile-dir ""
+  --run-dir ""
 )
 
 cleanup() {
   set +e
-  [[ -n "${HOST_DAEMON_PID:-}" ]] && kill "$HOST_DAEMON_PID" 2>/dev/null
-  [[ -n "${WITNESS_DAEMON_PID:-}" ]] && kill "$WITNESS_DAEMON_PID" 2>/dev/null
-  [[ -n "${ALICE_DAEMON_PID:-}" ]] && kill "$ALICE_DAEMON_PID" 2>/dev/null
-  [[ -n "${BOB_DAEMON_PID:-}" ]] && kill "$BOB_DAEMON_PID" 2>/dev/null
-  [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null
-  nigiri stop >/dev/null 2>&1 || true
+  stop_pid() {
+    local pid="$1"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  }
+  [[ -n "${NIGIRI_START_PID:-}" ]] && stop_pid "$NIGIRI_START_PID"
+  [[ -n "${HOST_DAEMON_PID:-}" ]] && stop_pid "$HOST_DAEMON_PID"
+  [[ -n "${WITNESS_DAEMON_PID:-}" ]] && stop_pid "$WITNESS_DAEMON_PID"
+  [[ -n "${ALICE_DAEMON_PID:-}" ]] && stop_pid "$ALICE_DAEMON_PID"
+  [[ -n "${BOB_DAEMON_PID:-}" ]] && stop_pid "$BOB_DAEMON_PID"
+  [[ -n "${SERVER_PID:-}" ]] && stop_pid "$SERVER_PID"
+  nigiri --datadir "$NIGIRI_DATADIR" stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 pcli() {
-  node --import tsx apps/cli/src/index.ts "${common_flags[@]}" "$@"
+  local command="$1"
+  shift
+  node --import tsx apps/cli/src/index.ts "$command" "${common_flags[@]}" "$@"
 }
 
 pdaemon() {
@@ -61,8 +67,95 @@ json_field() {
   ' "$1"
 }
 
+nigiri_cmd() {
+  nigiri --datadir "$NIGIRI_DATADIR" "$@"
+}
+
+free_port() {
+  node --input-type=module -e '
+    import { createServer } from "node:net";
+    const server = createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        process.exit(1);
+        return;
+      }
+      console.log(address.port);
+      server.close();
+    });
+  '
+}
+
+wait_for_http_json() {
+  local url="$1"
+  local attempts="${2:-120}"
+  local sleep_seconds="${3:-1}"
+  local body
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    if body="$(curl -sS "$url" 2>/dev/null)" && [[ -n "$body" ]]; then
+      printf '%s\n' "$body"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+  return 1
+}
+
+wait_for_ark_wallet() {
+  local attempts="${1:-60}"
+  local status
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    status="$(nigiri_cmd arkd wallet status 2>/dev/null || true)"
+    if [[ "$status" == *"unlocked: true"* && "$status" == *"synced: true"* ]]; then
+      printf '%s\n' "$status"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+seed_ark_liquidity() {
+  wait_for_ark_wallet 60 >/dev/null
+  local address
+  address="$(nigiri_cmd arkd wallet address | tr -d '\r' | tail -n 1)"
+  [[ -n "$address" ]]
+  for _ in {1..10}; do
+    nigiri_cmd faucet "$address" >/dev/null
+  done
+}
+
+SERVER_PORT="${SERVER_PORT:-$(free_port)}"
+HOST_PORT="${HOST_PORT:-$(free_port)}"
+WITNESS_PORT="${WITNESS_PORT:-$(free_port)}"
+ALICE_PORT="${ALICE_PORT:-$(free_port)}"
+BOB_PORT="${BOB_PORT:-$(free_port)}"
+
+rm -rf "$BASE"
+mkdir -p "$BASE"/{daemons,profiles,runs}
+mkdir -p "$NIGIRI_DATADIR"
+
+common_flags=(
+  --network regtest
+  --server-url "http://127.0.0.1:${SERVER_PORT}"
+  --indexer-url "http://127.0.0.1:${SERVER_PORT}"
+  --websocket-url "ws://127.0.0.1:${SERVER_PORT}/ws"
+  --ark-server-url http://127.0.0.1:7070
+  --boltz-url http://127.0.0.1:9069
+  --nigiri-datadir "$NIGIRI_DATADIR"
+  --daemon-dir "$BASE/daemons"
+  --profile-dir "$BASE/profiles"
+  --run-dir "$BASE/runs"
+)
+
 echo "Starting Nigiri..."
-nigiri start --ark --ln --ci
+nigiri_cmd start --ark --ln --ci >"$BASE/nigiri-start.log" 2>&1 &
+NIGIRI_START_PID=$!
+wait_for_http_json "http://127.0.0.1:7070/v1/info" 120 1 >/dev/null
+seed_ark_liquidity
+kill "$NIGIRI_START_PID" 2>/dev/null || true
+wait "$NIGIRI_START_PID" 2>/dev/null || true
 
 echo "Starting API server on :${SERVER_PORT}..."
 HOST=127.0.0.1 PORT="$SERVER_PORT" PARKER_NETWORK=regtest WEBSOCKET_URL="ws://127.0.0.1:${SERVER_PORT}/ws" \
@@ -88,11 +181,12 @@ HOST_BOOT="$(pcli bootstrap Host --profile host --json)"
 WITNESS_BOOT="$(pcli bootstrap Witness --profile witness --json)"
 ALICE_BOOT="$(pcli bootstrap Alice --profile alice --json)"
 BOB_BOOT="$(pcli bootstrap Bob --profile bob --json)"
+WITNESS_STATUS="$(pcli daemon status --profile witness --json)"
 
-WITNESS_PEER_URL="$(printf '%s' "$WITNESS_BOOT" | json_field mesh.peerUrl)"
-WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field mesh.peerId)"
-ALICE_PLAYER_ID="$(printf '%s' "$ALICE_BOOT" | json_field mesh.walletPlayerId)"
-BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field mesh.walletPlayerId)"
+WITNESS_PEER_URL="$(printf '%s' "$WITNESS_STATUS" | json_field data.metadata.peerUrl)"
+WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field data.mesh.peerId)"
+ALICE_PLAYER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.mesh.walletPlayerId)"
+BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.mesh.walletPlayerId)"
 
 echo "Funding wallets..."
 pcli faucet "$FAUCET_SATS" --profile alice --json >/dev/null
@@ -105,7 +199,7 @@ pcli network bootstrap add "$WITNESS_PEER_URL" witness --profile host --json >/d
 
 echo "Creating table..."
 CREATE_JSON="$(
-  BASE="$BASE" SERVER_PORT="$SERVER_PORT" WITNESS_PEER_ID="$WITNESS_PEER_ID" \
+  BASE="$BASE" SERVER_PORT="$SERVER_PORT" NIGIRI_DATADIR="$NIGIRI_DATADIR" WITNESS_PEER_ID="$WITNESS_PEER_ID" \
   node --import tsx --input-type=module <<'EOF'
 import { resolveCliRuntimeConfig } from "./apps/cli/src/config.ts";
 import { DaemonRpcClient } from "./apps/cli/src/daemonClient.ts";
@@ -117,6 +211,7 @@ const cfg = resolveCliRuntimeConfig({
   "websocket-url": `ws://127.0.0.1:${process.env.SERVER_PORT}/ws`,
   "ark-server-url": "http://127.0.0.1:7070",
   "boltz-url": "http://127.0.0.1:9069",
+  "nigiri-datadir": process.env.NIGIRI_DATADIR,
   "daemon-dir": `${process.env.BASE}/daemons`,
   "profile-dir": `${process.env.BASE}/profiles`,
   "run-dir": `${process.env.BASE}/runs`,
@@ -143,7 +238,7 @@ pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile bob   --json >/dev/nul
 
 echo "Playing one hand automatically..."
 
-BASE="$BASE" SERVER_PORT="$SERVER_PORT" TABLE_ID="$TABLE_ID" ALICE_PLAYER_ID="$ALICE_PLAYER_ID" BOB_PLAYER_ID="$BOB_PLAYER_ID" \
+BASE="$BASE" SERVER_PORT="$SERVER_PORT" NIGIRI_DATADIR="$NIGIRI_DATADIR" TABLE_ID="$TABLE_ID" ALICE_PLAYER_ID="$ALICE_PLAYER_ID" BOB_PLAYER_ID="$BOB_PLAYER_ID" \
 node --import tsx --input-type=module <<'EOF'
 import { resolveCliRuntimeConfig } from "./apps/cli/src/config.ts";
 import { DaemonRpcClient } from "./apps/cli/src/daemonClient.ts";
@@ -155,6 +250,7 @@ const cfg = resolveCliRuntimeConfig({
   "websocket-url": `ws://127.0.0.1:${process.env.SERVER_PORT}/ws`,
   "ark-server-url": "http://127.0.0.1:7070",
   "boltz-url": "http://127.0.0.1:9069",
+  "nigiri-datadir": process.env.NIGIRI_DATADIR,
   "daemon-dir": `${process.env.BASE}/daemons`,
   "profile-dir": `${process.env.BASE}/profiles`,
   "run-dir": `${process.env.BASE}/runs`,
@@ -216,6 +312,10 @@ for (let turn = 0; turn < 30; turn += 1) {
   const state = await alice.meshGetTable(tableId);
   const publicState = state.publicState;
   if (!publicState) {
+    await delay(250);
+    continue;
+  }
+  if (!publicState.handId || publicState.phase === null) {
     await delay(250);
     continue;
   }
