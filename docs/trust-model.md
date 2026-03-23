@@ -181,13 +181,13 @@ Today the host is trusted to:
 - replicate accurate table state
 - provide the current table copy to non-host peers
 
-### Peer requests are not individually signed
+### Peer requests use detached signatures
 
-Join, action, and table-sync requests between daemons are plain JSON over HTTP. The runtime does not currently wrap them in separately signed request envelopes.
+Join, action, and table-sync requests between daemons are JSON over HTTP with detached request signatures. The runtime still relies on HTTP transport semantics rather than an encrypted peer-to-peer channel.
 
 ### Replicated state is not fully re-verified on receipt
 
-Peers accept replicated table state through host polling and `/native/table/sync`. The current runtime does not yet re-run a full cryptographic replay and semantic verification pass before persisting that state.
+Peers accept replicated table state through host polling and `/native/table/sync` after request-level auth and monotonicity checks. The current runtime does not yet re-run a full cryptographic replay and semantic verification pass before persisting that state.
 
 ### Snapshot quorum is not yet multi-party enforced
 

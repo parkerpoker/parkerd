@@ -41,6 +41,14 @@ type nativeRuntime struct {
 	walletRuntime    *walletpkg.Runtime
 }
 
+const (
+	nativeTableAuthPlayerIDHeader  = "X-Parker-Player-Id"
+	nativeTableAuthSignedAtHeader  = "X-Parker-Signed-At"
+	nativeTableAuthSignatureHeader = "X-Parker-Signature"
+	nativeTableFetchAuthMaxAge     = 15 * time.Second
+	nativeTableSyncAuthMaxAge      = 15 * time.Second
+)
+
 func newNativeRuntime(profileName string, config RuntimeConfig, mode string) (*nativeRuntime, error) {
 	if mode == "" {
 		mode = "player"
@@ -467,6 +475,11 @@ func (runtime *nativeRuntime) JoinTable(inviteCode string, buyInSats int) (Nativ
 		WalletPlayerID:  runtime.walletID.PlayerID,
 		WalletPubkeyHex: runtime.walletID.PublicKeyHex,
 	}
+	binding, err := settlementcore.BuildIdentityBinding(tableID, runtime.selfPeerID(), runtime.selfPeerURL(), runtime.protocolIdentity, runtime.walletID, nowISO())
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	request.IdentityBinding = binding
 
 	var table nativeTableState
 	if hostPeerURL == runtime.selfPeerURL() {
@@ -514,11 +527,9 @@ func (runtime *nativeRuntime) SendAction(tableID string, action game.Action) (Na
 	if table == nil {
 		return NativeMeshTableView{}, fmt.Errorf("table %s not found", tableID)
 	}
-	request := nativeActionRequest{
-		Action:      action,
-		PlayerID:    runtime.walletID.PlayerID,
-		ProfileName: runtime.profileName,
-		TableID:     table.Config.TableID,
+	request, err := runtime.buildSignedActionRequest(*table, action)
+	if err != nil {
+		return NativeMeshTableView{}, err
 	}
 	var updated nativeTableState
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
@@ -801,7 +812,7 @@ func (runtime *nativeRuntime) routes() http.Handler {
 			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
 			return
 		}
-		_ = runtime.writeJSON(writer, table)
+		_ = runtime.writeJSON(writer, runtime.networkTableView(table, join.WalletPlayerID))
 	})
 	mux.HandleFunc("/native/table/action", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
@@ -820,20 +831,20 @@ func (runtime *nativeRuntime) routes() http.Handler {
 			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
 			return
 		}
-		_ = runtime.writeJSON(writer, table)
+		_ = runtime.writeJSON(writer, runtime.networkTableView(table, action.PlayerID))
 	})
 	mux.HandleFunc("/native/table/sync", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		var table nativeTableState
-		if err := json.NewDecoder(request.Body).Decode(&table); err != nil {
+		var syncRequest nativeTableSyncRequest
+		if err := json.NewDecoder(request.Body).Decode(&syncRequest); err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
 			return
 		}
-		if err := runtime.acceptRemoteTable(table); err != nil {
+		if err := runtime.acceptTableSync(syncRequest); err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
 			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
 			return
@@ -852,7 +863,7 @@ func (runtime *nativeRuntime) routes() http.Handler {
 			_ = runtime.writeJSON(writer, map[string]any{"error": "table not found"})
 			return
 		}
-		_ = runtime.writeJSON(writer, table)
+		_ = runtime.writeJSON(writer, runtime.networkTableView(*table, runtime.tableViewerPlayerID(request, *table)))
 	})
 	return mux
 }
@@ -866,6 +877,14 @@ func (runtime *nativeRuntime) handleJoinFromPeer(join nativeJoinRequest) (native
 		}
 		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
 			return errors.New("join request must be sent to the current host")
+		}
+		if err := runtime.validateJoinRequest(join); err != nil {
+			return err
+		}
+		peer := join.Peer
+		peer.LastSeenAt = nowISO()
+		if err := runtime.saveKnownPeer(peer); err != nil {
+			return err
 		}
 		for _, seat := range table.Seats {
 			if seat.PlayerID == join.WalletPlayerID {
@@ -949,16 +968,14 @@ func (runtime *nativeRuntime) handleActionFromPeer(request nativeActionRequest) 
 		if table.ActiveHand == nil {
 			return errors.New("hand is not active")
 		}
-		seatIndex := -1
-		for _, seat := range table.Seats {
-			if seat.PlayerID == request.PlayerID {
-				seatIndex = seat.SeatIndex
-				break
-			}
-		}
-		if seatIndex < 0 {
+		seat, ok := seatRecordForPlayer(*table, request.PlayerID)
+		if !ok {
 			return errors.New("player is not seated")
 		}
+		if err := runtime.validateActionRequest(*table, seat, request); err != nil {
+			return err
+		}
+		seatIndex := seat.SeatIndex
 		nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, seatIndex, request.Action)
 		if err != nil {
 			return err
@@ -1132,6 +1149,8 @@ func (runtime *nativeRuntime) failoverTable(tableID, reason string) error {
 			restored := runtime.publicStateFromSnapshot(*table, *table.LatestFullySignedSnapshot)
 			table.PublicState = &restored
 			table.ActiveHand = nil
+			table.Config.Status = "ready"
+			table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
 			snapshot, err := runtime.buildSnapshot(*table, restored)
 			if err != nil {
 				return err
@@ -1215,10 +1234,10 @@ func (runtime *nativeRuntime) syncPrivateAndFunds(table nativeTableState) error 
 }
 
 func (runtime *nativeRuntime) replicateTable(table nativeTableState) {
-	targets := map[string]struct{}{}
+	targets := map[string]string{}
 	for _, witness := range table.Witnesses {
 		if witness.Peer.PeerURL != "" && witness.Peer.PeerID != runtime.selfPeerID() {
-			targets[witness.Peer.PeerURL] = struct{}{}
+			targets[witness.Peer.PeerURL] = ""
 		}
 	}
 	for _, seat := range table.Seats {
@@ -1226,11 +1245,15 @@ func (runtime *nativeRuntime) replicateTable(table nativeTableState) {
 			continue
 		}
 		if peerURL := runtime.knownPeerURL(seat.PeerID); peerURL != "" {
-			targets[peerURL] = struct{}{}
+			targets[peerURL] = seat.PlayerID
 		}
 	}
-	for peerURL := range targets {
-		_, _ = runtime.postJSON(peerURL, "/native/table/sync", table)
+	for peerURL, visiblePlayerID := range targets {
+		syncRequest, err := runtime.buildTableSyncRequest(runtime.networkTableView(table, visiblePlayerID))
+		if err != nil {
+			continue
+		}
+		_, _ = runtime.postJSON(peerURL, "/native/table/sync", syncRequest)
 	}
 }
 
@@ -1706,6 +1729,13 @@ func (runtime *nativeRuntime) currentTableID() string {
 }
 
 func (runtime *nativeRuntime) acceptRemoteTable(table nativeTableState) error {
+	existing, err := runtime.store.readTable(table.Config.TableID)
+	if err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedRemoteTable(existing, table); err != nil {
+		return err
+	}
 	if err := runtime.store.writeTable(&table); err != nil {
 		return err
 	}
@@ -1786,6 +1816,9 @@ func (runtime *nativeRuntime) fetchRemoteTable(peerURL, tableID string) (*native
 	if err != nil {
 		return nil, err
 	}
+	if err := runtime.applyTableFetchAuth(request, tableID); err != nil {
+		return nil, err
+	}
 	response, err := runtime.httpClient.Do(request)
 	if err != nil {
 		return nil, err
@@ -1800,6 +1833,48 @@ func (runtime *nativeRuntime) fetchRemoteTable(peerURL, tableID string) (*native
 		return nil, err
 	}
 	return &table, nil
+}
+
+func (runtime *nativeRuntime) applyTableFetchAuth(request *http.Request, tableID string) error {
+	if runtime.walletID.PlayerID == "" || runtime.walletID.PrivateKeyHex == "" {
+		return nil
+	}
+	signedAt := nowISO()
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeTableFetchAuthPayload(tableID, runtime.walletID.PlayerID, signedAt))
+	if err != nil {
+		return err
+	}
+	request.Header.Set(nativeTableAuthPlayerIDHeader, runtime.walletID.PlayerID)
+	request.Header.Set(nativeTableAuthSignedAtHeader, signedAt)
+	request.Header.Set(nativeTableAuthSignatureHeader, signatureHex)
+	return nil
+}
+
+func (runtime *nativeRuntime) buildTableSyncRequest(table nativeTableState) (nativeTableSyncRequest, error) {
+	sentAt := nowISO()
+	tableHash, err := settlementcore.HashStructuredDataHex(table)
+	if err != nil {
+		return nativeTableSyncRequest{}, err
+	}
+	request := nativeTableSyncRequest{
+		SenderPeerID:            runtime.selfPeerID(),
+		SenderProtocolPubkeyHex: runtime.protocolIdentity.PublicKeyHex,
+		SentAt:                  sentAt,
+		Table:                   table,
+	}
+	signatureHex, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, nativeTableSyncAuthPayload(table.Config.TableID, request.SenderPeerID, tableHash, sentAt))
+	if err != nil {
+		return nativeTableSyncRequest{}, err
+	}
+	request.SignatureHex = signatureHex
+	return request, nil
+}
+
+func (runtime *nativeRuntime) acceptTableSync(request nativeTableSyncRequest) error {
+	if err := runtime.validateTableSyncRequest(request); err != nil {
+		return err
+	}
+	return runtime.acceptRemoteTable(request.Table)
 }
 
 func (runtime *nativeRuntime) remoteJoin(peerURL string, input nativeJoinRequest) (nativeTableState, error) {
@@ -1901,6 +1976,280 @@ func (runtime *nativeRuntime) knownPeerURL(peerID string) string {
 	return ""
 }
 
+func (runtime *nativeRuntime) buildSignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
+	handID := ""
+	if table.ActiveHand != nil {
+		handID = table.ActiveHand.State.HandID
+	}
+	if handID == "" && table.PublicState != nil {
+		handID = stringValue(table.PublicState.HandID)
+	}
+	if handID == "" {
+		return nativeActionRequest{}, errors.New("hand is not active")
+	}
+	signedAt := nowISO()
+	request := nativeActionRequest{
+		Action:      action,
+		Epoch:       table.CurrentEpoch,
+		HandID:      handID,
+		PlayerID:    runtime.walletID.PlayerID,
+		ProfileName: runtime.profileName,
+		SignedAt:    signedAt,
+		TableID:     table.Config.TableID,
+	}
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.Action, request.SignedAt))
+	if err != nil {
+		return nativeActionRequest{}, err
+	}
+	request.SignatureHex = signatureHex
+	return request, nil
+}
+
+func (runtime *nativeRuntime) validateJoinRequest(join nativeJoinRequest) error {
+	if join.IdentityBinding.TableID == "" || join.IdentityBinding.SignatureHex == "" {
+		return errors.New("join request is missing identity binding")
+	}
+	if join.IdentityBinding.TableID != join.TableID {
+		return errors.New("join request table binding mismatch")
+	}
+	if join.IdentityBinding.PeerID != join.Peer.PeerID {
+		return errors.New("join request peer binding mismatch")
+	}
+	if join.IdentityBinding.PeerURL != join.Peer.PeerURL {
+		return errors.New("join request peer URL binding mismatch")
+	}
+	if join.IdentityBinding.ProtocolID != join.ProtocolID {
+		return errors.New("join request protocol binding mismatch")
+	}
+	if join.IdentityBinding.ProtocolPubkeyHex != join.Peer.ProtocolPubkeyHex {
+		return errors.New("join request protocol key mismatch")
+	}
+	if join.IdentityBinding.WalletPlayerID != join.WalletPlayerID {
+		return errors.New("join request player binding mismatch")
+	}
+	if join.IdentityBinding.WalletPubkeyHex != join.WalletPubkeyHex {
+		return errors.New("join request wallet key mismatch")
+	}
+	expectedPlayerID, err := settlementcore.DerivePlayerID(join.WalletPubkeyHex)
+	if err != nil {
+		return err
+	}
+	if expectedPlayerID != join.WalletPlayerID {
+		return errors.New("join request player id does not match wallet key")
+	}
+	expectedProtocolID, err := settlementcore.DeriveScopedID(settlementcore.ProtocolIdentityScope, join.Peer.ProtocolPubkeyHex)
+	if err != nil {
+		return err
+	}
+	if expectedProtocolID != join.ProtocolID {
+		return errors.New("join request protocol id does not match protocol key")
+	}
+	ok, err := settlementcore.VerifyIdentityBinding(join.IdentityBinding)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("join request identity binding is invalid")
+	}
+	peerSelf, err := runtime.fetchPeerInfo(join.Peer.PeerURL)
+	if err != nil {
+		return fmt.Errorf("join request peer endpoint verification failed: %w", err)
+	}
+	if peerSelf.Peer.PeerID != join.Peer.PeerID ||
+		peerSelf.Peer.ProtocolPubkeyHex != join.Peer.ProtocolPubkeyHex ||
+		peerSelf.ProtocolID != join.ProtocolID ||
+		peerSelf.WalletPlayerID != join.WalletPlayerID {
+		return errors.New("join request peer endpoint does not serve the claimed identity")
+	}
+	return nil
+}
+
+func (runtime *nativeRuntime) validateTableSyncRequest(request nativeTableSyncRequest) error {
+	if request.Table.Config.TableID == "" || request.SenderPeerID == "" || request.SenderProtocolPubkeyHex == "" || request.SentAt == "" || request.SignatureHex == "" {
+		return errors.New("sync request is missing required authentication fields")
+	}
+	if !timestampWithinWindow(request.SentAt, nativeTableSyncAuthMaxAge) {
+		return errors.New("sync request is stale")
+	}
+	if request.SenderPeerID != request.Table.CurrentHost.Peer.PeerID {
+		return errors.New("sync request sender does not match table host")
+	}
+	if request.SenderProtocolPubkeyHex != request.Table.CurrentHost.Peer.ProtocolPubkeyHex {
+		return errors.New("sync request protocol key does not match table host")
+	}
+	tableHash, err := settlementcore.HashStructuredDataHex(request.Table)
+	if err != nil {
+		return err
+	}
+	ok, err := settlementcore.VerifyStructuredData(request.SenderProtocolPubkeyHex, nativeTableSyncAuthPayload(request.Table.Config.TableID, request.SenderPeerID, tableHash, request.SentAt), request.SignatureHex)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("sync request signature is invalid")
+	}
+	existing, err := runtime.store.readTable(request.Table.Config.TableID)
+	if err != nil {
+		return err
+	}
+	return runtime.validateSyncTransition(existing, request.Table, request.SenderPeerID)
+}
+
+func (runtime *nativeRuntime) validateActionRequest(table nativeTableState, seat nativeSeatRecord, request nativeActionRequest) error {
+	if request.TableID != table.Config.TableID {
+		return errors.New("action request table mismatch")
+	}
+	if request.PlayerID != seat.PlayerID {
+		return errors.New("action request player mismatch")
+	}
+	if request.HandID == "" || request.HandID != table.ActiveHand.State.HandID {
+		return errors.New("action request hand mismatch")
+	}
+	if request.Epoch != table.CurrentEpoch {
+		return errors.New("action request epoch mismatch")
+	}
+	if request.SignedAt == "" || request.SignatureHex == "" {
+		return errors.New("action request is missing player signature")
+	}
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.Action, request.SignedAt), request.SignatureHex)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("action request signature is invalid")
+	}
+	return nil
+}
+
+func (runtime *nativeRuntime) tableViewerPlayerID(request *http.Request, table nativeTableState) string {
+	playerID := strings.TrimSpace(request.Header.Get(nativeTableAuthPlayerIDHeader))
+	signedAt := strings.TrimSpace(request.Header.Get(nativeTableAuthSignedAtHeader))
+	signatureHex := strings.TrimSpace(request.Header.Get(nativeTableAuthSignatureHeader))
+	if playerID == "" || signedAt == "" || signatureHex == "" {
+		return ""
+	}
+	if !timestampWithinWindow(signedAt, nativeTableFetchAuthMaxAge) {
+		return ""
+	}
+	seat, ok := seatRecordForPlayer(table, playerID)
+	if !ok || strings.TrimSpace(seat.WalletPubkeyHex) == "" {
+		return ""
+	}
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeTableFetchAuthPayload(table.Config.TableID, playerID, signedAt), signatureHex)
+	if err != nil || !ok {
+		return ""
+	}
+	return playerID
+}
+
+func (runtime *nativeRuntime) validateSyncTransition(existing *nativeTableState, incoming nativeTableState, senderPeerID string) error {
+	if !runtime.isLocalTableParticipant(incoming) {
+		return errors.New("sync request does not target this daemon")
+	}
+	if existing == nil {
+		return nil
+	}
+	if incoming.CurrentEpoch < existing.CurrentEpoch {
+		return errors.New("sync request would roll back table epoch")
+	}
+	if incoming.CurrentEpoch == existing.CurrentEpoch {
+		if senderPeerID != existing.CurrentHost.Peer.PeerID {
+			return errors.New("sync request sender does not match the current host")
+		}
+		if incoming.CurrentHost.Peer.PeerID != existing.CurrentHost.Peer.PeerID {
+			return errors.New("sync request changed host without advancing epoch")
+		}
+		if len(incoming.Events) < len(existing.Events) {
+			return errors.New("sync request would roll back table events")
+		}
+		if len(incoming.Snapshots) < len(existing.Snapshots) {
+			return errors.New("sync request would roll back table snapshots")
+		}
+	}
+	if incoming.CurrentEpoch > existing.CurrentEpoch && !runtime.isAuthorizedRemoteHost(existing, incoming.CurrentHost.Peer.PeerID) {
+		return errors.New("sync request advanced to an unauthorized host")
+	}
+	return nil
+}
+
+func (runtime *nativeRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
+	if !runtime.isLocalTableParticipant(incoming) {
+		return errors.New("remote table does not target this daemon")
+	}
+	if existing == nil {
+		return nil
+	}
+	if incoming.CurrentEpoch < existing.CurrentEpoch {
+		return errors.New("remote table would roll back table epoch")
+	}
+	if incoming.CurrentEpoch == existing.CurrentEpoch {
+		if len(incoming.Events) < len(existing.Events) {
+			return errors.New("remote table would roll back table events")
+		}
+		if len(incoming.Snapshots) < len(existing.Snapshots) {
+			return errors.New("remote table would roll back table snapshots")
+		}
+	}
+	return nil
+}
+
+func (runtime *nativeRuntime) isLocalTableParticipant(table nativeTableState) bool {
+	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
+		return true
+	}
+	for _, witness := range table.Witnesses {
+		if witness.Peer.PeerID == runtime.selfPeerID() {
+			return true
+		}
+	}
+	return runtime.seatIndexForPlayer(table) >= 0
+}
+
+func (runtime *nativeRuntime) isAuthorizedRemoteHost(table *nativeTableState, candidatePeerID string) bool {
+	if table == nil || candidatePeerID == "" {
+		return false
+	}
+	if candidatePeerID == table.CurrentHost.Peer.PeerID {
+		return true
+	}
+	for _, witness := range table.Witnesses {
+		if witness.Peer.PeerID == candidatePeerID {
+			return true
+		}
+	}
+	if len(table.Witnesses) > 0 {
+		return false
+	}
+	lowestPeerID := ""
+	for _, seat := range table.Seats {
+		if lowestPeerID == "" || seat.PeerID < lowestPeerID {
+			lowestPeerID = seat.PeerID
+		}
+	}
+	return candidatePeerID == lowestPeerID
+}
+
+func timestampWithinWindow(timestamp string, maxAge time.Duration) bool {
+	if strings.TrimSpace(timestamp) == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339, timestamp)
+	if err != nil {
+		return false
+	}
+	age := time.Since(parsed)
+	if age < 0 {
+		age = -age
+	}
+	return age <= maxAge
+}
+
+func (runtime *nativeRuntime) networkTableView(table nativeTableState, visiblePlayerID string) nativeTableState {
+	view := cloneJSON(table)
+	view.ActiveHand = sanitizeActiveHandForNetwork(table.ActiveHand, visiblePlayerID)
+	return view
+}
+
 func (runtime *nativeRuntime) appendFundsOperation(operation NativeTableFundsOperation, cashoutSats int, status string) error {
 	funds, err := runtime.store.readTableFunds()
 	if err != nil {
@@ -1994,6 +2343,31 @@ func previousSnapshotHash(table nativeTableState) any {
 	return hash
 }
 
+func sanitizeActiveHandForNetwork(active *nativeActiveHand, visiblePlayerID string) *nativeActiveHand {
+	if active == nil {
+		return nil
+	}
+	sanitized := cloneJSON(*active)
+	sanitized.State = sanitizeHoldemStateForNetwork(sanitized.State)
+	sanitized.HoleCardsByPlayerID = map[string][]string{}
+	if visiblePlayerID != "" {
+		if cards, ok := active.HoleCardsByPlayerID[visiblePlayerID]; ok && len(cards) > 0 {
+			sanitized.HoleCardsByPlayerID[visiblePlayerID] = append([]string{}, cards...)
+		}
+	}
+	return &sanitized
+}
+
+func sanitizeHoldemStateForNetwork(state game.HoldemState) game.HoldemState {
+	sanitized := cloneJSON(state)
+	sanitized.DeckSeedHex = ""
+	sanitized.Runout = game.HoldemRunout{}
+	for index := range sanitized.Players {
+		sanitized.Players[index].HoleCards = [2]game.CardCode{}
+	}
+	return sanitized
+}
+
 func cloneSnapshot(snapshot *NativeCooperativeTableSnapshot) *NativeCooperativeTableSnapshot {
 	if snapshot == nil {
 		return nil
@@ -2024,6 +2398,46 @@ func peerIDsFromParticipants(participants []nativeKnownParticipant) []string {
 		values = append(values, participant.Peer.PeerID)
 	}
 	return values
+}
+
+func seatRecordForPlayer(table nativeTableState, playerID string) (nativeSeatRecord, bool) {
+	for _, seat := range table.Seats {
+		if seat.PlayerID == playerID {
+			return seat, true
+		}
+	}
+	return nativeSeatRecord{}, false
+}
+
+func nativeActionAuthPayload(tableID, playerID, handID string, epoch int, action game.Action, signedAt string) map[string]any {
+	return map[string]any{
+		"action":   rawJSONMap(action),
+		"epoch":    epoch,
+		"handId":   handID,
+		"playerId": playerID,
+		"signedAt": signedAt,
+		"tableId":  tableID,
+		"type":     "table-action",
+	}
+}
+
+func nativeTableFetchAuthPayload(tableID, playerID, signedAt string) map[string]any {
+	return map[string]any{
+		"playerId": playerID,
+		"signedAt": signedAt,
+		"tableId":  tableID,
+		"type":     "table-fetch",
+	}
+}
+
+func nativeTableSyncAuthPayload(tableID, senderPeerID, tableHash, sentAt string) map[string]any {
+	return map[string]any{
+		"senderPeerId": senderPeerID,
+		"sentAt":       sentAt,
+		"tableHash":    tableHash,
+		"tableId":      tableID,
+		"type":         "table-sync",
+	}
 }
 
 func zeroContributions(seats []nativeSeatRecord) map[string]int {

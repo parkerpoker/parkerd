@@ -130,7 +130,7 @@ func TestIdentityBindingRoundTrip(t *testing.T) {
 		t.Fatalf("create protocol identity: %v", err)
 	}
 
-	binding, err := BuildIdentityBinding("table-123", "peer-abc", protocol, wallet, "2026-03-22T12:34:56.000Z")
+	binding, err := BuildIdentityBinding("table-123", "peer-abc", "ws://127.0.0.1:9999/mesh", protocol, wallet, "2026-03-22T12:34:56.000Z")
 	if err != nil {
 		t.Fatalf("build identity binding: %v", err)
 	}
@@ -151,6 +151,16 @@ func TestIdentityBindingRoundTrip(t *testing.T) {
 	}
 	if ok {
 		t.Fatal("mutated binding unexpectedly verified")
+	}
+
+	clone = binding
+	clone.PeerURL = "ws://127.0.0.1:10000/mesh"
+	ok, err = VerifyIdentityBinding(clone)
+	if err != nil {
+		t.Fatalf("verify peer-url-mutated binding: %v", err)
+	}
+	if ok {
+		t.Fatal("peer-url-mutated binding unexpectedly verified")
 	}
 }
 

@@ -110,10 +110,10 @@ The active peer routes are registered in [`internal/native_runtime.go`](../inter
 ### Practical behavior
 
 - `GET /native/peer` returns the peer's current advertised identity and role information.
-- `POST /native/table/join` sends a join payload to the current host and returns the updated full table state.
-- `POST /native/table/action` sends an action payload to the current host and returns the updated full table state.
-- `POST /native/table/sync` pushes a full table copy to another peer.
-- `GET /native/table/{tableId}` fetches the host's current full table copy.
+- `POST /native/table/join` sends a signed join payload to the current host and returns the updated recipient-scoped table state.
+- `POST /native/table/action` sends a signed action payload to the current host and returns the updated recipient-scoped table state.
+- `POST /native/table/sync` pushes a signed recipient-scoped table copy to another peer.
+- `GET /native/table/{tableId}` fetches the host's current recipient-scoped table copy.
 
 ### Host heartbeat and sync timing
 
@@ -243,11 +243,11 @@ The host daemon:
 The current join flow is:
 
 1. the player decodes the invite and checks wallet availability
-2. the player sends `POST /native/table/join` to the host
+2. the player sends a wallet-signed `POST /native/table/join` with an identity binding to the host
 3. the host appends `SeatLocked`
 4. when the table reaches seat count, the host marks it `ready`
-5. the host builds a snapshot, appends `TableReady`, and starts the first hand
-6. the updated table is replicated to peers
+5. the host builds a snapshot, appends `TableReady`, and schedules the first hand
+6. the updated table is replicated to peers with active-hand secrets redacted per recipient
 
 The current Go runtime does not send separate signed `join-request` / `buy-in-confirm` envelopes between peers.
 
@@ -255,11 +255,11 @@ The current Go runtime does not send separate signed `join-request` / `buy-in-co
 
 The current action flow is:
 
-1. the player sends `POST /native/table/action` to the host
+1. the seated player sends a wallet-signed `POST /native/table/action` to the host
 2. the host applies the action through the Hold'em engine
 3. the host appends `PlayerAction`
 4. when the hand settles, the host builds a snapshot and appends `HandResult`
-5. the updated table is replicated to peers
+5. the updated table is replicated to peers with only the caller's hole cards included in replicated state
 
 The current Go runtime does not exchange separate signed `action-request` envelopes between peers.
 
@@ -272,7 +272,7 @@ Current rules:
 - witnesses can take over when configured
 - if no witnesses are configured, the seated player with the lowest peer ID is the failover candidate
 - the new host appends `HostRotated`
-- if a hand was in progress and a snapshot exists, the new host appends `HandAbort` and restores from that snapshot
+- if a hand was in progress and a snapshot exists, the new host appends `HandAbort`, restores from that snapshot, and schedules the next hand
 
 ## Public Indexer Protocol
 
@@ -299,8 +299,8 @@ The controller can proxy the public read routes for the browser.
 
 These points are important for reading the current implementation accurately:
 
-- peer join, action, and sync requests are plain JSON over HTTP; they are not individually signed request envelopes
-- peers accept replicated table state through `/native/table/sync` and host polling; they do not currently re-verify every remote event before persistence
+- peer join, action, and sync requests carry detached signatures over JSON payloads, but transport remains HTTP and peer URLs still downgrade from `ws://` to `http://` internally
+- peers accept replicated table state through `/native/table/sync` and host polling after request-level auth and monotonicity checks; they do not currently re-run a full event-by-event cryptographic replay before persistence
 - snapshots are signed, but the runtime does not yet collect or enforce a multi-party signature quorum
 - the `latestFullySignedSnapshot` field name is historical; in current code it is populated with the latest locally built snapshot
 - the indexer validates required fields, but it does not verify advertisement or update signatures before storing them

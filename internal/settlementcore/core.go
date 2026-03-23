@@ -44,6 +44,7 @@ type ScopedIdentity struct {
 
 type IdentityBinding struct {
 	PeerID            string `json:"peerId"`
+	PeerURL           string `json:"peerUrl"`
 	ProtocolID        string `json:"protocolId"`
 	ProtocolPubkeyHex string `json:"protocolPubkeyHex"`
 	SignedAt          string `json:"signedAt"`
@@ -203,13 +204,14 @@ func VerifyStructuredData(publicKeyHex string, input any, signatureHex string) (
 	return sig.Verify(HashMessage(stable), pubKey), nil
 }
 
-func BuildIdentityBinding(tableID, peerID string, protocolIdentity ScopedIdentity, walletIdentity LocalIdentity, signedAt string) (IdentityBinding, error) {
+func BuildIdentityBinding(tableID, peerID, peerURL string, protocolIdentity ScopedIdentity, walletIdentity LocalIdentity, signedAt string) (IdentityBinding, error) {
 	if signedAt == "" {
 		signedAt = nowISO()
 	}
 
 	unsigned := map[string]any{
 		"peerId":            peerID,
+		"peerUrl":           peerURL,
 		"protocolId":        protocolIdentity.ID,
 		"protocolPubkeyHex": protocolIdentity.PublicKeyHex,
 		"signedAt":          signedAt,
@@ -225,6 +227,7 @@ func BuildIdentityBinding(tableID, peerID string, protocolIdentity ScopedIdentit
 
 	return IdentityBinding{
 		PeerID:            peerID,
+		PeerURL:           peerURL,
 		ProtocolID:        protocolIdentity.ID,
 		ProtocolPubkeyHex: protocolIdentity.PublicKeyHex,
 		SignedAt:          signedAt,
@@ -238,6 +241,7 @@ func BuildIdentityBinding(tableID, peerID string, protocolIdentity ScopedIdentit
 func VerifyIdentityBinding(binding IdentityBinding) (bool, error) {
 	unsigned := map[string]any{
 		"peerId":            binding.PeerID,
+		"peerUrl":           binding.PeerURL,
 		"protocolId":        binding.ProtocolID,
 		"protocolPubkeyHex": binding.ProtocolPubkeyHex,
 		"signedAt":          binding.SignedAt,

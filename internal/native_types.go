@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/danieldresner/arkade_fun/internal/game"
+	"github.com/danieldresner/arkade_fun/internal/settlementcore"
 )
 
 type NativePeerAddress struct {
@@ -282,22 +283,35 @@ type nativePeerSelf struct {
 }
 
 type nativeJoinRequest struct {
-	BuyInSats       int               `json:"buyInSats"`
-	TableID         string            `json:"tableId"`
-	ProfileName     string            `json:"profileName"`
-	WalletPlayerID  string            `json:"walletPlayerId"`
-	Peer            NativePeerAddress `json:"peer"`
-	ProtocolID      string            `json:"protocolId"`
-	WalletPubkeyHex string            `json:"walletPubkeyHex"`
-	Nickname        string            `json:"nickname"`
-	ArkAddress      string            `json:"arkAddress"`
+	BuyInSats       int                            `json:"buyInSats"`
+	IdentityBinding settlementcore.IdentityBinding `json:"identityBinding"`
+	TableID         string                         `json:"tableId"`
+	ProfileName     string                         `json:"profileName"`
+	WalletPlayerID  string                         `json:"walletPlayerId"`
+	Peer            NativePeerAddress              `json:"peer"`
+	ProtocolID      string                         `json:"protocolId"`
+	WalletPubkeyHex string                         `json:"walletPubkeyHex"`
+	Nickname        string                         `json:"nickname"`
+	ArkAddress      string                         `json:"arkAddress"`
 }
 
 type nativeActionRequest struct {
-	Action      game.Action `json:"action"`
-	PlayerID    string      `json:"playerId"`
-	ProfileName string      `json:"profileName"`
-	TableID     string      `json:"tableId"`
+	Action       game.Action `json:"action"`
+	Epoch        int         `json:"epoch"`
+	HandID       string      `json:"handId"`
+	PlayerID     string      `json:"playerId"`
+	ProfileName  string      `json:"profileName"`
+	SignatureHex string      `json:"signatureHex"`
+	SignedAt     string      `json:"signedAt"`
+	TableID      string      `json:"tableId"`
+}
+
+type nativeTableSyncRequest struct {
+	SenderPeerID            string           `json:"senderPeerId"`
+	SenderProtocolPubkeyHex string           `json:"senderProtocolPubkeyHex"`
+	SentAt                  string           `json:"sentAt"`
+	SignatureHex            string           `json:"signatureHex"`
+	Table                   nativeTableState `json:"table"`
 }
 
 func rawJSONMap(input any) map[string]any {
