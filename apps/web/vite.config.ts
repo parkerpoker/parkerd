@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 
+import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -8,7 +9,7 @@ const INDEXER_TARGET = process.env.VITE_INDEXER_URL ?? "http://127.0.0.1:3020";
 
 export default defineConfig({
   envDir: resolve(__dirname, "../.."),
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   server: {
     host: "0.0.0.0",
     port: 3010,
