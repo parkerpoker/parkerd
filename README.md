@@ -1,92 +1,94 @@
 # Parker
 
-Parker is a peer-to-peer poker workspace built around private heads-up tables, deterministic commit/reveal dealing, and non-custodial bankroll coordination. The repo now supports both Mutinynet and local Nigiri/regtest flows. The repo is structured as an npm workspace with:
+Parker is a daemon-mesh poker workspace built around:
 
-- `apps/web` for the React/Vite client and wallet service worker
-- `apps/cli` for the Node CLI player client and local harness
-- `apps/server` for the Fastify coordinator, WebSocket relay, and persisted checkpoints
-- `packages/protocol` for shared schemas and message contracts
-- `packages/game-engine` for deterministic shuffling, Hold'em rules, and showdown logic
-- `packages/settlement` for identity/signing helpers, escrow descriptors, and mock/live adapter seams
+- daemon-owned table state and settlement
+- a thin local CLI that only controls the daemon over local RPC
+- an optional public indexer for table ads and read-only spectator views
+- Arkade-backed bankroll movement on Mutinynet or local Nigiri regtest
 
-## Current shape
+## Workspace Layout
 
-- The checked-in root [`.env.example`](/Users/danieldresner/src/arkade_fun/.env.example) covers both Mutinynet and local Nigiri/regtest settings for the server, web app, and CLI.
-- The settlement layer is split so the UI/server already speak in Arkade-style concepts: wallet summary, Lightning swaps, table escrow, checkpoints, and timeout delegations.
-- The server never keeps user private keys. It coordinates tables, mirrors transcripts, persists checkpoints, and runs timeout sweeps against posted delegations.
+- `apps/daemon`: long-running daemon process
+- `apps/cli`: operator CLI for wallet, network, table, funds, and daemon control
+- `apps/indexer`: optional public indexer and read-only HTTP API
+- `apps/web`: read-only browser for public tables
+- `packages/daemon-runtime`: shared daemon RPC/runtime implementation
+- `packages/protocol`: shared schemas and message contracts
+- `packages/game-engine`: deterministic Hold'em logic
+- `packages/settlement`: Arkade wallet and settlement helpers
+
+## Runtime Boundary
+
+- The daemon owns wallet access, peer transport, canonical event replay, snapshots, settlement, and persistence.
+- The CLI does not run gameplay logic. It only talks to the local daemon.
+- The indexer is not part of consensus. It stores signed public table ads and public updates for discovery.
+- The web app is read-only and only queries the indexer.
 
 ## Requirements
 
-- Node 22+ is expected. The current repo pins this in [`.nvmrc`](/Users/danieldresner/src/arkade_fun/.nvmrc).
-- Copy [`.env.example`](/Users/danieldresner/src/arkade_fun/.env.example) to [`.env`](/Users/danieldresner/src/arkade_fun/.env) if you want to switch between Mutinynet and local Nigiri/regtest settings.
+- Node `22+`
+- `npm install`
+- `nigiri` available locally for regtest flows
 
-## Commands
+## Workspace Commands
 
 ```bash
 npm install
-npm test
-npm run typecheck
 npm run build
+npm run typecheck
+npm run test
 ```
 
-For development, run the server and web app in separate terminals:
+Development entrypoints:
 
 ```bash
-npm run dev:server
+npm run dev:daemon
+npm run dev:cli -- help
+npm run dev:indexer
 npm run dev:web
 ```
 
-The CLI exposes wallet, table, peer, scenario, and harness commands:
+## CLI Examples
 
 ```bash
-npm run dev:cli -- --help
-npm run dev:cli -- bootstrap --profile alpha "Alpha"
-npm run dev:cli -- create-table --profile alpha
-npm run dev:cli -- join-table --profile beta ABCD1234
-npm run dev:cli -- interactive --profile alpha
+npm run dev:cli -- bootstrap Alpha --profile alpha
+npm run dev:cli -- wallet summary --profile alpha
+npm run dev:cli -- daemon start --profile alpha
+npm run dev:cli -- table public --profile alpha
 ```
 
-## Local Nigiri Flow
+## Local Regtest
 
-Start Nigiri with Ark + Lightning and point Parker at local regtest endpoints:
-
-```bash
-nigiri start --ark --ln --ci
-cp .env.example .env
-```
-
-Set these local values in [`.env`](/Users/danieldresner/src/arkade_fun/.env):
+Copy `.env.example` to `.env` if you want defaults for local development. The relevant local values are:
 
 ```bash
 PARKER_NETWORK=regtest
-PARKER_SERVER_URL=http://127.0.0.1:3020
-PARKER_WEBSOCKET_URL=ws://127.0.0.1:3020/ws
+PARKER_INDEXER_URL=http://127.0.0.1:3020
 PARKER_ARK_SERVER_URL=http://127.0.0.1:7070
 PARKER_BOLTZ_URL=http://127.0.0.1:9069
 VITE_NETWORK=regtest
+VITE_INDEXER_URL=http://127.0.0.1:3020
 VITE_ARK_SERVER_URL=http://127.0.0.1:7070
 VITE_BOLTZ_URL=http://127.0.0.1:9069
 ```
 
-Then run the server and a CLI player:
+One-command local poker simulation:
 
 ```bash
-npm run dev:server
-npm run dev:cli -- bootstrap --profile alpha "Alpha"
-npm run dev:cli -- wallet --profile alpha
-npm run dev:cli -- faucet --profile alpha 100000
-npm run dev:cli -- onboard --profile alpha
+make poker-regtest-round
 ```
 
-The checked-in example harness scenario is [apps/cli/examples/regtest-heads-up.json](/Users/danieldresner/src/arkade_fun/apps/cli/examples/regtest-heads-up.json):
+That target starts Nigiri, the indexer, four segregated daemons (`host`, `witness`, `alice`, `bob`), funds the two player wallets on regtest, creates a table, auto-plays a hand, and cashes both players out.
+
+The larger integration harness is also checked in:
 
 ```bash
-npm run dev:cli -- run-harness --scenario-file apps/cli/examples/regtest-heads-up.json
+npm run test:mesh-regtest
 ```
 
 ## Notes
 
-- The client registers a service worker from [apps/web/src/wallet-service-worker.ts](/Users/danieldresner/src/arkade_fun/apps/web/src/wallet-service-worker.ts) to keep the local identity and wallet summary outside React state.
-- Hole cards are hidden in checkpoints until showdown. Each client derives its own cards locally from the shared commitment/reveal material.
-- The CLI daemon and the web app both use the shared table WebSocket for relayed peer messages; there is no separate WebRTC transport anymore.
-- The default mock mode still keeps the full workspace buildable and testable without live network dependencies.
+- Public table discovery is optional and read-only.
+- The daemon mesh is the gameplay authority.
+- Old coordinator-era server and websocket gameplay paths have been removed from the active runtime.

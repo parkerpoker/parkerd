@@ -5,11 +5,17 @@ This document describes the protocol that is implemented today in this repositor
 Primary implementation units:
 
 - `packages/protocol/src/index.ts`
-- `apps/cli/src/meshRuntime.ts`
-- `apps/cli/src/peerTransport.ts`
+- `packages/daemon-runtime/src/meshRuntime.ts`
+- `packages/daemon-runtime/src/peerTransport.ts`
 - `packages/settlement/src/index.ts`
-- `apps/cli/src/tableFundsStateStore.ts`
+- `packages/daemon-runtime/src/tableFundsStateStore.ts`
 - `integration/mesh-regtest.ts`
+
+Runtime boundary:
+
+- `apps/daemon` owns the long-running process and all poker/runtime behavior.
+- `apps/cli` only controls the local daemon over Unix-socket RPC.
+- `apps/indexer` is optional and only stores signed public ads and public updates.
 
 ## Scope
 

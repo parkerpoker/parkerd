@@ -1,105 +1,89 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  clientSocketEventSchema,
-  createTableRequestSchema,
+  meshPlayerActionPayloadSchema,
   networkSchema,
-  parseServerSocketEvent,
-  serverSocketEventSchema,
+  publicTableUpdateSchema,
+  signedTableAdvertisementSchema,
 } from "../src/index.js";
 
 describe("protocol schemas", () => {
-  it("fills create table defaults", () => {
-    const parsed = createTableRequestSchema.parse({
-      host: {
-        playerId: "player-1234",
-        nickname: "Parker",
-        joinedAt: "2026-03-15T12:00:00.000Z",
-        pubkeyHex: "deadbeef",
-        arkAddress: "tark1testaddress",
-      },
-    });
-
-    expect(parsed.bigBlindSats).toBe(100);
-    expect(parsed.smallBlindSats).toBe(50);
-  });
-
-  it("accepts peer relay events", () => {
-    const parsed = clientSocketEventSchema.parse({
-      type: "peer-message",
+  it("accepts signed public advertisements", () => {
+    const parsed = signedTableAdvertisementSchema.parse({
+      protocolVersion: "poker/v1",
+      networkId: "regtest",
       tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
-      fromPlayerId: "player-alpha",
-      targetPlayerId: "player-beta",
-      message: "hello-beta",
+      hostPeerId: "peer-alpha-123",
+      hostPeerUrl: "ws://127.0.0.1:7777/mesh",
+      tableName: "Public Table",
+      stakes: {
+        bigBlindSats: 100,
+        smallBlindSats: 50,
+      },
+      currency: "sats",
+      seatCount: 2,
+      occupiedSeats: 1,
+      spectatorsAllowed: true,
+      hostModeCapabilities: ["host-dealer-v1"],
+      witnessCount: 1,
+      buyInMinSats: 4_000,
+      buyInMaxSats: 4_000,
+      visibility: "public",
+      adExpiresAt: "2026-03-23T00:00:10.000Z",
+      hostProtocolPubkeyHex: "02".repeat(33),
+      hostSignatureHex: "aa".repeat(64),
     });
 
-    expect(parsed.type).toBe("peer-message");
+    expect(parsed.tableName).toBe("Public Table");
   });
 
   it("accepts regtest networks", () => {
     expect(networkSchema.parse("regtest")).toBe("regtest");
   });
 
-  it("parses server snapshot events", () => {
-    const parsed = parseServerSocketEvent({
-      type: "table-snapshot",
-      snapshot: {
-        table: {
-          tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
-          inviteCode: "PARKER1",
-          hostPlayerId: "player-alpha",
-          network: "mutinynet",
-          variant: "holdem-heads-up",
-          smallBlindSats: 50,
-          bigBlindSats: 100,
-          buyInMinSats: 2000,
-          buyInMaxSats: 10000,
-          commitmentDeadlineSeconds: 20,
-          actionTimeoutSeconds: 25,
-          createdAt: "2026-03-15T12:00:00.000Z",
-          status: "waiting",
-        },
-        seats: [
-          {
-            reservationId: "770e8400-e29b-41d4-a716-446655440000",
-            tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
-            seatIndex: 0,
-            buyInSats: 4000,
-            status: "reserved",
-            inviteCode: "PARKER1",
-            createdAt: "2026-03-15T12:00:00.000Z",
-            expiresAt: "2026-03-15T12:05:00.000Z",
-            player: {
-              playerId: "player-alpha",
-              nickname: "Alpha",
-              joinedAt: "2026-03-15T12:00:00.000Z",
-              pubkeyHex: "deadbeef",
-              arkAddress: "tark1alpha",
-            },
-          },
-          {
-            reservationId: "770e8400-e29b-41d4-a716-446655440001",
-            tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
-            seatIndex: 1,
-            buyInSats: 4000,
-            status: "reserved",
-            inviteCode: "PARKER1",
-            createdAt: "2026-03-15T12:00:00.000Z",
-            expiresAt: "2026-03-15T12:05:00.000Z",
-            player: {
-              playerId: "player-beta",
-              nickname: "Beta",
-              joinedAt: "2026-03-15T12:00:00.000Z",
-              pubkeyHex: "cafebabe",
-              arkAddress: "tark1beta",
-            },
-          },
-        ],
-        commitments: [],
-        pendingDelegations: [],
+  it("parses public table updates", () => {
+    const advertisement = signedTableAdvertisementSchema.parse({
+      protocolVersion: "poker/v1",
+      networkId: "regtest",
+      tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
+      hostPeerId: "peer-alpha-123",
+      hostPeerUrl: "ws://127.0.0.1:7777/mesh",
+      tableName: "Public Table",
+      stakes: {
+        bigBlindSats: 100,
+        smallBlindSats: 50,
       },
+      currency: "sats",
+      seatCount: 2,
+      occupiedSeats: 1,
+      spectatorsAllowed: true,
+      hostModeCapabilities: ["host-dealer-v1"],
+      witnessCount: 1,
+      buyInMinSats: 4_000,
+      buyInMaxSats: 4_000,
+      visibility: "public",
+      adExpiresAt: "2026-03-23T00:00:10.000Z",
+      hostProtocolPubkeyHex: "02".repeat(33),
+      hostSignatureHex: "aa".repeat(64),
     });
 
-    expect(serverSocketEventSchema.parse(parsed).type).toBe("table-snapshot");
+    const parsed = publicTableUpdateSchema.parse({
+      type: "PublicTableSnapshot",
+      tableId: "9f710fc0-58a8-4cb2-8d89-014d977ff8d5",
+      advertisement,
+      publicState: null,
+      publishedAt: "2026-03-23T00:00:11.000Z",
+    });
+
+    expect(parsed.type).toBe("PublicTableSnapshot");
+  });
+
+  it("accepts mesh betting actions", () => {
+    const parsed = meshPlayerActionPayloadSchema.parse({
+      type: "raise",
+      totalSats: 800,
+    });
+
+    expect(parsed.totalSats).toBe(800);
   });
 });

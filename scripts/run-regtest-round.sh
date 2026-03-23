@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 BASE="${BASE:-/tmp/parker-auto-2p-$$}"
-SERVER_PORT="${SERVER_PORT:-}"
+INDEXER_PORT="${INDEXER_PORT:-}"
 HOST_PORT="${HOST_PORT:-}"
 WITNESS_PORT="${WITNESS_PORT:-}"
 ALICE_PORT="${ALICE_PORT:-}"
@@ -16,9 +16,7 @@ NIGIRI_DATADIR="${NIGIRI_DATADIR:-$HOME/Library/Application Support/Nigiri/parke
 
 common_flags=(
   --network regtest
-  --server-url ""
   --indexer-url ""
-  --websocket-url ""
   --ark-server-url http://127.0.0.1:7070
   --boltz-url http://127.0.0.1:9069
   --daemon-dir ""
@@ -38,7 +36,7 @@ cleanup() {
   [[ -n "${WITNESS_DAEMON_PID:-}" ]] && stop_pid "$WITNESS_DAEMON_PID"
   [[ -n "${ALICE_DAEMON_PID:-}" ]] && stop_pid "$ALICE_DAEMON_PID"
   [[ -n "${BOB_DAEMON_PID:-}" ]] && stop_pid "$BOB_DAEMON_PID"
-  [[ -n "${SERVER_PID:-}" ]] && stop_pid "$SERVER_PID"
+  [[ -n "${INDEXER_PID:-}" ]] && stop_pid "$INDEXER_PID"
   nigiri --datadir "$NIGIRI_DATADIR" stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -50,7 +48,7 @@ pcli() {
 }
 
 pdaemon() {
-  node --import tsx apps/cli/src/daemonEntry.ts "${common_flags[@]}" "$@"
+  node --import tsx apps/daemon/src/index.ts "${common_flags[@]}" "$@"
 }
 
 json_field() {
@@ -126,7 +124,7 @@ seed_ark_liquidity() {
   done
 }
 
-SERVER_PORT="${SERVER_PORT:-$(free_port)}"
+INDEXER_PORT="${INDEXER_PORT:-$(free_port)}"
 HOST_PORT="${HOST_PORT:-$(free_port)}"
 WITNESS_PORT="${WITNESS_PORT:-$(free_port)}"
 ALICE_PORT="${ALICE_PORT:-$(free_port)}"
@@ -138,9 +136,7 @@ mkdir -p "$NIGIRI_DATADIR"
 
 common_flags=(
   --network regtest
-  --server-url "http://127.0.0.1:${SERVER_PORT}"
-  --indexer-url "http://127.0.0.1:${SERVER_PORT}"
-  --websocket-url "ws://127.0.0.1:${SERVER_PORT}/ws"
+  --indexer-url "http://127.0.0.1:${INDEXER_PORT}"
   --ark-server-url http://127.0.0.1:7070
   --boltz-url http://127.0.0.1:9069
   --nigiri-datadir "$NIGIRI_DATADIR"
@@ -157,10 +153,10 @@ seed_ark_liquidity
 kill "$NIGIRI_START_PID" 2>/dev/null || true
 wait "$NIGIRI_START_PID" 2>/dev/null || true
 
-echo "Starting API server on :${SERVER_PORT}..."
-HOST=127.0.0.1 PORT="$SERVER_PORT" PARKER_NETWORK=regtest WEBSOCKET_URL="ws://127.0.0.1:${SERVER_PORT}/ws" \
-  node --import tsx apps/server/src/index.ts >"$BASE/server.log" 2>&1 &
-SERVER_PID=$!
+echo "Starting public indexer on :${INDEXER_PORT}..."
+HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest \
+  node --import tsx apps/indexer/src/index.ts >"$BASE/indexer.log" 2>&1 &
+INDEXER_PID=$!
 
 sleep 2
 
@@ -189,26 +185,23 @@ ALICE_PLAYER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.mesh.walletPlayer
 BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.mesh.walletPlayerId)"
 
 echo "Funding wallets..."
-pcli faucet "$FAUCET_SATS" --profile alice --json >/dev/null
-pcli onboard               --profile alice --json >/dev/null
-pcli faucet "$FAUCET_SATS" --profile bob   --json >/dev/null
-pcli onboard               --profile bob   --json >/dev/null
+pcli wallet faucet "$FAUCET_SATS" --profile alice --json >/dev/null
+pcli wallet onboard               --profile alice --json >/dev/null
+pcli wallet faucet "$FAUCET_SATS" --profile bob   --json >/dev/null
+pcli wallet onboard               --profile bob   --json >/dev/null
 
 echo "Connecting host to witness..."
 pcli network bootstrap add "$WITNESS_PEER_URL" witness --profile host --json >/dev/null
 
 echo "Creating table..."
 CREATE_JSON="$(
-  BASE="$BASE" SERVER_PORT="$SERVER_PORT" NIGIRI_DATADIR="$NIGIRI_DATADIR" WITNESS_PEER_ID="$WITNESS_PEER_ID" \
+  BASE="$BASE" INDEXER_PORT="$INDEXER_PORT" NIGIRI_DATADIR="$NIGIRI_DATADIR" WITNESS_PEER_ID="$WITNESS_PEER_ID" \
   node --import tsx --input-type=module <<'EOF'
-import { resolveCliRuntimeConfig } from "./apps/cli/src/config.ts";
-import { DaemonRpcClient } from "./apps/cli/src/daemonClient.ts";
+import { DaemonRpcClient, resolveCliRuntimeConfig } from "@parker/daemon-runtime";
 
 const cfg = resolveCliRuntimeConfig({
   network: "regtest",
-  "server-url": `http://127.0.0.1:${process.env.SERVER_PORT}`,
-  "indexer-url": `http://127.0.0.1:${process.env.SERVER_PORT}`,
-  "websocket-url": `ws://127.0.0.1:${process.env.SERVER_PORT}/ws`,
+  "indexer-url": `http://127.0.0.1:${process.env.INDEXER_PORT}`,
   "ark-server-url": "http://127.0.0.1:7070",
   "boltz-url": "http://127.0.0.1:9069",
   "nigiri-datadir": process.env.NIGIRI_DATADIR,
@@ -238,16 +231,13 @@ pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile bob   --json >/dev/nul
 
 echo "Playing one hand automatically..."
 
-BASE="$BASE" SERVER_PORT="$SERVER_PORT" NIGIRI_DATADIR="$NIGIRI_DATADIR" TABLE_ID="$TABLE_ID" ALICE_PLAYER_ID="$ALICE_PLAYER_ID" BOB_PLAYER_ID="$BOB_PLAYER_ID" \
+BASE="$BASE" INDEXER_PORT="$INDEXER_PORT" NIGIRI_DATADIR="$NIGIRI_DATADIR" TABLE_ID="$TABLE_ID" ALICE_PLAYER_ID="$ALICE_PLAYER_ID" BOB_PLAYER_ID="$BOB_PLAYER_ID" \
 node --import tsx --input-type=module <<'EOF'
-import { resolveCliRuntimeConfig } from "./apps/cli/src/config.ts";
-import { DaemonRpcClient } from "./apps/cli/src/daemonClient.ts";
+import { DaemonRpcClient, resolveCliRuntimeConfig } from "@parker/daemon-runtime";
 
 const cfg = resolveCliRuntimeConfig({
   network: "regtest",
-  "server-url": `http://127.0.0.1:${process.env.SERVER_PORT}`,
-  "indexer-url": `http://127.0.0.1:${process.env.SERVER_PORT}`,
-  "websocket-url": `ws://127.0.0.1:${process.env.SERVER_PORT}/ws`,
+  "indexer-url": `http://127.0.0.1:${process.env.INDEXER_PORT}`,
   "ark-server-url": "http://127.0.0.1:7070",
   "boltz-url": "http://127.0.0.1:9069",
   "nigiri-datadir": process.env.NIGIRI_DATADIR,

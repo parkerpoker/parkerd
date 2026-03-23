@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { PublicTableView } from "@parker/protocol";
 
 import { PokerCard } from "./components/PokerCard.js";
-import { getPublicTable, listPublicTables } from "./lib/api.js";
+import { getPublicTable, listPublicTables } from "./lib/indexerApi.js";
 
 function formatSats(value?: number) {
   return `${value ?? 0} sats`;

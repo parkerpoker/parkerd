@@ -1,13 +1,13 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-import type { SignedActionPayload } from "@parker/protocol";
-
-import { resolveCliRuntimeConfig, type CliFlagMap } from "./config.js";
-import { DaemonRpcClient } from "./daemonClient.js";
-import { runHarness, loadHarnessScenario } from "./harness.js";
-import { CliLogger } from "./logger.js";
-import { loadPlayerScenario, runPlayerScenario } from "./scenario.js";
+import {
+  CliLogger,
+  DaemonRpcClient,
+  resolveCliRuntimeConfig,
+  type CliFlagMap,
+  type MeshRuntimeMode,
+} from "@parker/daemon-runtime";
 
 async function main(argv: string[]) {
   const { command, flags, positionals } = parseArgv(argv);
@@ -19,35 +19,9 @@ async function main(argv: string[]) {
     return;
   }
 
-  if (command === "run-harness") {
-    const scenarioFile = requireFlag(flags, "scenario-file");
-    await runHarness({
-      config,
-      logger,
-      scenario: await loadHarnessScenario(scenarioFile),
-    });
-    return;
-  }
-
-  if (command === "play-scenario") {
-    const scenarioFile = requireFlag(flags, "scenario-file");
-    const scenario = await loadPlayerScenario(scenarioFile);
-    const scopedLogger = new CliLogger(config.outputJson, scenario.profile);
-    const runDir = typeof flags["run-dir"] === "string" ? flags["run-dir"] : undefined;
-    scopedLogger.result(
-      await runPlayerScenario({
-        config,
-        logger: scopedLogger,
-        ...(runDir ? { runDir } : {}),
-        scenario,
-      }),
-    );
-    return;
-  }
-
   if (command === "daemon") {
     const profile = requireFlag(flags, "profile", "player1");
-    await runDaemonCommand(profile, positionals, config, logger);
+    await runDaemonCommand(profile, positionals, flags, config, logger);
     return;
   }
 
@@ -84,7 +58,12 @@ async function main(argv: string[]) {
           logger.result(await client.meshTableAnnounce(positionals[1]));
           return;
         case "join":
-          logger.result(await client.meshTableJoin(requirePositional(positionals[1], "inviteCode"), parseOptionalNumber(positionals[2], 4_000)));
+          logger.result(
+            await client.meshTableJoin(
+              requirePositional(positionals[1], "inviteCode"),
+              parseOptionalNumber(positionals[2], 4_000),
+            ),
+          );
           return;
         case "watch":
           if (positionals[1]) {
@@ -99,6 +78,9 @@ async function main(argv: string[]) {
         case "action":
           logger.result(await client.meshSendAction(parseMeshActionPayload(positionals.slice(1))));
           return;
+        case "public":
+          logger.result(await client.meshPublicTables());
+          return;
         default:
           throw new Error(`unknown table subcommand ${positionals[0] ?? ""}`.trim());
       }
@@ -107,7 +89,12 @@ async function main(argv: string[]) {
     if (command === "funds") {
       switch (positionals[0]) {
         case "buy-in":
-          logger.result(await client.meshTableJoin(requirePositional(positionals[1], "inviteCode"), parseOptionalNumber(positionals[2], 4_000)));
+          logger.result(
+            await client.meshTableJoin(
+              requirePositional(positionals[1], "inviteCode"),
+              parseOptionalNumber(positionals[2], 4_000),
+            ),
+          );
           return;
         case "cashout":
           logger.result(await client.meshCashOut(positionals[1]));
@@ -123,71 +110,48 @@ async function main(argv: string[]) {
       }
     }
 
+    if (command === "wallet") {
+      switch (positionals[0] ?? "summary") {
+        case "summary":
+          logger.result(await client.walletSummary());
+          return;
+        case "deposit":
+          logger.result(await client.walletDeposit(parseRequiredNumber(positionals[1], "amountSats")));
+          return;
+        case "withdraw":
+          logger.result(
+            await client.walletWithdraw(
+              parseRequiredNumber(positionals[1], "amountSats"),
+              requirePositional(positionals[2], "invoice"),
+            ),
+          );
+          return;
+        case "faucet":
+          await client.walletFaucet(parseRequiredNumber(positionals[1], "amountSats"));
+          logger.result(await client.walletSummary());
+          return;
+        case "onboard":
+          logger.result({ txid: await client.walletOnboard(), wallet: await client.walletSummary() });
+          return;
+        case "offboard":
+          logger.result({
+            txid: await client.walletOffboard(
+              requirePositional(positionals[1], "address"),
+              positionals[2] ? parseRequiredNumber(positionals[2], "amountSats") : undefined,
+            ),
+          });
+          return;
+        default:
+          throw new Error(`unknown wallet subcommand ${positionals[0] ?? ""}`.trim());
+      }
+    }
+
     switch (command) {
       case "interactive":
         await runInteractive(client, logger);
         break;
       case "bootstrap":
         logger.result(await client.bootstrap(positionals[0]));
-        break;
-      case "wallet":
-        logger.result(await client.walletSummary());
-        break;
-      case "deposit":
-        logger.result(await client.walletDeposit(parseRequiredNumber(positionals[0], "amountSats")));
-        break;
-      case "withdraw":
-        logger.result(
-          await client.walletWithdraw(
-            parseRequiredNumber(positionals[0], "amountSats"),
-            requirePositional(positionals[1], "invoice"),
-          ),
-        );
-        break;
-      case "faucet":
-        await client.walletFaucet(parseRequiredNumber(positionals[0], "amountSats"));
-        logger.result(await client.walletSummary());
-        break;
-      case "onboard":
-        logger.result({ txid: await client.walletOnboard(), wallet: await client.walletSummary() });
-        break;
-      case "offboard":
-        logger.result({
-          txid: await client.walletOffboard(
-            requirePositional(positionals[0], "address"),
-            positionals[1] ? parseRequiredNumber(positionals[1], "amountSats") : undefined,
-          ),
-        });
-        break;
-      case "create-table":
-        logger.result(await client.createTable({}));
-        break;
-      case "join-table":
-        logger.result(await client.joinTable(requirePositional(positionals[0], "inviteCode"), parseOptionalNumber(positionals[1], 4_000)));
-        break;
-      case "connect":
-        await client.connectCurrentTable();
-        logger.result(client.currentState());
-        break;
-      case "snapshot":
-        logger.result(await client.getSnapshot());
-        break;
-      case "transcript":
-        logger.result(await client.getTranscript());
-        break;
-      case "commit":
-        logger.result(await client.commitSeed(false));
-        break;
-      case "reveal":
-        logger.result(await client.commitSeed(true));
-        break;
-      case "action":
-        logger.result(await client.sendAction(parseActionPayload(positionals)));
-        break;
-      case "peer-send":
-        await client.connectCurrentTable();
-        await client.sendPeerMessage(positionals.join(" "));
-        logger.result(client.currentState());
         break;
       default:
         throw new Error(`unknown command ${command}`);
@@ -230,68 +194,50 @@ async function runInteractive(client: DaemonRpcClient, logger: CliLogger) {
         printHelp();
         continue;
       }
-
       const parts = line.split(/\s+/);
       const [command, ...args] = parts;
       try {
-        switch (command) {
-          case "bootstrap":
-            logger.result(await client.bootstrap(args[0]));
-            break;
-          case "wallet":
-            logger.result(await client.walletSummary());
-            break;
-          case "deposit":
-            logger.result(await client.walletDeposit(parseRequiredNumber(args[0], "amountSats")));
-            break;
-          case "withdraw":
-            logger.result(
-              await client.walletWithdraw(
-                parseRequiredNumber(args[0], "amountSats"),
-                requirePositional(args[1], "invoice"),
-              ),
-            );
-            break;
-          case "faucet":
-            await client.walletFaucet(parseRequiredNumber(args[0], "amountSats"));
-            logger.result(await client.walletSummary());
-            break;
-          case "onboard":
-            logger.result(await client.walletOnboard());
-            break;
-          case "create-table":
-            logger.result(await client.createTable({}));
-            break;
-          case "join-table":
-            logger.result(await client.joinTable(requirePositional(args[0], "inviteCode"), parseOptionalNumber(args[1], 4_000)));
-            break;
-          case "connect":
-            await client.connectCurrentTable();
-            logger.result(client.currentState());
-            break;
-          case "snapshot":
-            logger.result(await client.getSnapshot());
-            break;
-          case "transcript":
-            logger.result(await client.getTranscript());
-            break;
-          case "commit":
-            logger.result(await client.commitSeed(false));
-            break;
-          case "reveal":
-            logger.result(await client.commitSeed(true));
-            break;
-          case "action":
-            logger.result(await client.sendAction(parseActionPayload(args)));
-            break;
-          case "peer-send":
-            await client.connectCurrentTable();
-            await client.sendPeerMessage(args.join(" "));
-            logger.result(client.currentState());
-            break;
-          default:
-            logger.error(`unknown interactive command ${command}`);
+        if (command === "bootstrap") {
+          logger.result(await client.bootstrap(args[0]));
+          continue;
         }
+        if (command === "wallet") {
+          const [subcommand = "summary", ...rest] = args;
+          switch (subcommand) {
+            case "summary":
+              logger.result(await client.walletSummary());
+              break;
+            case "deposit":
+              logger.result(await client.walletDeposit(parseRequiredNumber(rest[0], "amountSats")));
+              break;
+            case "withdraw":
+              logger.result(
+                await client.walletWithdraw(
+                  parseRequiredNumber(rest[0], "amountSats"),
+                  requirePositional(rest[1], "invoice"),
+                ),
+              );
+              break;
+            case "faucet":
+              await client.walletFaucet(parseRequiredNumber(rest[0], "amountSats"));
+              logger.result(await client.walletSummary());
+              break;
+            case "onboard":
+              logger.result(await client.walletOnboard());
+              break;
+            case "offboard":
+              logger.result(await client.walletOffboard(requirePositional(rest[0], "address"), rest[1] ? parseRequiredNumber(rest[1], "amountSats") : undefined));
+              break;
+            default:
+              logger.error(`unknown wallet subcommand ${subcommand}`);
+          }
+          continue;
+        }
+        if (command === "table" && args[0] === "action") {
+          logger.result(await client.meshSendAction(parseMeshActionPayload(args.slice(1))));
+          continue;
+        }
+        logger.error(`unknown interactive command ${command}`);
       } catch (error) {
         logger.error((error as Error).message);
       }
@@ -304,15 +250,17 @@ async function runInteractive(client: DaemonRpcClient, logger: CliLogger) {
 async function runDaemonCommand(
   profile: string,
   positionals: string[],
+  flags: CliFlagMap,
   config: ReturnType<typeof resolveCliRuntimeConfig>,
   logger: CliLogger,
 ) {
   const subcommand = positionals[0] ?? "status";
   const client = new DaemonRpcClient(profile, config);
+  const mode = parseMeshRuntimeMode(flags.mode);
 
   switch (subcommand) {
     case "start":
-      await client.ensureRunning();
+      await client.ensureRunning(mode);
       logger.result(await client.inspect(false));
       return;
     case "status":
@@ -344,20 +292,6 @@ async function runDaemonCommand(
   }
 }
 
-function parseActionPayload(positionals: string[]): SignedActionPayload {
-  const type = requirePositional(positionals[0], "actionType") as SignedActionPayload["type"];
-  if (type === "bet" || type === "raise") {
-    return {
-      type,
-      totalSats: parseRequiredNumber(positionals[1], "totalSats"),
-    };
-  }
-  if (type === "fold" || type === "check" || type === "call") {
-    return { type };
-  }
-  throw new Error(`unsupported action ${type}`);
-}
-
 function parseMeshActionPayload(positionals: string[]) {
   const type = requirePositional(positionals[0], "actionType");
   if (type === "bet" || type === "raise") {
@@ -370,6 +304,13 @@ function parseMeshActionPayload(positionals: string[]) {
     return { type } as const;
   }
   throw new Error(`unsupported mesh action ${type}`);
+}
+
+function parseMeshRuntimeMode(value: string | boolean | undefined): MeshRuntimeMode | undefined {
+  if (value === "player" || value === "host" || value === "witness" || value === "indexer") {
+    return value;
+  }
+  return undefined;
 }
 
 function parseArgv(argv: string[]) {
@@ -446,18 +387,15 @@ function printHelp() {
   process.stdout.write(
     [
       "parker-cli commands:",
-      "  network peers|bootstrap add <peerUrl> [alias] --profile <name>",
-      "  table create [--name <name>] [--public] | announce [tableId] | join <invite> [buyIn] | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] --profile <name>",
-      "  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
       "  bootstrap [nickname] --profile <name>",
-      "  wallet|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats] --profile <name>",
-      "  create-table|join-table <invite> [buyIn]|connect|snapshot|transcript|commit|reveal|action <fold|check|call|bet|raise> [sats]|peer-send <message> --profile <name>",
-      "  interactive --profile <name>",
+      "  wallet [summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
+      "  network peers|bootstrap add <peerUrl> [alias] --profile <name>",
+      "  table create [--name <name>] [--public] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] --profile <name>",
+      "  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
       "  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
-      "  play-scenario --scenario-file <path> [--run-dir <path>]",
-      "  run-harness --scenario-file <path>",
+      "  interactive --profile <name>",
       "Shared flags:",
-      "  --network <regtest|mutinynet> --server-url <url> --indexer-url <url> --websocket-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --mock --json",
+      "  --network <regtest|mutinynet> --indexer-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --mock --json",
       "",
     ].join("\n"),
   );

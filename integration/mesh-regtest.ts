@@ -11,12 +11,14 @@ import type {
   PublicTableState,
   SignedTableEvent,
 } from "@parker/protocol";
+import {
+  DaemonRpcClient,
+  ProfileDaemon,
+  resolveCliRuntimeConfig,
+} from "@parker/daemon-runtime";
 
-import { createApp } from "../apps/server/src/app.js";
-import { ParkerDatabase } from "../apps/server/src/db.js";
-import { resolveCliRuntimeConfig } from "../apps/cli/src/config.js";
-import { ProfileDaemon } from "../apps/cli/src/daemonProcess.js";
-import { DaemonRpcClient } from "../apps/cli/src/daemonClient.js";
+import { createApp } from "../apps/indexer/src/app.js";
+import { ParkerDatabase } from "../apps/indexer/src/db.js";
 const BUY_IN_SATS = 4_000;
 const FAUCET_AMOUNT_SATS = 100_000;
 const LIVE_BIG_BLIND_SATS = 800;
@@ -46,7 +48,7 @@ interface ScenarioEnvironment {
   beta: DaemonHarnessPeer;
   gamma: DaemonHarnessPeer;
   host: DaemonHarnessPeer;
-  serverUrl: string;
+  indexerUrl: string;
   tableId?: string;
   witness: DaemonHarnessPeer;
 }
@@ -271,28 +273,24 @@ async function createScenarioEnvironment(
   },
 ): Promise<ScenarioEnvironment> {
   const baseDir = join(rootDir, scenarioName);
-  const serverPort = await getFreePort();
+  const indexerPort = await getFreePort();
   const [hostPort, witnessPort, alphaPort, betaPort, gammaPort] = await getPeerPorts(5);
-  const serverUrl = `http://127.0.0.1:${serverPort}`;
+  const indexerUrl = `http://127.0.0.1:${indexerPort}`;
   const config = resolveCliRuntimeConfig({
     "ark-server-url": "http://127.0.0.1:7070",
     "boltz-url": "http://127.0.0.1:9069",
     "daemon-dir": join(baseDir, "daemons"),
-    "indexer-url": serverUrl,
+    "indexer-url": indexerUrl,
     mock: false,
     network: "regtest",
     ...(nigiriDatadir ? { "nigiri-datadir": nigiriDatadir } : {}),
     "profile-dir": join(baseDir, "profiles"),
     "run-dir": join(baseDir, "runs"),
-    "server-url": serverUrl,
-    "websocket-url": `${serverUrl.replace(/^http/, "ws")}/ws`,
   });
   const { app } = await createApp({
     database: new ParkerDatabase(":memory:"),
-    network: "regtest",
-    websocketUrl: `${serverUrl.replace(/^http/, "ws")}/ws`,
   });
-  await app.listen({ host: "127.0.0.1", port: serverPort });
+  await app.listen({ host: "127.0.0.1", port: indexerPort });
 
   const env: ScenarioEnvironment = {
     alpha: createHarnessPeer("alpha", "player", config, alphaPort),
@@ -301,7 +299,7 @@ async function createScenarioEnvironment(
     beta: createHarnessPeer("beta", "player", config, betaPort),
     gamma: createHarnessPeer("gamma", "player", config, gammaPort),
     host: createHarnessPeer("host", "host", config, hostPort),
-    serverUrl,
+    indexerUrl,
     witness: createHarnessPeer("witness", "witness", config, witnessPort),
   };
 
