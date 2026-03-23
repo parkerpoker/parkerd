@@ -6,3 +6,4 @@ coverage
 *.log
 .env
 apps/server/data
+apps/cli/data/daemons
