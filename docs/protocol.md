@@ -1,39 +1,51 @@
 # Poker Mesh Protocol
 
-This document describes the protocol that is implemented today in this repository. It is intentionally implementation-accurate and anchored to the current runtime rather than an aspirational design.
+This document describes the protocol implemented today in this repository. It stays protocol-focused: wire format, canonical state, signing rules, settlement checkpoints, and failover behavior.
+
+## Document Scope
+
+- Protocol consensus lives inside the daemon mesh implemented by [`apps/daemon`](../apps/daemon) and [`packages/daemon-runtime`](../packages/daemon-runtime).
+- [`apps/indexer`](../apps/indexer) is an optional public ingest/read model. [`apps/web`](../apps/web) is a read-only browser for that public read model.
+- The indexer and UI are outside consensus. They cannot append canonical gameplay events, sign settlement checkpoints, or finalize money movement.
+- For component topology and runtime boundaries, see [architecture.md](./architecture.md).
+- For guarantees, trust assumptions, and failure consequences, see [trust-model.md](./trust-model.md).
+
+## Current Runtime Split
+
+The protocol described here is exercised through the current runtime split:
+
+- `apps/daemon` owns long-running process behavior, peer transport, canonical event replay, settlement coordination, and local persistence.
+- `apps/cli` only controls the local daemon over profile-local Unix-socket RPC.
+- `apps/indexer` is optional and only ingests signed public advertisements and public updates, then serves a read model over HTTP.
+- `apps/web` is read-only and only queries the indexer HTTP API.
 
 Primary implementation units:
 
 - `packages/protocol/src/index.ts`
 - `packages/daemon-runtime/src/meshRuntime.ts`
 - `packages/daemon-runtime/src/peerTransport.ts`
+- `packages/daemon-runtime/src/daemonProcess.ts`
 - `packages/settlement/src/index.ts`
 - `packages/daemon-runtime/src/tableFundsStateStore.ts`
 - `integration/mesh-regtest.ts`
-
-Runtime boundary:
-
-- `apps/daemon` owns the long-running process and all poker/runtime behavior.
-- `apps/cli` only controls the local daemon over Unix-socket RPC.
-- `apps/indexer` is optional and only stores signed public ads and public updates.
 
 ## Scope
 
 - Protocol version: `poker/v1`
 - Canonical gameplay transport: direct daemon-to-daemon WebSockets on `/mesh`
 - Canonical state: signed `SignedTableEvent` history plus signed cooperative settlement-boundary snapshots
-- Settlement layer: Arkade-backed `TableFundsProvider` using wallet-local custody
-- Game variant: heads-up Texas Hold'em
+- Settlement layer: Arkade-backed `TableFundsProvider` with wallet-local custody
+- Implemented game variant: heads-up Texas Hold'em
 
-Although some shared schemas permit more seats, the current runtime only starts hands when exactly two bankroll participants are seated. The end-to-end harness uses two seated players, one host daemon, and at least one witness daemon.
+Although shared schemas allow more seats and more dealer modes, the current runtime only starts hands when exactly two bankroll participants are seated, and it only uses `host-dealer-v1`.
 
 ## Identity Model
 
 Each daemon uses three identities:
 
-- Peer identity: transport handshake and peer addressability
-- Protocol identity: poker participation, canonical events, auxiliary protocol signatures
-- Wallet identity: funds ownership, identity binding, and table-funds receipts
+- peer identity for transport handshake and peer addressability
+- protocol identity for poker participation and canonical signatures
+- wallet identity for funds ownership, join binding, and table-funds receipts
 
 ### Identity binding
 
@@ -52,11 +64,11 @@ The wallet identity signs the unsigned binding body. Hosts verify this binding w
 
 ## Canonical Structured Signing
 
-All structured signatures in the poker protocol use the same canonicalization and hashing rules from `packages/settlement/src/index.ts`.
+All structured signatures in the poker protocol use the same canonicalization and hashing rules implemented in `packages/settlement/src/index.ts`.
 
 ### Canonicalization
 
-`stableStringify()` first canonicalizes input data, then `JSON.stringify()` is applied to the canonical form.
+`stableStringify()` first canonicalizes input data, then applies `JSON.stringify()` to the canonical form.
 
 Canonicalization rules:
 
@@ -100,7 +112,7 @@ The runtime signs and verifies these exact bodies:
 - `HostLease`: lease without `signatures`
 - `HostFailoverAcceptance`: acceptance without `signatureHex`
 
-`unsignedFundsOperation()` canonicalizes the receipt after removing `signatureHex`. Hosts use this exact form when verifying `buy-in-confirm`.
+`unsignedFundsOperation()` canonicalizes the receipt after removing `signatureHex`. Hosts use that exact form when verifying `buy-in-confirm`.
 
 ## Transport
 
@@ -154,8 +166,8 @@ Invalid heartbeats are ignored and never affect failover timing.
 
 ### Public ads and relay frames
 
-- `public-ad` is verified against `hostProtocolPubkeyHex` and then cached
-- `public-update` is currently ignored by the mesh runtime
+- `public-ad` is verified against `hostProtocolPubkeyHex` and then cached locally
+- inbound `public-update` frames are ignored by the current mesh runtime
 - `relay-forward` is a best-effort forwarder to an already-open target socket and is not part of consensus
 
 ## Request / Response Protocol
@@ -306,7 +318,7 @@ When the local daemon appends an event:
 - `seq` is `1` if no event exists yet in that epoch, otherwise `lastSeqInEpoch + 1`
 - `prevEventHash` is the current `lastEventHash`, even across epoch boundaries
 
-This means the first event of a new epoch still points back to the last accepted hash from the previous epoch.
+The first event of a new epoch therefore still points back to the last accepted hash from the previous epoch.
 
 ### Acceptance rules
 
@@ -336,7 +348,7 @@ Additional event-specific rules are enforced before an event becomes canonical:
 - `JoinRequest`, `JoinAccepted`, `JoinRejected`: must be emitted by the current host and carry a valid signed join intent
 - `SeatLocked`: must be emitted by the current host and match a pending reservation
 - `BuyInLocked`: must be emitted by the current host and carry a valid locked funds receipt
-- Gameplay events (`TableReady`, `HandStart`, `DealerCommit`, `PrivateCardDelivery`, `StreetStart`, `PlayerAction`, `ActionAccepted`, `ActionRejected`, `StreetClosed`, `ShowdownReveal`, `HandResult`, `HandAbort`, `TableClosed`): must be emitted by the current host
+- gameplay events (`TableReady`, `HandStart`, `DealerCommit`, `PrivateCardDelivery`, `StreetStart`, `PlayerAction`, `ActionAccepted`, `ActionRejected`, `StreetClosed`, `ShowdownReveal`, `HandResult`, `HandAbort`, `TableClosed`): must be emitted by the current host
 - `HostLeaseGranted`: must be emitted by the lease holder and carry a fully valid lease
 - `WitnessSnapshot`: must be emitted by the current host or a configured witness and carry a fully valid snapshot
 - `HostFailoverProposed`: must be emitted by the current host or a configured witness, and `previousHostPeerId` must equal the current host
@@ -356,7 +368,7 @@ The initial lease is signed by the host plus every configured witness.
 
 ### Seating and readiness
 
-The current table flow is:
+The current flow is:
 
 1. player locally prepares buy-in funds
 2. player sends `join-request`
@@ -384,7 +396,7 @@ The host:
 - sequences all public actions and board state
 - reveals full audit material in `ShowdownReveal` when no player folded before settlement
 
-This is a trusted-host dealing model.
+This is a trusted-host dealing model, not dealerless mental poker.
 
 ### Private card delivery
 
@@ -423,7 +435,7 @@ The canonical sequence is:
 
 When the game engine reaches `phase === "settled"`:
 
-- `ShowdownReveal` is emitted if nobody folded out before settlement
+- `ShowdownReveal` is emitted if nobody folded before settlement
 - `HandResult` is emitted with the final `publicState`
 - a settlement-boundary snapshot is scheduled
 - the next hand is scheduled after a short delay
@@ -523,7 +535,7 @@ Per table, the provider stores:
 - `cashoutTxid`
 - `emergencyExitTxid`
 
-The CLI persists this state in:
+The local table-funds state is persisted at:
 
 - `<daemonDir>/<profile>.table-funds.json`
 
@@ -572,7 +584,7 @@ When a fully signed settlement-boundary snapshot is committed, every seated loca
    - records the returned Arkade transaction ID on the completed transfer entries
 5. if the local player is a winner:
    - waits for incoming spendable Arkade VTXOs from the losers' checkpoint transfers
-   - accepts both `settled` and `preconfirmed` incoming VTXOs as valid managed table position material
+   - accepts both `settled` and `preconfirmed` incoming VTXOs as valid managed position material
    - merges those VTXOs into `managedVtxos`
 6. stores the checkpoint record locally with:
    - `checkpointHash`
@@ -596,7 +608,7 @@ Renewals are local settlement maintenance and are not canonical table events.
 - the local provider has recorded the same `checkpointHash`
 - the requested amount equals the locally recorded Arkade table balance
 
-If the exact local table position is already present as spendable Arkade VTXOs matching the checkpoint balance, the provider completes cash-out by clearing the table association locally and returns a signed `cashout` receipt. This is the normal path in the regtest integration harness.
+If the exact local table position is already present as spendable Arkade VTXOs matching the checkpoint balance, the provider completes cash-out by clearing the table association locally and returns a signed `cashout` receipt.
 
 If the balance is zero, the provider clears local table state and returns a zero-valued completed receipt without calling Arkade settlement.
 
@@ -632,7 +644,7 @@ The enforceable money boundary is therefore the latest fully signed cooperative 
 
 ### Advisory `HandResult.checkpointHash`
 
-`HandResult` may carry a `checkpointHash`, but it is advisory only. The runtime computes settlement from the hash of the latest fully signed settlement-boundary snapshot created after `HandResult` or rollback, not from the `HandResult` field itself.
+`HandResult` may carry a `checkpointHash`, but it is advisory only. The runtime settles from the hash of the latest fully signed settlement-boundary snapshot created after `HandResult` or rollback, not from the `HandResult` field itself.
 
 ## Host Lease, Heartbeats, and Failover
 
@@ -716,7 +728,24 @@ The new host does not auto-start another hand until rollback is complete.
 
 ### Between-hand failover
 
-If failover happens at a clean settlement boundary, the new host simply rotates, installs the new lease, and schedules the next hand.
+If failover happens at a clean settlement boundary, the new host rotates, installs the new lease, and schedules the next hand.
+
+## Public Discovery Surface
+
+Public discovery is intentionally non-canonical.
+
+- Public tables are represented by signed `SignedTableAdvertisement` objects.
+- If a host marks a table `public`, the daemon can send the advertisement plus derived `PublicTableUpdate` records to the optional indexer over HTTP.
+- The daemon can also broadcast `public-ad` frames to known peers, and it can query the indexer for `meshPublicTables()`.
+- None of those public discovery or read-model paths define canonical money state.
+
+The current daemon publishes these public update types to the indexer:
+
+- `PublicTableSnapshot`
+- `PublicHandUpdate`
+- `PublicShowdownReveal`
+
+Those updates are derived from canonical daemon state. They are informative, not authoritative.
 
 ## Persistence and Replay
 
@@ -751,10 +780,8 @@ The shared schema still defines several variants that are not part of the curren
 - `TableWithdraw`
 - `SeatProposal`
 - `BuyInRequested`
-- `TableClosed`
 - `HostHeartbeat` event bodies
 - `PublicTableSnapshot`, `PublicHandUpdate`, and `PublicShowdownReveal` as canonical events
+- dealer modes other than `host-dealer-v1`
 
-Public table discovery uses signed advertisements and indexer HTTP ingest, but public readers are outside consensus.
-
-The repository also still contains a separate mock settlement provider for isolated development. It is not part of the Arkade-backed protocol specified here and is not used by the regtest integration harness documented in this file.
+The repository also contains a separate mock settlement provider for isolated development. It is not part of the Arkade-backed protocol described here and is not used by the regtest integration harness.

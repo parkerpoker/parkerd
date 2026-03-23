@@ -7,6 +7,12 @@ Parker is a daemon-mesh poker workspace built around:
 - an optional public indexer for table ads and read-only spectator views
 - Arkade-backed bankroll movement on Mutinynet or local Nigiri regtest
 
+## Documentation
+
+- [docs/protocol.md](./docs/protocol.md): wire format, canonical event/snapshot rules, settlement boundaries, and failover semantics
+- [docs/trust-model.md](./docs/trust-model.md): guarantees, trust assumptions, privacy tradeoffs, and failure outcomes
+- [docs/architecture.md](./docs/architecture.md): current component topology, runtime boundaries, deployment shapes, and recovery flows
+
 ## Workspace Layout
 
 - `apps/daemon`: long-running daemon process
