@@ -1,4 +1,4 @@
-import type { PublicTableView } from "@parker/protocol";
+import type { PublicTableView } from "../types/parker.js";
 
 export const INDEXER_URL = import.meta.env.VITE_INDEXER_URL ?? "";
 

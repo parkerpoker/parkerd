@@ -1,4 +1,4 @@
-import type { LocalProfileSummary } from '@parker/daemon-runtime';
+import type { LocalProfileSummary } from '../../types/parker.js';
 import { ChevronDown } from 'lucide-react';
 
 import type { LocalProfileStatusResponse } from '../../lib/localControllerApi.js';

@@ -230,7 +230,7 @@ start_controller() {
   PARKER_DAEMON_DIR="$actor_root/daemons" \
   PARKER_PROFILE_DIR="$actor_root/profiles" \
   PARKER_RUN_DIR="$actor_root/runs" \
-    node --import tsx apps/controller/src/index.ts >"$BASE/${label}.controller.log" 2>&1 &
+    "$ROOT_DIR/scripts/bin/parker-controller" >"$BASE/${label}.controller.log" 2>&1 &
   printf '%s\n' "$!"
 }
 
@@ -274,7 +274,7 @@ wait_for_ark_ready 120 >/dev/null
 
 echo "Starting indexer on :${INDEXER_PORT}..."
 HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest \
-  node --import tsx apps/indexer/src/index.ts >"$BASE/indexer.log" 2>&1 &
+  "$ROOT_DIR/scripts/bin/parker-indexer" >"$BASE/indexer.log" 2>&1 &
 INDEXER_PID=$!
 wait_for_http "http://127.0.0.1:${INDEXER_PORT}/health" 30 1
 

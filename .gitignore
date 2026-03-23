@@ -6,8 +6,10 @@ coverage
 *.log
 .env
 .tmp/
-parker-cli
-parker-daemon
+/parker-cli
+/parker-controller
+/parker-daemon
+/parker-indexer
 apps/*/data/
 apps/*/dist/
 apps/example

@@ -1,4 +1,4 @@
-import type { DaemonRuntimeState } from "@parker/daemon-runtime";
+import type { DaemonRuntimeState } from "../types/parker.js";
 
 import { localControllerHeaders } from "./localControllerApi.js";
 

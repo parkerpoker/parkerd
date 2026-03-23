@@ -1,5 +1,4 @@
-import type { MeshTableView } from '@parker/daemon-runtime';
-import type { PublicTableView } from '@parker/protocol';
+import type { MeshTableView, PublicTableView } from '../../types/parker.js';
 import { Eye, Users, Coins } from 'lucide-react';
 
 import { PokerCard } from '../../components/PokerCard.js';

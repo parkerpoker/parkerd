@@ -4,7 +4,7 @@ import type {
   MeshRuntimeMode,
   MeshTableView,
   ProfileDaemonStatus,
-} from "@parker/daemon-runtime";
+} from "../types/parker.js";
 
 const LOCAL_CONTROLLER_HEADER = "X-Parker-Local-Controller";
 const LOCAL_CONTROLLER_BASE = import.meta.env.VITE_LOCAL_CONTROLLER_URL ?? "";

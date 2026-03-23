@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+GO_SOURCE_DIR="$ROOT_DIR/cmd/parker-daemon"
+BIN_DIR="${PARKER_BIN_DIR:-$ROOT_DIR/.tmp/parker-bin}"
+GO_BIN="${PARKER_GO_BIN:-}"
+GO_FALLBACK_BIN="/opt/homebrew/bin/go"
+GO_CACHE_DIR="${PARKER_GO_CACHE_DIR:-$ROOT_DIR/.tmp/parker-gocache}"
+GO_MOD_CACHE_DIR="${PARKER_GO_MOD_CACHE_DIR:-$ROOT_DIR/.tmp/parker-gomodcache}"
+GO_TOOLCHAIN="${PARKER_GOTOOLCHAIN:-auto}"
+
+require_go() {
+  if [[ -n "$GO_BIN" && -x "$GO_BIN" ]]; then
+    return 0
+  fi
+  if GO_BIN="$(command -v go 2>/dev/null)"; then
+    return 0
+  fi
+  if [[ -x "$GO_FALLBACK_BIN" ]]; then
+    GO_BIN="$GO_FALLBACK_BIN"
+    return 0
+  fi
+  echo "parker-daemon: Go toolchain not found. Install Go or set PARKER_GO_BIN to a valid go binary." >&2
+  exit 1
+}
+
+build_go_binary() {
+  local output="$BIN_DIR/parker-daemon-go"
+  local rebuild=0
+  mkdir -p "$BIN_DIR"
+  mkdir -p "$GO_CACHE_DIR" "$GO_MOD_CACHE_DIR"
+
+  if [[ ! -d "$GO_SOURCE_DIR" ]]; then
+    echo "parker-daemon: expected Go source at $GO_SOURCE_DIR but it does not exist." >&2
+    exit 1
+  fi
+
+  if [[ ! -x "$output" ]] || [[ "$ROOT_DIR/go.mod" -nt "$output" ]] || [[ -f "$ROOT_DIR/go.sum" && "$ROOT_DIR/go.sum" -nt "$output" ]]; then
+    rebuild=1
+  elif [[ -d "$ROOT_DIR/internal" ]] && find "$GO_SOURCE_DIR" "$ROOT_DIR/internal" -type f -newer "$output" -print -quit | grep -q .; then
+    rebuild=1
+  elif find "$GO_SOURCE_DIR" -type f -newer "$output" -print -quit | grep -q .; then
+    rebuild=1
+  fi
+
+  if [[ "$rebuild" == "1" ]]; then
+    require_go
+    (
+      cd "$ROOT_DIR"
+      GOTOOLCHAIN="$GO_TOOLCHAIN" GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "$GO_BIN" build -o "$output" ./cmd/parker-daemon
+    )
+  fi
+
+  exec "$output" "$@"
+}
+
+if [[ -n "${PARKER_DAEMON_IMPL:-}" ]] && [[ "${PARKER_DAEMON_IMPL}" != "go" ]]; then
+  echo "parker-daemon: TypeScript selection via PARKER_DAEMON_IMPL is no longer supported by this wrapper." >&2
+  echo "parker-daemon: run apps/daemon/src/index.ts directly if you need the legacy reference daemon." >&2
+  exit 1
+fi
+
+build_go_binary "$@"

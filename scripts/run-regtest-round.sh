@@ -355,7 +355,7 @@ wait "$NIGIRI_START_PID" 2>/dev/null || true
 
 echo "Starting public indexer on :${INDEXER_PORT}..."
 HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest \
-  node --import tsx apps/indexer/src/index.ts >"$BASE/indexer.log" 2>&1 &
+  "$ROOT_DIR/scripts/bin/parker-indexer" >"$BASE/indexer.log" 2>&1 &
 INDEXER_PID=$!
 
 sleep 2

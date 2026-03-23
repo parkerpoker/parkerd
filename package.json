@@ -7,33 +7,13 @@
     "node": ">=22.0.0"
   },
   "workspaces": [
-    "apps/*",
-    "packages/*"
+    "apps/web"
   ],
   "scripts": {
-    "build": "npm run build -w @parker/protocol && npm run build -w @parker/game-engine && npm run build -w @parker/settlement && npm run build -w @parker/daemon-runtime && npm run build -w @parker/indexer && npm run build -w @parker/daemon && npm run build -w @parker/controller && npm run build -w @parker/cli && npm run build -w @parker/web",
-    "dev:cli": "npm run dev -w @parker/cli",
-    "dev:controller": "npm run dev -w @parker/controller",
-    "dev:daemon": "npm run dev -w @parker/daemon",
-    "dev:indexer": "npm run dev -w @parker/indexer",
+    "build": "npm run build -w @parker/web",
     "dev:local": "./scripts/bin/dev-local",
     "dev:web": "npm run dev -w @parker/web",
-    "test:mesh-regtest": "node --import tsx integration/mesh-regtest.ts --start-nigiri",
-    "test": "npm run test -w @parker/protocol && npm run test -w @parker/game-engine && npm run test -w @parker/settlement && npm run test -w @parker/daemon-runtime && npm run test -w @parker/indexer && npm run test -w @parker/daemon && npm run test -w @parker/controller && npm run test -w @parker/cli",
-    "typecheck": "npm run typecheck -w @parker/protocol && npm run typecheck -w @parker/game-engine && npm run typecheck -w @parker/settlement && npm run typecheck -w @parker/daemon-runtime && npm run typecheck -w @parker/indexer && npm run typecheck -w @parker/daemon && npm run typecheck -w @parker/controller && npm run typecheck -w @parker/cli && npm run typecheck -w @parker/web"
-  },
-  "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
-    "@types/node": "^22.13.1",
-    "@types/react": "^18.3.18",
-    "@types/react-dom": "^18.3.5",
-    "@types/ws": "^8.18.1",
-    "@vitejs/plugin-react": "^4.4.1",
-    "rimraf": "^6.0.1",
-    "tsup": "^8.3.5",
-    "tsx": "^4.19.3",
-    "typescript": "^5.7.3",
-    "vite": "^6.2.1",
-    "vitest": "^3.0.8"
+    "test": "go test ./... && npm run typecheck -w @parker/web",
+    "typecheck": "npm run typecheck -w @parker/web"
   }
 }

@@ -3,8 +3,8 @@ import { startTransition, useEffect, useState } from "react";
 import type {
   LocalProfileSummary,
   MeshTableView,
-} from "@parker/daemon-runtime";
-import type { PublicTableView } from "@parker/protocol";
+  PublicTableView,
+} from "./types/parker.js";
 
 import { Header } from "./app/components/header.js";
 import { OverviewView } from "./app/views/overview.js";
