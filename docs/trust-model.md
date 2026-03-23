@@ -1,25 +1,25 @@
 # Trust Model
 
-This document describes the current trust model implemented in this repository. It is intentionally current-state only.
+This document describes the trust model implemented today in this repository. It is intentionally current-state only.
 
-The short version is:
+For wire surfaces, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md).
 
-- wallet keys stay local to each daemon
-- the daemon mesh, signed event log, and fully signed cooperative snapshots define enforceable money state
-- the indexer is informational only
-- the local browser UI can instruct the daemon through the controller, but it still does not hold keys or sign protocol messages
-- `host-dealer-v1` still places meaningful trust in the host for hidden-card privacy and fair dealing
+## Short Version
 
-For wire/state rules, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md).
+- wallet keys stay local to each daemon profile
+- the browser UI and controller do not hold wallet or protocol private keys
+- the current Go runtime is still host-authoritative for gameplay progression, hidden-card privacy, and replicated table state
+- the runtime signs events, advertisements, snapshots, and funds operations, but it does not yet enforce the stronger multi-party verification model described in older design docs
+- the indexer is informational only and does not authorize money movement
 
 ## Security Boundary Summary
 
-- Consensus lives in the daemon mesh, not in the indexer or UI.
-- The localhost controller is not part of consensus. It is a local control plane for one machine.
-- Money movement is bounded by fully signed settlement snapshots plus each player's local Arkade table-funds state.
-- Unfinished hands are not forced onto Arkade. The last fully signed settlement-boundary snapshot is the last enforceable money state.
-- Public ads and public hand updates can inform humans, but they cannot create, authorize, or finalize bankroll changes.
-- The browser UI can trigger local wallet and table actions through the controller, but only the daemon can authorize and execute them with local keys.
+- Local wallet custody lives in each daemon profile.
+- The localhost controller is a local control plane, not a money-authorizing peer.
+- The browser UI can trigger local actions, but only the daemon owns signing, persistence, and wallet operations.
+- The indexer and public UI are optional read surfaces only.
+- The host or failover successor is currently trusted as the active table authority.
+- Signed events and snapshots exist, but remote peers do not yet independently enforce full cryptographic replay and quorum validation on every replicated object.
 
 ## Assets
 
@@ -27,58 +27,55 @@ For wire/state rules, see [protocol.md](./protocol.md). For component topology, 
 
 Each profile has a local wallet identity. The daemon uses it for:
 
-- Arkade wallet ownership
-- join identity binding
-- signed table-funds receipts
+- wallet custody
+- local table-funds operations
+- signed renew, cash-out, and emergency-exit receipts
 
-If a wallet private key is compromised, the attacker can control that player's bankroll and produce valid wallet-level receipts for that player.
+If a wallet private key is compromised, that player's bankroll can be controlled by the attacker.
 
-### Bankroll state
+### Protocol and peer keys
 
-Each seated player keeps local table-funds state for:
+Each profile also has local peer and protocol identities used for:
 
-- prepared VTXOs
-- managed table VTXOs
-- current local table balance
-- checkpoint records
-- cash-out and emergency-exit receipts
+- peer addressability
+- event signing
+- snapshot signing
+- advertisement signing
 
-This state is local to the player's daemon and is required for checkpoint recording, renewal, cash-out, and emergency exit.
+These keys stay local to the daemon profile, not in the browser.
 
-### Canonical event log
+### Local table copy
 
-`SignedTableEvent` history is the authoritative gameplay transcript. It determines:
+Each daemon stores its own replica of the table, including:
 
-- seating
-- host epochs
-- gameplay ordering
-- public state evolution
-- failover decisions
+- table config
+- seats
+- public state
+- signed events
+- snapshots
+- private hand material relevant to that profile
 
-If two peers hold the same valid event history, they can deterministically replay the same canonical state.
+This replica is operationally important because failover and funds operations use it directly.
 
-### Signed snapshots
+### Table-funds state
 
-`CooperativeTableSnapshot` is the enforceable money checkpoint. A snapshot only becomes fully authoritative when it carries signatures from:
+Each daemon keeps local table-funds state for:
 
-- the current host
-- every seated player
-- every configured witness
-
-That fully signed snapshot is the boundary used for checkpoint recording, cash-out, and emergency exit.
+- buy-in amounts
+- checkpoint hashes
+- wallet-signed operation receipts
+- local cash-out and exit status
 
 ### Public metadata
 
-Signed public advertisements and derived public updates expose information such as:
+Public advertisements and updates expose:
 
 - table name and stakes
-- host identity
-- witness count
-- public board state
-- public chip counts
-- showdown hole cards when revealed
+- host identity and witness count
+- occupied seats
+- public game state
 
-This data is useful for discovery and spectatorship, but it is not a money-authorizing asset.
+This information is useful for discovery and spectatorship, but it is not wallet custody.
 
 ## Actors
 
@@ -86,266 +83,215 @@ This data is useful for discovery and spectatorship, but it is not a money-autho
 
 A player daemon:
 
-- owns the player's wallet keys locally
-- prepares and confirms buy-ins locally
-- signs join intents, action intents, and settlement snapshots
-- records checkpoints and executes cash-out or emergency exit for that player
-
-Players do not directly append canonical actions. They submit action requests to the current host.
+- owns local wallet, peer, and protocol keys
+- joins tables
+- submits actions to the host
+- stores a replicated table copy
+- performs local renew, cash-out, and emergency-exit operations
 
 ### Host daemon
 
 A host daemon:
 
-- creates the table
-- validates joins and buy-ins
-- orders canonical gameplay events
-- performs trusted dealing in `host-dealer-v1`
-- collects settlement snapshot signatures
-- publishes optional public ads and public updates when configured
-
-The host is a protocol participant and part of every snapshot quorum. In the current dealing model, it also has privileged visibility into hidden-card material.
+- creates tables
+- accepts joins
+- sequences gameplay
+- deals hidden cards in `host-dealer-v1`
+- appends events
+- builds snapshots
+- replicates table state to other peers
+- publishes public state when configured
 
 ### Witness daemon
 
 A witness daemon:
 
-- signs host leases
-- receives and stores canonical events and snapshots
-- verifies host heartbeats
-- can initiate failover if the host disappears
-- can become the next host after a successful failover quorum
+- stores replicated table copies
+- watches host heartbeat freshness
+- can take over when witnesses are configured
 
-Witnesses improve recoverability, but they do not remove trust in the host for hidden-card privacy.
-
-### Indexer
-
-The optional indexer:
-
-- accepts signed public advertisements
-- accepts derived public table updates
-- stores them in a public read model
-- serves them over HTTP to daemons and the web UI
-
-The indexer does not participate in consensus, does not hold wallet keys, and cannot move funds.
-
-### UI
-
-The web UI:
-
-- reads the indexer HTTP API for public spectator state
-- reads the localhost controller for local profile, wallet, gameplay, and settlement state
-- can instruct the local daemon through the controller
-
-The UI still does not:
-
-- hold wallet or protocol private keys
-- sign protocol objects
-- read profile JSON directly
-- talk directly to the daemon mesh
+If no witnesses are configured, failover falls back to the seated player with the lowest peer ID.
 
 ### Local controller
 
 The localhost controller:
 
-- binds to loopback only
-- translates browser-safe HTTP and SSE into daemon RPC
-- enforces browser-origin and custom-header checks
-- does not own money, keys, or consensus state
+- exposes browser-safe HTTP and SSE
+- enforces origin and custom-header checks
+- forwards structured actions to the local daemon
+- does not own keys or funds
 
-### Arkade operator
+### Indexer
 
-Arkade and related backing services remain relevant because the current settlement adapter depends on them for:
+The optional indexer:
 
-- wallet onboarding and offboarding
-- offchain table-position construction
-- checkpoint transfer execution
-- some cash-out and emergency-exit paths
+- stores public ads and updates
+- serves public table views over HTTP
+- does not join gameplay authority
+- does not hold wallet keys
+- does not authorize money movement
 
-The protocol narrows when Arkade state can matter, but it does not eliminate availability dependence on the operator-backed infrastructure.
+### Web UI
 
-## Guarantees
+The web UI:
+
+- reads public state from the indexer or controller proxy
+- reads local daemon state through the controller
+- can instruct the local daemon through the controller
+
+It still does not:
+
+- hold wallet or protocol private keys
+- talk to peer `/native/*` routes directly
+- talk to the Unix socket directly
+
+## Guarantees Provided Today
 
 ### Wallet custody stays local
 
-Player wallet private keys are generated and stored locally per daemon profile. Neither the host, witness, indexer, nor UI needs those keys to participate in the protocol.
+Player wallet private keys are generated and stored locally per daemon profile. Neither the host, witness, indexer, nor browser needs those keys to participate.
 
-### Canonical gameplay is signed and replayable
+### Browser access is mediated
 
-Canonical gameplay is an append-only stream of signed events. Peers verify signatures, event hashes, ordering, and semantic rules before accepting an event into canonical state.
+The browser only reaches the daemon through the localhost controller, which:
 
-### Settlement is pinned to cooperative snapshots
+- binds to loopback by default
+- checks allowed origins
+- requires the `X-Parker-Local-Controller` header for browser requests
 
-Bets and street transitions do not directly move Arkade custody. The enforceable money boundary is the latest fully signed settlement-boundary snapshot.
+### Local funds operations are signed
 
-### Invalid host-only unsigned state cannot force cash-out
+Renew, cash-out, and exit receipts are signed with the local wallet key and include the current checkpoint hash recorded by the daemon.
 
-The host cannot unilaterally invent a valid settlement outcome with unsigned local state. Cash-out and emergency exit require:
+### Public surfaces are non-custodial
 
-- a fully signed cooperative snapshot
-- a matching locally recorded checkpoint hash in the player's table-funds state
+The indexer and public browser surfaces can be stale, missing, or maliciously curated without gaining the ability to sign wallet operations on behalf of a player.
 
-### Witnesses improve recovery
+## Important Current Limitations
 
-When witnesses are configured and available, they can preserve canonical history, detect missing heartbeats, gather failover acceptances, and drive host rotation without relying on the failed host.
+### Host authority is stronger than the older design docs implied
 
-### Public surfaces are informational only
+The current Go runtime is not yet a fully verified signed mesh.
 
-The indexer and the public browser view can display stale, missing, or maliciously curated public information without gaining the ability to authorize bankroll changes. They cannot create valid `SignedTableEvent`, `CooperativeTableSnapshot`, or `TableFundsOperation` records on behalf of players.
+Today the host is trusted to:
 
-### Local browser control is still bounded by the daemon
+- accept joins
+- accept actions
+- advance gameplay
+- replicate accurate table state
+- provide the current table copy to non-host peers
 
-The local browser can ask the controller to move funds, join tables, or submit actions, but:
+### Peer requests are not individually signed
 
-- the request only reaches `127.0.0.1`
-- the controller only forwards structured routes
-- the daemon still decides whether the action is valid
-- the daemon still owns every signing and persistence step
+Join, action, and table-sync requests between daemons are plain JSON over HTTP. The runtime does not currently wrap them in separately signed request envelopes.
+
+### Replicated state is not fully re-verified on receipt
+
+Peers accept replicated table state through host polling and `/native/table/sync`. The current runtime does not yet re-run a full cryptographic replay and semantic verification pass before persisting that state.
+
+### Snapshot quorum is not yet multi-party enforced
+
+The field name `latestFullySignedSnapshot` is historical. In current code, the runtime populates it with the latest locally built snapshot, and that snapshot currently carries only the builder's signature.
+
+That means:
+
+- snapshot hashes are still useful local checkpoints
+- but they are not yet the multi-party settlement proofs described in older design docs
+
+### The indexer does not verify signatures before storage
+
+The indexer validates required fields, but it does not currently cryptographically verify advertisements or updates before storing them.
 
 ## Trust Assumptions
 
-### The host is trusted for hidden-card privacy in `host-dealer-v1`
+### Trust the host for hidden-card privacy and dealing integrity
 
 Current dealing is host-run. The host:
 
-- generates the deck
-- knows the hole cards before showdown
-- controls private card delivery
+- generates the deck seed
+- knows all hole cards during the hand
+- determines the public hand progression
 
-That means the host can learn or misuse hidden-card information. The protocol does not currently provide dealerless mental-poker privacy or cryptographic fairness against a malicious dealer.
+This is not dealerless mental poker.
 
-This is why the practical recommendation remains:
+### Trust the host or failover successor for replicated table truth
 
-- prefer a non-playing host for public games
-- treat the host as trusted with respect to hidden-card secrecy and dealing integrity
+Because non-host peers currently rely on replicated table copies rather than a fully verified signed mesh, the active host or failover successor is effectively the authoritative table source.
 
-### Witness presence matters for failover and fresh checkpoints
+### Trust each local machine to protect its own secrets
 
-The runtime only lets a witness initiate failover. If no witness is configured, or a configured witness is unavailable:
+Each participant machine is trusted to protect:
 
-- automatic host failover does not happen
-- manual `rotateHost()` cannot be initiated by players or the current host
-- fresh fully signed snapshots may stop if a configured witness is missing from the exact snapshot quorum
-
-Existing fully signed snapshots remain valid, but recoverability degrades.
+- wallet keys
+- protocol and peer keys
+- persisted table state
+- local private hand material
+- controller-origin protections when the browser UI is in use
 
 ### Arkade availability still matters
 
-The daemon mesh defines who should own what, but the current settlement adapter still depends on Arkade-backed services for several wallet and settlement operations. If Arkade or related services are down, money movement may stall even though the signed poker state remains intact.
-
-### Operator choices still shape public exposure
-
-The host decides whether a table is public and whether to publish to an indexer. If the table is public, the public path exposes metadata and public game state by design.
-
-### Local machine security still matters
-
-Each daemon is trusted to protect:
-
-- local private keys
-- persisted event and snapshot history
-- local Arkade table-funds state
-
-When the controller UI is in use, the same machine is also trusted to protect:
-
-- allowed local browser origins
-- the loopback controller process
-- the browser tab from malicious local extensions or injected same-origin content
-
-Compromise of a participating machine can compromise that participant's role and secrets.
-
-## Host-Dealer Privacy Tradeoff
-
-The current privacy model is asymmetrical:
-
-- the host learns deck order and player hole cards
-- the receiving player learns only their own hole cards during the hand
-- witnesses replicate public history and snapshots, but do not receive hidden-card plaintext during ordinary play
-- the indexer and UI only see public state plus showdown reveals when they are published
-
-This is better than pushing hidden-card handling into a browser spectator surface, but it is not equal-peer privacy. The system is intentionally honest about that tradeoff.
-
-## Non-Goals
-
-Version 1 does not claim:
-
-- dealerless or trustless hidden-card privacy
-- browser-native daemon or wallet custody
-- browser-native mesh participation
-- trustless public discovery through the indexer
-- enforceability of unfinished mid-hand state on Arkade
-- that the current Arkade table-funds adapter is hardened for production mainnet use
-- that witnesses or indexers can override a player's local wallet custody
+The poker runtime can continue to track state locally, but renew, cash-out, exit, and some wallet flows still depend on Arkade-backed services.
 
 ## Failure Outcomes
 
-### Host crash between hands
+### Host loss between hands
 
-If a witness is present and heartbeats stop:
+If the host stops updating heartbeat timestamps:
 
-- the witness can gather failover acceptances
-- the witness can install a new host lease for the next epoch
-- the table can continue from the last canonical settlement boundary
+- witnesses can take over when configured
+- otherwise the seated player with the lowest peer ID can take over
+- the new host continues from the latest stored snapshot
 
-No unfinished-hand rollback is needed in this case.
+This is operational recovery, not a byzantine-proof consensus change.
 
-### Host crash mid-hand
+### Host loss mid-hand
 
-If failover occurs during an active unsettled hand and a fully signed settlement snapshot already exists:
+If failover occurs during an active hand and a snapshot exists:
 
 - the new host appends `HandAbort`
-- public state rolls back to the latest fully signed settlement-boundary snapshot
-- a new settlement snapshot is collected over that rolled-back state
+- public state rolls back to the latest stored snapshot
+- the table continues from there
 
-The interrupted hand is discarded as unenforceable. The last signed checkpoint remains the money truth.
+Because the snapshot is not yet a multi-party quorum proof, that rollback trust is only as strong as the replicated table state already accepted by the peers.
 
 ### Witness loss
 
-If a configured witness disappears:
+If witnesses are configured and disappear:
 
-- the current host may still continue ordering gameplay
-- but automatic failover is lost because only witnesses initiate failover
-- and new fully signed snapshots can stall because the runtime requires every configured witness in the exact snapshot quorum
-
-The practical effect is that the table may keep playing while losing the ability to advance its enforceable checkpoint boundary safely.
+- a player cannot take over while witnesses are still configured
+- automatic failover can stall
+- gameplay may continue until the host itself fails
 
 ### Indexer loss
 
-If the indexer is down or unreachable:
+If the indexer is down:
 
-- gameplay consensus continues in the daemon mesh
-- players can still use direct invites and the canonical mesh
-- public discovery and read-only spectatorship degrade or disappear
-
-No bankroll movement is authorized by the indexer, so its loss is informational rather than custodial.
+- direct table play can continue
+- public discovery and spectatorship degrade or disappear
+- no wallet authority is lost
 
 ### UI loss
 
 If the web UI is unavailable:
 
-- gameplay continues
-- indexer ingest can continue
-- there is no direct effect on wallet custody or canonical state
-
-The UI is optional display surface only.
+- daemon-to-daemon play can continue
+- CLI control still works
+- no wallet keys are exposed by that failure
 
 ### Arkade outage
 
 If Arkade-backed services are unavailable:
 
 - wallet onboarding/offboarding may fail
-- buy-in preparation or confirmation may fail
-- checkpoint recording may stall
-- renewals may fail
-- cash-out or emergency exit may require waiting for operator availability unless the exact spendable local position is already available
-
-Signed event history and fully signed snapshots still preserve who should own what, but some real money movement paths may be blocked until the backing services recover.
+- renew, cash-out, or exit flows may stall
+- local poker state can still exist, but some real funds operations may have to wait
 
 ## Practical Reading
 
 The safest way to interpret the current system is:
 
-- trust the daemon mesh for canonical poker state
-- trust fully signed snapshots for enforceable money state
-- trust each player daemon to protect its own keys and local funds state
+- trust each daemon with its own wallet custody
+- treat the host or failover successor as the practical gameplay authority
+- treat events and snapshots as signed audit artifacts, not yet as fully verified multi-party consensus proofs
 - do not trust the indexer or UI with money authority
-- do not over-claim privacy against a malicious host in `host-dealer-v1`
+- do not over-claim privacy or fairness against a malicious host in `host-dealer-v1`

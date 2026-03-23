@@ -1,99 +1,120 @@
 # Current Architecture
 
-This document describes the architecture implemented today in this repository. It is intentionally current-state only and does not mix in planned or speculative designs.
+This document describes the architecture implemented today in this repository. It is intentionally current-state only.
 
-For protocol rules, see [protocol.md](./protocol.md). For guarantees and assumptions, see [trust-model.md](./trust-model.md).
+For protocol details, see [protocol.md](./protocol.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Overview
 
-Parker currently runs as a daemon mesh:
+Parker currently runs as a Go-first daemon workspace:
 
-- each participant runs a local daemon process
-- the CLI only controls a local daemon over Unix-socket RPC
-- the local controller only controls a local daemon over HTTP and SSE backed by that same RPC
-- gameplay consensus happens over daemon-to-daemon WebSockets on `/mesh`
-- each player's daemon owns its own Arkade wallet interactions and table-funds state
-- an optional indexer stores signed public ads and public updates for discovery
-- the web app is a hybrid UI:
-  - spectator reads come from the indexer
-  - local player control goes through the localhost controller
+- `cmd/parker-daemon` runs the gameplay and settlement daemon
+- `cmd/parker-cli` controls a local daemon over Unix-socket RPC
+- `cmd/parker-controller` exposes localhost HTTP and SSE backed by that same daemon RPC
+- `cmd/parker-indexer` stores public advertisements and public updates for discovery
+- `apps/web` is the remaining TypeScript browser UI
+- `scripts/bin/*` wrappers build and run the Go binaries on demand
 
-The practical boundary is simple:
+The peer runtime is host-authoritative today:
 
-- `apps/daemon` is the gameplay and settlement runtime
-- `apps/cli` and `apps/controller` are local control only
-- `apps/indexer` is optional public ingest/read model only
-- `apps/web` is a browser UI, not a mesh peer
+- each participant runs a local daemon
+- the host accepts joins and actions, appends events, builds snapshots, and replicates table state
+- peer listeners expose JSON endpoints under `/native/*`
+- public discovery remains optional through the indexer
+- the browser stays outside daemon custody and peer-to-peer transport
+
+One compatibility detail is worth calling out explicitly: daemons still advertise peer URLs shaped like `ws://host:port/mesh`, but the current Go runtime derives an HTTP base URL from that address and exchanges JSON over `/native/*`.
+
+## Practical Repo Mapping
+
+- `cmd/parker-daemon` plus [`internal/native_runtime.go`](../internal/native_runtime.go) are the gameplay and settlement runtime
+- `cmd/parker-cli` plus [`internal/client.go`](../internal/client.go) are the local CLI control surface
+- `cmd/parker-controller` plus [`internal/controller/app.go`](../internal/controller/app.go) are the localhost browser bridge
+- `cmd/parker-indexer` plus [`internal/indexer/app.go`](../internal/indexer/app.go) are the optional public ingest/read model
+- [`internal/storage/store.go`](../internal/storage/store.go) provides the runtime and indexer storage backends
+- [`internal/settlementcore/core.go`](../internal/settlementcore/core.go) implements canonical JSON hashing and signatures
+- [`internal/game`](../internal/game) contains the current heads-up Hold'em engine
+- `apps/web` is the only product surface that still ships as TypeScript
 
 ## Component Roles
 
 ### Daemon process
 
-`apps/daemon` starts one `ProfileDaemon` per profile. That process wraps:
+`cmd/parker-daemon` starts [`internal/daemon.Service`](../internal/daemon/service.go), which currently wraps [`internal.ProxyDaemon`](../internal/proxy_daemon.go) and the native runtime in [`internal/native_runtime.go`](../internal/native_runtime.go).
 
-- local Unix-socket RPC for the CLI
-- `MeshRuntime` for poker state and peer orchestration
-- `PeerTransport` for `/mesh` WebSocket connectivity
-- wallet runtime and Arkade table-funds operations
-- profile-local persistence for keys, peers, events, snapshots, and private hand state
+This process owns:
 
-This is the only runtime component that:
+- the profile-local Unix socket used by the CLI and controller
+- the local watch stream (`status`, `watch`, `log`, `state`)
+- peer-to-peer table replication and host polling
+- wallet access and table-funds operations
+- local persistence for profiles, peers, tables, events, snapshots, and private hand state
 
-- appends canonical gameplay events
-- collects settlement snapshot signatures
-- records Arkade checkpoints
-- executes cash-out and emergency-exit flows
+This is the only component that can:
+
+- create tables
+- accept joins and actions
+- append signed events
+- build snapshots
+- execute renew, cash-out, and emergency-exit operations
 
 ### CLI process
 
-`apps/cli` is a thin local control surface. It talks only to the local daemon through the profile socket at:
+`cmd/parker-cli` is a thin local control surface. It talks only to the local daemon through the profile socket:
 
 - `<daemonDir>/<profile>.sock`
 
-The CLI exposes the current command groups:
+The current command groups are:
 
+- `bootstrap`
 - `wallet`
 - `network`
 - `table`
 - `funds`
 - `daemon`
-- `bootstrap`
 - `interactive`
 
-It does not participate in the mesh directly, and it does not implement gameplay logic on its own.
+It does not participate in peer-to-peer table sync directly.
 
 ### Local controller service
 
-`apps/controller` is a loopback-only Fastify service that adapts the existing Unix-socket daemon RPC into browser-safe routes and an SSE watch stream.
+`cmd/parker-controller` is a loopback-only Go `net/http` service that adapts daemon RPC into browser-safe HTTP and SSE.
 
 It exposes:
 
 - structured `GET` and `POST` routes under `/api/local`
-- `GET /api/local/profiles/:profile/watch` as an SSE bridge over `DaemonRpcClient.watch()`
-- optional same-origin serving of the built web bundle and proxied public indexer reads
+- `GET /api/local/profiles/{profile}/watch` as an SSE bridge over daemon `watch`
+- optional same-origin serving of a built `apps/web/dist`
+- proxy `GET /api/public/tables` reads to the configured indexer
+
+It also enforces:
+
+- loopback binding by default
+- allowed-origin checks
+- the `X-Parker-Local-Controller` browser header requirement
 
 It does not:
 
 - own keys
 - sign protocol objects
-- join the daemon mesh
-- reimplement wallet, table, or settlement logic
+- join peer-to-peer table sync
+- reimplement gameplay or settlement logic
 
 ### Host, witness, and player modes
 
 Host, witness, and player are daemon operating modes, not separate binaries.
 
-- host mode creates tables, validates joins and buy-ins, orders gameplay, and collects snapshots
-- witness mode signs leases, monitors host heartbeats, and can drive failover
-- player mode owns bankroll, joins tables, signs actions and snapshots, and executes local settlement operations
+- host mode creates tables, accepts joins, sequences gameplay, appends events, and replicates table state
+- witness mode stores replicated tables and can take over after stale host heartbeats
+- player mode owns bankroll, joins tables, submits actions, and executes local funds operations
 
-Within a specific table, a daemon's table-local role can change after failover. The most important current example is that a witness daemon can become the new host for a later epoch.
+If witnesses are configured, only witnesses take over automatically. If no witnesses are configured, the seated player with the lowest peer ID becomes the failover candidate.
 
-The CLI still accepts `--mode indexer`, but the implemented public read path in this repository is the standalone [`apps/indexer`](../apps/indexer) service, not a separate consensus-participating mesh role with distinct `MeshRuntime` behavior.
+The CLI still accepts `--mode indexer` for compatibility, but the actual public read path in this repository is the standalone `cmd/parker-indexer` service.
 
 ### Optional indexer
 
-`apps/indexer` is a standalone Fastify service with a SQLite-backed public read model.
+`cmd/parker-indexer` is a standalone Go `net/http` service with a public read model stored through [`internal/storage/store.go`](../internal/storage/store.go).
 
 It accepts:
 
@@ -103,134 +124,120 @@ It accepts:
 And it serves:
 
 - `GET /api/public/tables`
-- `GET /api/public/tables/:tableId`
+- `GET /api/public/tables/{tableId}`
 
-The indexer never joins consensus and never authorizes money movement. It only stores and serves public information derived from daemon state.
+The indexer does not participate in gameplay authority or money movement. It only stores and serves public information.
 
 ### Browser UI
 
-`apps/web` now runs in two modes:
+`apps/web` runs in two practical modes:
 
-- public spectator mode from the optional indexer
-- local controller mode from the localhost controller
+- public spectator mode backed by the indexer
+- local player-control mode backed by the localhost controller
 
 In controller mode the browser can:
 
-- choose a local profile
-- start and inspect the local daemon
-- request wallet moves
+- list local profiles
+- inspect or start the local daemon
+- request wallet actions
 - create or join tables
 - submit gameplay actions
-- request renewals, cash-out, or emergency exit
+- request renew, cash-out, or emergency exit
 
-Even in controller mode, the browser is still outside consensus:
+Even in controller mode, the browser is still outside daemon custody:
 
-- it does not hold private keys
+- it does not hold wallet or protocol private keys
 - it does not read profile files or Unix sockets
-- it does not connect to `/mesh`
-- it does not sign protocol messages itself
+- it does not talk to peer `/native/*` endpoints directly
 
 ### Arkade and Nigiri dependencies
 
 The current runtime uses Arkade-backed wallet and table-funds operations for:
 
-- buy-in preparation and locking
-- checkpoint recording
+- faucet/onboarding flows
+- buy-in and funds tracking
 - renewals
 - cash-out
 - emergency exit
 
-In local regtest, Nigiri provides the local supporting services. The checked-in regtest flows use:
-
-- Arkade server at `http://127.0.0.1:7070`
-- Boltz API at `http://127.0.0.1:9069`
-- `nigiri` for wallet funding and local service startup
+In local regtest, Nigiri provides the local backing services.
 
 ## Runtime Boundaries
 
-### Consensus boundary
+### Daemon authority boundary
 
-Consensus is limited to:
+Gameplay authority lives in the daemon, not in the browser or indexer.
 
-- daemon mesh transport
-- signed canonical events
-- signed cooperative snapshots
-- local replay of that canonical history
-
-Everything inside this boundary lives in the daemon runtime.
+- the daemon decides whether joins and actions are accepted
+- the daemon builds public state, events, and snapshots
+- the daemon persists the local table copy and funds state
 
 ### Local control boundary
 
-The CLI crosses a local-only boundary:
+The CLI and controller cross a local-only boundary:
 
-- CLI issues commands over the profile socket
-- daemon executes wallet, networking, and table operations
+- the CLI uses Unix-socket NDJSON RPC
+- the controller uses localhost HTTP and SSE
+- the daemon executes the actual wallet, network, and table operations
 
-The controller crosses the same boundary over localhost HTTP and SSE:
+No remote peer talks to another peer's CLI or controller.
 
-- browser UI issues structured controller requests with origin and header checks
-- controller forwards them to the daemon RPC
-- daemon executes wallet, networking, and table operations
+### Peer replication boundary
 
-No remote peer ever talks to another peer's CLI or controller.
+The current Go runtime exchanges JSON between daemons on these endpoints:
+
+- `GET /native/peer`
+- `POST /native/table/join`
+- `POST /native/table/action`
+- `POST /native/table/sync`
+- `GET /native/table/{tableId}`
+
+The host remains authoritative for joins, actions, and routine table replication. Other peers poll the host table when they are not the current host.
 
 ### Public read boundary
 
-The indexer and UI sit outside consensus:
+The indexer and public UI sit outside gameplay authority:
 
-- hosts may publish signed ads and derived public updates to the indexer
-- the UI reads the indexer over HTTP
-- failures or staleness here do not change canonical money state
-
-### Settlement boundary
-
-Each player's daemon owns:
-
-- wallet keys
-- local table-funds state
-- checkpoint records
-- local cash-out and emergency-exit execution
-
-The daemon mesh can define balances, but each player still needs their own daemon to act on those balances locally.
+- hosts can publish public advertisements and snapshots to the indexer
+- the web app reads those routes over HTTP
+- failures or staleness there do not change local wallet custody
 
 ## Component Diagram
 
 ```mermaid
 flowchart LR
   subgraph "Host Machine"
-    HostDaemon["apps/daemon<br/>host mode"]
+    HostDaemon["cmd/parker-daemon<br/>host mode"]
   end
 
   subgraph "Witness Machine"
-    WitnessDaemon["apps/daemon<br/>witness mode"]
+    WitnessDaemon["cmd/parker-daemon<br/>witness mode"]
   end
 
   subgraph "Player Machine"
-    PlayerCLI["apps/cli<br/>local RPC control"]
-    Controller["apps/controller<br/>localhost HTTP + SSE"]
+    PlayerCLI["cmd/parker-cli<br/>local RPC control"]
+    Controller["cmd/parker-controller<br/>localhost HTTP + SSE"]
     BrowserUI["apps/web<br/>public browser + local player UI"]
-    PlayerDaemon["apps/daemon<br/>player mode"]
+    PlayerDaemon["cmd/parker-daemon<br/>player mode"]
     PlayerCLI -->|"Unix socket RPC"| PlayerDaemon
     Controller -->|"Unix socket RPC"| PlayerDaemon
     BrowserUI -->|"HTTP + SSE on localhost"| Controller
   end
 
-  Indexer["apps/indexer<br/>optional public ingest + read model"]
-  UI["apps/web<br/>public browser"]
+  Indexer["cmd/parker-indexer<br/>optional public read model"]
   Arkade["Arkade / Boltz services"]
   Nigiri["Nigiri (regtest only)"]
 
-  HostDaemon <-->|"poker/v1 mesh over /mesh"| WitnessDaemon
-  HostDaemon <-->|"poker/v1 mesh over /mesh"| PlayerDaemon
-  WitnessDaemon <-->|"poker/v1 mesh over /mesh"| PlayerDaemon
+  HostDaemon <-->|"HTTP JSON on /native/*"| WitnessDaemon
+  HostDaemon <-->|"HTTP JSON on /native/*"| PlayerDaemon
+  WitnessDaemon <-->|"HTTP JSON on /native/*"| PlayerDaemon
 
   HostDaemon -->|"wallet + table-funds ops"| Arkade
   WitnessDaemon -->|"wallet + table-funds ops"| Arkade
   PlayerDaemon -->|"wallet + table-funds ops"| Arkade
 
-  HostDaemon -->|"announceTable + publishUpdate"| Indexer
-  PlayerDaemon -->|"fetchPublicTables (optional)"| Indexer
-  UI -->|"GET /api/public/tables"| Indexer
+  HostDaemon -->|"POST table ads + updates"| Indexer
+  BrowserUI -->|"GET /api/public/tables"| Indexer
 
   Nigiri -.->|"local regtest backing"| Arkade
 ```
@@ -246,71 +253,47 @@ A minimal private table can run with:
 - no indexer
 - no UI
 
-This can function for direct-invite play, but it has weaker recovery because witness-driven failover is unavailable.
+This can function for direct-invite play, but it has weaker recovery and no public discovery.
 
-### Public table with witness and spectators
+### Public table with witnesses and spectators
 
 The current public-facing topology is:
 
 - one host daemon
 - one or more player daemons
-- at least one witness daemon
+- zero or more witness daemons
 - one optional local controller per player machine
 - optional indexer
 - optional browser UI
 
-This gives a public discovery path while keeping gameplay authority in the daemon mesh.
+This gives a public discovery path while keeping gameplay and funds actions in the daemons.
 
 ### Local regtest harnesses
 
-The repository currently exercises two regtest shapes:
+The repository currently exercises these local shapes:
 
-- `npm run dev:local` starts `host`, `witness`, `alice`, and `bob`, plus Nigiri, the controller, the indexer, and the web UI
-- `make poker-regtest-round` starts `host`, `witness`, `alice`, and `bob`, plus Nigiri and the indexer
-- `npm run test:mesh-regtest` starts `host`, `witness`, `alpha`, `beta`, and `gamma`, plus an in-process indexer, to cover failover and public-discovery scenarios
-
-## Example Mesh Graph
-
-```mermaid
-graph TD
-  Host["host daemon"]
-  Witness["witness daemon"]
-  Alice["alice daemon"]
-  Bob["bob daemon"]
-  Indexer["optional indexer"]
-  UI["spectator UI"]
-
-  Host --- Witness
-  Host --- Alice
-  Host --- Bob
-  Witness --- Alice
-  Witness --- Bob
-  Alice --- Bob
-
-  Host -->|"signed public ad"| Indexer
-  Host -->|"public table updates"| Indexer
-  UI -->|"read-only queries"| Indexer
-```
+- `npm run dev:local` starts Nigiri when needed, the Go indexer, the Go controller, the web UI, and `host` / `witness` / `alice` / `bob` daemons
+- `make poker-regtest-round` starts Nigiri, the indexer, four Go daemons, funds the players, creates a table, auto-plays a hand, and cashes both players out
+- `make poker-regtest-ui-2p` starts Nigiri, the indexer, two isolated player daemons, two controllers, and two browser UIs
 
 ## Gameplay / Data Flows
 
 ### Table creation and seating
 
-1. A local CLI asks the host daemon to create a table.
-2. The host daemon creates `TableAnnounce`, builds the initial lease, and gets witness lease signatures when configured.
-3. The host daemon may publish the signed advertisement to the optional indexer if the table is public.
-4. A player daemon receives or decodes the invite, prepares buy-in funds locally, and sends `join-request`.
-5. The host daemon validates the join and appends `JoinRequest` plus `JoinAccepted` or `JoinRejected`.
-6. The joining player confirms the buy-in locally and sends `buy-in-confirm`.
-7. Once all seats are locked, the host appends `TableReady`, captures a signed settlement snapshot, and begins the first hand.
+1. A local CLI or controller asks the host daemon to create a table.
+2. The host daemon appends `TableAnnounce`, stores the invite code, and optionally builds an advertisement.
+3. If the table is public and an indexer is configured, the daemon publishes the advertisement and public snapshot.
+4. A player daemon decodes the invite and sends a JSON join request to the host.
+5. The host daemon accepts the seat, appends `SeatLocked`, and marks the table ready when seat count is reached.
+6. Once the table is ready, the host builds a snapshot and starts the first hand.
 
 ### Gameplay loop
 
-1. The host daemon starts the hand, commits the deck, and privately delivers hole cards.
-2. Player daemons send signed action requests to the current host.
-3. The host appends canonical action events and advances public state.
-4. On settlement, the host emits `HandResult` and collects a new cooperative settlement snapshot.
-5. Each seated player records the resulting checkpoint locally in its Arkade table-funds state.
+1. The host daemon starts the hand and derives hidden cards locally.
+2. Player daemons send JSON action requests to the current host.
+3. The host advances public state, appends `PlayerAction`, and persists the updated table.
+4. When the hand settles, the host appends `HandResult`, builds a snapshot, and schedules the next hand.
+5. Each participating daemon updates its local table-funds checkpoint state from the replicated table copy.
 
 ### Public read flow
 
@@ -319,125 +302,30 @@ For public tables, the host daemon can publish:
 - signed table advertisements
 - public table snapshots
 - public hand updates
-- public showdown reveals
 
-The indexer stores those records, and the web UI polls that read model. None of those steps affect canonical gameplay state.
-
-## Sequence Diagram
-
-```mermaid
-sequenceDiagram
-  participant HostCLI as "Host CLI"
-  participant Host as "host daemon"
-  participant Witness as "witness daemon"
-  participant Alice as "alice daemon"
-  participant Bob as "bob daemon"
-  participant Indexer as "optional indexer"
-  participant Arkade as "Arkade"
-
-  HostCLI->>Host: meshCreateTable()
-  Host->>Witness: lease-sign-request(epoch 1)
-  Witness-->>Host: lease-sign-response
-  Host->>Host: append TableAnnounce + HostLeaseGranted
-  opt public table
-    Host->>Indexer: POST table ad + initial public snapshot
-  end
-
-  Alice->>Arkade: prepareBuyIn()
-  Alice->>Host: join-request + prepared receipt
-  Host-->>Alice: join-response + canonical backlog
-
-  Bob->>Arkade: prepareBuyIn()
-  Bob->>Host: join-request + prepared receipt
-  Host-->>Bob: join-response + canonical backlog
-
-  Alice->>Arkade: confirmBuyIn()
-  Alice->>Host: buy-in-confirm
-  Bob->>Arkade: confirmBuyIn()
-  Bob->>Host: buy-in-confirm
-
-  Host->>Host: append TableReady
-  Host->>Alice: snapshot-sign-request
-  Host->>Bob: snapshot-sign-request
-  Host->>Witness: snapshot-sign-request
-  Alice-->>Host: snapshot-sign-response
-  Bob-->>Host: snapshot-sign-response
-  Witness-->>Host: snapshot-sign-response
-  Host->>Host: append WitnessSnapshot
-
-  loop each action
-    Alice->>Host: action-request when Alice is acting
-    Bob->>Host: action-request when Bob is acting
-    Host->>Host: append PlayerAction + ActionAccepted
-  end
-
-  Host->>Host: append HandResult
-  Host->>Alice: snapshot-sign-request
-  Host->>Bob: snapshot-sign-request
-  Host->>Witness: snapshot-sign-request
-  Alice-->>Host: snapshot-sign-response
-  Bob-->>Host: snapshot-sign-response
-  Witness-->>Host: snapshot-sign-response
-  Host->>Host: append WitnessSnapshot
-
-  Alice->>Arkade: recordCheckpoint() then cashOut()
-  Bob->>Arkade: recordCheckpoint() then cashOut()
-```
+The indexer stores those records, and the web UI reads that model. None of those steps give the indexer authority over gameplay or keys.
 
 ## Failure / Recovery Paths
 
 ### Between-hand host loss
 
-If the host disappears after a clean settlement boundary:
+If the host stops updating `LastHostHeartbeatAt`:
 
-- the witness detects missed heartbeats
-- the witness gathers failover acceptances from the seated players and configured witnesses
-- the witness installs a new host lease for the next epoch
-- the new host schedules the next hand
-
-No rollback is required because the table was already at a settlement boundary.
+- witnesses can take over when configured
+- if no witnesses are configured, the seated player with the lowest peer ID is the failover candidate
+- the new host appends `HostRotated`
+- the next hand starts from the latest stored snapshot
 
 ### Mid-hand host loss
 
-If the host disappears during an active unsettled hand and there is already a fully signed settlement checkpoint:
+If the host disappears during an active hand and a snapshot already exists:
 
-- a witness collects failover acceptances
-- the witness becomes the next host
-- the new host appends `HandAbort`
-- public state rolls back to the latest fully signed settlement snapshot
-- the new host captures a fresh rollback snapshot before resuming play
-
-## Recovery Diagram
-
-```mermaid
-sequenceDiagram
-  participant Host as "old host"
-  participant Witness as "witness / new host"
-  participant Alice as "alice"
-  participant Bob as "bob"
-
-  Host--xWitness: heartbeats stop
-  Note over Witness: host-failure timeout expires
-
-  Witness->>Witness: append HostFailoverProposed
-  Witness->>Alice: failover-accept-request
-  Witness->>Bob: failover-accept-request
-  Alice-->>Witness: signed acceptance
-  Bob-->>Witness: signed acceptance
-
-  Witness->>Witness: build new lease
-  Witness->>Witness: append HostRotated (new epoch)
-  Witness->>Witness: append HandAbort
-
-  Witness->>Alice: snapshot-sign-request(rollback snapshot)
-  Witness->>Bob: snapshot-sign-request(rollback snapshot)
-  Alice-->>Witness: snapshot-sign-response
-  Bob-->>Witness: snapshot-sign-response
-
-  Note over Witness: latest fully signed settlement boundary restored
-```
+- the failover daemon appends `HostRotated`
+- it appends `HandAbort`
+- it restores public state from the latest stored snapshot
+- it writes a fresh snapshot and continues from there
 
 ## Relationship To Other Docs
 
-- [protocol.md](./protocol.md): canonical wire format, event rules, snapshot rules, settlement rules, and failover semantics
-- [trust-model.md](./trust-model.md): guarantees, trust assumptions, privacy tradeoffs, and operational failure consequences
+- [protocol.md](./protocol.md): current local RPC surface, peer endpoints, signed objects, and public-read protocol
+- [trust-model.md](./trust-model.md): guarantees, trust assumptions, and operational failure consequences
