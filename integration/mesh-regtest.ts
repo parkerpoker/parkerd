@@ -13,17 +13,20 @@ import type {
 } from "@parker/protocol";
 import {
   DaemonRpcClient,
-  ProfileDaemon,
   resolveCliRuntimeConfig,
 } from "@parker/daemon-runtime";
 
 import { createApp } from "../apps/indexer/src/app.js";
 import { ParkerDatabase } from "../apps/indexer/src/db.js";
+
 const BUY_IN_SATS = 4_000;
 const FAUCET_AMOUNT_SATS = 100_000;
 const LIVE_BIG_BLIND_SATS = 800;
 const LIVE_SMALL_BLIND_SATS = 400;
 const WALLET_MIN_AVAILABLE_SATS = 20_000;
+const NIGIRI_COMMAND = join(process.cwd(), "scripts", "bin", "nigiri");
+
+process.env.PARKER_NIGIRI_BIN ??= NIGIRI_COMMAND;
 
 interface HarnessArgs {
   baseDir?: string;
@@ -56,9 +59,31 @@ interface ScenarioEnvironment {
 interface DaemonHarnessPeer {
   alias: string;
   client: DaemonRpcClient;
-  daemon: ProfileDaemon;
+  daemon: ExternalProfileDaemon;
   profile: string;
   walletPlayerId?: string;
+}
+
+class ExternalProfileDaemon {
+  constructor(
+    private readonly profile: string,
+    private readonly config: ReturnType<typeof resolveCliRuntimeConfig>,
+    private readonly mode: "host" | "player" | "witness",
+  ) {}
+
+  async start() {
+    const client = new DaemonRpcClient(this.profile, this.config);
+    await client.ensureRunning(this.mode);
+  }
+
+  async stop() {
+    const client = new DaemonRpcClient(this.profile, this.config);
+    try {
+      await client.stopDaemon();
+    } catch {
+      // Ignore stop races during harness cleanup.
+    }
+  }
 }
 
 interface MeshTableView {
@@ -548,7 +573,7 @@ function createHarnessPeer(profile: string, mode: "host" | "player" | "witness",
   return {
     alias: profile,
     client: new DaemonRpcClient(profile, peerConfig),
-    daemon: new ProfileDaemon(profile, peerConfig, mode),
+    daemon: new ExternalProfileDaemon(profile, peerConfig, mode),
     profile,
   };
 }
@@ -658,14 +683,35 @@ async function runCommandOutput(command: string, args: string[]) {
   return stdout;
 }
 
+async function runShellCommand(command: string, args: string[]) {
+  await runCommand("/bin/zsh", ["-lc", [command, ...args].map(shellEscape).join(" ")]);
+}
+
+async function runShellCommandOutput(command: string, args: string[]) {
+  return await runCommandOutput("/bin/zsh", ["-lc", [command, ...args].map(shellEscape).join(" ")]);
+}
+
 async function runNigiriCommand(datadir: string | undefined, args: string[]) {
   const prefixedArgs = datadir ? ["--datadir", datadir, ...args] : args;
-  await runCommand("nigiri", prefixedArgs);
+  await runShellCommand(NIGIRI_COMMAND, prefixedArgs);
 }
 
 async function runNigiriCommandOutput(datadir: string | undefined, args: string[]) {
   const prefixedArgs = datadir ? ["--datadir", datadir, ...args] : args;
-  return await runCommandOutput("nigiri", prefixedArgs);
+  return await runShellCommandOutput(NIGIRI_COMMAND, prefixedArgs);
+}
+
+function startNigiriProcess(datadir: string | undefined, args: string[]) {
+  const prefixedArgs = datadir ? ["--datadir", datadir, ...args] : args;
+  const child = spawn("/bin/zsh", ["-lc", [NIGIRI_COMMAND, ...prefixedArgs].map(shellEscape).join(" ")], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
+function shellEscape(value: string) {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
 function resolveNigiriDatadir(baseDir: string) {
@@ -682,7 +728,7 @@ function resolveNigiriDatadir(baseDir: string) {
 async function ensureNigiriStarted(datadir: string) {
   await mkdir(datadir, { recursive: true });
   try {
-    await runNigiriCommand(datadir, ["start", "--ark", "--ln", "--ci"]);
+    startNigiriProcess(datadir, ["start", "--ark", "--ln", "--ci"]);
   } catch (error) {
     log("nigiri-start-nonzero", {
       datadir,

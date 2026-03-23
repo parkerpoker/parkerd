@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+NIGIRI_BIN="$ROOT_DIR/scripts/bin/nigiri"
 
 BASE="${BASE:-/tmp/parker-browser-2p-$$}"
 INDEXER_PORT="${INDEXER_PORT:-}"
@@ -36,10 +37,14 @@ ensure_node_toolchain() {
     echo "npm must be available on PATH to run poker-regtest-ui-2p." >&2
     exit 1
   }
-  command -v nigiri >/dev/null 2>&1 || {
+  "$NIGIRI_BIN" --version >/dev/null 2>&1 || {
     echo "nigiri must be available on PATH to run poker-regtest-ui-2p." >&2
     exit 1
   }
+  if ! command -v go >/dev/null 2>&1 && [[ ! -x /opt/homebrew/bin/go ]] && [[ ! -x "$HOME/.gvm/gos/go1.24.0/bin/go" ]]; then
+    echo "go must be available on PATH to run parker-cli and parker-daemon." >&2
+    exit 1
+  fi
 }
 
 cleanup() {
@@ -55,7 +60,7 @@ cleanup() {
   [[ -n "${BOB_DAEMON_PID:-}" ]] && stop_pid "$BOB_DAEMON_PID"
   [[ -n "${INDEXER_PID:-}" ]] && stop_pid "$INDEXER_PID"
   [[ -n "${NIGIRI_START_PID:-}" ]] && stop_pid "$NIGIRI_START_PID"
-  nigiri --datadir "$NIGIRI_DATADIR" stop >/dev/null 2>&1 || true
+  "$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" stop >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -91,10 +96,10 @@ wait_for_http() {
 }
 
 wait_for_ark_wallet() {
-  local attempts="${1:-60}"
+  local attempts="${1:-240}"
   local status
   for ((attempt = 0; attempt < attempts; attempt += 1)); do
-    status="$(nigiri --datadir "$NIGIRI_DATADIR" arkd wallet status 2>/dev/null || true)"
+    status="$("$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" arkd wallet status 2>/dev/null || true)"
     if [[ "$status" == *"unlocked: true"* && "$status" == *"synced: true"* ]]; then
       return 0
     fi
@@ -104,13 +109,75 @@ wait_for_ark_wallet() {
 }
 
 seed_ark_liquidity() {
-  wait_for_ark_wallet 60 >/dev/null
+  wait_for_ark_wallet 240 >/dev/null
   local address
-  address="$(nigiri --datadir "$NIGIRI_DATADIR" arkd wallet address | tr -d '\r' | tail -n 1)"
+  address="$("$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" arkd wallet address | tr -d '\r' | tail -n 1)"
   [[ -n "$address" ]]
   for _ in {1..10}; do
-    nigiri --datadir "$NIGIRI_DATADIR" faucet "$address" >/dev/null
+    "$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" faucet "$address" >/dev/null
   done
+}
+
+wait_for_ark_ready() {
+  local attempts="${1:-120}"
+  local body=""
+  local signer_pubkey=""
+  local forfeit_pubkey=""
+
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    if body="$(curl -fsS http://127.0.0.1:7070/v1/info 2>/dev/null)" && [[ -n "$body" ]]; then
+      signer_pubkey="$(printf '%s' "$body" | json_field signerPubkey)"
+      forfeit_pubkey="$(printf '%s' "$body" | json_field forfeitPubkey)"
+      if [[ -n "$signer_pubkey" && "$signer_pubkey" != "null" ]]; then
+        printf '%s\n' "$body"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+
+  echo "timed out waiting for Ark server signer pubkey" >&2
+  return 1
+}
+
+json_field() {
+  node --input-type=module -e '
+    const path = process.argv[1].split(".");
+    let input = "";
+    process.stdin.on("data", (chunk) => input += chunk);
+    process.stdin.on("end", () => {
+      let value = JSON.parse(input);
+      for (const key of path) value = value?.[key];
+      if (typeof value === "object") console.log(JSON.stringify(value));
+      else console.log(value ?? "");
+    });
+  ' "$1"
+}
+
+assert_go_daemon_active() {
+  local label="$1"
+  local actor_root="$2"
+  local profile="$3"
+  local metadata_path="$actor_root/daemons/${profile}.json"
+  local log_path="$BASE/${label}.daemon.log"
+  local pid=""
+  local command_line=""
+
+  for ((attempt = 0; attempt < 40; attempt += 1)); do
+    if [[ -f "$metadata_path" ]]; then
+      pid="$(json_field pid <"$metadata_path")"
+      if [[ -n "$pid" ]]; then
+        command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+        if [[ "$command_line" == *"parker-daemon-go"* ]] && [[ -f "$log_path" ]] && grep -q 'go parker daemon starting' "$log_path"; then
+          return 0
+        fi
+      fi
+    fi
+    sleep 0.25
+  done
+
+  echo "expected Go daemon evidence for profile $profile; pid=${pid:-missing} command=${command_line:-missing}" >&2
+  return 1
 }
 
 actor_flags() {
@@ -132,7 +199,7 @@ pcli_actor() {
   local profile_name="$2"
   shift 2
   actor_flags "$actor_root"
-  node --import tsx apps/cli/src/index.ts "$@" "${ACTOR_FLAGS[@]}" --profile "$profile_name"
+  "$ROOT_DIR/scripts/bin/parker-cli" "$@" "${ACTOR_FLAGS[@]}" --profile "$profile_name"
 }
 
 start_daemon() {
@@ -142,7 +209,7 @@ start_daemon() {
   local peer_port="$4"
   mkdir -p "$actor_root"/{daemons,profiles,runs}
   actor_flags "$actor_root"
-  node --import tsx apps/daemon/src/index.ts \
+  "$ROOT_DIR/scripts/bin/parker-daemon" \
     "${ACTOR_FLAGS[@]}" \
     --profile "$profile_name" \
     --mode player \
@@ -199,10 +266,11 @@ echo "Building the web bundle for controller-served UIs..."
 npm run build -w @parker/web >/dev/null
 
 echo "Starting Nigiri..."
-nigiri --datadir "$NIGIRI_DATADIR" start --ark --ln --ci >"$BASE/nigiri.log" 2>&1 &
+"$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" start --ark --ln --ci >"$BASE/nigiri.log" 2>&1 &
 NIGIRI_START_PID=$!
 wait_for_http "http://127.0.0.1:7070/v1/info" 120 1
 seed_ark_liquidity
+wait_for_ark_ready 120 >/dev/null
 
 echo "Starting indexer on :${INDEXER_PORT}..."
 HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest \
@@ -214,6 +282,9 @@ echo "Starting Alice and Bob daemons..."
 ALICE_DAEMON_PID="$(start_daemon alice "$ALICE_ROOT" alice "$ALICE_PEER_PORT")"
 BOB_DAEMON_PID="$(start_daemon bob "$BOB_ROOT" bob "$BOB_PEER_PORT")"
 sleep 2
+assert_go_daemon_active alice "$ALICE_ROOT" alice
+assert_go_daemon_active bob "$BOB_ROOT" bob
+echo "Verified Go daemon ownership via metadata PID and native startup banner."
 
 echo "Bootstrapping Alice and Bob..."
 pcli_actor "$ALICE_ROOT" alice bootstrap Alice --json >/dev/null

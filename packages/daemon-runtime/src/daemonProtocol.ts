@@ -32,30 +32,37 @@ export interface DaemonRuntimeState {
   wallet?: WalletSummary;
 }
 
-export type DaemonMethod =
-  | "bootstrap"
-  | "meshBootstrapPeer"
-  | "meshCashOut"
-  | "meshCreateTable"
-  | "meshExit"
-  | "meshGetTable"
-  | "meshNetworkPeers"
-  | "meshPublicTables"
-  | "meshRenew"
-  | "meshRotateHost"
-  | "meshSendAction"
-  | "meshTableAnnounce"
-  | "meshTableJoin"
-  | "ping"
-  | "status"
-  | "stop"
-  | "watch"
-  | "walletDeposit"
-  | "walletFaucet"
-  | "walletOffboard"
-  | "walletOnboard"
-  | "walletSummary"
-  | "walletWithdraw";
+export const DAEMON_HEARTBEAT_INTERVAL_MS = 5_000;
+
+export const DAEMON_METHODS = [
+  "bootstrap",
+  "meshBootstrapPeer",
+  "meshCashOut",
+  "meshCreateTable",
+  "meshExit",
+  "meshGetTable",
+  "meshNetworkPeers",
+  "meshPublicTables",
+  "meshRenew",
+  "meshRotateHost",
+  "meshSendAction",
+  "meshTableAnnounce",
+  "meshTableJoin",
+  "ping",
+  "status",
+  "stop",
+  "watch",
+  "walletDeposit",
+  "walletFaucet",
+  "walletOffboard",
+  "walletOnboard",
+  "walletSummary",
+  "walletWithdraw",
+] as const;
+
+export const DAEMON_WATCH_EVENTS = ["log", "state"] as const;
+
+export type DaemonMethod = (typeof DAEMON_METHODS)[number];
 
 export interface DaemonRequestEnvelope {
   id: string;
@@ -73,7 +80,7 @@ export interface DaemonResponseEnvelope {
 }
 
 export interface DaemonEventEnvelope {
-  event: "log" | "state";
+  event: (typeof DAEMON_WATCH_EVENTS)[number];
   payload: DaemonRuntimeState | LogEnvelope;
   type: "event";
 }

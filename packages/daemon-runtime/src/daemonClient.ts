@@ -310,13 +310,12 @@ export class DaemonRpcClient {
       await cleanupProfileDaemonArtifacts(this.paths);
     }
 
-    const daemonEntryPath = resolveDaemonEntryPath();
-    const execArgs = ensureTypeScriptLoader(process.execArgv, daemonEntryPath);
-    const args = [...execArgs, daemonEntryPath, "--profile", this.profileName];
+    const daemonLauncherPath = resolveDaemonLauncherPath();
+    const args = ["--profile", this.profileName];
     if (mode) {
       args.push("--mode", mode);
     }
-    const child = spawn(process.execPath, args, {
+    const child = spawn(daemonLauncherPath, args, {
       cwd: process.cwd(),
       detached: true,
       env: {
@@ -365,22 +364,8 @@ export class DaemonRpcClient {
   }
 }
 
-function resolveDaemonEntryPath() {
-  return fileURLToPath(
-    import.meta.url.endsWith(".ts")
-      ? new URL("../../../apps/daemon/src/index.ts", import.meta.url)
-      : new URL("../../../apps/daemon/dist/index.js", import.meta.url),
-  );
-}
-
-function ensureTypeScriptLoader(execArgs: string[], daemonEntryPath: string) {
-  if (!daemonEntryPath.endsWith(".ts")) {
-    return execArgs;
-  }
-  if (execArgs.some((arg) => arg.includes("tsx"))) {
-    return execArgs;
-  }
-  return ["--import", "tsx", ...execArgs];
+function resolveDaemonLauncherPath() {
+  return fileURLToPath(new URL("../../../scripts/bin/parker-daemon", import.meta.url));
 }
 
 function sleep(ms: number) {

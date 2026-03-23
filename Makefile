@@ -6,7 +6,7 @@ poker-regtest-round:
 	./scripts/run-regtest-round.sh
 
 dev-local:
-	node --import tsx scripts/dev-local.ts
+	./scripts/bin/dev-local
 
 poker-regtest-ui-2p:
 	./scripts/run-two-player-ui.sh

@@ -1,21 +1,36 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const network = process.env.PARKER_NETWORK ?? "regtest";
 const startNigiri = network === "regtest";
+const daemonLauncher = "./scripts/bin/parker-daemon";
+const nigiriLauncher = "./scripts/bin/nigiri";
 const childProcesses = new Set<ChildProcess>();
+const nigiriDatadir =
+  process.env.PARKER_NIGIRI_DATADIR ??
+  join(homedir(), "Library", "Application Support", "Nigiri", "parker-dev-local");
+const indexerUrl = process.env.PARKER_INDEXER_URL ?? process.env.VITE_INDEXER_URL ?? "http://127.0.0.1:3020";
+const sharedEnv = {
+  ...process.env,
+  PARKER_INDEXER_URL: indexerUrl,
+  VITE_INDEXER_URL: process.env.VITE_INDEXER_URL ?? indexerUrl,
+  ...(startNigiri ? { PARKER_NIGIRI_DATADIR: nigiriDatadir } : {}),
+};
 
 async function main() {
   if (startNigiri) {
-    await runSetupCommand("Nigiri", "nigiri", ["start"]);
+    stopNigiri();
+    await runBlockingProcess("Nigiri", nigiriLauncher, ["--datadir", nigiriDatadir, "start", "--ark", "--ln", "--ci"]);
   }
 
   startLongRunningProcess("Indexer", "npm", ["run", "dev:indexer"]);
   startLongRunningProcess("Controller", "npm", ["run", "dev:controller"]);
   startLongRunningProcess("Web", "npm", ["run", "dev:web"]);
-  startLongRunningProcess("Host", "node", ["--import", "tsx", "apps/daemon/src/index.ts", "--profile", "host", "--mode", "host"]);
-  startLongRunningProcess("Witness", "node", ["--import", "tsx", "apps/daemon/src/index.ts", "--profile", "witness", "--mode", "witness"]);
-  startLongRunningProcess("Alice", "node", ["--import", "tsx", "apps/daemon/src/index.ts", "--profile", "alice", "--mode", "player"]);
-  startLongRunningProcess("Bob", "node", ["--import", "tsx", "apps/daemon/src/index.ts", "--profile", "bob", "--mode", "player"]);
+  startLongRunningProcess("Host", daemonLauncher, ["--profile", "host", "--mode", "host"]);
+  startLongRunningProcess("Witness", daemonLauncher, ["--profile", "witness", "--mode", "witness"]);
+  startLongRunningProcess("Alice", daemonLauncher, ["--profile", "alice", "--mode", "player"]);
+  startLongRunningProcess("Bob", daemonLauncher, ["--profile", "bob", "--mode", "player"]);
 
   process.stdout.write(
     `parker local dev stack running (network=${network}, nigiri=${startNigiri ? "started" : "skipped"})\n`,
@@ -26,6 +41,9 @@ async function main() {
       child.kill("SIGTERM");
     }
     childProcesses.clear();
+    if (startNigiri) {
+      stopNigiri();
+    }
     process.exit(0);
   };
 
@@ -36,7 +54,7 @@ async function main() {
 function startLongRunningProcess(label: string, command: string, args: string[]) {
   const child = spawn(command, args, {
     cwd: process.cwd(),
-    env: process.env,
+    env: sharedEnv,
     stdio: ["ignore", "pipe", "pipe"],
   });
   childProcesses.add(child);
@@ -53,27 +71,29 @@ function startLongRunningProcess(label: string, command: string, args: string[])
   });
 }
 
-async function runSetupCommand(label: string, command: string, args: string[]) {
-  await new Promise<void>((resolve, reject) => {
+function runBlockingProcess(label: string, command: string, args: string[]) {
+  return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: process.cwd(),
-      env: process.env,
+      env: sharedEnv,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    childProcesses.add(child);
+
     child.stdout?.on("data", (chunk: Buffer | string) => {
       writePrefixed(label, chunk.toString());
     });
     child.stderr?.on("data", (chunk: Buffer | string) => {
       writePrefixed(label, chunk.toString());
     });
-    child.once("exit", (code) => {
+    child.on("exit", (code, signal) => {
+      childProcesses.delete(child);
       if (code === 0) {
         resolve();
         return;
       }
-      reject(new Error(`${label} failed with exit code ${code ?? "unknown"}`));
+      reject(new Error(`${label} exited (${signal ?? code ?? "unknown"})`));
     });
-    child.once("error", reject);
   });
 }
 
@@ -81,6 +101,14 @@ function writePrefixed(label: string, text: string) {
   for (const line of text.split(/\r?\n/).filter(Boolean)) {
     process.stdout.write(`[${label}] ${line}\n`);
   }
+}
+
+function stopNigiri() {
+  spawnSync(nigiriLauncher, ["--datadir", nigiriDatadir, "stop"], {
+    cwd: process.cwd(),
+    env: sharedEnv,
+    stdio: "ignore",
+  });
 }
 
 void main().catch((error) => {

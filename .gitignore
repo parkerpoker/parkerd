@@ -6,6 +6,12 @@ coverage
 *.log
 .env
 .tmp/
+parker-cli
+parker-daemon
 apps/*/data/
 apps/*/dist/
+apps/example
 packages/*/dist/
+apps/.claude
+third_party/
+tools/bin/

@@ -16,7 +16,7 @@
     "dev:controller": "npm run dev -w @parker/controller",
     "dev:daemon": "npm run dev -w @parker/daemon",
     "dev:indexer": "npm run dev -w @parker/indexer",
-    "dev:local": "node --import tsx scripts/dev-local.ts",
+    "dev:local": "./scripts/bin/dev-local",
     "dev:web": "npm run dev -w @parker/web",
     "test:mesh-regtest": "node --import tsx integration/mesh-regtest.ts --start-nigiri",
     "test": "npm run test -w @parker/protocol && npm run test -w @parker/game-engine && npm run test -w @parker/settlement && npm run test -w @parker/daemon-runtime && npm run test -w @parker/indexer && npm run test -w @parker/daemon && npm run test -w @parker/controller && npm run test -w @parker/cli",

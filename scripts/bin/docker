@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -x /Applications/Docker.app/Contents/Resources/bin/docker ]]; then
+  exec /Applications/Docker.app/Contents/Resources/bin/docker "$@"
+fi
+
+if [[ -x /opt/homebrew/bin/docker ]]; then
+  exec /opt/homebrew/bin/docker "$@"
+fi
+
+if [[ -x /usr/local/bin/docker ]]; then
+  exec /usr/local/bin/docker "$@"
+fi
+
+echo "docker is not available" >&2
+exit 127

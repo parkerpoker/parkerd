@@ -1,0 +1,85 @@
+{
+  "transport": {
+    "kind": "unix-ndjson",
+    "request": {
+      "type": "request",
+      "fields": ["type", "id", "method", "params?"]
+    },
+    "response": {
+      "type": "response",
+      "fields": ["type", "id", "ok", "result?", "error?"]
+    },
+    "event": {
+      "type": "event",
+      "fields": ["type", "event", "payload"],
+      "eventNames": ["log", "state"]
+    }
+  },
+  "methods": [
+    "bootstrap",
+    "meshBootstrapPeer",
+    "meshCashOut",
+    "meshCreateTable",
+    "meshExit",
+    "meshGetTable",
+    "meshNetworkPeers",
+    "meshPublicTables",
+    "meshRenew",
+    "meshRotateHost",
+    "meshSendAction",
+    "meshTableAnnounce",
+    "meshTableJoin",
+    "ping",
+    "status",
+    "stop",
+    "watch",
+    "walletDeposit",
+    "walletFaucet",
+    "walletOffboard",
+    "walletOnboard",
+    "walletSummary",
+    "walletWithdraw"
+  ],
+  "paths": {
+    "log": "<daemonDir>/<slug>.log",
+    "metadata": "<daemonDir>/<slug>.json",
+    "socket": "<daemonDir>/<slug>.sock",
+    "stateDir": "<daemonDir>/<slug>.state",
+    "slugRule": "replace non [a-zA-Z0-9_-] with _"
+  },
+  "metadata": {
+    "fields": [
+      "lastHeartbeat",
+      "logPath",
+      "mode?",
+      "peerId?",
+      "peerUrl?",
+      "pid",
+      "profile",
+      "protocolId?",
+      "socketPath",
+      "startedAt",
+      "status"
+    ],
+    "statusValues": ["starting", "running", "stopping"],
+    "heartbeatMs": 5000,
+    "cleanupRemoves": ["socket", "metadata"],
+    "cleanupRetains": ["log", "stateDir"]
+  },
+  "watch": {
+    "ackTimeoutMs": 5000,
+    "initialFrame": "response",
+    "streamFrames": ["event"]
+  },
+  "autostart": {
+    "reachableTimeoutMs": 10000,
+    "requestTimeoutMs": 60000,
+    "detached": true,
+    "stdio": "ignore"
+  },
+  "launcher": {
+    "daemonWrapper": "scripts/bin/parker-daemon",
+    "cliWrapper": "scripts/bin/parker-cli",
+    "mode": "go-only"
+  }
+}
