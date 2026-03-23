@@ -88,11 +88,14 @@ func runNetworkCommand(client *parker.Client, positionals []string, outputJSON b
 		if len(positionals) < 2 || positionals[1] != "add" {
 			return errors.New("network bootstrap requires the `add` subcommand")
 		}
-		peerURL, err := requirePositional(positionals, 2, "peerUrl")
+		endpoint, err := requirePositional(positionals, 2, "endpoint")
 		if err != nil {
 			return err
 		}
-		params := map[string]any{"peerUrl": peerURL}
+		params := map[string]any{
+			"endpoint": endpoint,
+			"peerUrl":  endpoint,
+		}
 		if len(positionals) > 3 && positionals[3] != "" {
 			params["alias"] = positionals[3]
 		}
@@ -608,13 +611,13 @@ func printHelp() {
 		"parker-cli commands:",
 		"  bootstrap [nickname] --profile <name>",
 		"  wallet [summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
-		"  network peers|bootstrap add <peerUrl> [alias] --profile <name>",
+		"  network peers|bootstrap add <endpoint> [alias] --profile <name>",
 		"  table create [--name <name>] [--public] [--witness-peer-ids <id[,id]>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
 		"  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
 		"  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
 		"  interactive --profile <name>",
 		"Shared flags:",
-		"  --network <regtest|mutinynet> --indexer-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --mock --json",
+		"  --network <regtest|mutinynet> --indexer-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --transport-mode <legacy|v2> --tor-socks-addr <addr> --tor-control-addr <addr> --gossip-bootstrap-peers <csv> --mailbox-endpoints <csv> --mock --json",
 		"",
 	}, "\n"))
 }

@@ -4,6 +4,7 @@ import type {
   MeshRuntimeMode,
   MeshTableView,
   ProfileDaemonStatus,
+  TransportPeerSummary,
 } from "../types/parker.js";
 
 const LOCAL_CONTROLLER_HEADER = "X-Parker-Local-Controller";
@@ -130,14 +131,17 @@ export function requestLocalOffboard(profile: string, address: string, amountSat
 }
 
 export function listLocalPeers(profile: string) {
-  return fetchControllerJson<NonNullable<DaemonRuntimeState["mesh"]>["peers"]>(`/api/local/profiles/${profile}/network/peers`);
+  return fetchControllerJson<Array<NonNullable<DaemonRuntimeState["mesh"]>["peers"][number] | TransportPeerSummary>>(
+    `/api/local/profiles/${profile}/network/peers`,
+  );
 }
 
 export function bootstrapLocalPeer(
   profile: string,
   body: {
     alias?: string;
-    peerUrl: string;
+    endpoint: string;
+    peerUrl?: string;
     roles?: MeshRuntimeMode[];
   },
 ) {

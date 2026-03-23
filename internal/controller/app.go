@@ -46,8 +46,9 @@ type App struct {
 }
 
 type DaemonRuntimeState struct {
-	Mesh   *mesh.RuntimeState       `json:"mesh,omitempty"`
-	Wallet *walletpkg.WalletSummary `json:"wallet,omitempty"`
+	Mesh      *mesh.RuntimeState              `json:"mesh,omitempty"`
+	Transport *parker.TransportV2RuntimeState `json:"transport,omitempty"`
+	Wallet    *walletpkg.WalletSummary        `json:"wallet,omitempty"`
 }
 
 type ProfileDaemonStatus struct {

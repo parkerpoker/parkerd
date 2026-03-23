@@ -32,13 +32,13 @@ type ProxyDaemon struct {
 
 	metadataMu sync.Mutex
 	readyOnce  sync.Once
-	runtime    *nativeRuntime
+	runtime    daemonRuntime
 	stopOnce   sync.Once
 	watchers   sync.Map
 }
 
 func NewProxyDaemon(profileName string, config RuntimeConfig, mode string) (*ProxyDaemon, error) {
-	runtime, err := newNativeRuntime(profileName, config, mode)
+	runtime, err := newDaemonRuntime(profileName, config, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -243,18 +243,15 @@ func (d *ProxyDaemon) handleRuntimeRequest(method string, params map[string]any)
 	case "bootstrap":
 		return d.runtime.Bootstrap(stringFromMap(params, "nickname", ""))
 	case "walletSummary":
-		return d.runtime.walletSummary()
+		return d.runtime.WalletSummary()
 	case "walletFaucet":
 		amount := intFromMap(params, "amountSats", 0)
 		if amount <= 0 {
 			return nil, errors.New("amountSats is required")
 		}
-		if err := d.runtime.walletRuntime.Faucet(d.profileName, amount); err != nil {
-			return nil, err
-		}
-		return d.runtime.walletSummary()
+		return d.runtime.WalletFaucet(amount)
 	case "walletOnboard":
-		return d.runtime.walletRuntime.Onboard(d.profileName)
+		return d.runtime.WalletOnboard()
 	case "walletOffboard":
 		address := stringFromMap(params, "address", "")
 		if address == "" {
@@ -264,15 +261,16 @@ func (d *ProxyDaemon) handleRuntimeRequest(method string, params map[string]any)
 		if amount, ok := optionalInt(params, "amountSats"); ok {
 			amountPtr = &amount
 		}
-		return d.runtime.walletRuntime.Offboard(d.profileName, address, amountPtr)
+		return d.runtime.WalletOffboard(address, amountPtr)
 	case "walletDeposit":
-		return d.runtime.walletRuntime.CreateDepositQuote(d.profileName, intFromMap(params, "amountSats", 0))
+		return d.runtime.WalletDeposit(intFromMap(params, "amountSats", 0))
 	case "walletWithdraw":
-		return d.runtime.walletRuntime.SubmitWithdrawal(d.profileName, intFromMap(params, "amountSats", 0), stringFromMap(params, "invoice", ""))
+		return d.runtime.WalletWithdraw(intFromMap(params, "amountSats", 0), stringFromMap(params, "invoice", ""))
 	case "meshNetworkPeers":
 		return d.runtime.NetworkPeers()
 	case "meshBootstrapPeer":
-		return d.runtime.BootstrapPeer(stringFromMap(params, "peerUrl", ""), stringFromMap(params, "alias", ""), stringSliceFromMap(params, "roles"))
+		endpoint := firstNonEmpty(stringFromMap(params, "endpoint", ""), stringFromMap(params, "peerUrl", ""))
+		return d.runtime.BootstrapPeer(endpoint, stringFromMap(params, "alias", ""), stringSliceFromMap(params, "roles"))
 	case "meshCreateTable":
 		tableParams := nestedMap(params, "table")
 		return d.runtime.CreateTable(tableParams)
@@ -393,15 +391,28 @@ func (d *ProxyDaemon) writeRunningMetadata() error {
 	d.metadata.Mode = d.mode
 	d.metadata.Status = "running"
 	d.metadata.LastHeartbeat = timestampNow()
+	d.metadata.TransportMode = d.config.TransportMode
+
+	if transport := normalizeStateMap(d.currentState()["transport"]); len(transport) > 0 {
+		if peer := normalizeStateMap(transport["peer"]); len(peer) > 0 {
+			d.metadata.PeerID = firstNonEmpty(stringValue(peer["peerId"]), d.metadata.PeerID)
+			d.metadata.PeerEndpoint = firstNonEmpty(stringValue(peer["endpoint"]), d.metadata.PeerEndpoint)
+			d.metadata.DirectOnion = firstNonEmpty(stringValue(peer["directOnion"]), d.metadata.DirectOnion)
+			d.metadata.GossipOnion = firstNonEmpty(stringValue(peer["gossipOnion"]), d.metadata.GossipOnion)
+			d.metadata.ProtocolID = firstNonEmpty(stringValue(peer["protocolId"]), d.metadata.ProtocolID)
+		}
+	}
 
 	if mesh := normalizeStateMap(d.currentState()["mesh"]); len(mesh) > 0 {
 		if peer := normalizeStateMap(mesh["peer"]); len(peer) > 0 {
 			d.metadata.PeerID = firstNonEmpty(stringValue(peer["peerId"]), d.metadata.PeerID)
 			d.metadata.PeerURL = firstNonEmpty(stringValue(peer["peerUrl"]), d.metadata.PeerURL)
+			d.metadata.PeerEndpoint = firstNonEmpty(stringValue(peer["peerUrl"]), d.metadata.PeerEndpoint)
 			d.metadata.ProtocolID = firstNonEmpty(stringValue(peer["protocolId"]), d.metadata.ProtocolID)
 		}
 		d.metadata.PeerID = firstNonEmpty(stringValue(mesh["peerId"]), d.metadata.PeerID)
 		d.metadata.PeerURL = firstNonEmpty(stringValue(mesh["peerUrl"]), d.metadata.PeerURL)
+		d.metadata.PeerEndpoint = firstNonEmpty(stringValue(mesh["peerUrl"]), d.metadata.PeerEndpoint)
 		d.metadata.ProtocolID = firstNonEmpty(stringValue(mesh["protocolId"]), d.metadata.ProtocolID)
 	}
 

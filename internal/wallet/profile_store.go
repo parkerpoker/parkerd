@@ -149,13 +149,14 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 
 func ToLocalProfileSummary(profile PlayerProfileState) LocalProfileSummary {
 	summary := LocalProfileSummary{
-		HasPeerIdentity:     profile.PeerPrivateKeyHex != "",
-		HasProtocolIdentity: profile.ProtocolPrivateKeyHex != "",
-		HasWalletIdentity:   profile.WalletPrivateKeyHex != "",
-		KnownPeerCount:      len(profile.KnownPeers),
-		MeshTableCount:      len(profile.MeshTables),
-		Nickname:            profile.Nickname,
-		ProfileName:         profile.ProfileName,
+		HasPeerIdentity:      profile.PeerPrivateKeyHex != "",
+		HasProtocolIdentity:  profile.ProtocolPrivateKeyHex != "",
+		HasTransportIdentity: profile.TransportPrivateKeyHex != "",
+		HasWalletIdentity:    profile.WalletPrivateKeyHex != "",
+		KnownPeerCount:       len(profile.KnownPeers),
+		MeshTableCount:       len(profile.MeshTables),
+		Nickname:             profile.Nickname,
+		ProfileName:          profile.ProfileName,
 	}
 	if profile.CurrentMeshTableID != "" {
 		summary.CurrentMeshTableID = profile.CurrentMeshTableID

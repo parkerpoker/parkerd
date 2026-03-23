@@ -102,7 +102,7 @@ export function App() {
   const [offboardAddress, setOffboardAddress] = useState("bcrt1qexampleoffboardaddress000000000");
   const [offboardAmount, setOffboardAmount] = useState("");
   const [peerAlias, setPeerAlias] = useState("");
-  const [peerUrl, setPeerUrl] = useState("ws://127.0.0.1:7777/mesh");
+  const [peerEndpoint, setPeerEndpoint] = useState("tor://peer.onion:9735");
   const [createTableName, setCreateTableName] = useState("Browser Table");
   const [createSmallBlind, setCreateSmallBlind] = useState("50");
   const [createBigBlind, setCreateBigBlind] = useState("100");
@@ -114,9 +114,10 @@ export function App() {
 
   const networkName = import.meta.env.VITE_NETWORK ?? "regtest";
   const localMesh = profileStatus?.daemon.state?.mesh;
+  const localTransport = profileStatus?.daemon.state?.transport;
   const localWallet = profileStatus?.daemon.state?.wallet;
   const localTableSummaries = localMesh?.tables ?? [];
-  const peers = localMesh?.peers ?? [];
+  const peers = localTransport?.peers ?? localMesh?.peers ?? [];
   const latestSnapshot = selectedLocalTable?.latestSnapshot;
   const latestCheckpoint = selectedLocalTable?.latestFullySignedSnapshot;
   const spectatorModeOnly = controllerAvailable !== true || !selectedProfile;
@@ -467,8 +468,8 @@ export function App() {
             controllerConnected={controllerConnected}
             nickname={nickname}
             onNicknameChange={setNickname}
-            peerUrl={peerUrl}
-            onPeerUrlChange={setPeerUrl}
+            peerEndpoint={peerEndpoint}
+            onPeerEndpointChange={setPeerEndpoint}
             peerAlias={peerAlias}
             onPeerAliasChange={setPeerAlias}
             peers={peers}
@@ -498,7 +499,8 @@ export function App() {
               void runControllerAction("Add bootstrap peer", async () =>
                 await bootstrapLocalPeer(selectedProfile, {
                   ...(peerAlias ? { alias: peerAlias } : {}),
-                  peerUrl,
+                  endpoint: peerEndpoint,
+                  peerUrl: peerEndpoint,
                   roles: ["host", "witness", "player"],
                 }),
               );

@@ -21,12 +21,19 @@ import (
 )
 
 const (
-	namespaceRuntimeTableState   = "runtime/table/state"
-	namespaceRuntimePrivateState = "runtime/table/private"
-	namespaceRuntimePublicAds    = "runtime/public/ad"
-	namespaceRuntimeTableFunds   = "runtime/table/funds"
-	namespaceRuntimeEvents       = "runtime/table/events"
-	namespaceRuntimeSnapshots    = "runtime/table/snapshots"
+	namespaceRuntimeTableState          = "runtime/table/state"
+	namespaceRuntimePrivateState        = "runtime/table/private"
+	namespaceRuntimePublicAds           = "runtime/public/ad"
+	namespaceRuntimeTableFunds          = "runtime/table/funds"
+	namespaceRuntimeEvents              = "runtime/table/events"
+	namespaceRuntimeSnapshots           = "runtime/table/snapshots"
+	namespaceRuntimeTransportManifest   = "runtime/transport/manifest"
+	namespaceRuntimeTransportPeers      = "runtime/transport/peer"
+	namespaceRuntimeTransportOutbox     = "runtime/transport/outbox"
+	namespaceRuntimeTransportInbox      = "runtime/transport/inbox"
+	namespaceRuntimeTransportDedupe     = "runtime/transport/dedupe"
+	namespaceRuntimeTransportDeadLetter = "runtime/transport/dead-letter"
+	namespaceRuntimeTransportTables     = "runtime/transport/table"
 
 	namespaceIndexerAds     = "indexer/public/ad"
 	namespaceIndexerStates  = "indexer/public/state"
@@ -209,6 +216,86 @@ func (repository *RuntimeRepository) WithTableLock(tableID string, fn func() err
 	mutex.Lock()
 	defer mutex.Unlock()
 	return fn()
+}
+
+func (repository *RuntimeRepository) LoadTransportManifest() ([]byte, error) {
+	return repository.stores.core.GetRecord(namespaceRuntimeTransportManifest, repository.profile)
+}
+
+func (repository *RuntimeRepository) SaveTransportManifest(raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportManifest, repository.profile, raw)
+}
+
+func (repository *RuntimeRepository) ListTransportPeers() (map[string][]byte, error) {
+	return repository.stores.core.ListRecords(namespaceRuntimeTransportPeers)
+}
+
+func (repository *RuntimeRepository) SaveTransportPeer(peerID string, raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportPeers, peerID, raw)
+}
+
+func (repository *RuntimeRepository) DeleteTransportPeer(peerID string) error {
+	return repository.stores.core.DeleteRecord(namespaceRuntimeTransportPeers, peerID)
+}
+
+func (repository *RuntimeRepository) ListTransportOutbox() (map[string][]byte, error) {
+	return repository.stores.core.ListRecords(namespaceRuntimeTransportOutbox)
+}
+
+func (repository *RuntimeRepository) SaveTransportOutboxEntry(messageID string, raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportOutbox, messageID, raw)
+}
+
+func (repository *RuntimeRepository) DeleteTransportOutboxEntry(messageID string) error {
+	return repository.stores.core.DeleteRecord(namespaceRuntimeTransportOutbox, messageID)
+}
+
+func (repository *RuntimeRepository) ListTransportInbox() (map[string][]byte, error) {
+	return repository.stores.core.ListRecords(namespaceRuntimeTransportInbox)
+}
+
+func (repository *RuntimeRepository) SaveTransportInboxEntry(messageID string, raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportInbox, messageID, raw)
+}
+
+func (repository *RuntimeRepository) DeleteTransportInboxEntry(messageID string) error {
+	return repository.stores.core.DeleteRecord(namespaceRuntimeTransportInbox, messageID)
+}
+
+func (repository *RuntimeRepository) ListTransportDedupe() (map[string][]byte, error) {
+	return repository.stores.core.ListRecords(namespaceRuntimeTransportDedupe)
+}
+
+func (repository *RuntimeRepository) SaveTransportDedupeEntry(key string, raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportDedupe, key, raw)
+}
+
+func (repository *RuntimeRepository) DeleteTransportDedupeEntry(key string) error {
+	return repository.stores.core.DeleteRecord(namespaceRuntimeTransportDedupe, key)
+}
+
+func (repository *RuntimeRepository) ListTransportDeadLetters() (map[string][]byte, error) {
+	return repository.stores.core.ListRecords(namespaceRuntimeTransportDeadLetter)
+}
+
+func (repository *RuntimeRepository) SaveTransportDeadLetter(messageID string, raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportDeadLetter, messageID, raw)
+}
+
+func (repository *RuntimeRepository) DeleteTransportDeadLetter(messageID string) error {
+	return repository.stores.core.DeleteRecord(namespaceRuntimeTransportDeadLetter, messageID)
+}
+
+func (repository *RuntimeRepository) LoadTransportTable(tableID string) ([]byte, error) {
+	return repository.stores.core.GetRecord(namespaceRuntimeTransportTables, tableID)
+}
+
+func (repository *RuntimeRepository) SaveTransportTable(tableID string, raw []byte) error {
+	return repository.stores.core.PutRecord(namespaceRuntimeTransportTables, tableID, raw)
+}
+
+func (repository *RuntimeRepository) ListTransportTables() (map[string][]byte, error) {
+	return repository.stores.core.ListRecords(namespaceRuntimeTransportTables)
 }
 
 func OpenIndexerRepository(runtimeConfig cfg.RuntimeConfig) (*IndexerRepository, error) {

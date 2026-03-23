@@ -17,7 +17,13 @@ type TableSessionState struct {
 
 type KnownPeerState struct {
 	Alias             string   `json:"alias,omitempty"`
+	Capabilities      []string `json:"capabilities,omitempty"`
+	DirectEndpoint    string   `json:"directEndpoint,omitempty"`
+	Endpoint          string   `json:"endpoint,omitempty"`
+	GossipEndpoint    string   `json:"gossipEndpoint,omitempty"`
 	LastSeenAt        string   `json:"lastSeenAt,omitempty"`
+	MailboxEndpoints  []string `json:"mailboxEndpoints,omitempty"`
+	ManifestEpoch     int      `json:"manifestEpoch,omitempty"`
 	PeerID            string   `json:"peerId"`
 	PeerURL           string   `json:"peerUrl"`
 	ProtocolPubkeyHex string   `json:"protocolPubkeyHex,omitempty"`
@@ -36,30 +42,32 @@ type MeshTableReferenceState struct {
 }
 
 type PlayerProfileState struct {
-	CurrentTable          *TableSessionState                 `json:"currentTable,omitempty"`
-	CurrentMeshTableID    string                             `json:"currentMeshTableId,omitempty"`
-	HandSeeds             map[string]string                  `json:"handSeeds"`
-	KnownPeers            []KnownPeerState                   `json:"knownPeers,omitempty"`
-	MeshTables            map[string]MeshTableReferenceState `json:"meshTables,omitempty"`
-	MockWallet            *WalletSummary                     `json:"mockWallet,omitempty"`
-	Nickname              string                             `json:"nickname"`
-	PeerPrivateKeyHex     string                             `json:"peerPrivateKeyHex,omitempty"`
-	PrivateKeyHex         string                             `json:"privateKeyHex"`
-	ProfileName           string                             `json:"profileName"`
-	ProtocolPrivateKeyHex string                             `json:"protocolPrivateKeyHex,omitempty"`
-	WalletPrivateKeyHex   string                             `json:"walletPrivateKeyHex,omitempty"`
+	CurrentTable           *TableSessionState                 `json:"currentTable,omitempty"`
+	CurrentMeshTableID     string                             `json:"currentMeshTableId,omitempty"`
+	HandSeeds              map[string]string                  `json:"handSeeds"`
+	KnownPeers             []KnownPeerState                   `json:"knownPeers,omitempty"`
+	MeshTables             map[string]MeshTableReferenceState `json:"meshTables,omitempty"`
+	MockWallet             *WalletSummary                     `json:"mockWallet,omitempty"`
+	Nickname               string                             `json:"nickname"`
+	PeerPrivateKeyHex      string                             `json:"peerPrivateKeyHex,omitempty"`
+	PrivateKeyHex          string                             `json:"privateKeyHex"`
+	ProfileName            string                             `json:"profileName"`
+	ProtocolPrivateKeyHex  string                             `json:"protocolPrivateKeyHex,omitempty"`
+	TransportPrivateKeyHex string                             `json:"transportPrivateKeyHex,omitempty"`
+	WalletPrivateKeyHex    string                             `json:"walletPrivateKeyHex,omitempty"`
 }
 
 type LocalProfileSummary struct {
-	CurrentMeshTableID  string `json:"currentMeshTableId,omitempty"`
-	CurrentTableID      string `json:"currentTableId,omitempty"`
-	HasPeerIdentity     bool   `json:"hasPeerIdentity"`
-	HasProtocolIdentity bool   `json:"hasProtocolIdentity"`
-	HasWalletIdentity   bool   `json:"hasWalletIdentity"`
-	KnownPeerCount      int    `json:"knownPeerCount"`
-	MeshTableCount      int    `json:"meshTableCount"`
-	Nickname            string `json:"nickname"`
-	ProfileName         string `json:"profileName"`
+	CurrentMeshTableID   string `json:"currentMeshTableId,omitempty"`
+	CurrentTableID       string `json:"currentTableId,omitempty"`
+	HasPeerIdentity      bool   `json:"hasPeerIdentity"`
+	HasProtocolIdentity  bool   `json:"hasProtocolIdentity"`
+	HasTransportIdentity bool   `json:"hasTransportIdentity"`
+	HasWalletIdentity    bool   `json:"hasWalletIdentity"`
+	KnownPeerCount       int    `json:"knownPeerCount"`
+	MeshTableCount       int    `json:"meshTableCount"`
+	Nickname             string `json:"nickname"`
+	ProfileName          string `json:"profileName"`
 }
 
 type BootstrapResult struct {

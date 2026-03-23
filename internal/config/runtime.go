@@ -50,6 +50,13 @@ type RuntimeConfig struct {
 	PeerPort          int
 	ProfileDir        string
 	RunDir            string
+	TransportMode     string
+	TorControlAddr    string
+	TorSocksAddr      string
+	GossipBootstrap   []string
+	GossipOnionPort   int
+	DirectOnionPort   int
+	MailboxEndpoints  []string
 	UseMockSettlement bool
 }
 
@@ -66,9 +73,13 @@ type ProfileDaemonMetadata struct {
 	Mode          string `json:"mode,omitempty"`
 	PeerID        string `json:"peerId,omitempty"`
 	PeerURL       string `json:"peerUrl,omitempty"`
+	PeerEndpoint  string `json:"peerEndpoint,omitempty"`
 	PID           int    `json:"pid"`
 	Profile       string `json:"profile"`
 	ProtocolID    string `json:"protocolId,omitempty"`
+	GossipOnion   string `json:"gossipOnion,omitempty"`
+	DirectOnion   string `json:"directOnion,omitempty"`
+	TransportMode string `json:"transportMode,omitempty"`
 	SocketPath    string `json:"socketPath"`
 	StartedAt     string `json:"startedAt"`
 	Status        string `json:"status"`
@@ -99,6 +110,7 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		IndexerPort:       DefaultIndexerPort,
 		Network:           network,
 		PeerHost:          "127.0.0.1",
+		TransportMode:     "legacy",
 	}
 	if network == "mutinynet" {
 		cfg.ArkServerURL = MutinynetArkServerURL
@@ -217,6 +229,35 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 	cfg.PeerPort = parseOptionalInt(
 		firstNonEmpty(flags["peer-port"], env["PARKER_PEER_PORT"], env["ARKD_PEER_PORT"]),
 		0,
+	)
+	cfg.TransportMode = normalizeChoice(
+		firstNonEmpty(flags["transport-mode"], env["PARKER_TRANSPORT_MODE"], cfg.TransportMode),
+		[]string{"legacy", "v2"},
+		cfg.TransportMode,
+	)
+	cfg.TorSocksAddr = firstNonEmpty(
+		flags["tor-socks-addr"],
+		env["PARKER_TOR_SOCKS_ADDR"],
+		"127.0.0.1:9050",
+	)
+	cfg.TorControlAddr = firstNonEmpty(
+		flags["tor-control-addr"],
+		env["PARKER_TOR_CONTROL_ADDR"],
+		"127.0.0.1:9051",
+	)
+	cfg.GossipBootstrap = parseCSV(
+		firstNonEmpty(flags["gossip-bootstrap-peers"], env["PARKER_GOSSIP_BOOTSTRAP_PEERS"]),
+	)
+	cfg.GossipOnionPort = parseOptionalInt(
+		firstNonEmpty(flags["gossip-onion-port"], env["PARKER_GOSSIP_ONION_PORT"]),
+		9734,
+	)
+	cfg.DirectOnionPort = parseOptionalInt(
+		firstNonEmpty(flags["direct-onion-port"], env["PARKER_DIRECT_ONION_PORT"]),
+		9735,
+	)
+	cfg.MailboxEndpoints = parseCSV(
+		firstNonEmpty(flags["mailbox-endpoints"], env["PARKER_MAILBOX_ENDPOINTS"]),
 	)
 	cfg.IndexerHost = firstNonEmpty(
 		flags["indexer-host"],
@@ -431,6 +472,21 @@ func parseOptionalInt(input string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func parseCSV(input string) []string {
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+	parts := strings.Split(input, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			values = append(values, part)
+		}
+	}
+	return values
 }
 
 func normalizeChoice(value string, allowed []string, fallback string) string {

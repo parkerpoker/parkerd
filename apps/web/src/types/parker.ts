@@ -1,6 +1,7 @@
 // Web-local Parker types kept in sync with the Go controller, daemon, and indexer contracts.
 
 export type MeshRuntimeMode = "player" | "host" | "witness" | "indexer";
+export type TransportMode = "legacy" | "v2";
 
 export interface WalletSummary {
   availableSats: number;
@@ -14,6 +15,7 @@ export interface LocalProfileSummary {
   currentTableId?: string;
   hasPeerIdentity: boolean;
   hasProtocolIdentity: boolean;
+  hasTransportIdentity: boolean;
   hasWalletIdentity: boolean;
   knownPeerCount: number;
   meshTableCount: number;
@@ -22,9 +24,12 @@ export interface LocalProfileSummary {
 }
 
 export interface ProfileDaemonMetadata {
+  directOnion?: string;
+  gossipOnion?: string;
   lastHeartbeat: string;
   logPath: string;
   mode?: MeshRuntimeMode;
+  peerEndpoint?: string;
   peerId?: string;
   peerUrl?: string;
   pid: number;
@@ -33,13 +38,20 @@ export interface ProfileDaemonMetadata {
   socketPath: string;
   startedAt: string;
   status: "running" | "starting" | "stopping";
+  transportMode?: TransportMode;
 }
 
 export interface PeerAddress {
   alias?: string;
+  capabilities?: string[];
+  directEndpoint?: string;
+  endpoint?: string;
+  gossipEndpoint?: string;
   lastSeenAt?: string;
+  mailboxEndpoints?: string[];
+  manifestEpoch?: number;
   peerId: string;
-  peerUrl: string;
+  peerUrl?: string;
   protocolPubkeyHex?: string;
   relayPeerId?: string;
   roles: string[];
@@ -97,6 +109,45 @@ export interface MeshRuntimeState {
   peers: PeerAddress[];
   publicTables: SignedTableAdvertisement[];
   tables: TableSummary[];
+}
+
+export interface TransportPeerSummary {
+  alias?: string;
+  capabilities?: string[];
+  directOnion?: string;
+  endpoint?: string;
+  gossipOnion?: string;
+  lastSeenAt?: string;
+  mailboxEndpoints?: string[];
+  manifestEpoch?: number;
+  peerId: string;
+  protocolId?: string;
+  roles: string[];
+}
+
+export interface TransportRuntimeState {
+  bootstrapPeers: string[];
+  mailboxes: string[];
+  mode: string;
+  peer: {
+    directOnion?: string;
+    endpoint?: string;
+    gossipOnion?: string;
+    peerId?: string;
+    protocolId?: string;
+    transportKeyId?: string;
+    transportWireVersion: number;
+    walletPlayerId?: string;
+  };
+  peers: TransportPeerSummary[];
+  queues: {
+    deadLetter: number;
+    dedupe: number;
+    inbox: number;
+    outbox: number;
+  };
+  transportMode: TransportMode;
+  transportWireVersion: number;
 }
 
 export interface LegalAction {
@@ -234,6 +285,7 @@ export interface MeshTableView {
 
 export interface DaemonRuntimeState {
   mesh?: MeshRuntimeState;
+  transport?: TransportRuntimeState;
   wallet?: WalletSummary;
 }
 

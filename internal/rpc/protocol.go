@@ -58,7 +58,8 @@ type EventEnvelope struct {
 }
 
 type RuntimeState struct {
-	Mesh *MeshRuntimeState `json:"mesh,omitempty"`
+	Mesh      *MeshRuntimeState `json:"mesh,omitempty"`
+	Transport any               `json:"transport,omitempty"`
 }
 
 type MeshRuntimeState struct {

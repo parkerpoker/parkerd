@@ -390,8 +390,19 @@ func (c *Client) startEnvironment() []string {
 		"PARKER_DAEMON_DIR="+c.Config.DaemonDir,
 		"PARKER_PEER_HOST="+c.Config.PeerHost,
 		"PARKER_PEER_PORT="+strconv.Itoa(c.Config.PeerPort),
+		"PARKER_TRANSPORT_MODE="+c.Config.TransportMode,
+		"PARKER_TOR_SOCKS_ADDR="+c.Config.TorSocksAddr,
+		"PARKER_TOR_CONTROL_ADDR="+c.Config.TorControlAddr,
+		"PARKER_GOSSIP_ONION_PORT="+strconv.Itoa(c.Config.GossipOnionPort),
+		"PARKER_DIRECT_ONION_PORT="+strconv.Itoa(c.Config.DirectOnionPort),
 		"PARKER_RUN_DIR="+c.Config.RunDir,
 	)
+	if len(c.Config.GossipBootstrap) > 0 {
+		environment = append(environment, "PARKER_GOSSIP_BOOTSTRAP_PEERS="+strings.Join(c.Config.GossipBootstrap, ","))
+	}
+	if len(c.Config.MailboxEndpoints) > 0 {
+		environment = append(environment, "PARKER_MAILBOX_ENDPOINTS="+strings.Join(c.Config.MailboxEndpoints, ","))
+	}
 	if c.Config.IndexerURL != "" {
 		environment = append(environment, "PARKER_INDEXER_URL="+c.Config.IndexerURL)
 	}

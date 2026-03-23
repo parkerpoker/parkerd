@@ -17,11 +17,11 @@ interface NetworkViewProps {
   controllerConnected: boolean;
   nickname: string;
   onNicknameChange: (value: string) => void;
-  peerUrl: string;
-  onPeerUrlChange: (value: string) => void;
+  peerEndpoint: string;
+  onPeerEndpointChange: (value: string) => void;
   peerAlias: string;
   onPeerAliasChange: (value: string) => void;
-  peers: Array<{ peerId: string; alias?: string | undefined; peerUrl: string; roles: string[] }>;
+  peers: Array<{ peerId: string; alias?: string | undefined; endpoint?: string; peerUrl?: string; roles: string[] }>;
   busyAction: string | null;
   onAction: (label: string, action: () => Promise<unknown>) => void;
   notice: string | null;
@@ -52,8 +52,8 @@ export function NetworkView({
   controllerConnected,
   nickname,
   onNicknameChange,
-  peerUrl,
-  onPeerUrlChange,
+  peerEndpoint,
+  onPeerEndpointChange,
   peerAlias,
   onPeerAliasChange,
   peers,
@@ -72,6 +72,7 @@ export function NetworkView({
   onEmergencyExit,
 }: NetworkViewProps) {
   const localMesh = profileStatus?.daemon.state?.mesh;
+  const localTransport = profileStatus?.daemon.state?.transport;
   const daemonRunning = profileStatus?.daemon.reachable === true;
 
   return (
@@ -121,7 +122,7 @@ export function NetworkView({
             </div>
             <div className="rounded-md border border-border bg-secondary/50 p-2 text-xs">
               <div className="text-muted-foreground">Peer ID</div>
-              <div className="text-foreground truncate">{localMesh?.peer.peerId ?? 'n/a'}</div>
+              <div className="text-foreground truncate">{localTransport?.peer.peerId ?? localMesh?.peer.peerId ?? 'n/a'}</div>
             </div>
           </div>
 
@@ -152,7 +153,7 @@ export function NetworkView({
             <span className="text-foreground">{peers.length}</span>
           </div>
 
-          <InputField label="Bootstrap Peer URL" value={peerUrl} onChange={(e) => onPeerUrlChange(e.target.value)} placeholder="ws://127.0.0.1:7777/mesh" />
+          <InputField label="Bootstrap Endpoint" value={peerEndpoint} onChange={(e) => onPeerEndpointChange(e.target.value)} placeholder="tor://peer.onion:9735" />
           <InputField label="Alias (optional)" value={peerAlias} onChange={(e) => onPeerAliasChange(e.target.value)} placeholder="Peer alias" />
           <Button variant="primary" onClick={onAddPeer} disabled={!selectedProfile || busyAction !== null} className="w-full">
             Add Peer
@@ -163,7 +164,7 @@ export function NetworkView({
               {peers.map((peer) => (
                 <div key={peer.peerId} className="rounded-md border border-border bg-secondary/50 p-2 text-xs">
                   <div className="text-foreground truncate">{peer.alias ?? peer.peerId}</div>
-                  <div className="text-muted-foreground truncate">{peer.peerUrl}</div>
+                  <div className="text-muted-foreground truncate">{peer.endpoint ?? peer.peerUrl ?? 'n/a'}</div>
                   <div className="text-muted-foreground">{peer.roles.join(', ') || 'no roles'}</div>
                 </div>
               ))}
