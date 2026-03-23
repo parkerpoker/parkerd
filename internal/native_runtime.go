@@ -1977,6 +1977,10 @@ func (runtime *nativeRuntime) knownPeerURL(peerID string) string {
 }
 
 func (runtime *nativeRuntime) buildSignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
+	decisionIndex, err := nativeActionDecisionIndex(table)
+	if err != nil {
+		return nativeActionRequest{}, err
+	}
 	handID := ""
 	if table.ActiveHand != nil {
 		handID = table.ActiveHand.State.HandID
@@ -1989,15 +1993,16 @@ func (runtime *nativeRuntime) buildSignedActionRequest(table nativeTableState, a
 	}
 	signedAt := nowISO()
 	request := nativeActionRequest{
-		Action:      action,
-		Epoch:       table.CurrentEpoch,
-		HandID:      handID,
-		PlayerID:    runtime.walletID.PlayerID,
-		ProfileName: runtime.profileName,
-		SignedAt:    signedAt,
-		TableID:     table.Config.TableID,
+		Action:        action,
+		DecisionIndex: decisionIndex,
+		Epoch:         table.CurrentEpoch,
+		HandID:        handID,
+		PlayerID:      runtime.walletID.PlayerID,
+		ProfileName:   runtime.profileName,
+		SignedAt:      signedAt,
+		TableID:       table.Config.TableID,
 	}
-	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.Action, request.SignedAt))
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
@@ -2108,10 +2113,17 @@ func (runtime *nativeRuntime) validateActionRequest(table nativeTableState, seat
 	if request.Epoch != table.CurrentEpoch {
 		return errors.New("action request epoch mismatch")
 	}
+	expectedDecisionIndex, err := nativeActionDecisionIndex(table)
+	if err != nil {
+		return err
+	}
+	if request.DecisionIndex != expectedDecisionIndex {
+		return errors.New("action request decision mismatch")
+	}
 	if request.SignedAt == "" || request.SignatureHex == "" {
 		return errors.New("action request is missing player signature")
 	}
-	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.Action, request.SignedAt), request.SignatureHex)
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt), request.SignatureHex)
 	if err != nil {
 		return err
 	}
@@ -2409,15 +2421,23 @@ func seatRecordForPlayer(table nativeTableState, playerID string) (nativeSeatRec
 	return nativeSeatRecord{}, false
 }
 
-func nativeActionAuthPayload(tableID, playerID, handID string, epoch int, action game.Action, signedAt string) map[string]any {
+func nativeActionDecisionIndex(table nativeTableState) (int, error) {
+	if table.ActiveHand == nil {
+		return 0, errors.New("hand is not active")
+	}
+	return len(table.ActiveHand.State.ActionLog), nil
+}
+
+func nativeActionAuthPayload(tableID, playerID, handID string, epoch int, decisionIndex int, action game.Action, signedAt string) map[string]any {
 	return map[string]any{
-		"action":   rawJSONMap(action),
-		"epoch":    epoch,
-		"handId":   handID,
-		"playerId": playerID,
-		"signedAt": signedAt,
-		"tableId":  tableID,
-		"type":     "table-action",
+		"action":        rawJSONMap(action),
+		"decisionIndex": decisionIndex,
+		"epoch":         epoch,
+		"handId":        handID,
+		"playerId":      playerID,
+		"signedAt":      signedAt,
+		"tableId":       tableID,
+		"type":          "table-action",
 	}
 }
 

@@ -296,14 +296,15 @@ type nativeJoinRequest struct {
 }
 
 type nativeActionRequest struct {
-	Action       game.Action `json:"action"`
-	Epoch        int         `json:"epoch"`
-	HandID       string      `json:"handId"`
-	PlayerID     string      `json:"playerId"`
-	ProfileName  string      `json:"profileName"`
-	SignatureHex string      `json:"signatureHex"`
-	SignedAt     string      `json:"signedAt"`
-	TableID      string      `json:"tableId"`
+	Action        game.Action `json:"action"`
+	DecisionIndex int         `json:"decisionIndex"`
+	Epoch         int         `json:"epoch"`
+	HandID        string      `json:"handId"`
+	PlayerID      string      `json:"playerId"`
+	ProfileName   string      `json:"profileName"`
+	SignatureHex  string      `json:"signatureHex"`
+	SignedAt      string      `json:"signedAt"`
+	TableID       string      `json:"tableId"`
 }
 
 type nativeTableSyncRequest struct {

@@ -65,15 +65,16 @@ func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 
 	signedAt := nowISO()
 	forged := nativeActionRequest{
-		Action:      game.Action{Type: game.ActionCall},
-		Epoch:       table.CurrentEpoch,
-		HandID:      table.ActiveHand.State.HandID,
-		PlayerID:    host.walletID.PlayerID,
-		ProfileName: guest.profileName,
-		SignedAt:    signedAt,
-		TableID:     tableID,
+		Action:        game.Action{Type: game.ActionCall},
+		DecisionIndex: len(table.ActiveHand.State.ActionLog),
+		Epoch:         table.CurrentEpoch,
+		HandID:        table.ActiveHand.State.HandID,
+		PlayerID:      host.walletID.PlayerID,
+		ProfileName:   guest.profileName,
+		SignedAt:      signedAt,
+		TableID:       tableID,
 	}
-	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeActionAuthPayload(forged.TableID, forged.PlayerID, forged.HandID, forged.Epoch, forged.Action, forged.SignedAt))
+	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeActionAuthPayload(forged.TableID, forged.PlayerID, forged.HandID, forged.Epoch, forged.DecisionIndex, forged.Action, forged.SignedAt))
 	if err != nil {
 		t.Fatalf("sign forged action: %v", err)
 	}
@@ -81,6 +82,47 @@ func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 
 	if _, err := host.handleActionFromPeer(forged); err == nil || !strings.Contains(err.Error(), "signature") {
 		t.Fatalf("expected forged action to be rejected with signature error, got %v", err)
+	}
+}
+
+func TestHandleActionRejectsReplayedDecisionSignature(t *testing.T) {
+	t.Parallel()
+
+	host := newNativeTestRuntime(t, "host")
+	guest := newNativeTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, host, tableID)
+
+	staleCall, err := host.buildSignedActionRequest(table, game.Action{Type: game.ActionCall})
+	if err != nil {
+		t.Fatalf("build stale call request: %v", err)
+	}
+
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionRaise, TotalSats: 200}); err != nil {
+		t.Fatalf("host send raise: %v", err)
+	}
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("guest send preflop call: %v", err)
+	}
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 100}); err != nil {
+		t.Fatalf("guest send flop bet: %v", err)
+	}
+
+	if _, err := host.handleActionFromPeer(staleCall); err == nil || !strings.Contains(err.Error(), "decision mismatch") {
+		t.Fatalf("expected stale call to be rejected with decision mismatch, got %v", err)
+	}
+
+	current := mustReadNativeTable(t, host, tableID)
+	freshCall, err := host.buildSignedActionRequest(current, game.Action{Type: game.ActionCall})
+	if err != nil {
+		t.Fatalf("build fresh call request: %v", err)
+	}
+	if freshCall.DecisionIndex != len(current.ActiveHand.State.ActionLog) {
+		t.Fatalf("expected fresh decision index %d, got %d", len(current.ActiveHand.State.ActionLog), freshCall.DecisionIndex)
+	}
+	if _, err := host.handleActionFromPeer(freshCall); err != nil {
+		t.Fatalf("expected fresh call request to succeed, got %v", err)
 	}
 }
 

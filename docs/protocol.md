@@ -255,7 +255,7 @@ The current Go runtime does not send separate signed `join-request` / `buy-in-co
 
 The current action flow is:
 
-1. the seated player sends a wallet-signed `POST /native/table/action` to the host
+1. the seated player sends a wallet-signed `POST /native/table/action` to the host; the signed payload is bound to the current per-hand `decisionIndex` (`len(ActionLog)`) so it is valid only for that exact turn
 2. the host applies the action through the Hold'em engine
 3. the host appends `PlayerAction`
 4. when the hand settles, the host builds a snapshot and appends `HandResult`
