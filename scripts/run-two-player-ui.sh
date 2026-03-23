@@ -187,6 +187,7 @@ actor_flags() {
     --indexer-url "http://127.0.0.1:${INDEXER_PORT}"
     --ark-server-url http://127.0.0.1:7070
     --boltz-url http://127.0.0.1:9069
+    --datadir "$actor_root/data"
     --nigiri-datadir "$NIGIRI_DATADIR"
     --daemon-dir "$actor_root/daemons"
     --profile-dir "$actor_root/profiles"
@@ -226,6 +227,7 @@ start_controller() {
   PARKER_INDEXER_URL="http://127.0.0.1:${INDEXER_PORT}" \
   PARKER_ARK_SERVER_URL=http://127.0.0.1:7070 \
   PARKER_BOLTZ_URL=http://127.0.0.1:9069 \
+  PARKER_DATADIR="$actor_root/data" \
   PARKER_NIGIRI_DATADIR="$NIGIRI_DATADIR" \
   PARKER_DAEMON_DIR="$actor_root/daemons" \
   PARKER_PROFILE_DIR="$actor_root/profiles" \
@@ -273,7 +275,7 @@ seed_ark_liquidity
 wait_for_ark_ready 120 >/dev/null
 
 echo "Starting indexer on :${INDEXER_PORT}..."
-HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest \
+HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest PARKER_DATADIR="$BASE/indexer" \
   "$ROOT_DIR/scripts/bin/parker-indexer" >"$BASE/indexer.log" 2>&1 &
 INDEXER_PID=$!
 wait_for_http "http://127.0.0.1:${INDEXER_PORT}/health" 30 1

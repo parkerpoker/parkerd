@@ -20,6 +20,7 @@ common_flags=(
   --indexer-url ""
   --ark-server-url http://127.0.0.1:7070
   --boltz-url http://127.0.0.1:9069
+  --datadir ""
   --daemon-dir ""
   --profile-dir ""
   --run-dir ""
@@ -338,6 +339,7 @@ common_flags=(
   --indexer-url "http://127.0.0.1:${INDEXER_PORT}"
   --ark-server-url http://127.0.0.1:7070
   --boltz-url http://127.0.0.1:9069
+  --datadir "$BASE/data"
   --nigiri-datadir "$NIGIRI_DATADIR"
   --daemon-dir "$BASE/daemons"
   --profile-dir "$BASE/profiles"
@@ -354,7 +356,7 @@ kill "$NIGIRI_START_PID" 2>/dev/null || true
 wait "$NIGIRI_START_PID" 2>/dev/null || true
 
 echo "Starting public indexer on :${INDEXER_PORT}..."
-HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest \
+HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest PARKER_DATADIR="$BASE/indexer" \
   "$ROOT_DIR/scripts/bin/parker-indexer" >"$BASE/indexer.log" 2>&1 &
 INDEXER_PID=$!
 

@@ -12,9 +12,13 @@ const childProcesses = new Set();
 const nigiriDatadir =
   process.env.PARKER_NIGIRI_DATADIR ??
   join(homedir(), "Library", "Application Support", "Nigiri", "parker-dev-local");
+const localDataDir =
+  process.env.PARKER_DATADIR ??
+  join(homedir(), "Library", "Application Support", "Nigiri", "parker-dev-local-data");
 const indexerURL = process.env.PARKER_INDEXER_URL ?? process.env.VITE_INDEXER_URL ?? "http://127.0.0.1:3020";
 const sharedEnv = {
   ...process.env,
+  PARKER_DATADIR: localDataDir,
   PARKER_INDEXER_URL: indexerURL,
   VITE_INDEXER_URL: process.env.VITE_INDEXER_URL ?? indexerURL,
   ...(startNigiri ? { PARKER_NIGIRI_DATADIR: nigiriDatadir } : {}),

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -121,12 +123,17 @@ func (stores *Stores) Close() error {
 }
 
 func OpenRuntimeRepository(runtimeConfig cfg.RuntimeConfig, profile string) (*RuntimeRepository, error) {
-	stores, err := Open(runtimeConfig)
+	profileSlug := cfg.SlugProfile(profile)
+	scopedConfig := runtimeConfig
+	scopedConfig.CoreDBDSN = runtimeScopedDSN(runtimeConfig.CoreDBType, runtimeConfig.CoreDBDSN, profileSlug)
+	scopedConfig.EventDBDSN = runtimeScopedDSN(runtimeConfig.EventDBType, runtimeConfig.EventDBDSN, profileSlug)
+
+	stores, err := Open(scopedConfig)
 	if err != nil {
 		return nil, err
 	}
 	return &RuntimeRepository{
-		profile: cfg.SlugProfile(profile),
+		profile: profileSlug,
 		stores:  stores,
 	}, nil
 }
@@ -328,6 +335,11 @@ type sqlStore struct {
 }
 
 func openSQLStore(driverName, dsn string) (*sqlStore, error) {
+	if driverName == "sqlite" {
+		if err := os.MkdirAll(filepath.Dir(dsn), 0o755); err != nil {
+			return nil, err
+		}
+	}
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, err
@@ -535,6 +547,9 @@ type badgerStore struct {
 }
 
 func openBadgerStore(path string) (*badgerStore, error) {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, err
+	}
 	db, err := badger.Open(badger.DefaultOptions(path).WithLogger(nil))
 	if err != nil {
 		return nil, err
@@ -774,5 +789,20 @@ func indexerTableCacheKey(tableID string) string {
 func reverseBytes(values [][]byte) {
 	for left, right := 0, len(values)-1; left < right; left, right = left+1, right-1 {
 		values[left], values[right] = values[right], values[left]
+	}
+}
+
+func runtimeScopedDSN(kind, dsn, profile string) string {
+	if dsn == "" || profile == "" {
+		return dsn
+	}
+
+	switch kind {
+	case "sqlite":
+		return filepath.Join(filepath.Dir(dsn), "runtime", profile, filepath.Base(dsn))
+	case "badger":
+		return filepath.Join(dsn, "runtime", profile)
+	default:
+		return dsn
 	}
 }
