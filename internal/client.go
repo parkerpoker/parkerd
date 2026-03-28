@@ -36,6 +36,7 @@ type WatchSession struct {
 }
 
 const daemonStartupTimeout = 30 * time.Second
+const existingDaemonReachabilityTimeout = 5 * time.Second
 
 func NewClient(profileName string, config RuntimeConfig) *Client {
 	return &Client{
@@ -65,6 +66,10 @@ func (c *Client) CurrentState() map[string]any {
 func (c *Client) EnsureRunning(mode string) error {
 	if c.isReachable() {
 		return nil
+	}
+	paths := BuildProfileDaemonPaths(c.Config.DaemonDir, c.ProfileName)
+	if metadata, err := ReadProfileDaemonMetadata(paths); err == nil && metadata != nil && IsPidAlive(metadata.PID) {
+		return c.waitForReachable(existingDaemonReachabilityTimeout)
 	}
 	if err := c.startDaemonProcess(mode); err != nil {
 		return err
@@ -380,6 +385,7 @@ func (c *Client) startEnvironment() []string {
 		"PARKER_BOLTZ_URL="+c.Config.BoltzAPIURL,
 		"PARKER_NIGIRI_BIN="+filepath.Join(rootDir, "scripts", "bin", "nigiri"),
 		"PARKER_USE_MOCK_SETTLEMENT="+fmt.Sprintf("%t", c.Config.UseMockSettlement),
+		"PARKER_USE_TOR="+fmt.Sprintf("%t", c.Config.UseTor),
 		"PARKER_DATADIR="+c.Config.DataDir,
 		"PARKER_DB_TYPE="+c.Config.CoreDBType,
 		"PARKER_DB_DSN="+c.Config.CoreDBDSN,
@@ -396,6 +402,12 @@ func (c *Client) startEnvironment() []string {
 		"PARKER_DIRECT_ONION_PORT="+strconv.Itoa(c.Config.DirectOnionPort),
 		"PARKER_RUN_DIR="+c.Config.RunDir,
 	)
+	if c.Config.TorCookieAuth != "" {
+		environment = append(environment, "PARKER_TOR_COOKIE_AUTH="+c.Config.TorCookieAuth)
+	}
+	if c.Config.TorTargetHost != "" {
+		environment = append(environment, "PARKER_TOR_TARGET_HOST="+c.Config.TorTargetHost)
+	}
 	if len(c.Config.GossipBootstrap) > 0 {
 		environment = append(environment, "PARKER_GOSSIP_BOOTSTRAP_PEERS="+strings.Join(c.Config.GossipBootstrap, ","))
 	}

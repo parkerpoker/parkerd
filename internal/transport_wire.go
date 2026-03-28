@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"strings"
 	"time"
 
@@ -38,30 +37,14 @@ const (
 	nativeTransportMessageAck           = "ack"
 	nativeTransportMessageNack          = "nack"
 
-	nativeTransportRequestTTL = 15 * time.Second
+	nativeTransportRequestTTL      = 30 * time.Second
+	nativeTransportReadTimeout     = 10 * time.Second
+	nativeTransportWriteTimeout    = 20 * time.Second
+	nativeTransportExchangeTimeout = 20 * time.Second
 )
 
 type nativeTransportError struct {
 	Error string `json:"error"`
-}
-
-func peerTransportAddr(peerURL string) (string, error) {
-	if strings.TrimSpace(peerURL) == "" {
-		return "", fmt.Errorf("peer endpoint is required")
-	}
-	parsed, err := url.Parse(peerURL)
-	if err != nil {
-		return "", err
-	}
-	switch parsed.Scheme {
-	case "parker", "tcp", "tor", "":
-	default:
-		return "", fmt.Errorf("unsupported peer endpoint scheme %q", parsed.Scheme)
-	}
-	if parsed.Host == "" {
-		return "", fmt.Errorf("peer endpoint host is missing")
-	}
-	return parsed.Host, nil
 }
 
 func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
@@ -82,16 +65,18 @@ func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
 
 func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = connection.SetReadDeadline(time.Now().Add(nativeTransportReadTimeout))
 
 	reader := bufio.NewReader(connection)
 	line, err := readTrimmedLine(reader)
 	if err != nil || line == "" {
 		return
 	}
+	_ = connection.SetReadDeadline(time.Time{})
 
 	var request TransportEnvelope
 	if err := json.Unmarshal([]byte(line), &request); err != nil {
+		_ = connection.SetWriteDeadline(time.Now().Add(nativeTransportWriteTimeout))
 		_ = writeJSONLine(connection, runtime.plainNack("", err))
 		return
 	}
@@ -100,6 +85,7 @@ func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	if err != nil {
 		response = runtime.nackFromRequest(request, err)
 	}
+	_ = connection.SetWriteDeadline(time.Now().Add(nativeTransportWriteTimeout))
 	_ = writeJSONLine(connection, response)
 }
 
@@ -158,17 +144,13 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request TransportEnvelop
 }
 
 func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request TransportEnvelope) (TransportEnvelope, error) {
-	address, err := peerTransportAddr(peerURL)
-	if err != nil {
-		return TransportEnvelope{}, err
-	}
-	connection, err := net.DialTimeout("tcp", address, 5*time.Second)
+	connection, err := runtime.dialPeerTransport(peerURL)
 	if err != nil {
 		return TransportEnvelope{}, err
 	}
 	defer connection.Close()
 
-	_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = connection.SetDeadline(time.Now().Add(nativeTransportExchangeTimeout))
 	if err := writeJSONLine(connection, request); err != nil {
 		return TransportEnvelope{}, err
 	}
@@ -185,6 +167,9 @@ func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request Transp
 }
 
 func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error) {
+	if cached, ok := runtime.cachedPeerInfo(peerURL); ok {
+		return cached, nil
+	}
 	request, _, err := runtime.newOutboundEnvelope(nativeTransportMessagePeerProbe, nativeTransportChannelDiscovery, "", "", map[string]any{}, "")
 	if err != nil {
 		return nativePeerSelf{}, err
@@ -201,7 +186,34 @@ func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return nativePeerSelf{}, err
 	}
+	runtime.cachePeerInfo(peerURL, decoded)
 	return decoded, nil
+}
+
+func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+
+	peerInfo, ok := runtime.peerInfoCache[peerURL]
+	if !ok {
+		return nativePeerSelf{}, false
+	}
+	return peerInfo, true
+}
+
+func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+
+	if runtime.peerInfoCache == nil {
+		runtime.peerInfoCache = map[string]nativePeerSelf{}
+	}
+	if strings.TrimSpace(peerURL) != "" {
+		runtime.peerInfoCache[peerURL] = peerInfo
+	}
+	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" {
+		runtime.peerInfoCache[canonical] = peerInfo
+	}
 }
 
 func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTableState, error) {

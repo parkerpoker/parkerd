@@ -50,8 +50,11 @@ type RuntimeConfig struct {
 	PeerPort          int
 	ProfileDir        string
 	RunDir            string
+	UseTor            bool
+	TorCookieAuth     string
 	TorControlAddr    string
 	TorSocksAddr      string
+	TorTargetHost     string
 	GossipBootstrap   []string
 	GossipOnionPort   int
 	DirectOnionPort   int
@@ -223,6 +226,13 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		firstNonEmpty(flags["peer-port"], env["PARKER_PEER_PORT"], env["ARKD_PEER_PORT"]),
 		0,
 	)
+	cfg.UseTor = parseBoolean(
+		firstNonEmpty(flags["use-tor"], env["PARKER_USE_TOR"]),
+		false,
+	)
+	cfg.TorCookieAuth = normalizeTorCookieAuth(
+		firstNonEmpty(flags["tor-cookie-auth"], env["PARKER_TOR_COOKIE_AUTH"]),
+	)
 	cfg.TorSocksAddr = firstNonEmpty(
 		flags["tor-socks-addr"],
 		env["PARKER_TOR_SOCKS_ADDR"],
@@ -232,6 +242,10 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		flags["tor-control-addr"],
 		env["PARKER_TOR_CONTROL_ADDR"],
 		"127.0.0.1:9051",
+	)
+	cfg.TorTargetHost = firstNonEmpty(
+		flags["tor-target-host"],
+		env["PARKER_TOR_TARGET_HOST"],
 	)
 	cfg.GossipBootstrap = parseCSV(
 		firstNonEmpty(flags["gossip-bootstrap-peers"], env["PARKER_GOSSIP_BOOTSTRAP_PEERS"]),
@@ -499,6 +513,38 @@ func resolveBackendDSN(kind string, configured string, sqliteFallback string, ba
 func resolveOptionalPath(path string) string {
 	if strings.TrimSpace(path) == "" {
 		return ""
+	}
+	return resolvePath(path)
+}
+
+func normalizeTorCookieAuth(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes", "auto":
+		return "auto"
+	case "0", "false", "no":
+		return ""
+	default:
+		return resolveUserPath(value)
+	}
+}
+
+func resolveUserPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if path == "~" {
+				path = home
+			} else {
+				path = filepath.Join(home, path[2:])
+			}
+		}
 	}
 	return resolvePath(path)
 }

@@ -51,6 +51,35 @@ func TestTableTrafficRedactsActiveHandSecretsAndPushesToJoiner(t *testing.T) {
 	assertTableVisibleCards(t, afterGuestAction, guest.walletID.PlayerID)
 }
 
+func TestGuestSendActionWaitsForSlowReplicationTargetsInParallel(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send action: %v", err)
+	}
+
+	host.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+		time.Sleep(700 * time.Millisecond)
+		return nil
+	}
+
+	startedAt := time.Now()
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+		t.Fatalf("guest send action: %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed >= 1100*time.Millisecond {
+		t.Fatalf("expected guest action response to wait on parallel, not sequential, replication; got %s", elapsed)
+	}
+}
+
 func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 	t.Parallel()
 

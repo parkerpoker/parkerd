@@ -329,24 +329,21 @@ func (runtime *daemonRuntimeAdapter) buildManifest() (TransportPeerManifest, err
 	if endpoint == "" {
 		endpoint = "parker://" + runtime.peerIdentity.ID
 	}
+	transportEndpoints := transportEndpointsForPeerURL(endpoint, runtime.config.MailboxEndpoints)
 	manifest := TransportPeerManifest{
-		Capabilities:     []string{"direct", "state-sync", "table"},
-		CreatedAt:        nowISO(),
-		DirectOnion:      endpoint,
-		Endpoint:         endpoint,
-		ExpiresAt:        addMillis(nowISO(), 7*24*60*60*1000),
-		MailboxEndpoints: append([]string{}, runtime.config.MailboxEndpoints...),
-		ManifestEpoch:    1,
-		PeerID:           runtime.peerIdentity.ID,
-		ProtocolID:       runtime.protocolIdentity.ID,
-		SignatureKeyID:   runtime.protocolIdentity.PublicKeyHex,
-		SigningKey:       runtime.protocolIdentity.PublicKeyHex,
-		TransportEncKey:  runtime.transportPublic,
-		TransportEndpoints: TransportPeerEndpoints{
-			DirectOnion:      endpoint,
-			Endpoint:         endpoint,
-			MailboxEndpoints: append([]string{}, runtime.config.MailboxEndpoints...),
-		},
+		Capabilities:         []string{"direct", "state-sync", "table"},
+		CreatedAt:            nowISO(),
+		DirectOnion:          transportEndpoints.DirectOnion,
+		Endpoint:             endpoint,
+		ExpiresAt:            addMillis(nowISO(), 7*24*60*60*1000),
+		MailboxEndpoints:     append([]string{}, runtime.config.MailboxEndpoints...),
+		ManifestEpoch:        1,
+		PeerID:               runtime.peerIdentity.ID,
+		ProtocolID:           runtime.protocolIdentity.ID,
+		SignatureKeyID:       runtime.protocolIdentity.PublicKeyHex,
+		SigningKey:           runtime.protocolIdentity.PublicKeyHex,
+		TransportEncKey:      runtime.transportPublic,
+		TransportEndpoints:   transportEndpoints,
 		TransportWireVersion: transportWireVersion,
 	}
 	unsigned := rawJSONMap(manifest)
@@ -361,38 +358,45 @@ func (runtime *daemonRuntimeAdapter) buildManifest() (TransportPeerManifest, err
 
 func (runtime *daemonRuntimeAdapter) transportPeerFromSelf(peer nativePeerSelf) TransportPeerSummary {
 	endpoint := peer.Peer.PeerURL
+	transportEndpoints := transportEndpointsForPeerURL(endpoint, nil)
 	return TransportPeerSummary{
-		Alias:         peer.Alias,
-		Capabilities:  []string{"direct", "state-sync", "table"},
-		DirectOnion:   endpoint,
-		Endpoint:      endpoint,
-		LastSeenAt:    nowISO(),
-		ManifestEpoch: 1,
-		PeerID:        peer.Peer.PeerID,
-		ProtocolID:    peer.ProtocolID,
-		Roles:         append([]string{}, peer.Peer.Roles...),
-		TransportEndpoints: TransportPeerEndpoints{
-			DirectOnion: endpoint,
-			Endpoint:    endpoint,
-		},
+		Alias:              peer.Alias,
+		Capabilities:       []string{"direct", "state-sync", "table"},
+		DirectOnion:        transportEndpoints.DirectOnion,
+		Endpoint:           endpoint,
+		LastSeenAt:         nowISO(),
+		ManifestEpoch:      1,
+		PeerID:             peer.Peer.PeerID,
+		ProtocolID:         peer.ProtocolID,
+		Roles:              append([]string{}, peer.Peer.Roles...),
+		TransportEndpoints: transportEndpoints,
 	}
 }
 
 func (runtime *daemonRuntimeAdapter) transportPeerFromKnownPeer(peer NativePeerAddress) TransportPeerSummary {
+	transportEndpoints := transportEndpointsForPeerURL(peer.PeerURL, nil)
 	return TransportPeerSummary{
-		Alias:         peer.Alias,
-		Capabilities:  []string{"direct", "state-sync", "table"},
-		DirectOnion:   peer.PeerURL,
-		Endpoint:      peer.PeerURL,
-		LastSeenAt:    peer.LastSeenAt,
-		ManifestEpoch: 1,
-		PeerID:        peer.PeerID,
-		Roles:         append([]string{}, peer.Roles...),
-		TransportEndpoints: TransportPeerEndpoints{
-			DirectOnion: peer.PeerURL,
-			Endpoint:    peer.PeerURL,
-		},
+		Alias:              peer.Alias,
+		Capabilities:       []string{"direct", "state-sync", "table"},
+		DirectOnion:        transportEndpoints.DirectOnion,
+		Endpoint:           peer.PeerURL,
+		LastSeenAt:         peer.LastSeenAt,
+		ManifestEpoch:      1,
+		PeerID:             peer.PeerID,
+		Roles:              append([]string{}, peer.Roles...),
+		TransportEndpoints: transportEndpoints,
 	}
+}
+
+func transportEndpointsForPeerURL(endpoint string, mailboxes []string) TransportPeerEndpoints {
+	transportEndpoints := TransportPeerEndpoints{
+		Endpoint:         endpoint,
+		MailboxEndpoints: append([]string{}, mailboxes...),
+	}
+	if isOnionPeerURL(endpoint) {
+		transportEndpoints.DirectOnion = endpoint
+	}
+	return transportEndpoints
 }
 
 func (runtime *daemonRuntimeAdapter) loadProfileState() (*walletpkg.PlayerProfileState, error) {

@@ -23,11 +23,13 @@ import (
 
 type meshRuntime struct {
 	config           RuntimeConfig
+	clearPeerURL     string
 	httpClient       *http.Client
 	lastSyncAt       map[string]time.Time
 	listener         net.Listener
 	mode             string
 	mu               sync.Mutex
+	peerInfoCache    map[string]nativePeerSelf
 	peerIdentity     settlementcore.ScopedIdentity
 	profileName      string
 	profileStore     *walletpkg.ProfileStore
@@ -35,8 +37,10 @@ type meshRuntime struct {
 	protocolIdentity settlementcore.ScopedIdentity
 	self             nativePeerSelf
 	server           *http.Server
+	tableSyncSender  func(peerURL string, input nativeTableSyncRequest) error
 	started          bool
 	store            *meshStore
+	torService       *runtimeHiddenService
 	transportKeyID   string
 	transportPrivate string
 	transportPublic  string
@@ -65,6 +69,7 @@ func newMeshRuntime(profileName string, config RuntimeConfig, mode string) (*mes
 		httpClient:   &http.Client{Timeout: 5 * time.Second},
 		lastSyncAt:   map[string]time.Time{},
 		mode:         mode,
+		peerInfoCache: map[string]nativePeerSelf{},
 		profileName:  profileName,
 		profileStore: walletpkg.NewProfileStore(config.ProfileDir),
 		store:        store,
@@ -102,10 +107,17 @@ func (runtime *meshRuntime) Close() error {
 	runtime.server = nil
 	listener := runtime.listener
 	runtime.listener = nil
+	torService := runtime.torService
+	runtime.torService = nil
+	runtime.clearPeerURL = ""
+	runtime.self.Peer.PeerURL = ""
 	runtime.started = false
 	runtime.mu.Unlock()
 
 	var joined error
+	if torService != nil {
+		joined = errors.Join(joined, runtime.unregisterTorHiddenService(torService))
+	}
 	if server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -765,16 +777,7 @@ func (runtime *meshRuntime) ensureBootstrapLocked(nickname string) error {
 
 func (runtime *meshRuntime) startPeerServerLocked() error {
 	if runtime.listener != nil {
-		if runtime.self.Peer.PeerURL == "" {
-			if tcpAddr, ok := runtime.listener.Addr().(*net.TCPAddr); ok {
-				host := runtime.config.PeerHost
-				if host == "" || host == "0.0.0.0" || host == "::" {
-					host = "127.0.0.1"
-				}
-				runtime.self.Peer.PeerURL = fmt.Sprintf("parker://%s:%d", host, tcpAddr.Port)
-			}
-		}
-		return nil
+		return runtime.ensureAdvertisedPeerURLLocked()
 	}
 	host := runtime.config.PeerHost
 	if host == "" {
@@ -785,16 +788,20 @@ func (runtime *meshRuntime) startPeerServerLocked() error {
 		return err
 	}
 	runtime.listener = listener
-	tcpAddr, _ := listener.Addr().(*net.TCPAddr)
-	port := runtime.config.PeerPort
-	if tcpAddr != nil && tcpAddr.Port != 0 {
-		port = tcpAddr.Port
-	}
-	if host == "0.0.0.0" || host == "::" {
-		host = "127.0.0.1"
-	}
-	runtime.self.Peer.PeerURL = fmt.Sprintf("parker://%s:%d", host, port)
 	runtime.server = nil
+	if err := ensureRuntimeStateDir(runtime.store.paths.StateDir); err != nil {
+		_ = listener.Close()
+		runtime.listener = nil
+		return err
+	}
+	if err := runtime.ensureAdvertisedPeerURLLocked(); err != nil {
+		_ = listener.Close()
+		runtime.listener = nil
+		runtime.clearPeerURL = ""
+		runtime.torService = nil
+		runtime.self.Peer.PeerURL = ""
+		return err
+	}
 	go runtime.servePeerTransport(listener)
 	return nil
 }
@@ -1179,13 +1186,23 @@ func (runtime *meshRuntime) replicateTable(table nativeTableState) {
 			targets[peerURL] = seat.PlayerID
 		}
 	}
+	var waitGroup sync.WaitGroup
 	for peerURL, visiblePlayerID := range targets {
 		syncRequest, err := runtime.buildTableSyncRequest(runtime.networkTableView(table, visiblePlayerID))
 		if err != nil {
 			continue
 		}
-		_ = runtime.sendTableSync(peerURL, syncRequest)
+		waitGroup.Add(1)
+		go func(peerURL string, syncRequest nativeTableSyncRequest) {
+			defer waitGroup.Done()
+			if runtime.tableSyncSender != nil {
+				_ = runtime.tableSyncSender(peerURL, syncRequest)
+				return
+			}
+			_ = runtime.sendTableSync(peerURL, syncRequest)
+		}(peerURL, syncRequest)
 	}
+	waitGroup.Wait()
 }
 
 func (runtime *meshRuntime) publishPublicState(table nativeTableState) error {

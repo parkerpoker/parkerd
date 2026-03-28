@@ -94,3 +94,20 @@ func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
 		t.Fatalf("expected witness role, received %#v", peers[0].Roles)
 	}
 }
+
+func TestTransportEndpointsForPeerURLOnlySetsDirectOnionForOnionEndpoints(t *testing.T) {
+	t.Parallel()
+
+	clear := transportEndpointsForPeerURL("parker://127.0.0.1:9735", []string{"https://mailbox.example"})
+	if clear.Endpoint != "parker://127.0.0.1:9735" {
+		t.Fatalf("expected clear endpoint to be preserved, got %q", clear.Endpoint)
+	}
+	if clear.DirectOnion != "" {
+		t.Fatalf("expected clear endpoint to leave directOnion empty, got %q", clear.DirectOnion)
+	}
+
+	onion := transportEndpointsForPeerURL("parker://merchantabcdefghijklmnop.onion:9735", nil)
+	if onion.DirectOnion != onion.Endpoint {
+		t.Fatalf("expected onion endpoint to populate directOnion, got endpoint=%q directOnion=%q", onion.Endpoint, onion.DirectOnion)
+	}
+}
