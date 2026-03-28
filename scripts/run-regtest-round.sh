@@ -13,6 +13,7 @@ WITNESS_PORT="${WITNESS_PORT:-}"
 ALICE_PORT="${ALICE_PORT:-}"
 BOB_PORT="${BOB_PORT:-}"
 USE_TOR="${USE_TOR:-false}"
+SETUP_ONLY="${SETUP_ONLY:-false}"
 PCLI_TIMEOUT_SECONDS="${PCLI_TIMEOUT_SECONDS:-}"
 TOR_TARGET_HOST="${TOR_TARGET_HOST:-host.docker.internal}"
 HOST_TOR_SOCKS_PORT="${HOST_TOR_SOCKS_PORT:-}"
@@ -41,11 +42,19 @@ common_flags=(
   --run-dir ""
 )
 
-tor_enabled() {
-  case "$(printf '%s' "$USE_TOR" | tr '[:upper:]' '[:lower:]')" in
+setting_enabled() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+tor_enabled() {
+  setting_enabled "$USE_TOR"
+}
+
+setup_only_enabled() {
+  setting_enabled "$SETUP_ONLY"
 }
 
 ensure_toolchains() {
@@ -187,10 +196,6 @@ pcli() {
   local command="$1"
   shift
   run_with_timeout "$(command_timeout_seconds)" "$ROOT_DIR/scripts/bin/parker-cli" "$command" "${common_flags[@]}" "$@"
-}
-
-pdaemon() {
-  "$ROOT_DIR/scripts/bin/parker-daemon" "${common_flags[@]}" "$@"
 }
 
 pdevtool() {
@@ -417,6 +422,38 @@ retry_pcli_json() {
   return 1
 }
 
+launch_background() {
+  local log_path="$1"
+  shift
+
+  if setup_only_enabled; then
+    LAUNCHED_PID="$(
+      LC_ALL=C LANG=C LC_CTYPE=C /usr/bin/perl -MPOSIX=setsid -e '
+        use strict;
+        use warnings;
+
+        my $log_path = shift @ARGV;
+        my $pid = fork();
+        die "fork failed\n" unless defined $pid;
+
+        if ($pid) {
+          print "$pid\n";
+          exit 0;
+        }
+
+        die "setsid failed\n" unless defined setsid();
+        open STDIN, "<", "/dev/null" or die "open stdin failed: $!\n";
+        open STDOUT, ">>", $log_path or die "open stdout failed: $!\n";
+        open STDERR, ">&STDOUT" or die "redirect stderr failed: $!\n";
+        exec @ARGV or die "exec failed: $!\n";
+      ' "$log_path" "$@"
+    )"
+  else
+    "$@" >"$log_path" 2>&1 &
+    LAUNCHED_PID="$!"
+  fi
+}
+
 start_profile_daemon() {
   local profile="$1"
   local mode="$2"
@@ -425,16 +462,25 @@ start_profile_daemon() {
   local socks_port="${5:-}"
   local control_port="${6:-}"
   local cookie_path="${7:-}"
+  local command=(
+    "$ROOT_DIR/scripts/bin/parker-daemon"
+    "${common_flags[@]}"
+    --profile "$profile"
+    --mode "$mode"
+    --peer-port "$peer_port"
+  )
 
   if tor_enabled; then
-    PARKER_TOR_SOCKS_ADDR="127.0.0.1:${socks_port}" \
-    PARKER_TOR_CONTROL_ADDR="127.0.0.1:${control_port}" \
-    PARKER_TOR_COOKIE_AUTH="$cookie_path" \
-    pdaemon --profile "$profile" --mode "$mode" --peer-port "$peer_port" >"$log_path" 2>&1 &
-  else
-    pdaemon --profile "$profile" --mode "$mode" --peer-port "$peer_port" >"$log_path" 2>&1 &
+    launch_background "$log_path" \
+      env \
+      PARKER_TOR_SOCKS_ADDR="127.0.0.1:${socks_port}" \
+      PARKER_TOR_CONTROL_ADDR="127.0.0.1:${control_port}" \
+      PARKER_TOR_COOKIE_AUTH="$cookie_path" \
+      "${command[@]}"
+    return 0
   fi
-  printf '%s\n' "$!"
+
+  launch_background "$log_path" "${command[@]}"
 }
 
 assert_go_daemon_active() {
@@ -750,6 +796,75 @@ wait_for_table_status() {
   return 1
 }
 
+write_runtime_env() {
+  local runtime_env_path="$BASE/runtime.env"
+
+  {
+    printf 'export ROOT_DIR=%q\n' "$ROOT_DIR"
+    printf 'export BASE=%q\n' "$BASE"
+    printf 'export USE_TOR=%q\n' "$USE_TOR"
+    printf 'export PARKER_NETWORK=%q\n' "regtest"
+    printf 'export PARKER_ARK_SERVER_URL=%q\n' "http://127.0.0.1:7070"
+    printf 'export PARKER_BOLTZ_URL=%q\n' "http://127.0.0.1:9069"
+    printf 'export PARKER_INDEXER_URL=%q\n' "http://127.0.0.1:${INDEXER_PORT}"
+    printf 'export PARKER_DATADIR=%q\n' "$BASE/data"
+    printf 'export PARKER_NIGIRI_DATADIR=%q\n' "$NIGIRI_DATADIR"
+    printf 'export PARKER_DAEMON_DIR=%q\n' "$BASE/daemons"
+    printf 'export PARKER_PROFILE_DIR=%q\n' "$BASE/profiles"
+    printf 'export PARKER_RUN_DIR=%q\n' "$BASE/runs"
+    printf 'export INDEXER_PORT=%q\n' "$INDEXER_PORT"
+    printf 'export HOST_PORT=%q\n' "$HOST_PORT"
+    printf 'export WITNESS_PORT=%q\n' "$WITNESS_PORT"
+    printf 'export ALICE_PORT=%q\n' "$ALICE_PORT"
+    printf 'export BOB_PORT=%q\n' "$BOB_PORT"
+    printf 'export HOST_DAEMON_PID=%q\n' "${HOST_DAEMON_PID:-}"
+    printf 'export WITNESS_DAEMON_PID=%q\n' "${WITNESS_DAEMON_PID:-}"
+    printf 'export ALICE_DAEMON_PID=%q\n' "${ALICE_DAEMON_PID:-}"
+    printf 'export BOB_DAEMON_PID=%q\n' "${BOB_DAEMON_PID:-}"
+    printf 'export INDEXER_PID=%q\n' "${INDEXER_PID:-}"
+    printf 'export HOST_PEER_ID=%q\n' "${HOST_PEER_ID:-}"
+    printf 'export WITNESS_PEER_ID=%q\n' "${WITNESS_PEER_ID:-}"
+    printf 'export ALICE_PEER_ID=%q\n' "${ALICE_PEER_ID:-}"
+    printf 'export BOB_PEER_ID=%q\n' "${BOB_PEER_ID:-}"
+    printf 'export HOST_PEER_URL=%q\n' "${HOST_PEER_URL:-}"
+    printf 'export WITNESS_PEER_URL=%q\n' "${WITNESS_PEER_URL:-}"
+    printf 'export ALICE_PEER_URL=%q\n' "${ALICE_PEER_URL:-}"
+    printf 'export BOB_PEER_URL=%q\n' "${BOB_PEER_URL:-}"
+    printf 'export ALICE_PLAYER_ID=%q\n' "${ALICE_PLAYER_ID:-}"
+    printf 'export BOB_PLAYER_ID=%q\n' "${BOB_PLAYER_ID:-}"
+    printf 'export INVITE_CODE=%q\n' "${INVITE_CODE:-}"
+    printf 'export TABLE_ID=%q\n' "${TABLE_ID:-}"
+    printf 'export TOR_PROJECT=%q\n' "$TOR_PROJECT"
+    printf 'export TOR_COMPOSE_FILE=%q\n' "$TOR_COMPOSE_FILE"
+    printf 'export TOR_STATE_BASE=%q\n' "$TOR_STATE_BASE"
+    printf 'export HOST_TOR_SOCKS_PORT=%q\n' "${HOST_TOR_SOCKS_PORT:-}"
+    printf 'export HOST_TOR_CONTROL_PORT=%q\n' "${HOST_TOR_CONTROL_PORT:-}"
+    printf 'export WITNESS_TOR_SOCKS_PORT=%q\n' "${WITNESS_TOR_SOCKS_PORT:-}"
+    printf 'export WITNESS_TOR_CONTROL_PORT=%q\n' "${WITNESS_TOR_CONTROL_PORT:-}"
+    printf 'export ALICE_TOR_SOCKS_PORT=%q\n' "${ALICE_TOR_SOCKS_PORT:-}"
+    printf 'export ALICE_TOR_CONTROL_PORT=%q\n' "${ALICE_TOR_CONTROL_PORT:-}"
+    printf 'export BOB_TOR_SOCKS_PORT=%q\n' "${BOB_TOR_SOCKS_PORT:-}"
+    printf 'export BOB_TOR_CONTROL_PORT=%q\n' "${BOB_TOR_CONTROL_PORT:-}"
+  } >"$runtime_env_path"
+}
+
+print_local_stack_summary() {
+  local runtime_env_path="$BASE/runtime.env"
+
+  echo "Local regtest stack is ready."
+  printf 'BASE=%s\n' "$BASE"
+  printf 'RUNTIME_ENV=%s\n' "$runtime_env_path"
+  printf 'INDEXER_URL=http://127.0.0.1:%s\n' "$INDEXER_PORT"
+  printf 'HOST_PEER_URL=%s\n' "${HOST_PEER_URL:-}"
+  printf 'WITNESS_PEER_URL=%s\n' "${WITNESS_PEER_URL:-}"
+  printf 'ALICE_PEER_URL=%s\n' "${ALICE_PEER_URL:-}"
+  printf 'BOB_PEER_URL=%s\n' "${BOB_PEER_URL:-}"
+  printf 'INVITE_CODE=%s\n' "$INVITE_CODE"
+  printf 'TABLE_ID=%s\n' "$TABLE_ID"
+  printf 'LOG_DIR=%s\n' "$BASE"
+  printf 'SOURCE_ENV=source %q\n' "$runtime_env_path"
+}
+
 play_hand_automatically() {
   local state_json=""
   local hand_id=""
@@ -877,17 +992,26 @@ if tor_enabled; then
 fi
 
 echo "Starting public indexer on :${INDEXER_PORT}..."
-HOST=127.0.0.1 PORT="$INDEXER_PORT" PARKER_NETWORK=regtest PARKER_DATADIR="$BASE/indexer" \
-  "$ROOT_DIR/scripts/bin/parker-indexer" >"$BASE/indexer.log" 2>&1 &
-INDEXER_PID=$!
+launch_background "$BASE/indexer.log" \
+  env \
+  HOST=127.0.0.1 \
+  PORT="$INDEXER_PORT" \
+  PARKER_NETWORK=regtest \
+  PARKER_DATADIR="$BASE/indexer" \
+  "$ROOT_DIR/scripts/bin/parker-indexer"
+INDEXER_PID="$LAUNCHED_PID"
 
 sleep 2
 
 echo "Starting daemons..."
-HOST_DAEMON_PID="$(start_profile_daemon host host "$HOST_PORT" "$BASE/host.log" "$HOST_TOR_SOCKS_PORT" "$HOST_TOR_CONTROL_PORT" "$TOR_STATE_BASE/host/control_auth_cookie")"
-WITNESS_DAEMON_PID="$(start_profile_daemon witness witness "$WITNESS_PORT" "$BASE/witness.log" "$WITNESS_TOR_SOCKS_PORT" "$WITNESS_TOR_CONTROL_PORT" "$TOR_STATE_BASE/witness/control_auth_cookie")"
-ALICE_DAEMON_PID="$(start_profile_daemon alice player "$ALICE_PORT" "$BASE/alice.log" "$ALICE_TOR_SOCKS_PORT" "$ALICE_TOR_CONTROL_PORT" "$TOR_STATE_BASE/alice/control_auth_cookie")"
-BOB_DAEMON_PID="$(start_profile_daemon bob player "$BOB_PORT" "$BASE/bob.log" "$BOB_TOR_SOCKS_PORT" "$BOB_TOR_CONTROL_PORT" "$TOR_STATE_BASE/bob/control_auth_cookie")"
+start_profile_daemon host host "$HOST_PORT" "$BASE/host.log" "$HOST_TOR_SOCKS_PORT" "$HOST_TOR_CONTROL_PORT" "$TOR_STATE_BASE/host/control_auth_cookie"
+HOST_DAEMON_PID="$LAUNCHED_PID"
+start_profile_daemon witness witness "$WITNESS_PORT" "$BASE/witness.log" "$WITNESS_TOR_SOCKS_PORT" "$WITNESS_TOR_CONTROL_PORT" "$TOR_STATE_BASE/witness/control_auth_cookie"
+WITNESS_DAEMON_PID="$LAUNCHED_PID"
+start_profile_daemon alice player "$ALICE_PORT" "$BASE/alice.log" "$ALICE_TOR_SOCKS_PORT" "$ALICE_TOR_CONTROL_PORT" "$TOR_STATE_BASE/alice/control_auth_cookie"
+ALICE_DAEMON_PID="$LAUNCHED_PID"
+start_profile_daemon bob player "$BOB_PORT" "$BASE/bob.log" "$BOB_TOR_SOCKS_PORT" "$BOB_TOR_CONTROL_PORT" "$TOR_STATE_BASE/bob/control_auth_cookie"
+BOB_DAEMON_PID="$LAUNCHED_PID"
 
 sleep 2
 
@@ -907,8 +1031,8 @@ WITNESS_BOOT="$(pcli bootstrap Witness --profile witness --json)"
 ALICE_BOOT="$(pcli bootstrap Alice --profile alice --json)"
 BOB_BOOT="$(pcli bootstrap Bob --profile bob --json)"
 HOST_PEER_ID="$(printf '%s' "$HOST_BOOT" | json_field data.transport.peer.peerId)"
+HOST_PEER_URL="$(wait_for_peer_url host "$(if tor_enabled; then printf 'true'; else printf 'false'; fi)")"
 if tor_enabled; then
-  HOST_PEER_URL="$(wait_for_peer_url host true)"
   WITNESS_PEER_URL="$(wait_for_peer_url witness true)"
   ALICE_PEER_URL="$(wait_for_peer_url alice true)"
   BOB_PEER_URL="$(wait_for_peer_url bob true)"
@@ -916,6 +1040,8 @@ if tor_enabled; then
   printf '  host=%s\n  witness=%s\n  alice=%s\n  bob=%s\n' "$HOST_PEER_URL" "$WITNESS_PEER_URL" "$ALICE_PEER_URL" "$BOB_PEER_URL"
 else
   WITNESS_PEER_URL="$(wait_for_peer_url witness false)"
+  ALICE_PEER_URL="$(wait_for_peer_url alice false)"
+  BOB_PEER_URL="$(wait_for_peer_url bob false)"
 fi
 WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field data.transport.peer.peerId)"
 ALICE_PEER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.transport.peer.peerId)"
@@ -963,6 +1089,14 @@ if tor_enabled; then
 else
   pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile alice --json >/dev/null
   pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile bob   --json >/dev/null
+fi
+
+write_runtime_env
+
+if setup_only_enabled; then
+  trap - EXIT INT TERM HUP
+  print_local_stack_summary
+  exit 0
 fi
 
 echo "Playing one hand automatically..."

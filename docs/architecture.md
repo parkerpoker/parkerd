@@ -289,6 +289,9 @@ This gives a public discovery path while keeping gameplay and funds actions in t
 
 The repository currently exercises these local shapes:
 
+- `make local` rebuilds the local binaries, starts Nigiri, the indexer, the localhost controller, and four local daemons: `dealer` in host mode plus `witness`, `alice`, and `bob`
+- `make deps`, `make dealer`, `make witness`, `make alice`, `make bob`, and their matching `-down` targets let you manage the local regtest services individually
+- `make fund-alice` and `make fund-bob` bootstrap those player profiles if needed, faucet funds, and onboard them
 - `make poker-regtest-round` starts Nigiri, the indexer, four Go daemons, funds the players, creates a table, auto-plays a hand, and cashes both players out
 
 ## Gameplay / Data Flows

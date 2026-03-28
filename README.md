@@ -93,13 +93,41 @@ PARKER_ARK_SERVER_URL=http://127.0.0.1:7070
 PARKER_BOLTZ_URL=http://127.0.0.1:9069
 ```
 
+Managed local stack:
+
+```bash
+make local
+```
+
+That target rebuilds the local binaries, starts Nigiri, the indexer, the localhost controller, and four local daemons: `dealer` in host mode plus `witness`, `alice`, and `bob`. The player and dealer profiles are left for manual bootstrap and funding flows.
+
+Useful lifecycle commands:
+
+```bash
+make local-down
+make deps
+make deps-down
+make dealer
+make dealer-down
+make witness
+make witness-down
+make alice
+make alice-down
+make bob
+make bob-down
+make fund-alice
+make fund-bob
+```
+
+The managed stack keeps its runtime under `.tmp/local-regtest`, including a stable exported env file at `.tmp/local-regtest/runtime.env`.
+
 One-command local poker simulation:
 
 ```bash
 make poker-regtest-round
 ```
 
-That target starts Nigiri, the indexer, four segregated Go daemons (`host`, `witness`, `alice`, `bob`), funds the player wallets on regtest, creates a table, auto-plays a hand, and cashes both players out.
+That target still starts Nigiri, the indexer, four segregated Go daemons (`host`, `witness`, `alice`, `bob`), funds the player wallets on regtest, creates a table, auto-plays a hand, and cashes both players out.
 
 ## Notes
 
