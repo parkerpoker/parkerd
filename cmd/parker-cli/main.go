@@ -617,7 +617,7 @@ func printHelp() {
 		"  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
 		"  interactive --profile <name>",
 		"Shared flags:",
-		"  --network <regtest|mutinynet> --indexer-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --transport-mode <legacy|v2> --tor-socks-addr <addr> --tor-control-addr <addr> --gossip-bootstrap-peers <csv> --mailbox-endpoints <csv> --mock --json",
+		"  --network <regtest|mutinynet> --indexer-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --tor-socks-addr <addr> --tor-control-addr <addr> --gossip-bootstrap-peers <csv> --mailbox-endpoints <csv> --mock --json",
 		"",
 	}, "\n"))
 }

@@ -50,7 +50,6 @@ type RuntimeConfig struct {
 	PeerPort          int
 	ProfileDir        string
 	RunDir            string
-	TransportMode     string
 	TorControlAddr    string
 	TorSocksAddr      string
 	GossipBootstrap   []string
@@ -79,7 +78,6 @@ type ProfileDaemonMetadata struct {
 	ProtocolID    string `json:"protocolId,omitempty"`
 	GossipOnion   string `json:"gossipOnion,omitempty"`
 	DirectOnion   string `json:"directOnion,omitempty"`
-	TransportMode string `json:"transportMode,omitempty"`
 	SocketPath    string `json:"socketPath"`
 	StartedAt     string `json:"startedAt"`
 	Status        string `json:"status"`
@@ -92,7 +90,6 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		flags["network"],
 		env["PARKER_NETWORK"],
 		env["ARKD_NETWORK"],
-		env["VITE_NETWORK"],
 		"regtest",
 	)
 	if network != "mutinynet" && network != "regtest" {
@@ -110,7 +107,6 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		IndexerPort:       DefaultIndexerPort,
 		Network:           network,
 		PeerHost:          "127.0.0.1",
-		TransportMode:     "legacy",
 	}
 	if network == "mutinynet" {
 		cfg.ArkServerURL = MutinynetArkServerURL
@@ -122,21 +118,18 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		flags["ark-server-url"],
 		env["PARKER_ARK_SERVER_URL"],
 		env["ARKD_ARK_SERVER_URL"],
-		env["VITE_ARK_SERVER_URL"],
 		cfg.ArkServerURL,
 	)
 	cfg.BoltzAPIURL = firstNonEmpty(
 		flags["boltz-url"],
 		env["PARKER_BOLTZ_URL"],
 		env["ARKD_BOLTZ_URL"],
-		env["VITE_BOLTZ_URL"],
 		cfg.BoltzAPIURL,
 	)
 	cfg.IndexerURL = firstNonEmpty(
 		flags["indexer-url"],
 		env["PARKER_INDEXER_URL"],
 		env["ARKD_INDEXER_URL"],
-		env["VITE_INDEXER_URL"],
 	)
 	cfg.NigiriDatadir = firstNonEmpty(
 		resolveOptionalPath(flags["nigiri-datadir"]),
@@ -230,11 +223,6 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 		firstNonEmpty(flags["peer-port"], env["PARKER_PEER_PORT"], env["ARKD_PEER_PORT"]),
 		0,
 	)
-	cfg.TransportMode = normalizeChoice(
-		firstNonEmpty(flags["transport-mode"], env["PARKER_TRANSPORT_MODE"], cfg.TransportMode),
-		[]string{"legacy", "v2"},
-		cfg.TransportMode,
-	)
 	cfg.TorSocksAddr = firstNonEmpty(
 		flags["tor-socks-addr"],
 		env["PARKER_TOR_SOCKS_ADDR"],
@@ -274,7 +262,6 @@ func ResolveRuntimeConfig(flags map[string]string) (RuntimeConfig, error) {
 			flags["mock"],
 			env["PARKER_USE_MOCK_SETTLEMENT"],
 			env["ARKD_USE_MOCK_SETTLEMENT"],
-			env["VITE_USE_MOCK_SETTLEMENT"],
 		),
 		false,
 	)
@@ -539,8 +526,9 @@ func firstNonEmpty(values ...string) string {
 func walkToRepoRoot(start string) string {
 	current := resolvePath(start)
 	for {
-		if fileExists(filepath.Join(current, "package.json")) &&
-			dirExists(filepath.Join(current, "apps")) &&
+		if fileExists(filepath.Join(current, "go.mod")) &&
+			dirExists(filepath.Join(current, "cmd")) &&
+			dirExists(filepath.Join(current, "internal")) &&
 			dirExists(filepath.Join(current, "scripts")) {
 			return current
 		}

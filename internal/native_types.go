@@ -274,12 +274,13 @@ type nativeTableState struct {
 }
 
 type nativePeerSelf struct {
-	Alias          string            `json:"alias"`
-	Mode           string            `json:"mode"`
-	Peer           NativePeerAddress `json:"peer"`
-	ProfileName    string            `json:"profileName"`
-	ProtocolID     string            `json:"protocolId"`
-	WalletPlayerID string            `json:"walletPlayerId"`
+	Alias              string            `json:"alias"`
+	Mode               string            `json:"mode"`
+	Peer               NativePeerAddress `json:"peer"`
+	ProfileName        string            `json:"profileName"`
+	ProtocolID         string            `json:"protocolId"`
+	TransportPubkeyHex string            `json:"transportPubkeyHex,omitempty"`
+	WalletPlayerID     string            `json:"walletPlayerId"`
 }
 
 type nativeJoinRequest struct {
@@ -305,6 +306,13 @@ type nativeActionRequest struct {
 	SignatureHex  string      `json:"signatureHex"`
 	SignedAt      string      `json:"signedAt"`
 	TableID       string      `json:"tableId"`
+}
+
+type nativeTableFetchRequest struct {
+	PlayerID     string `json:"playerId,omitempty"`
+	SignatureHex string `json:"signatureHex,omitempty"`
+	SignedAt     string `json:"signedAt,omitempty"`
+	TableID      string `json:"tableId"`
 }
 
 type nativeTableSyncRequest struct {

@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,7 +21,6 @@ const (
 	LocalControllerHeader      = "X-Parker-Local-Controller"
 	defaultControllerPort      = 3030
 	defaultDevWebPort          = 3010
-	indexHTMLName              = "index.html"
 	controllerKeepaliveSeconds = 15
 )
 
@@ -31,7 +28,6 @@ type Options struct {
 	AllowedOrigins []string
 	Config         cfg.RuntimeConfig
 	ControllerPort int
-	WebDistDir     string
 }
 
 type App struct {
@@ -39,16 +35,14 @@ type App struct {
 	allowedOrigins   []string
 	config           cfg.RuntimeConfig
 	controllerPort   int
-	hasBundledWeb    bool
 	mux              *http.ServeMux
 	profileStore     *walletpkg.ProfileStore
-	webDistDir       string
 }
 
 type DaemonRuntimeState struct {
-	Mesh      *mesh.RuntimeState              `json:"mesh,omitempty"`
-	Transport *parker.TransportV2RuntimeState `json:"transport,omitempty"`
-	Wallet    *walletpkg.WalletSummary        `json:"wallet,omitempty"`
+	Mesh      *mesh.RuntimeState            `json:"mesh,omitempty"`
+	Transport *parker.TransportRuntimeState `json:"transport,omitempty"`
+	Wallet    *walletpkg.WalletSummary      `json:"wallet,omitempty"`
 }
 
 type ProfileDaemonStatus struct {
@@ -68,7 +62,6 @@ type LocalControllerHealth struct {
 	OK                      bool     `json:"ok"`
 	ProfilesDir             string   `json:"profilesDir"`
 	PublicIndexerConfigured bool     `json:"publicIndexerConfigured"`
-	WebBundleAvailable      bool     `json:"webBundleAvailable"`
 }
 
 type controllerError struct {
@@ -106,15 +99,9 @@ func NewApp(options Options) (*App, error) {
 		controllerPort:   controllerPort,
 		mux:              http.NewServeMux(),
 		profileStore:     walletpkg.NewProfileStore(runtimeConfig.ProfileDir),
-		webDistDir:       options.WebDistDir,
 	}
 	for _, origin := range allowedOrigins {
 		app.allowedOriginSet[origin] = struct{}{}
-	}
-	if options.WebDistDir != "" {
-		if _, err := os.Stat(filepath.Join(options.WebDistDir, indexHTMLName)); err == nil {
-			app.hasBundledWeb = true
-		}
 	}
 
 	app.registerRoutes()
@@ -133,12 +120,6 @@ func (app *App) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if app.hasBundledWeb && shouldServeBundledAsset(request.URL.Path) {
-		if err := app.serveBundledAsset(writer, request.URL.Path); err == nil {
-			return
-		}
-	}
-
 	app.mux.ServeHTTP(writer, request)
 }
 
@@ -150,7 +131,6 @@ func (app *App) registerRoutes() {
 			OK:                      true,
 			ProfilesDir:             app.config.ProfileDir,
 			PublicIndexerConfigured: app.config.IndexerURL != "",
-			WebBundleAvailable:      app.hasBundledWeb,
 		})
 	})
 
@@ -494,26 +474,6 @@ func (app *App) proxyIndexerRequest(writer http.ResponseWriter, path string) err
 	return err
 }
 
-func (app *App) serveBundledAsset(writer http.ResponseWriter, requestPath string) error {
-	path := strings.TrimPrefix(requestPath, "/")
-	if path == "" {
-		path = indexHTMLName
-	}
-	targetPath := filepath.Join(app.webDistDir, filepath.Clean(path))
-	info, err := os.Stat(targetPath)
-	if err != nil || info.IsDir() {
-		targetPath = filepath.Join(app.webDistDir, indexHTMLName)
-	}
-	body, err := os.ReadFile(targetPath)
-	if err != nil {
-		return err
-	}
-	writer.Header().Set("Content-Type", firstNonEmpty(mime.TypeByExtension(filepath.Ext(targetPath)), "text/html; charset=utf-8"))
-	writer.WriteHeader(http.StatusOK)
-	_, err = writer.Write(body)
-	return err
-}
-
 func (app *App) requireProfileSummary(profile string) (walletpkg.LocalProfileSummary, error) {
 	summary, err := app.profileStore.LoadSummary(profile)
 	if err != nil {
@@ -629,10 +589,6 @@ func parseMode(value any) string {
 	default:
 		return ""
 	}
-}
-
-func shouldServeBundledAsset(path string) bool {
-	return !strings.HasPrefix(path, "/api/") && path != "/health"
 }
 
 func writeControllerError(writer http.ResponseWriter, err error) {

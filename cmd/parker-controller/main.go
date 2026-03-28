@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -40,15 +39,9 @@ func run(argv []string) error {
 		controllerHost = raw
 	}
 
-	repoRoot, err := cfg.FindRepoRoot()
-	if err != nil {
-		return err
-	}
-	webDistDir := filepath.Join(repoRoot, "apps", "web", "dist")
 	app, err := controllerpkg.NewApp(controllerpkg.Options{
 		Config:         runtimeConfig,
 		ControllerPort: controllerPort,
-		WebDistDir:     webDistDir,
 	})
 	if err != nil {
 		return err

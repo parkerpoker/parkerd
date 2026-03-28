@@ -1,10 +1,7 @@
 package parker
 
 import (
-	"bytes"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,8 +15,8 @@ import (
 func TestTableTrafficRedactsActiveHandSecretsAndPushesToJoiner(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	guest := newNativeTestRuntime(t, "guest")
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 
@@ -57,8 +54,8 @@ func TestTableTrafficRedactsActiveHandSecretsAndPushesToJoiner(t *testing.T) {
 func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	guest := newNativeTestRuntime(t, "guest")
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 	table := mustReadNativeTable(t, host, tableID)
@@ -88,8 +85,8 @@ func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 func TestHandleActionRejectsReplayedDecisionSignature(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	guest := newNativeTestRuntime(t, "guest")
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 	table := mustReadNativeTable(t, host, tableID)
@@ -129,9 +126,9 @@ func TestHandleActionRejectsReplayedDecisionSignature(t *testing.T) {
 func TestFailoverAfterHandAbortSchedulesNextHand(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	player := newNativeTestRuntime(t, "player")
-	witness := newNativeTestRuntime(t, "witness")
+	host := newMeshTestRuntime(t, "host")
+	player := newMeshTestRuntime(t, "player")
+	witness := newMeshTestRuntime(t, "witness")
 
 	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
 		t.Fatalf("bootstrap witness peer: %v", err)
@@ -181,8 +178,8 @@ func TestFailoverAfterHandAbortSchedulesNextHand(t *testing.T) {
 func TestHandleJoinRejectsPeerEndpointMismatch(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	guest := newNativeTestRuntime(t, "guest")
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
 
 	createResult, err := host.CreateTable(map[string]any{"name": "Join Validation Table"})
 	if err != nil {
@@ -202,8 +199,8 @@ func TestHandleJoinRejectsPeerEndpointMismatch(t *testing.T) {
 func TestSyncRouteRejectsForgedEnvelope(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	guest := newNativeTestRuntime(t, "guest")
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 	before := mustReadNativeTable(t, guest, tableID)
@@ -212,18 +209,27 @@ func TestSyncRouteRejectsForgedEnvelope(t *testing.T) {
 		t.Fatalf("build sync request: %v", err)
 	}
 	syncRequest.Table.CurrentEpoch++
-
-	body, err := json.Marshal(syncRequest)
+	guestInfo, err := host.fetchPeerInfo(guest.selfPeerURL())
 	if err != nil {
-		t.Fatalf("marshal forged sync request: %v", err)
+		t.Fatalf("fetch guest peer info: %v", err)
 	}
-	request := httptest.NewRequest(http.MethodPost, "/native/table/sync", bytes.NewReader(body))
-	request.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	guest.routes().ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("expected forged sync to be rejected, got status %d body=%s", recorder.Code, recorder.Body.String())
+	request, requestKey, err := host.newOutboundEnvelope(
+		nativeTransportMessageTablePush,
+		nativeTransportChannelSync,
+		tableID,
+		guestInfo.Peer.PeerID,
+		syncRequest,
+		guestInfo.TransportPubkeyHex,
+	)
+	if err != nil {
+		t.Fatalf("build forged transport envelope: %v", err)
+	}
+	response, err := host.exchangePeerTransport(guest.selfPeerURL(), request)
+	if err != nil {
+		t.Fatalf("send forged sync envelope: %v", err)
+	}
+	if _, err := host.decodeResponseEnvelope(response, requestKey); err == nil || !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("expected forged sync to be rejected with signature error, got %v", err)
 	}
 	after := mustReadNativeTable(t, guest, tableID)
 	if after.CurrentEpoch != before.CurrentEpoch {
@@ -234,8 +240,8 @@ func TestSyncRouteRejectsForgedEnvelope(t *testing.T) {
 func TestTableFetchAuthRejectsStaleSignature(t *testing.T) {
 	t.Parallel()
 
-	host := newNativeTestRuntime(t, "host")
-	guest := newNativeTestRuntime(t, "guest")
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 	staleSignedAt := addMillis(nowISO(), -int((nativeTableFetchAuthMaxAge+time.Second)/time.Millisecond))
@@ -243,25 +249,42 @@ func TestTableFetchAuthRejectsStaleSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign stale fetch auth: %v", err)
 	}
-
-	request := httptest.NewRequest(http.MethodGet, "/native/table/"+tableID, nil)
-	request.Header.Set(nativeTableAuthPlayerIDHeader, guest.walletID.PlayerID)
-	request.Header.Set(nativeTableAuthSignedAtHeader, staleSignedAt)
-	request.Header.Set(nativeTableAuthSignatureHeader, signatureHex)
-	recorder := httptest.NewRecorder()
-	host.routes().ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected stale fetch request to fall back to anonymous view, got %d", recorder.Code)
+	hostInfo, err := guest.fetchPeerInfo(host.selfPeerURL())
+	if err != nil {
+		t.Fatalf("fetch host peer info: %v", err)
+	}
+	request, requestKey, err := guest.newOutboundEnvelope(
+		nativeTransportMessageTablePull,
+		nativeTransportChannelTable,
+		tableID,
+		hostInfo.Peer.PeerID,
+		nativeTableFetchRequest{
+			PlayerID:     guest.walletID.PlayerID,
+			SignatureHex: signatureHex,
+			SignedAt:     staleSignedAt,
+			TableID:      tableID,
+		},
+		hostInfo.TransportPubkeyHex,
+	)
+	if err != nil {
+		t.Fatalf("build stale fetch request envelope: %v", err)
+	}
+	response, err := guest.exchangePeerTransport(host.selfPeerURL(), request)
+	if err != nil {
+		t.Fatalf("send stale fetch request: %v", err)
+	}
+	body, err := guest.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		t.Fatalf("decode stale fetch response envelope: %v", err)
 	}
 	var table nativeTableState
-	if err := json.NewDecoder(recorder.Body).Decode(&table); err != nil {
+	if err := json.Unmarshal(body, &table); err != nil {
 		t.Fatalf("decode stale fetch response: %v", err)
 	}
 	assertTableVisibleCards(t, table, "")
 }
 
-func newNativeTestRuntime(t *testing.T, profileName string) *nativeRuntime {
+func newMeshTestRuntime(t *testing.T, profileName string) *meshRuntime {
 	t.Helper()
 
 	rootDir := t.TempDir()
@@ -281,21 +304,21 @@ func newNativeTestRuntime(t *testing.T, profileName string) *nativeRuntime {
 		t.Fatalf("resolve runtime config: %v", err)
 	}
 
-	runtime, err := newNativeRuntime(profileName, runtimeConfig, "player")
+	runtime, err := newMeshRuntime(profileName, runtimeConfig, "player")
 	if err != nil {
-		t.Fatalf("new native runtime: %v", err)
+		t.Fatalf("new mesh runtime: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = runtime.Close()
 	})
 
 	if _, err := runtime.Bootstrap(profileName); err != nil {
-		t.Fatalf("bootstrap native runtime %s: %v", profileName, err)
+		t.Fatalf("bootstrap mesh runtime %s: %v", profileName, err)
 	}
 	return runtime
 }
 
-func createStartedTwoPlayerTable(t *testing.T, host, guest *nativeRuntime, witnessPeerIDs ...string) (string, string) {
+func createStartedTwoPlayerTable(t *testing.T, host, guest *meshRuntime, witnessPeerIDs ...string) (string, string) {
 	t.Helper()
 
 	createResult, err := host.CreateTable(map[string]any{
@@ -323,7 +346,7 @@ func createStartedTwoPlayerTable(t *testing.T, host, guest *nativeRuntime, witne
 	return tableID, inviteCode
 }
 
-func mustReadNativeTable(t *testing.T, runtime *nativeRuntime, tableID string) nativeTableState {
+func mustReadNativeTable(t *testing.T, runtime *meshRuntime, tableID string) nativeTableState {
 	t.Helper()
 
 	table, err := runtime.requireLocalTable(tableID)
@@ -333,33 +356,40 @@ func mustReadNativeTable(t *testing.T, runtime *nativeRuntime, tableID string) n
 	return *table
 }
 
-func mustFetchNativeTableWithoutAuth(t *testing.T, runtime *nativeRuntime, tableID string) nativeTableState {
+func mustFetchNativeTableWithoutAuth(t *testing.T, runtime *meshRuntime, tableID string) nativeTableState {
 	t.Helper()
 
-	base, err := peerHTTPBase(runtime.selfPeerURL())
+	peerInfo, err := runtime.fetchPeerInfo(runtime.selfPeerURL())
 	if err != nil {
-		t.Fatalf("peer http base: %v", err)
+		t.Fatalf("fetch local peer info: %v", err)
 	}
-	request, err := http.NewRequest(http.MethodGet, base+"/native/table/"+tableID, nil)
+	request, requestKey, err := runtime.newOutboundEnvelope(
+		nativeTransportMessageTablePull,
+		nativeTransportChannelTable,
+		tableID,
+		peerInfo.Peer.PeerID,
+		nativeTableFetchRequest{TableID: tableID},
+		peerInfo.TransportPubkeyHex,
+	)
 	if err != nil {
 		t.Fatalf("new anonymous table request: %v", err)
 	}
-	response, err := runtime.httpClient.Do(request)
+	response, err := runtime.exchangePeerTransport(runtime.selfPeerURL(), request)
 	if err != nil {
 		t.Fatalf("anonymous table fetch: %v", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("anonymous table fetch returned %d", response.StatusCode)
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		t.Fatalf("decode anonymous table envelope: %v", err)
 	}
 	var table nativeTableState
-	if err := json.NewDecoder(response.Body).Decode(&table); err != nil {
+	if err := json.Unmarshal(body, &table); err != nil {
 		t.Fatalf("decode anonymous table fetch: %v", err)
 	}
 	return table
 }
 
-func startNextHandForTest(t *testing.T, runtime *nativeRuntime, tableID string) {
+func startNextHandForTest(t *testing.T, runtime *meshRuntime, tableID string) {
 	t.Helper()
 
 	table := mustReadNativeTable(t, runtime, tableID)
@@ -375,7 +405,7 @@ func startNextHandForTest(t *testing.T, runtime *nativeRuntime, tableID string) 
 	}
 }
 
-func mustBuildJoinRequest(t *testing.T, runtime *nativeRuntime, tableID, peerURL string) nativeJoinRequest {
+func mustBuildJoinRequest(t *testing.T, runtime *meshRuntime, tableID, peerURL string) nativeJoinRequest {
 	t.Helper()
 
 	profile, err := runtime.loadProfileState()

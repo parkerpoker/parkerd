@@ -391,7 +391,6 @@ func (d *ProxyDaemon) writeRunningMetadata() error {
 	d.metadata.Mode = d.mode
 	d.metadata.Status = "running"
 	d.metadata.LastHeartbeat = timestampNow()
-	d.metadata.TransportMode = d.config.TransportMode
 
 	if transport := normalizeStateMap(d.currentState()["transport"]); len(transport) > 0 {
 		if peer := normalizeStateMap(transport["peer"]); len(peer) > 0 {

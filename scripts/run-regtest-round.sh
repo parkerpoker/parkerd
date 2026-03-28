@@ -28,7 +28,7 @@ common_flags=(
 
 ensure_toolchains() {
   local candidate
-  for candidate in /opt/homebrew/bin /usr/local/bin "$HOME"/.nvm/versions/node/*/bin; do
+  for candidate in /opt/homebrew/bin /usr/local/bin "$HOME"/.gvm/gos/go1.24.0/bin; do
     [[ -d "$candidate" ]] || continue
     case ":$PATH:" in
       *":$candidate:"*) ;;
@@ -36,10 +36,6 @@ ensure_toolchains() {
     esac
   done
 
-  command -v node >/dev/null 2>&1 || {
-    echo "node must be available on PATH to run poker-regtest-round." >&2
-    exit 1
-  }
   "$NIGIRI_BIN" --version >/dev/null 2>&1 || {
     echo "nigiri must be available on PATH to run poker-regtest-round." >&2
     exit 1
@@ -56,20 +52,54 @@ ensure_toolchains() {
 
 cleanup() {
   set +e
-  stop_pid() {
+  terminate_pid() {
     local pid="$1"
+    [[ -n "$pid" ]] || return 0
     kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 20; attempt += 1)); do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        return 0
+      fi
+      sleep 0.1
+    done
+    kill -9 "$pid" 2>/dev/null || true
   }
-  [[ -n "${NIGIRI_START_PID:-}" ]] && stop_pid "$NIGIRI_START_PID"
-  [[ -n "${HOST_DAEMON_PID:-}" ]] && stop_pid "$HOST_DAEMON_PID"
-  [[ -n "${WITNESS_DAEMON_PID:-}" ]] && stop_pid "$WITNESS_DAEMON_PID"
-  [[ -n "${ALICE_DAEMON_PID:-}" ]] && stop_pid "$ALICE_DAEMON_PID"
-  [[ -n "${BOB_DAEMON_PID:-}" ]] && stop_pid "$BOB_DAEMON_PID"
-  [[ -n "${INDEXER_PID:-}" ]] && stop_pid "$INDEXER_PID"
+
+  collect_run_daemon_pids() {
+    local metadata pid command_line
+    for metadata in "$BASE"/daemons/*.json; do
+      [[ -f "$metadata" ]] || continue
+      pid="$(json_field pid <"$metadata" 2>/dev/null || true)"
+      [[ -n "$pid" ]] && printf '%s\n' "$pid"
+    done
+
+    ps -axo pid=,command= 2>/dev/null | while read -r pid command_line; do
+      if [[ "$command_line" == *"parker-daemon-go"* ]] && [[ "$command_line" == *"--daemon-dir $BASE/daemons"* ]]; then
+        printf '%s\n' "$pid"
+      fi
+    done
+  }
+
+  if [[ -d "$BASE/daemons" ]]; then
+    "$ROOT_DIR/scripts/bin/parker-cli" daemon stop "${common_flags[@]}" --profile host >/dev/null 2>&1 || true
+    "$ROOT_DIR/scripts/bin/parker-cli" daemon stop "${common_flags[@]}" --profile witness >/dev/null 2>&1 || true
+    "$ROOT_DIR/scripts/bin/parker-cli" daemon stop "${common_flags[@]}" --profile alice >/dev/null 2>&1 || true
+    "$ROOT_DIR/scripts/bin/parker-cli" daemon stop "${common_flags[@]}" --profile bob >/dev/null 2>&1 || true
+  fi
+
+  collect_run_daemon_pids | sort -u | while read -r pid; do
+    terminate_pid "$pid"
+  done
+
+  [[ -n "${NIGIRI_START_PID:-}" ]] && terminate_pid "$NIGIRI_START_PID"
+  [[ -n "${HOST_DAEMON_PID:-}" ]] && terminate_pid "$HOST_DAEMON_PID"
+  [[ -n "${WITNESS_DAEMON_PID:-}" ]] && terminate_pid "$WITNESS_DAEMON_PID"
+  [[ -n "${ALICE_DAEMON_PID:-}" ]] && terminate_pid "$ALICE_DAEMON_PID"
+  [[ -n "${BOB_DAEMON_PID:-}" ]] && terminate_pid "$BOB_DAEMON_PID"
+  [[ -n "${INDEXER_PID:-}" ]] && terminate_pid "$INDEXER_PID"
   "$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" stop >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM HUP
 
 ensure_toolchains
 
@@ -83,18 +113,12 @@ pdaemon() {
   "$ROOT_DIR/scripts/bin/parker-daemon" "${common_flags[@]}" "$@"
 }
 
+pdevtool() {
+  "$ROOT_DIR/scripts/bin/parker-devtool" "$@"
+}
+
 json_field() {
-  node --input-type=module -e '
-    const path = process.argv[1].split(".");
-    let s = "";
-    process.stdin.on("data", d => s += d);
-    process.stdin.on("end", () => {
-      let v = JSON.parse(s);
-      for (const k of path) v = v?.[k];
-      if (typeof v === "object") console.log(JSON.stringify(v));
-      else console.log(v ?? "");
-    });
-  ' "$1"
+  pdevtool json-field "$1"
 }
 
 assert_go_daemon_active() {
@@ -121,24 +145,30 @@ assert_go_daemon_active() {
   return 1
 }
 
+wait_for_daemon_reachable() {
+  local profile="$1"
+  local status reachable
+
+  for ((attempt = 0; attempt < 80; attempt += 1)); do
+    if status="$(pcli daemon status --profile "$profile" --json 2>/dev/null)"; then
+      reachable="$(printf '%s' "$status" | json_field data.reachable)"
+      if [[ "$reachable" == "true" ]]; then
+        return 0
+      fi
+    fi
+    sleep 0.25
+  done
+
+  echo "timed out waiting for daemon $profile to become reachable" >&2
+  return 1
+}
+
 nigiri_cmd() {
   "$NIGIRI_BIN" --datadir "$NIGIRI_DATADIR" "$@"
 }
 
 free_port() {
-  node --input-type=module -e '
-    import { createServer } from "node:net";
-    const server = createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        process.exit(1);
-        return;
-      }
-      console.log(address.port);
-      server.close();
-    });
-  '
+  pdevtool free-port
 }
 
 wait_for_http_json() {
@@ -203,44 +233,7 @@ wait_for_ark_ready() {
 }
 
 select_table_action() {
-  ALICE_PLAYER_ID="$ALICE_PLAYER_ID" BOB_PLAYER_ID="$BOB_PLAYER_ID" node --input-type=module -e '
-    let input = "";
-    process.stdin.on("data", (chunk) => input += chunk);
-    process.stdin.on("end", () => {
-      const envelope = JSON.parse(input);
-      const state = envelope?.data ?? {};
-      const publicState = state.publicState;
-      if (!publicState || !publicState.handId || publicState.phase == null) {
-        console.log("");
-        return;
-      }
-      if (publicState.phase === "settled") {
-        console.log("settled");
-        return;
-      }
-      const alicePlayerId = process.env.ALICE_PLAYER_ID;
-      const bobPlayerId = process.env.BOB_PLAYER_ID;
-      const seats = publicState.seatedPlayers ?? [];
-      const aliceSeat = seats.find((seat) => seat.playerId === alicePlayerId);
-      const bobSeat = seats.find((seat) => seat.playerId === bobPlayerId);
-      if (!aliceSeat || !bobSeat) {
-        throw new Error("missing seats");
-      }
-      const actor = publicState.actingSeatIndex === aliceSeat.seatIndex ? "alice" : "bob";
-      const actorPlayerId = actor === "alice" ? alicePlayerId : bobPlayerId;
-      const contribution = publicState.roundContributions?.[actorPlayerId] ?? 0;
-      const toCall = Math.max(0, (publicState.currentBetSats ?? 0) - contribution);
-      let action = "check";
-      let amount = "";
-      if (publicState.phase === "preflop" && toCall === 0) {
-        action = "bet";
-        amount = String(Math.max(publicState.minRaiseToSats || 800, 800));
-      } else if (toCall > 0) {
-        action = "call";
-      }
-      console.log([actor, action, amount].filter(Boolean).join(" "));
-    });
-  '
+  pdevtool select-table-action --alice "$ALICE_PLAYER_ID" --bob "$BOB_PLAYER_ID"
 }
 
 send_table_action_with_retry() {
@@ -378,7 +371,11 @@ assert_go_daemon_active host
 assert_go_daemon_active witness
 assert_go_daemon_active alice
 assert_go_daemon_active bob
-echo "Verified Go daemon ownership via metadata PID and native startup banner."
+wait_for_daemon_reachable host
+wait_for_daemon_reachable witness
+wait_for_daemon_reachable alice
+wait_for_daemon_reachable bob
+echo "Verified Go daemon ownership via metadata PID, startup banner, and live socket reachability."
 
 echo "Bootstrapping identities..."
 HOST_BOOT="$(pcli bootstrap Host --profile host --json)"
@@ -388,9 +385,9 @@ BOB_BOOT="$(pcli bootstrap Bob --profile bob --json)"
 WITNESS_STATUS="$(pcli daemon status --profile witness --json)"
 
 WITNESS_PEER_URL="$(printf '%s' "$WITNESS_STATUS" | json_field data.metadata.peerUrl)"
-WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field data.mesh.peerId)"
-ALICE_PLAYER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.mesh.walletPlayerId)"
-BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.mesh.walletPlayerId)"
+WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field data.transport.peer.peerId)"
+ALICE_PLAYER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.transport.peer.walletPlayerId)"
+BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.transport.peer.walletPlayerId)"
 
 echo "Funding wallets..."
 pcli wallet faucet "$FAUCET_SATS" --profile alice --json >/dev/null

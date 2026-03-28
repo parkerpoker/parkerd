@@ -21,7 +21,7 @@ import (
 	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
 )
 
-type nativeRuntime struct {
+type meshRuntime struct {
 	config           RuntimeConfig
 	httpClient       *http.Client
 	lastSyncAt       map[string]time.Time
@@ -36,7 +36,10 @@ type nativeRuntime struct {
 	self             nativePeerSelf
 	server           *http.Server
 	started          bool
-	store            *nativeStore
+	store            *meshStore
+	transportKeyID   string
+	transportPrivate string
+	transportPublic  string
 	walletID         settlementcore.LocalIdentity
 	walletRuntime    *walletpkg.Runtime
 }
@@ -49,15 +52,15 @@ const (
 	nativeTableSyncAuthMaxAge      = 15 * time.Second
 )
 
-func newNativeRuntime(profileName string, config RuntimeConfig, mode string) (*nativeRuntime, error) {
+func newMeshRuntime(profileName string, config RuntimeConfig, mode string) (*meshRuntime, error) {
 	if mode == "" {
 		mode = "player"
 	}
-	store, err := newNativeStore(profileName, config)
+	store, err := newMeshStore(profileName, config)
 	if err != nil {
 		return nil, err
 	}
-	return &nativeRuntime{
+	return &meshRuntime{
 		config:       config,
 		httpClient:   &http.Client{Timeout: 5 * time.Second},
 		lastSyncAt:   map[string]time.Time{},
@@ -76,7 +79,7 @@ func newNativeRuntime(profileName string, config RuntimeConfig, mode string) (*n
 	}, nil
 }
 
-func (runtime *nativeRuntime) Start() error {
+func (runtime *meshRuntime) Start() error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 
@@ -93,7 +96,7 @@ func (runtime *nativeRuntime) Start() error {
 	return nil
 }
 
-func (runtime *nativeRuntime) Close() error {
+func (runtime *meshRuntime) Close() error {
 	runtime.mu.Lock()
 	server := runtime.server
 	runtime.server = nil
@@ -117,7 +120,7 @@ func (runtime *nativeRuntime) Close() error {
 	return joined
 }
 
-func (runtime *nativeRuntime) Bootstrap(nickname string) (map[string]any, error) {
+func (runtime *meshRuntime) Bootstrap(nickname string) (map[string]any, error) {
 	runtime.mu.Lock()
 	if err := runtime.ensureBootstrapLocked(nickname); err != nil {
 		runtime.mu.Unlock()
@@ -154,7 +157,7 @@ func (runtime *nativeRuntime) Bootstrap(nickname string) (map[string]any, error)
 	}, nil
 }
 
-func (runtime *nativeRuntime) Tick() {
+func (runtime *meshRuntime) Tick() {
 	_ = runtime.Start()
 
 	tableIDs, err := runtime.store.listTableIDs()
@@ -203,7 +206,7 @@ func (runtime *nativeRuntime) Tick() {
 	}
 }
 
-func (runtime *nativeRuntime) CurrentState() (map[string]any, error) {
+func (runtime *meshRuntime) CurrentState() (map[string]any, error) {
 	wallet, err := runtime.walletSummary()
 	if err != nil {
 		return nil, err
@@ -218,7 +221,7 @@ func (runtime *nativeRuntime) CurrentState() (map[string]any, error) {
 	}, nil
 }
 
-func (runtime *nativeRuntime) QuickState() (map[string]any, error) {
+func (runtime *meshRuntime) QuickState() (map[string]any, error) {
 	mesh, err := runtime.meshState()
 	if err != nil {
 		return nil, err
@@ -228,7 +231,7 @@ func (runtime *nativeRuntime) QuickState() (map[string]any, error) {
 	}, nil
 }
 
-func (runtime *nativeRuntime) walletSummary() (walletpkg.WalletSummary, error) {
+func (runtime *meshRuntime) walletSummary() (walletpkg.WalletSummary, error) {
 	base, err := runtime.walletRuntime.GetWallet(runtime.profileName)
 	if err != nil {
 		return walletpkg.WalletSummary{}, err
@@ -251,7 +254,7 @@ func (runtime *nativeRuntime) walletSummary() (walletpkg.WalletSummary, error) {
 	return base, nil
 }
 
-func (runtime *nativeRuntime) meshState() (NativeMeshRuntimeState, error) {
+func (runtime *meshRuntime) meshState() (NativeMeshRuntimeState, error) {
 	peers, err := runtime.knownPeers()
 	if err != nil {
 		return NativeMeshRuntimeState{}, err
@@ -299,11 +302,11 @@ func (runtime *nativeRuntime) meshState() (NativeMeshRuntimeState, error) {
 	}, nil
 }
 
-func (runtime *nativeRuntime) NetworkPeers() ([]NativePeerAddress, error) {
+func (runtime *meshRuntime) NetworkPeers() ([]NativePeerAddress, error) {
 	return runtime.knownPeers()
 }
 
-func (runtime *nativeRuntime) BootstrapPeer(peerURL, alias string, roles []string) (NativePeerAddress, error) {
+func (runtime *meshRuntime) BootstrapPeer(peerURL, alias string, roles []string) (NativePeerAddress, error) {
 	if strings.TrimSpace(peerURL) == "" {
 		return NativePeerAddress{}, errors.New("peer URL is required")
 	}
@@ -338,7 +341,7 @@ func provisionalPeerID(peerURL string) string {
 	return "peer-" + fmt.Sprintf("%x", sum[:])[:20]
 }
 
-func (runtime *nativeRuntime) CreateTable(input map[string]any) (map[string]any, error) {
+func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, error) {
 	if err := runtime.Start(); err != nil {
 		return nil, err
 	}
@@ -421,7 +424,7 @@ func (runtime *nativeRuntime) CreateTable(input map[string]any) (map[string]any,
 	}, nil
 }
 
-func (runtime *nativeRuntime) AnnounceTable(tableID string) (map[string]any, error) {
+func (runtime *meshRuntime) AnnounceTable(tableID string) (map[string]any, error) {
 	table, err := runtime.requireLocalTable(tableID)
 	if err != nil {
 		return nil, err
@@ -439,7 +442,7 @@ func (runtime *nativeRuntime) AnnounceTable(tableID string) (map[string]any, err
 	return rawJSONMap(*table.Advertisement), nil
 }
 
-func (runtime *nativeRuntime) JoinTable(inviteCode string, buyInSats int) (NativeMeshTableView, error) {
+func (runtime *meshRuntime) JoinTable(inviteCode string, buyInSats int) (NativeMeshTableView, error) {
 	if err := runtime.Start(); err != nil {
 		return NativeMeshTableView{}, err
 	}
@@ -496,7 +499,7 @@ func (runtime *nativeRuntime) JoinTable(inviteCode string, buyInSats int) (Nativ
 	return runtime.localTableView(table), nil
 }
 
-func (runtime *nativeRuntime) GetTable(tableID string) (NativeMeshTableView, error) {
+func (runtime *meshRuntime) GetTable(tableID string) (NativeMeshTableView, error) {
 	if err := runtime.Start(); err != nil {
 		return NativeMeshTableView{}, err
 	}
@@ -516,7 +519,7 @@ func (runtime *nativeRuntime) GetTable(tableID string) (NativeMeshTableView, err
 	return runtime.localTableView(*table), nil
 }
 
-func (runtime *nativeRuntime) SendAction(tableID string, action game.Action) (NativeMeshTableView, error) {
+func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (NativeMeshTableView, error) {
 	if err := runtime.Start(); err != nil {
 		return NativeMeshTableView{}, err
 	}
@@ -546,7 +549,7 @@ func (runtime *nativeRuntime) SendAction(tableID string, action game.Action) (Na
 	return runtime.localTableView(updated), nil
 }
 
-func (runtime *nativeRuntime) RotateHost(tableID string) (NativeMeshTableView, error) {
+func (runtime *meshRuntime) RotateHost(tableID string) (NativeMeshTableView, error) {
 	if err := runtime.failoverTable(tableID, "manual rotation"); err != nil {
 		return NativeMeshTableView{}, err
 	}
@@ -557,7 +560,7 @@ func (runtime *nativeRuntime) RotateHost(tableID string) (NativeMeshTableView, e
 	return runtime.localTableView(*table), nil
 }
 
-func (runtime *nativeRuntime) PublicTables() ([]NativePublicTableView, error) {
+func (runtime *meshRuntime) PublicTables() ([]NativePublicTableView, error) {
 	if runtime.config.IndexerURL != "" {
 		indexerURL := strings.TrimSuffix(runtime.config.IndexerURL, "/") + "/api/public/tables"
 		request, err := http.NewRequest(http.MethodGet, indexerURL, nil)
@@ -591,11 +594,11 @@ func (runtime *nativeRuntime) PublicTables() ([]NativePublicTableView, error) {
 	return views, nil
 }
 
-func (runtime *nativeRuntime) CashOut(tableID string) (map[string]any, error) {
+func (runtime *meshRuntime) CashOut(tableID string) (map[string]any, error) {
 	return runtime.completeFunds(tableID, "cashout", "completed")
 }
 
-func (runtime *nativeRuntime) Renew(tableID string) ([]map[string]any, error) {
+func (runtime *meshRuntime) Renew(tableID string) ([]map[string]any, error) {
 	table, err := runtime.refreshLocalTable(tableID)
 	if err != nil {
 		return nil, err
@@ -614,11 +617,11 @@ func (runtime *nativeRuntime) Renew(tableID string) ([]map[string]any, error) {
 	return []map[string]any{rawJSONMap(operation)}, nil
 }
 
-func (runtime *nativeRuntime) Exit(tableID string) (map[string]any, error) {
+func (runtime *meshRuntime) Exit(tableID string) (map[string]any, error) {
 	return runtime.completeFunds(tableID, "emergency-exit", "exited")
 }
 
-func (runtime *nativeRuntime) completeFunds(tableID, kind, finalStatus string) (map[string]any, error) {
+func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (map[string]any, error) {
 	table, err := runtime.refreshLocalTable(tableID)
 	if err != nil {
 		return nil, err
@@ -641,7 +644,7 @@ func (runtime *nativeRuntime) completeFunds(tableID, kind, finalStatus string) (
 	}, nil
 }
 
-func (runtime *nativeRuntime) requireLocalTable(tableID string) (*nativeTableState, error) {
+func (runtime *meshRuntime) requireLocalTable(tableID string) (*nativeTableState, error) {
 	table, err := runtime.store.readTable(tableID)
 	if err != nil {
 		return nil, err
@@ -652,7 +655,7 @@ func (runtime *nativeRuntime) requireLocalTable(tableID string) (*nativeTableSta
 	return table, nil
 }
 
-func (runtime *nativeRuntime) refreshLocalTable(tableID string) (*nativeTableState, error) {
+func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState, error) {
 	table, err := runtime.store.readTable(tableID)
 	if err != nil || table == nil {
 		return table, err
@@ -675,7 +678,7 @@ func (runtime *nativeRuntime) refreshLocalTable(tableID string) (*nativeTableSta
 	return table, nil
 }
 
-func (runtime *nativeRuntime) ensureBootstrapLocked(nickname string) error {
+func (runtime *meshRuntime) ensureBootstrapLocked(nickname string) error {
 	if runtime.walletID.PlayerID != "" && runtime.protocolID != "" {
 		if nickname == "" {
 			return nil
@@ -697,6 +700,12 @@ func (runtime *nativeRuntime) ensureBootstrapLocked(nickname string) error {
 	}
 	if state.ProtocolPrivateKeyHex == "" {
 		state.ProtocolPrivateKeyHex, err = settlementcore.RandomHex(32)
+		if err != nil {
+			return err
+		}
+	}
+	if state.TransportPrivateKeyHex == "" {
+		state.TransportPrivateKeyHex, err = randomX25519PrivateKeyHex()
 		if err != nil {
 			return err
 		}
@@ -723,10 +732,17 @@ func (runtime *nativeRuntime) ensureBootstrapLocked(nickname string) error {
 	if err != nil {
 		return err
 	}
+	transportPublic, err := x25519PublicKeyHex(state.TransportPrivateKeyHex)
+	if err != nil {
+		return err
+	}
 	runtime.walletID = walletID
 	runtime.peerIdentity = peerIdentity
 	runtime.protocolIdentity = protocolIdentity
 	runtime.protocolID = protocolIdentity.ID
+	runtime.transportPrivate = state.TransportPrivateKeyHex
+	runtime.transportPublic = transportPublic
+	runtime.transportKeyID = transportKeyID(transportPublic)
 	existingPeerURL := runtime.self.Peer.PeerURL
 	runtime.self = nativePeerSelf{
 		Alias: state.Nickname,
@@ -739,14 +755,15 @@ func (runtime *nativeRuntime) ensureBootstrapLocked(nickname string) error {
 			ProtocolPubkeyHex: protocolIdentity.PublicKeyHex,
 			Roles:             []string{runtime.mode},
 		},
-		ProfileName:    runtime.profileName,
-		ProtocolID:     protocolIdentity.ID,
-		WalletPlayerID: walletID.PlayerID,
+		ProfileName:        runtime.profileName,
+		ProtocolID:         protocolIdentity.ID,
+		TransportPubkeyHex: transportPublic,
+		WalletPlayerID:     walletID.PlayerID,
 	}
 	return nil
 }
 
-func (runtime *nativeRuntime) startPeerServerLocked() error {
+func (runtime *meshRuntime) startPeerServerLocked() error {
 	if runtime.listener != nil {
 		if runtime.self.Peer.PeerURL == "" {
 			if tcpAddr, ok := runtime.listener.Addr().(*net.TCPAddr); ok {
@@ -754,7 +771,7 @@ func (runtime *nativeRuntime) startPeerServerLocked() error {
 				if host == "" || host == "0.0.0.0" || host == "::" {
 					host = "127.0.0.1"
 				}
-				runtime.self.Peer.PeerURL = fmt.Sprintf("ws://%s:%d/mesh", host, tcpAddr.Port)
+				runtime.self.Peer.PeerURL = fmt.Sprintf("parker://%s:%d", host, tcpAddr.Port)
 			}
 		}
 		return nil
@@ -776,99 +793,13 @@ func (runtime *nativeRuntime) startPeerServerLocked() error {
 	if host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
 	}
-	runtime.self.Peer.PeerURL = fmt.Sprintf("ws://%s:%d/mesh", host, port)
-
-	server := &http.Server{Handler: runtime.routes()}
-	runtime.server = server
-	go func() {
-		_ = server.Serve(listener)
-	}()
+	runtime.self.Peer.PeerURL = fmt.Sprintf("parker://%s:%d", host, port)
+	runtime.server = nil
+	go runtime.servePeerTransport(listener)
 	return nil
 }
 
-func (runtime *nativeRuntime) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/native/peer", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet {
-			writer.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		runtime.writeJSON(writer, runtime.self)
-	})
-	mux.HandleFunc("/native/table/join", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			writer.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var join nativeJoinRequest
-		if err := json.NewDecoder(request.Body).Decode(&join); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
-			return
-		}
-		table, err := runtime.handleJoinFromPeer(join)
-		if err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
-			return
-		}
-		_ = runtime.writeJSON(writer, runtime.networkTableView(table, join.WalletPlayerID))
-	})
-	mux.HandleFunc("/native/table/action", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			writer.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var action nativeActionRequest
-		if err := json.NewDecoder(request.Body).Decode(&action); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
-			return
-		}
-		table, err := runtime.handleActionFromPeer(action)
-		if err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
-			return
-		}
-		_ = runtime.writeJSON(writer, runtime.networkTableView(table, action.PlayerID))
-	})
-	mux.HandleFunc("/native/table/sync", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			writer.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var syncRequest nativeTableSyncRequest
-		if err := json.NewDecoder(request.Body).Decode(&syncRequest); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
-			return
-		}
-		if err := runtime.acceptTableSync(syncRequest); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			_ = runtime.writeJSON(writer, map[string]any{"error": err.Error()})
-			return
-		}
-		_ = runtime.writeJSON(writer, map[string]any{"ok": true})
-	})
-	mux.HandleFunc("/native/table/", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodGet {
-			writer.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		tableID := strings.TrimPrefix(request.URL.Path, "/native/table/")
-		table, err := runtime.store.readTable(tableID)
-		if err != nil || table == nil {
-			writer.WriteHeader(http.StatusNotFound)
-			_ = runtime.writeJSON(writer, map[string]any{"error": "table not found"})
-			return
-		}
-		_ = runtime.writeJSON(writer, runtime.networkTableView(*table, runtime.tableViewerPlayerID(request, *table)))
-	})
-	return mux
-}
-
-func (runtime *nativeRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTableState, error) {
+func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTableState, error) {
 	var updated nativeTableState
 	err := runtime.store.withTableLock(join.TableID, func() error {
 		table, err := runtime.store.readTable(join.TableID)
@@ -955,7 +886,7 @@ func (runtime *nativeRuntime) handleJoinFromPeer(join nativeJoinRequest) (native
 	return updated, err
 }
 
-func (runtime *nativeRuntime) handleActionFromPeer(request nativeActionRequest) (nativeTableState, error) {
+func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (nativeTableState, error) {
 	var updated nativeTableState
 	err := runtime.store.withTableLock(request.TableID, func() error {
 		table, err := runtime.store.readTable(request.TableID)
@@ -1030,7 +961,7 @@ func (runtime *nativeRuntime) handleActionFromPeer(request nativeActionRequest) 
 	return updated, err
 }
 
-func (runtime *nativeRuntime) startNextHandLocked(table *nativeTableState) error {
+func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	if table.NextHandAt != "" && elapsedMillis(table.NextHandAt) < 0 {
 		return nil
 	}
@@ -1100,7 +1031,7 @@ func (runtime *nativeRuntime) startNextHandLocked(table *nativeTableState) error
 	})
 }
 
-func (runtime *nativeRuntime) failoverTable(tableID, reason string) error {
+func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
 	return runtime.store.withTableLock(tableID, func() error {
 		table, err := runtime.store.readTable(tableID)
 		if err != nil || table == nil {
@@ -1168,7 +1099,7 @@ func (runtime *nativeRuntime) failoverTable(tableID, reason string) error {
 	})
 }
 
-func (runtime *nativeRuntime) persistAndReplicate(table *nativeTableState, publish bool) error {
+func (runtime *meshRuntime) persistAndReplicate(table *nativeTableState, publish bool) error {
 	table.LastSyncedAt = nowISO()
 	if err := runtime.store.writeTable(table); err != nil {
 		return err
@@ -1190,7 +1121,7 @@ func (runtime *nativeRuntime) persistAndReplicate(table *nativeTableState, publi
 	return nil
 }
 
-func (runtime *nativeRuntime) syncPrivateAndFunds(table nativeTableState) error {
+func (runtime *meshRuntime) syncPrivateAndFunds(table nativeTableState) error {
 	localState := map[string]any{
 		"auditBundlesByHandId": map[string]any{},
 		"myHoleCardsByHandId":  map[string]any{},
@@ -1233,7 +1164,7 @@ func (runtime *nativeRuntime) syncPrivateAndFunds(table nativeTableState) error 
 	return runtime.store.writeTableFunds(funds)
 }
 
-func (runtime *nativeRuntime) replicateTable(table nativeTableState) {
+func (runtime *meshRuntime) replicateTable(table nativeTableState) {
 	targets := map[string]string{}
 	for _, witness := range table.Witnesses {
 		if witness.Peer.PeerURL != "" && witness.Peer.PeerID != runtime.selfPeerID() {
@@ -1253,11 +1184,11 @@ func (runtime *nativeRuntime) replicateTable(table nativeTableState) {
 		if err != nil {
 			continue
 		}
-		_, _ = runtime.postJSON(peerURL, "/native/table/sync", syncRequest)
+		_ = runtime.sendTableSync(peerURL, syncRequest)
 	}
 }
 
-func (runtime *nativeRuntime) publishPublicState(table nativeTableState) error {
+func (runtime *meshRuntime) publishPublicState(table nativeTableState) error {
 	if table.Advertisement == nil || runtime.config.IndexerURL == "" {
 		return nil
 	}
@@ -1276,7 +1207,7 @@ func (runtime *nativeRuntime) publishPublicState(table nativeTableState) error {
 	return nil
 }
 
-func (runtime *nativeRuntime) buildAdvertisement(table nativeTableState) (NativeAdvertisement, error) {
+func (runtime *meshRuntime) buildAdvertisement(table nativeTableState) (NativeAdvertisement, error) {
 	unsigned := map[string]any{
 		"adExpiresAt":           addMillis(nowISO(), 3600_000),
 		"buyInMaxSats":          table.Config.BuyInMaxSats,
@@ -1330,7 +1261,7 @@ func (runtime *nativeRuntime) buildAdvertisement(table nativeTableState) (Native
 	}, nil
 }
 
-func (runtime *nativeRuntime) appendEvent(table *nativeTableState, body map[string]any) error {
+func (runtime *meshRuntime) appendEvent(table *nativeTableState, body map[string]any) error {
 	prevHash := any(nil)
 	if table.LastEventHash != "" {
 		prevHash = table.LastEventHash
@@ -1373,7 +1304,7 @@ func (runtime *nativeRuntime) appendEvent(table *nativeTableState, body map[stri
 	return nil
 }
 
-func (runtime *nativeRuntime) buildReadyPublicState(table nativeTableState) NativePublicTableState {
+func (runtime *meshRuntime) buildReadyPublicState(table nativeTableState) NativePublicTableState {
 	chips := map[string]int{}
 	seatedPlayers := make([]NativeSeatedPlayer, 0, len(table.Seats))
 	for _, seat := range table.Seats {
@@ -1407,7 +1338,7 @@ func (runtime *nativeRuntime) buildReadyPublicState(table nativeTableState) Nati
 	}
 }
 
-func (runtime *nativeRuntime) publicStateFromHand(table nativeTableState, hand game.HoldemState) NativePublicTableState {
+func (runtime *meshRuntime) publicStateFromHand(table nativeTableState, hand game.HoldemState) NativePublicTableState {
 	seatedPlayers := make([]NativeSeatedPlayer, 0, len(table.Seats))
 	chipBalances := map[string]int{}
 	roundContributions := map[string]int{}
@@ -1469,7 +1400,7 @@ func (runtime *nativeRuntime) publicStateFromHand(table nativeTableState, hand g
 	}
 }
 
-func (runtime *nativeRuntime) publicStateFromSnapshot(table nativeTableState, snapshot NativeCooperativeTableSnapshot) NativePublicTableState {
+func (runtime *meshRuntime) publicStateFromSnapshot(table nativeTableState, snapshot NativeCooperativeTableSnapshot) NativePublicTableState {
 	return NativePublicTableState{
 		ActingSeatIndex:      snapshot.TurnIndex,
 		Board:                []string{},
@@ -1497,7 +1428,7 @@ func (runtime *nativeRuntime) publicStateFromSnapshot(table nativeTableState, sn
 	}
 }
 
-func (runtime *nativeRuntime) buildSnapshot(table nativeTableState, publicState NativePublicTableState) (NativeCooperativeTableSnapshot, error) {
+func (runtime *meshRuntime) buildSnapshot(table nativeTableState, publicState NativePublicTableState) (NativeCooperativeTableSnapshot, error) {
 	snapshot := NativeCooperativeTableSnapshot{
 		CreatedAt:            nowISO(),
 		ChipBalances:         cloneJSON(publicState.ChipBalances),
@@ -1537,7 +1468,7 @@ func (runtime *nativeRuntime) buildSnapshot(table nativeTableState, publicState 
 	return snapshot, nil
 }
 
-func (runtime *nativeRuntime) snapshotHash(snapshot NativeCooperativeTableSnapshot) string {
+func (runtime *meshRuntime) snapshotHash(snapshot NativeCooperativeTableSnapshot) string {
 	unsigned := rawJSONMap(snapshot)
 	delete(unsigned, "signatures")
 	hash, err := settlementcore.HashStructuredDataHex(unsigned)
@@ -1547,7 +1478,7 @@ func (runtime *nativeRuntime) snapshotHash(snapshot NativeCooperativeTableSnapsh
 	return hash
 }
 
-func (runtime *nativeRuntime) localTableView(table nativeTableState) NativeMeshTableView {
+func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTableView {
 	var mySeatIndex any
 	var myPlayerID any
 	var myHoleCards any
@@ -1589,7 +1520,7 @@ func (runtime *nativeRuntime) localTableView(table nativeTableState) NativeMeshT
 	}
 }
 
-func (runtime *nativeRuntime) tableSummary(table nativeTableState) NativeTableSummary {
+func (runtime *meshRuntime) tableSummary(table nativeTableState) NativeTableSummary {
 	phase := any(nil)
 	handNumber := 0
 	if table.PublicState != nil {
@@ -1614,7 +1545,7 @@ func (runtime *nativeRuntime) tableSummary(table nativeTableState) NativeTableSu
 	}
 }
 
-func (runtime *nativeRuntime) roleForTable(table nativeTableState) string {
+func (runtime *meshRuntime) roleForTable(table nativeTableState) string {
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		return "host"
 	}
@@ -1626,7 +1557,7 @@ func (runtime *nativeRuntime) roleForTable(table nativeTableState) string {
 	return "player"
 }
 
-func (runtime *nativeRuntime) knownPeers() ([]NativePeerAddress, error) {
+func (runtime *meshRuntime) knownPeers() ([]NativePeerAddress, error) {
 	profile, err := runtime.loadProfileState()
 	if err != nil {
 		return nil, err
@@ -1647,7 +1578,7 @@ func (runtime *nativeRuntime) knownPeers() ([]NativePeerAddress, error) {
 	return peers, nil
 }
 
-func (runtime *nativeRuntime) saveKnownPeer(peer NativePeerAddress) error {
+func (runtime *meshRuntime) saveKnownPeer(peer NativePeerAddress) error {
 	profile, err := runtime.loadProfileState()
 	if err != nil {
 		return err
@@ -1685,13 +1616,13 @@ func (runtime *nativeRuntime) saveKnownPeer(peer NativePeerAddress) error {
 	return runtime.profileStore.Save(*profile)
 }
 
-func (runtime *nativeRuntime) loadProfileState() (*walletpkg.PlayerProfileState, error) {
+func (runtime *meshRuntime) loadProfileState() (*walletpkg.PlayerProfileState, error) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	return runtime.loadProfileStateLocked()
 }
 
-func (runtime *nativeRuntime) loadProfileStateLocked() (*walletpkg.PlayerProfileState, error) {
+func (runtime *meshRuntime) loadProfileStateLocked() (*walletpkg.PlayerProfileState, error) {
 	state, err := runtime.profileStore.Load(runtime.profileName)
 	if err != nil {
 		return nil, err
@@ -1717,7 +1648,7 @@ func (runtime *nativeRuntime) loadProfileStateLocked() (*walletpkg.PlayerProfile
 	return state, nil
 }
 
-func (runtime *nativeRuntime) currentTableID() string {
+func (runtime *meshRuntime) currentTableID() string {
 	profile, err := runtime.loadProfileState()
 	if err != nil {
 		return ""
@@ -1728,7 +1659,7 @@ func (runtime *nativeRuntime) currentTableID() string {
 	return profile.CurrentMeshTableID
 }
 
-func (runtime *nativeRuntime) acceptRemoteTable(table nativeTableState) error {
+func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) error {
 	existing, err := runtime.store.readTable(table.Config.TableID)
 	if err != nil {
 		return err
@@ -1773,7 +1704,7 @@ func (runtime *nativeRuntime) acceptRemoteTable(table nativeTableState) error {
 	return runtime.syncPrivateAndFunds(table)
 }
 
-func (runtime *nativeRuntime) seatIndexForPlayer(table nativeTableState) int {
+func (runtime *meshRuntime) seatIndexForPlayer(table nativeTableState) int {
 	for _, seat := range table.Seats {
 		if seat.PlayerID == runtime.walletID.PlayerID {
 			return seat.SeatIndex
@@ -1782,75 +1713,7 @@ func (runtime *nativeRuntime) seatIndexForPlayer(table nativeTableState) int {
 	return -1
 }
 
-func (runtime *nativeRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error) {
-	base, err := peerHTTPBase(peerURL)
-	if err != nil {
-		return nativePeerSelf{}, err
-	}
-	request, err := http.NewRequest(http.MethodGet, base+"/native/peer", nil)
-	if err != nil {
-		return nativePeerSelf{}, err
-	}
-	response, err := runtime.httpClient.Do(request)
-	if err != nil {
-		return nativePeerSelf{}, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(response.Body)
-		return nativePeerSelf{}, fmt.Errorf("peer info request failed: %s", strings.TrimSpace(string(body)))
-	}
-	var decoded nativePeerSelf
-	if err := json.NewDecoder(response.Body).Decode(&decoded); err != nil {
-		return nativePeerSelf{}, err
-	}
-	return decoded, nil
-}
-
-func (runtime *nativeRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTableState, error) {
-	base, err := peerHTTPBase(peerURL)
-	if err != nil {
-		return nil, err
-	}
-	request, err := http.NewRequest(http.MethodGet, base+"/native/table/"+tableID, nil)
-	if err != nil {
-		return nil, err
-	}
-	if err := runtime.applyTableFetchAuth(request, tableID); err != nil {
-		return nil, err
-	}
-	response, err := runtime.httpClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		body, _ := io.ReadAll(response.Body)
-		return nil, fmt.Errorf("remote table request failed: %s", strings.TrimSpace(string(body)))
-	}
-	var table nativeTableState
-	if err := json.NewDecoder(response.Body).Decode(&table); err != nil {
-		return nil, err
-	}
-	return &table, nil
-}
-
-func (runtime *nativeRuntime) applyTableFetchAuth(request *http.Request, tableID string) error {
-	if runtime.walletID.PlayerID == "" || runtime.walletID.PrivateKeyHex == "" {
-		return nil
-	}
-	signedAt := nowISO()
-	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeTableFetchAuthPayload(tableID, runtime.walletID.PlayerID, signedAt))
-	if err != nil {
-		return err
-	}
-	request.Header.Set(nativeTableAuthPlayerIDHeader, runtime.walletID.PlayerID)
-	request.Header.Set(nativeTableAuthSignedAtHeader, signedAt)
-	request.Header.Set(nativeTableAuthSignatureHeader, signatureHex)
-	return nil
-}
-
-func (runtime *nativeRuntime) buildTableSyncRequest(table nativeTableState) (nativeTableSyncRequest, error) {
+func (runtime *meshRuntime) buildTableSyncRequest(table nativeTableState) (nativeTableSyncRequest, error) {
 	sentAt := nowISO()
 	tableHash, err := settlementcore.HashStructuredDataHex(table)
 	if err != nil {
@@ -1870,51 +1733,19 @@ func (runtime *nativeRuntime) buildTableSyncRequest(table nativeTableState) (nat
 	return request, nil
 }
 
-func (runtime *nativeRuntime) acceptTableSync(request nativeTableSyncRequest) error {
+func (runtime *meshRuntime) acceptTableSync(request nativeTableSyncRequest) error {
 	if err := runtime.validateTableSyncRequest(request); err != nil {
 		return err
 	}
 	return runtime.acceptRemoteTable(request.Table)
 }
 
-func (runtime *nativeRuntime) remoteJoin(peerURL string, input nativeJoinRequest) (nativeTableState, error) {
-	response, err := runtime.postJSON(peerURL, "/native/table/join", input)
-	if err != nil {
-		return nativeTableState{}, err
-	}
-	var table nativeTableState
-	if err := json.Unmarshal(response, &table); err != nil {
-		return nativeTableState{}, err
-	}
-	return table, nil
-}
-
-func (runtime *nativeRuntime) remoteAction(peerURL string, input nativeActionRequest) (nativeTableState, error) {
-	response, err := runtime.postJSON(peerURL, "/native/table/action", input)
-	if err != nil {
-		return nativeTableState{}, err
-	}
-	var table nativeTableState
-	if err := json.Unmarshal(response, &table); err != nil {
-		return nativeTableState{}, err
-	}
-	return table, nil
-}
-
-func (runtime *nativeRuntime) postJSON(peerURL, path string, input any) ([]byte, error) {
-	base := peerURL
-	if !strings.HasPrefix(path, "/api/") {
-		var err error
-		base, err = peerHTTPBase(peerURL)
-		if err != nil {
-			return nil, err
-		}
-	}
+func (runtime *meshRuntime) postJSON(endpoint, path string, input any) ([]byte, error) {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(base, "/")+path, bytes.NewReader(body))
+	request, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(endpoint, "/")+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -1934,12 +1765,12 @@ func (runtime *nativeRuntime) postJSON(peerURL, path string, input any) ([]byte,
 	return data, nil
 }
 
-func (runtime *nativeRuntime) shouldPollHost(tableID string) bool {
+func (runtime *meshRuntime) shouldPollHost(tableID string) bool {
 	last := runtime.lastSyncAt[tableID]
 	return time.Since(last) >= nativeTableSyncInterval
 }
 
-func (runtime *nativeRuntime) shouldHandleFailover(table nativeTableState) bool {
+func (runtime *meshRuntime) shouldHandleFailover(table nativeTableState) bool {
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		return false
 	}
@@ -1963,7 +1794,7 @@ func (runtime *nativeRuntime) shouldHandleFailover(table nativeTableState) bool 
 	return lowestPeerID == runtime.selfPeerID()
 }
 
-func (runtime *nativeRuntime) knownPeerURL(peerID string) string {
+func (runtime *meshRuntime) knownPeerURL(peerID string) string {
 	peers, err := runtime.knownPeers()
 	if err != nil {
 		return ""
@@ -1976,7 +1807,7 @@ func (runtime *nativeRuntime) knownPeerURL(peerID string) string {
 	return ""
 }
 
-func (runtime *nativeRuntime) buildSignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
+func (runtime *meshRuntime) buildSignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
 	decisionIndex, err := nativeActionDecisionIndex(table)
 	if err != nil {
 		return nativeActionRequest{}, err
@@ -2010,7 +1841,7 @@ func (runtime *nativeRuntime) buildSignedActionRequest(table nativeTableState, a
 	return request, nil
 }
 
-func (runtime *nativeRuntime) validateJoinRequest(join nativeJoinRequest) error {
+func (runtime *meshRuntime) validateJoinRequest(join nativeJoinRequest) error {
 	if join.IdentityBinding.TableID == "" || join.IdentityBinding.SignatureHex == "" {
 		return errors.New("join request is missing identity binding")
 	}
@@ -2069,7 +1900,7 @@ func (runtime *nativeRuntime) validateJoinRequest(join nativeJoinRequest) error 
 	return nil
 }
 
-func (runtime *nativeRuntime) validateTableSyncRequest(request nativeTableSyncRequest) error {
+func (runtime *meshRuntime) validateTableSyncRequest(request nativeTableSyncRequest) error {
 	if request.Table.Config.TableID == "" || request.SenderPeerID == "" || request.SenderProtocolPubkeyHex == "" || request.SentAt == "" || request.SignatureHex == "" {
 		return errors.New("sync request is missing required authentication fields")
 	}
@@ -2100,7 +1931,7 @@ func (runtime *nativeRuntime) validateTableSyncRequest(request nativeTableSyncRe
 	return runtime.validateSyncTransition(existing, request.Table, request.SenderPeerID)
 }
 
-func (runtime *nativeRuntime) validateActionRequest(table nativeTableState, seat nativeSeatRecord, request nativeActionRequest) error {
+func (runtime *meshRuntime) validateActionRequest(table nativeTableState, seat nativeSeatRecord, request nativeActionRequest) error {
 	if request.TableID != table.Config.TableID {
 		return errors.New("action request table mismatch")
 	}
@@ -2133,7 +1964,7 @@ func (runtime *nativeRuntime) validateActionRequest(table nativeTableState, seat
 	return nil
 }
 
-func (runtime *nativeRuntime) tableViewerPlayerID(request *http.Request, table nativeTableState) string {
+func (runtime *meshRuntime) tableViewerPlayerID(request *http.Request, table nativeTableState) string {
 	playerID := strings.TrimSpace(request.Header.Get(nativeTableAuthPlayerIDHeader))
 	signedAt := strings.TrimSpace(request.Header.Get(nativeTableAuthSignedAtHeader))
 	signatureHex := strings.TrimSpace(request.Header.Get(nativeTableAuthSignatureHeader))
@@ -2154,7 +1985,7 @@ func (runtime *nativeRuntime) tableViewerPlayerID(request *http.Request, table n
 	return playerID
 }
 
-func (runtime *nativeRuntime) validateSyncTransition(existing *nativeTableState, incoming nativeTableState, senderPeerID string) error {
+func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, incoming nativeTableState, senderPeerID string) error {
 	if !runtime.isLocalTableParticipant(incoming) {
 		return errors.New("sync request does not target this daemon")
 	}
@@ -2184,7 +2015,7 @@ func (runtime *nativeRuntime) validateSyncTransition(existing *nativeTableState,
 	return nil
 }
 
-func (runtime *nativeRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
+func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
 	if !runtime.isLocalTableParticipant(incoming) {
 		return errors.New("remote table does not target this daemon")
 	}
@@ -2205,7 +2036,7 @@ func (runtime *nativeRuntime) validateAcceptedRemoteTable(existing *nativeTableS
 	return nil
 }
 
-func (runtime *nativeRuntime) isLocalTableParticipant(table nativeTableState) bool {
+func (runtime *meshRuntime) isLocalTableParticipant(table nativeTableState) bool {
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		return true
 	}
@@ -2217,7 +2048,7 @@ func (runtime *nativeRuntime) isLocalTableParticipant(table nativeTableState) bo
 	return runtime.seatIndexForPlayer(table) >= 0
 }
 
-func (runtime *nativeRuntime) isAuthorizedRemoteHost(table *nativeTableState, candidatePeerID string) bool {
+func (runtime *meshRuntime) isAuthorizedRemoteHost(table *nativeTableState, candidatePeerID string) bool {
 	if table == nil || candidatePeerID == "" {
 		return false
 	}
@@ -2256,13 +2087,13 @@ func timestampWithinWindow(timestamp string, maxAge time.Duration) bool {
 	return age <= maxAge
 }
 
-func (runtime *nativeRuntime) networkTableView(table nativeTableState, visiblePlayerID string) nativeTableState {
+func (runtime *meshRuntime) networkTableView(table nativeTableState, visiblePlayerID string) nativeTableState {
 	view := cloneJSON(table)
 	view.ActiveHand = sanitizeActiveHandForNetwork(table.ActiveHand, visiblePlayerID)
 	return view
 }
 
-func (runtime *nativeRuntime) appendFundsOperation(operation NativeTableFundsOperation, cashoutSats int, status string) error {
+func (runtime *meshRuntime) appendFundsOperation(operation NativeTableFundsOperation, cashoutSats int, status string) error {
 	funds, err := runtime.store.readTableFunds()
 	if err != nil {
 		return err
@@ -2293,7 +2124,7 @@ func (runtime *nativeRuntime) appendFundsOperation(operation NativeTableFundsOpe
 	return runtime.store.writeTableFunds(funds)
 }
 
-func (runtime *nativeRuntime) buildFundsOperation(tableID string, amountSats int, kind, status, checkpointHash string) (NativeTableFundsOperation, error) {
+func (runtime *meshRuntime) buildFundsOperation(tableID string, amountSats int, kind, status, checkpointHash string) (NativeTableFundsOperation, error) {
 	unsigned := map[string]any{
 		"amountSats":      amountSats,
 		"checkpointHash":  checkpointHash,
@@ -2327,19 +2158,19 @@ func (runtime *nativeRuntime) buildFundsOperation(tableID string, amountSats int
 	}, nil
 }
 
-func (runtime *nativeRuntime) selfPeerID() string {
+func (runtime *meshRuntime) selfPeerID() string {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	return runtime.self.Peer.PeerID
 }
 
-func (runtime *nativeRuntime) selfPeerURL() string {
+func (runtime *meshRuntime) selfPeerURL() string {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	return runtime.self.Peer.PeerURL
 }
 
-func (runtime *nativeRuntime) writeJSON(writer http.ResponseWriter, value any) error {
+func (runtime *meshRuntime) writeJSON(writer http.ResponseWriter, value any) error {
 	writer.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(writer).Encode(value)
 }

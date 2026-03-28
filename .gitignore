@@ -1,8 +1,4 @@
-node_modules
-dist
 .DS_Store
-.vite
-coverage
 *.log
 .env
 .tmp/
@@ -10,10 +6,8 @@ coverage
 /parker-controller
 /parker-daemon
 /parker-indexer
+/parker-devtool
 apps/*/data/
-apps/*/dist/
-apps/example
-packages/*/dist/
 apps/.claude
 third_party/
 tools/bin/

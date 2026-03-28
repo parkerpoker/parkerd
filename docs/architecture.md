@@ -12,7 +12,7 @@ Parker currently runs as a Go-first daemon workspace:
 - `cmd/parker-cli` controls a local daemon over Unix-socket RPC
 - `cmd/parker-controller` exposes localhost HTTP and SSE backed by that same daemon RPC
 - `cmd/parker-indexer` stores public advertisements and public updates for discovery
-- `apps/web` is the remaining TypeScript browser UI
+- external browser clients can talk to the localhost controller
 - `scripts/bin/*` wrappers build and run the Go binaries on demand
 
 The peer runtime is host-authoritative today:
@@ -23,24 +23,24 @@ The peer runtime is host-authoritative today:
 - public discovery remains optional through the indexer
 - the browser stays outside daemon custody and peer-to-peer transport
 
-One compatibility detail is worth calling out explicitly: daemons still advertise peer URLs shaped like `ws://host:port/mesh`, but the current Go runtime derives an HTTP base URL from that address and exchanges JSON over `/native/*`.
+Daemons now advertise direct peer endpoints shaped like `parker://host:port` and exchange signed transport envelopes over the framed TCP transport implemented in the daemon.
 
 ## Practical Repo Mapping
 
-- `cmd/parker-daemon` plus [`internal/native_runtime.go`](../internal/native_runtime.go) are the gameplay and settlement runtime
+- `cmd/parker-daemon` plus [`internal/mesh_runtime.go`](../internal/mesh_runtime.go) and [`internal/transport_wire.go`](../internal/transport_wire.go) are the gameplay and peer-transport runtime
 - `cmd/parker-cli` plus [`internal/client.go`](../internal/client.go) are the local CLI control surface
 - `cmd/parker-controller` plus [`internal/controller/app.go`](../internal/controller/app.go) are the localhost browser bridge
 - `cmd/parker-indexer` plus [`internal/indexer/app.go`](../internal/indexer/app.go) are the optional public ingest/read model
 - [`internal/storage/store.go`](../internal/storage/store.go) provides the runtime and indexer storage backends
 - [`internal/settlementcore/core.go`](../internal/settlementcore/core.go) implements canonical JSON hashing and signatures
 - [`internal/game`](../internal/game) contains the current heads-up Hold'em engine
-- `apps/web` is the only product surface that still ships as TypeScript
+- browser clients are maintained outside this repository
 
 ## Component Roles
 
 ### Daemon process
 
-`cmd/parker-daemon` starts [`internal/daemon.Service`](../internal/daemon/service.go), which currently wraps [`internal.ProxyDaemon`](../internal/proxy_daemon.go) and the native runtime in [`internal/native_runtime.go`](../internal/native_runtime.go).
+`cmd/parker-daemon` starts [`internal/daemon.Service`](../internal/daemon/service.go), which currently wraps [`internal.ProxyDaemon`](../internal/proxy_daemon.go), the daemon runtime adapter in [`internal/daemon_runtime_adapter.go`](../internal/daemon_runtime_adapter.go), and the gameplay engine in [`internal/mesh_runtime.go`](../internal/mesh_runtime.go).
 
 This process owns:
 
@@ -84,7 +84,6 @@ It exposes:
 
 - structured `GET` and `POST` routes under `/api/local`
 - `GET /api/local/profiles/{profile}/watch` as an SSE bridge over daemon `watch`
-- optional same-origin serving of a built `apps/web/dist`
 - proxy `GET /api/public/tables` reads to the configured indexer
 
 It also enforces:
@@ -128,9 +127,9 @@ And it serves:
 
 The indexer does not participate in gameplay authority or money movement. It only stores and serves public information.
 
-### Browser UI
+### Browser clients
 
-`apps/web` runs in two practical modes:
+External browser clients typically run in two practical modes:
 
 - public spectator mode backed by the indexer
 - local player-control mode backed by the localhost controller
@@ -199,7 +198,7 @@ The host remains authoritative for joins, actions, and routine table replication
 The indexer and public UI sit outside gameplay authority:
 
 - hosts can publish public advertisements and snapshots to the indexer
-- the web app reads those routes over HTTP
+- browser clients read those routes over HTTP
 - failures or staleness there do not change local wallet custody
 
 ## Component Diagram
@@ -217,7 +216,7 @@ flowchart LR
   subgraph "Player Machine"
     PlayerCLI["cmd/parker-cli<br/>local RPC control"]
     Controller["cmd/parker-controller<br/>localhost HTTP + SSE"]
-    BrowserUI["apps/web<br/>public browser + local player UI"]
+    BrowserUI["External browser client<br/>public browser + local player UI"]
     PlayerDaemon["cmd/parker-daemon<br/>player mode"]
     PlayerCLI -->|"Unix socket RPC"| PlayerDaemon
     Controller -->|"Unix socket RPC"| PlayerDaemon
@@ -251,7 +250,7 @@ A minimal private table can run with:
 - one host daemon
 - two player daemons
 - no indexer
-- no UI
+- no browser client
 
 This can function for direct-invite play, but it has weaker recovery and no public discovery.
 
@@ -264,7 +263,7 @@ The current public-facing topology is:
 - zero or more witness daemons
 - one optional local controller per player machine
 - optional indexer
-- optional browser UI
+- optional external browser client
 
 This gives a public discovery path while keeping gameplay and funds actions in the daemons.
 
@@ -272,9 +271,7 @@ This gives a public discovery path while keeping gameplay and funds actions in t
 
 The repository currently exercises these local shapes:
 
-- `npm run dev:local` starts Nigiri when needed, the Go indexer, the Go controller, the web UI, and `host` / `witness` / `alice` / `bob` daemons
 - `make poker-regtest-round` starts Nigiri, the indexer, four Go daemons, funds the players, creates a table, auto-plays a hand, and cashes both players out
-- `make poker-regtest-ui-2p` starts Nigiri, the indexer, two isolated player daemons, two controllers, and two browser UIs
 
 ## Gameplay / Data Flows
 
@@ -303,7 +300,7 @@ For public tables, the host daemon can publish:
 - public table snapshots
 - public hand updates
 
-The indexer stores those records, and the web UI reads that model. None of those steps give the indexer authority over gameplay or keys.
+The indexer stores those records, and browser clients read that model. None of those steps give the indexer authority over gameplay or keys.
 
 ## Failure / Recovery Paths
 

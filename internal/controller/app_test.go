@@ -90,6 +90,11 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 		t.Fatalf("bootstrap status = %d body=%s", bootstrapResponse.Code, bootstrapResponse.Body.String())
 	}
 	var bootstrapResult struct {
+		Transport struct {
+			Peer struct {
+				Endpoint string `json:"endpoint"`
+			} `json:"peer"`
+		} `json:"transport"`
 		Mesh struct {
 			WalletPlayerID string `json:"walletPlayerId"`
 		} `json:"mesh"`
@@ -99,6 +104,9 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 	}
 	if !strings.HasPrefix(bootstrapResult.Mesh.WalletPlayerID, "player-") {
 		t.Fatalf("unexpected wallet player id %q", bootstrapResult.Mesh.WalletPlayerID)
+	}
+	if bootstrapResult.Transport.Peer.Endpoint == "" {
+		t.Fatalf("expected bootstrap to return a transport endpoint")
 	}
 
 	walletResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/wallet", nil)
@@ -114,9 +122,9 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 	}
 
 	networkBootstrapResponse := localRequest(t, app, http.MethodPost, "/api/local/profiles/alice/network/bootstrap", map[string]any{
-		"alias":   "ghost-host",
-		"peerUrl": "ws://127.0.0.1:39999/mesh",
-		"roles":   []string{"host"},
+		"alias":    "ghost-host",
+		"endpoint": bootstrapResult.Transport.Peer.Endpoint,
+		"roles":    []string{"host"},
 	})
 	if networkBootstrapResponse.Code != http.StatusOK {
 		t.Fatalf("network bootstrap status = %d body=%s", networkBootstrapResponse.Code, networkBootstrapResponse.Body.String())

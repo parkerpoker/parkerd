@@ -3,8 +3,6 @@ package parker
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
@@ -22,19 +20,19 @@ const (
 	nativeTableSyncInterval = 1 * time.Second
 )
 
-type nativeStore struct {
+type meshStore struct {
 	config      RuntimeConfig
 	profileName string
 	paths       ProfileDaemonPaths
 	repository  *storepkg.RuntimeRepository
 }
 
-func newNativeStore(profileName string, config RuntimeConfig) (*nativeStore, error) {
+func newMeshStore(profileName string, config RuntimeConfig) (*meshStore, error) {
 	repository, err := storepkg.OpenRuntimeRepository(config, profileName)
 	if err != nil {
 		return nil, err
 	}
-	return &nativeStore{
+	return &meshStore{
 		config:      config,
 		profileName: profileName,
 		paths:       BuildProfileDaemonPaths(config.DaemonDir, profileName),
@@ -42,11 +40,11 @@ func newNativeStore(profileName string, config RuntimeConfig) (*nativeStore, err
 	}, nil
 }
 
-func (store *nativeStore) close() error {
+func (store *meshStore) close() error {
 	return store.repository.Close()
 }
 
-func (store *nativeStore) readTable(tableID string) (*nativeTableState, error) {
+func (store *meshStore) readTable(tableID string) (*nativeTableState, error) {
 	data, err := store.repository.LoadTableState(tableID)
 	if err != nil {
 		return nil, err
@@ -61,7 +59,7 @@ func (store *nativeStore) readTable(tableID string) (*nativeTableState, error) {
 	return &table, nil
 }
 
-func (store *nativeStore) writeTable(table *nativeTableState) error {
+func (store *meshStore) writeTable(table *nativeTableState) error {
 	data, err := json.MarshalIndent(table, "", "  ")
 	if err != nil {
 		return err
@@ -70,7 +68,7 @@ func (store *nativeStore) writeTable(table *nativeTableState) error {
 	return store.repository.SaveTableState(table.Config.TableID, data)
 }
 
-func (store *nativeStore) rewriteEvents(tableID string, events []NativeSignedTableEvent) error {
+func (store *meshStore) rewriteEvents(tableID string, events []NativeSignedTableEvent) error {
 	encoded := make([][]byte, 0, len(events))
 	for _, event := range events {
 		data, err := json.Marshal(event)
@@ -82,7 +80,7 @@ func (store *nativeStore) rewriteEvents(tableID string, events []NativeSignedTab
 	return store.repository.ReplaceEvents(tableID, encoded)
 }
 
-func (store *nativeStore) rewriteSnapshots(tableID string, snapshots []NativeCooperativeTableSnapshot) error {
+func (store *meshStore) rewriteSnapshots(tableID string, snapshots []NativeCooperativeTableSnapshot) error {
 	encoded := make([][]byte, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		data, err := json.Marshal(snapshot)
@@ -94,7 +92,7 @@ func (store *nativeStore) rewriteSnapshots(tableID string, snapshots []NativeCoo
 	return store.repository.ReplaceSnapshots(tableID, encoded)
 }
 
-func (store *nativeStore) writePrivateState(tableID string, profileState map[string]any) error {
+func (store *meshStore) writePrivateState(tableID string, profileState map[string]any) error {
 	data, err := json.MarshalIndent(profileState, "", "  ")
 	if err != nil {
 		return err
@@ -103,11 +101,11 @@ func (store *nativeStore) writePrivateState(tableID string, profileState map[str
 	return store.repository.SavePrivateState(tableID, data)
 }
 
-func (store *nativeStore) listTableIDs() ([]string, error) {
+func (store *meshStore) listTableIDs() ([]string, error) {
 	return store.repository.ListTableIDs()
 }
 
-func (store *nativeStore) upsertPublicAd(ad NativeAdvertisement) error {
+func (store *meshStore) upsertPublicAd(ad NativeAdvertisement) error {
 	data, err := json.MarshalIndent(ad, "", "  ")
 	if err != nil {
 		return err
@@ -116,7 +114,7 @@ func (store *nativeStore) upsertPublicAd(ad NativeAdvertisement) error {
 	return store.repository.UpsertPublicAd(ad.TableID, data)
 }
 
-func (store *nativeStore) readPublicAds() (map[string]NativeAdvertisement, error) {
+func (store *meshStore) readPublicAds() (map[string]NativeAdvertisement, error) {
 	records, err := store.repository.LoadPublicAds()
 	if err != nil {
 		return nil, err
@@ -135,7 +133,7 @@ func (store *nativeStore) readPublicAds() (map[string]NativeAdvertisement, error
 	return decoded, nil
 }
 
-func (store *nativeStore) readTableFunds() (NativeTableFundsState, error) {
+func (store *meshStore) readTableFunds() (NativeTableFundsState, error) {
 	data, err := store.repository.LoadTableFunds()
 	if err != nil {
 		return NativeTableFundsState{}, err
@@ -158,7 +156,7 @@ func (store *nativeStore) readTableFunds() (NativeTableFundsState, error) {
 	return funds, nil
 }
 
-func (store *nativeStore) writeTableFunds(state NativeTableFundsState) error {
+func (store *meshStore) writeTableFunds(state NativeTableFundsState) error {
 	if state.Tables == nil {
 		state.Tables = map[string]NativeTableFundsEntry{}
 	}
@@ -170,7 +168,7 @@ func (store *nativeStore) writeTableFunds(state NativeTableFundsState) error {
 	return store.repository.SaveTableFunds(data)
 }
 
-func (store *nativeStore) withTableLock(tableID string, fn func() error) error {
+func (store *meshStore) withTableLock(tableID string, fn func() error) error {
 	return store.repository.WithTableLock(tableID, fn)
 }
 
@@ -199,29 +197,6 @@ func decodeInvite(invite string) (map[string]any, error) {
 		return nil, err
 	}
 	return decoded, nil
-}
-
-func peerHTTPBase(peerURL string) (string, error) {
-	if strings.TrimSpace(peerURL) == "" {
-		return "", fmt.Errorf("peer URL is required")
-	}
-	parsed, err := url.Parse(peerURL)
-	if err != nil {
-		return "", err
-	}
-	scheme := "http"
-	switch parsed.Scheme {
-	case "http", "https":
-		scheme = parsed.Scheme
-	case "ws":
-		scheme = "http"
-	case "wss":
-		scheme = "https"
-	}
-	if parsed.Host == "" {
-		return "", fmt.Errorf("peer URL host is missing")
-	}
-	return (&url.URL{Scheme: scheme, Host: parsed.Host}).String(), nil
 }
 
 func nowISO() string {

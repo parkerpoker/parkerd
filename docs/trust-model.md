@@ -7,7 +7,7 @@ For wire surfaces, see [protocol.md](./protocol.md). For component topology, see
 ## Short Version
 
 - wallet keys stay local to each daemon profile
-- the browser UI and controller do not hold wallet or protocol private keys
+- the browser client and controller do not hold wallet or protocol private keys
 - the current Go runtime is still host-authoritative for gameplay progression, hidden-card privacy, and replicated table state
 - the runtime signs events, advertisements, snapshots, and funds operations, but it does not yet enforce the stronger multi-party verification model described in older design docs
 - the indexer is informational only and does not authorize money movement
@@ -16,8 +16,8 @@ For wire surfaces, see [protocol.md](./protocol.md). For component topology, see
 
 - Local wallet custody lives in each daemon profile.
 - The localhost controller is a local control plane, not a money-authorizing peer.
-- The browser UI can trigger local actions, but only the daemon owns signing, persistence, and wallet operations.
-- The indexer and public UI are optional read surfaces only.
+- The browser client can trigger local actions, but only the daemon owns signing, persistence, and wallet operations.
+- The indexer and public browser surfaces are optional read surfaces only.
 - The host or failover successor is currently trusted as the active table authority.
 - Signed events and snapshots exist, but remote peers do not yet independently enforce full cryptographic replay and quorum validation on every replicated object.
 
@@ -131,9 +131,9 @@ The optional indexer:
 - does not hold wallet keys
 - does not authorize money movement
 
-### Web UI
+### Browser client
 
-The web UI:
+The browser client:
 
 - reads public state from the indexer or controller proxy
 - reads local daemon state through the controller
@@ -226,7 +226,7 @@ Each participant machine is trusted to protect:
 - protocol and peer keys
 - persisted table state
 - local private hand material
-- controller-origin protections when the browser UI is in use
+- controller-origin protections when a browser client is in use
 
 ### Arkade availability still matters
 
@@ -270,9 +270,9 @@ If the indexer is down:
 - public discovery and spectatorship degrade or disappear
 - no wallet authority is lost
 
-### UI loss
+### Browser-client loss
 
-If the web UI is unavailable:
+If a browser client is unavailable:
 
 - daemon-to-daemon play can continue
 - CLI control still works
@@ -293,5 +293,5 @@ The safest way to interpret the current system is:
 - trust each daemon with its own wallet custody
 - treat the host or failover successor as the practical gameplay authority
 - treat events and snapshots as signed audit artifacts, not yet as fully verified multi-party consensus proofs
-- do not trust the indexer or UI with money authority
+- do not trust the indexer or browser client with money authority
 - do not over-claim privacy or fairness against a malicious host in `host-dealer-v1`

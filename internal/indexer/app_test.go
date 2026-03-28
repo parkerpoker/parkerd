@@ -40,7 +40,7 @@ func TestIndexerStoresAndServesPublicTables(t *testing.T) {
 		"networkId":             "regtest",
 		"tableId":               tableID,
 		"hostPeerId":            "peer-host-1",
-		"hostPeerUrl":           "ws://127.0.0.1:7777/mesh",
+		"hostPeerUrl":           "parker://127.0.0.1:7777",
 		"tableName":             "Public Test Table",
 		"stakes":                map[string]int{"smallBlindSats": 50, "bigBlindSats": 100},
 		"currency":              "sats",

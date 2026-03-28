@@ -2,19 +2,18 @@ package parker
 
 import "testing"
 
-func TestTransportV2BootstrapAndState(t *testing.T) {
+func TestTransportBootstrapAndState(t *testing.T) {
 	config, err := ResolveRuntimeConfig(FlagMap{
-		"datadir":        t.TempDir(),
-		"mock":           "true",
-		"transport-mode": "v2",
+		"datadir": t.TempDir(),
+		"mock":    "true",
 	})
 	if err != nil {
 		t.Fatalf("resolve runtime config: %v", err)
 	}
 
-	runtime, err := newTransportV2Runtime("alice", config, "player")
+	runtime, err := newDaemonRuntimeAdapter("alice", config, "player")
 	if err != nil {
-		t.Fatalf("new transport v2 runtime: %v", err)
+		t.Fatalf("new daemon runtime adapter: %v", err)
 	}
 	defer runtime.Close()
 
@@ -23,10 +22,6 @@ func TestTransportV2BootstrapAndState(t *testing.T) {
 		t.Fatalf("bootstrap runtime: %v", err)
 	}
 	transport := decodeMap(MustMarshalJSON(bootstrap["transport"]))
-	if transport["transportMode"] != "v2" {
-		t.Fatalf("expected transport mode v2, received %#v", transport["transportMode"])
-	}
-
 	peer := normalizeStateMap(transport["peer"])
 	if stringValue(peer["peerId"]) == "" {
 		t.Fatalf("expected peer id in bootstrap state")
@@ -39,39 +34,48 @@ func TestTransportV2BootstrapAndState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current state: %v", err)
 	}
-	if normalizeStateMap(state["transport"])["transportWireVersion"] != float64(transportV2WireVersion) {
-		t.Fatalf("expected transport wire version %d", transportV2WireVersion)
+	if normalizeStateMap(state["transport"])["transportWireVersion"] != float64(transportWireVersion) {
+		t.Fatalf("expected transport wire version %d", transportWireVersion)
 	}
 }
 
-func TestTransportV2BootstrapPeerPersistsEndpoint(t *testing.T) {
+func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
 	config, err := ResolveRuntimeConfig(FlagMap{
-		"datadir":        t.TempDir(),
-		"mock":           "true",
-		"transport-mode": "v2",
+		"datadir": t.TempDir(),
+		"mock":    "true",
 	})
 	if err != nil {
 		t.Fatalf("resolve runtime config: %v", err)
 	}
 
-	runtime, err := newTransportV2Runtime("alice", config, "player")
+	remote, err := newDaemonRuntimeAdapter("bob", config, "player")
 	if err != nil {
-		t.Fatalf("new transport v2 runtime: %v", err)
+		t.Fatalf("new remote daemon runtime adapter: %v", err)
+	}
+	defer remote.Close()
+	if _, err := remote.Bootstrap("Bob"); err != nil {
+		t.Fatalf("bootstrap remote daemon runtime adapter: %v", err)
+	}
+
+	runtime, err := newDaemonRuntimeAdapter("alice", config, "player")
+	if err != nil {
+		t.Fatalf("new daemon runtime adapter: %v", err)
 	}
 	defer runtime.Close()
 	if err := runtime.Start(); err != nil {
 		t.Fatalf("start runtime: %v", err)
 	}
 
-	peer, err := runtime.BootstrapPeer("tor://peer.onion:9735", "Bob", []string{"witness"})
+	peerEndpoint := remote.inner.selfPeerURL()
+	peer, err := runtime.BootstrapPeer(peerEndpoint, "Bob", []string{"witness"})
 	if err != nil {
 		t.Fatalf("bootstrap peer: %v", err)
 	}
-	summary, ok := peer.(TransportV2PeerSummary)
+	summary, ok := peer.(TransportPeerSummary)
 	if !ok {
 		t.Fatalf("expected transport peer summary, received %T", peer)
 	}
-	if summary.Endpoint != "tor://peer.onion:9735" {
+	if summary.Endpoint != peerEndpoint {
 		t.Fatalf("expected endpoint to persist, received %q", summary.Endpoint)
 	}
 
@@ -79,7 +83,7 @@ func TestTransportV2BootstrapPeerPersistsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("network peers: %v", err)
 	}
-	peers, ok := peersValue.([]TransportV2PeerSummary)
+	peers, ok := peersValue.([]TransportPeerSummary)
 	if !ok {
 		t.Fatalf("expected transport peer list, received %T", peersValue)
 	}

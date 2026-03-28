@@ -8,21 +8,21 @@ For component topology, see [architecture.md](./architecture.md). For guarantees
 
 The active implementation is split across:
 
-- [`cmd/parker-daemon`](../cmd/parker-daemon/main.go) and [`internal/native_runtime.go`](../internal/native_runtime.go) for daemon behavior and peer-to-peer table sync
+- [`cmd/parker-daemon`](../cmd/parker-daemon/main.go), [`internal/mesh_runtime.go`](../internal/mesh_runtime.go), and [`internal/transport_wire.go`](../internal/transport_wire.go) for daemon behavior and peer-to-peer table sync
 - [`internal/proxy_daemon.go`](../internal/proxy_daemon.go) and [`internal/client.go`](../internal/client.go) for local daemon RPC
 - [`cmd/parker-controller`](../cmd/parker-controller/main.go) and [`internal/controller/app.go`](../internal/controller/app.go) for localhost browser control
 - [`cmd/parker-indexer`](../cmd/parker-indexer/main.go) and [`internal/indexer/app.go`](../internal/indexer/app.go) for public ingest and spectator reads
 - [`internal/settlementcore/core.go`](../internal/settlementcore/core.go) for canonical JSON hashing and signatures
 - [`internal/native_types.go`](../internal/native_types.go) for the main runtime object shapes
 
-The browser UI in `apps/web` is outside peer-to-peer protocol consensus.
+Any browser client using the localhost controller is outside peer-to-peer protocol consensus.
 
 ## Current Runtime Split
 
 The current implementation has three distinct protocol surfaces:
 
 1. local daemon RPC over Unix-socket NDJSON
-2. peer-to-peer JSON over HTTP endpoints under `/native/*`
+2. peer-to-peer framed TCP messages over `parker://` endpoints with signed transport envelopes
 3. public indexer ingest/read over HTTP
 
 Only the first two are required for direct table play.
@@ -87,33 +87,38 @@ This is the contract used by both the CLI watcher and the controller's SSE bridg
 
 ## Peer-To-Peer Runtime Protocol
 
-The current Go runtime does not implement the older signed WebSocket mesh described in earlier design docs. Instead, it exchanges JSON over HTTP.
+The current Go runtime does not implement the older signed WebSocket mesh described in earlier design docs. Instead, it exchanges signed transport envelopes over a framed TCP transport.
 
 ### Peer address format
 
-Peer URLs are still stored and advertised as:
+Peer endpoints are stored and advertised as:
 
-- `ws://<host>:<port>/mesh`
+- `parker://<host>:<port>`
 
-for compatibility, but the runtime converts those URLs to an HTTP base internally before making requests.
+The runtime dials those endpoints directly over TCP and exchanges one signed request envelope followed by one signed response envelope per connection.
 
-### Peer endpoints
+### Peer message types
 
-The active peer routes are registered in [`internal/native_runtime.go`](../internal/native_runtime.go):
+The active peer transport handlers live in [`internal/mesh_runtime.go`](../internal/mesh_runtime.go) and [`internal/transport_wire.go`](../internal/transport_wire.go):
 
-- `GET /native/peer`
-- `POST /native/table/join`
-- `POST /native/table/action`
-- `POST /native/table/sync`
-- `GET /native/table/{tableId}`
+- `peer.manifest.get`
+- `peer.manifest`
+- `table.state.pull`
+- `table.state.push`
+- `table.join.request`
+- `table.join.response`
+- `table.action.request`
+- `table.action.response`
+- `ack`
+- `nack`
 
 ### Practical behavior
 
-- `GET /native/peer` returns the peer's current advertised identity and role information.
-- `POST /native/table/join` sends a signed join payload to the current host and returns the updated recipient-scoped table state.
-- `POST /native/table/action` sends a signed action payload to the current host and returns the updated recipient-scoped table state.
-- `POST /native/table/sync` pushes a signed recipient-scoped table copy to another peer.
-- `GET /native/table/{tableId}` fetches the host's current recipient-scoped table copy.
+- `peer.manifest.get` requests the peer's current advertised identity and transport metadata.
+- `table.join.request` sends a signed join payload to the current host and returns the updated recipient-scoped table state.
+- `table.action.request` sends a signed action payload to the current host and returns the updated recipient-scoped table state.
+- `table.state.push` pushes a signed recipient-scoped table copy to another peer.
+- `table.state.pull` fetches the host's current recipient-scoped table copy.
 
 ### Host heartbeat and sync timing
 
@@ -156,7 +161,7 @@ Important rules:
 
 ### Event signing
 
-`appendEvent()` in [`internal/native_runtime.go`](../internal/native_runtime.go) signs the event body after removing the `signature` field.
+`appendEvent()` in [`internal/mesh_runtime.go`](../internal/mesh_runtime.go) signs the event body after removing the `signature` field.
 
 Each `NativeSignedTableEvent` includes:
 

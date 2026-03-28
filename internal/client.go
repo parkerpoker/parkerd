@@ -390,7 +390,6 @@ func (c *Client) startEnvironment() []string {
 		"PARKER_DAEMON_DIR="+c.Config.DaemonDir,
 		"PARKER_PEER_HOST="+c.Config.PeerHost,
 		"PARKER_PEER_PORT="+strconv.Itoa(c.Config.PeerPort),
-		"PARKER_TRANSPORT_MODE="+c.Config.TransportMode,
 		"PARKER_TOR_SOCKS_ADDR="+c.Config.TorSocksAddr,
 		"PARKER_TOR_CONTROL_ADDR="+c.Config.TorControlAddr,
 		"PARKER_GOSSIP_ONION_PORT="+strconv.Itoa(c.Config.GossipOnionPort),
@@ -477,8 +476,10 @@ func (c *Client) updateCachedStateFromRaw(raw json.RawMessage) {
 		return
 	}
 	if _, hasMesh := candidate["mesh"]; !hasMesh {
-		if _, hasWallet := candidate["wallet"]; !hasWallet {
-			return
+		if _, hasTransport := candidate["transport"]; !hasTransport {
+			if _, hasWallet := candidate["wallet"]; !hasWallet {
+				return
+			}
 		}
 	}
 
@@ -536,7 +537,7 @@ func isClosedConnError(err error) bool {
 func daemonRequestTimeout(method string) time.Duration {
 	switch method {
 	case "walletOnboard":
-		// The reference TS flow allows time for boarding funds to appear, then a second phase for onboarding retries.
+		// Give boarding funds time to appear, then allow a second phase for onboarding retries.
 		return 130 * time.Second
 	default:
 		return DaemonRequestTimeoutMS * time.Millisecond

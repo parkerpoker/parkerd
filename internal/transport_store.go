@@ -8,31 +8,40 @@ import (
 	storepkg "github.com/danieldresner/arkade_fun/internal/storage"
 )
 
-type transportV2Store struct {
+type transportStore struct {
 	config      RuntimeConfig
+	ownsRepo    bool
 	profileName string
 	paths       ProfileDaemonPaths
 	repository  *storepkg.RuntimeRepository
 }
 
-func newTransportV2Store(profileName string, config RuntimeConfig) (*transportV2Store, error) {
+func newTransportStore(profileName string, config RuntimeConfig) (*transportStore, error) {
 	repository, err := storepkg.OpenRuntimeRepository(config, profileName)
 	if err != nil {
 		return nil, err
 	}
-	return &transportV2Store{
+	return newTransportStoreWithRepository(profileName, config, repository, true), nil
+}
+
+func newTransportStoreWithRepository(profileName string, config RuntimeConfig, repository *storepkg.RuntimeRepository, ownsRepo bool) *transportStore {
+	return &transportStore{
 		config:      config,
+		ownsRepo:    ownsRepo,
 		profileName: profileName,
 		paths:       BuildProfileDaemonPaths(config.DaemonDir, profileName),
 		repository:  repository,
-	}, nil
+	}
 }
 
-func (store *transportV2Store) close() error {
+func (store *transportStore) close() error {
+	if !store.ownsRepo {
+		return nil
+	}
 	return store.repository.Close()
 }
 
-func (store *transportV2Store) readManifest() (*TransportV2PeerManifest, error) {
+func (store *transportStore) readManifest() (*TransportPeerManifest, error) {
 	data, err := store.repository.LoadTransportManifest()
 	if err != nil {
 		return nil, err
@@ -40,14 +49,14 @@ func (store *transportV2Store) readManifest() (*TransportV2PeerManifest, error) 
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return nil, nil
 	}
-	var manifest TransportV2PeerManifest
+	var manifest TransportPeerManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, err
 	}
 	return &manifest, nil
 }
 
-func (store *transportV2Store) writeManifest(manifest TransportV2PeerManifest) error {
+func (store *transportStore) writeManifest(manifest TransportPeerManifest) error {
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
@@ -56,17 +65,17 @@ func (store *transportV2Store) writeManifest(manifest TransportV2PeerManifest) e
 	return store.repository.SaveTransportManifest(data)
 }
 
-func (store *transportV2Store) listPeers() ([]TransportV2PeerSummary, error) {
+func (store *transportStore) listPeers() ([]TransportPeerSummary, error) {
 	records, err := store.repository.ListTransportPeers()
 	if err != nil {
 		return nil, err
 	}
-	peers := make([]TransportV2PeerSummary, 0, len(records))
+	peers := make([]TransportPeerSummary, 0, len(records))
 	for _, raw := range records {
 		if len(raw) == 0 {
 			continue
 		}
-		var peer TransportV2PeerSummary
+		var peer TransportPeerSummary
 		if err := json.Unmarshal(raw, &peer); err != nil {
 			return nil, err
 		}
@@ -76,7 +85,7 @@ func (store *transportV2Store) listPeers() ([]TransportV2PeerSummary, error) {
 	return peers, nil
 }
 
-func (store *transportV2Store) writePeer(peer TransportV2PeerSummary) error {
+func (store *transportStore) writePeer(peer TransportPeerSummary) error {
 	data, err := json.MarshalIndent(peer, "", "  ")
 	if err != nil {
 		return err
@@ -85,24 +94,24 @@ func (store *transportV2Store) writePeer(peer TransportV2PeerSummary) error {
 	return store.repository.SaveTransportPeer(peer.PeerID, data)
 }
 
-func (store *transportV2Store) queueState() (TransportV2QueueState, error) {
+func (store *transportStore) queueState() (TransportQueueState, error) {
 	outbox, err := store.repository.ListTransportOutbox()
 	if err != nil {
-		return TransportV2QueueState{}, err
+		return TransportQueueState{}, err
 	}
 	inbox, err := store.repository.ListTransportInbox()
 	if err != nil {
-		return TransportV2QueueState{}, err
+		return TransportQueueState{}, err
 	}
 	dedupe, err := store.repository.ListTransportDedupe()
 	if err != nil {
-		return TransportV2QueueState{}, err
+		return TransportQueueState{}, err
 	}
 	deadLetters, err := store.repository.ListTransportDeadLetters()
 	if err != nil {
-		return TransportV2QueueState{}, err
+		return TransportQueueState{}, err
 	}
-	return TransportV2QueueState{
+	return TransportQueueState{
 		DeadLetter: len(deadLetters),
 		Dedupe:     len(dedupe),
 		Inbox:      len(inbox),
@@ -110,7 +119,7 @@ func (store *transportV2Store) queueState() (TransportV2QueueState, error) {
 	}, nil
 }
 
-func (store *transportV2Store) saveOutbox(envelope TransportV2Envelope) error {
+func (store *transportStore) saveOutbox(envelope TransportEnvelope) error {
 	data, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {
 		return err
@@ -119,7 +128,7 @@ func (store *transportV2Store) saveOutbox(envelope TransportV2Envelope) error {
 	return store.repository.SaveTransportOutboxEntry(envelope.MessageID, data)
 }
 
-func (store *transportV2Store) saveInbox(envelope TransportV2Envelope) error {
+func (store *transportStore) saveInbox(envelope TransportEnvelope) error {
 	data, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {
 		return err
@@ -128,7 +137,7 @@ func (store *transportV2Store) saveInbox(envelope TransportV2Envelope) error {
 	return store.repository.SaveTransportInboxEntry(envelope.MessageID, data)
 }
 
-func (store *transportV2Store) saveDedupe(record TransportV2DedupeRecord) error {
+func (store *transportStore) saveDedupe(record TransportDedupeRecord) error {
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
@@ -137,7 +146,7 @@ func (store *transportV2Store) saveDedupe(record TransportV2DedupeRecord) error 
 	return store.repository.SaveTransportDedupeEntry(record.SenderPeerID+":"+record.DedupeKey, data)
 }
 
-func (store *transportV2Store) saveDeadLetter(entry TransportV2DeadLetter) error {
+func (store *transportStore) saveDeadLetter(entry TransportDeadLetter) error {
 	data, err := json.MarshalIndent(entry, "", "  ")
 	if err != nil {
 		return err

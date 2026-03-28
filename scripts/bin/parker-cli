@@ -56,8 +56,7 @@ build_go_binary() {
 }
 
 if [[ -n "${PARKER_CLI_IMPL:-}" ]] && [[ "${PARKER_CLI_IMPL}" != "go" ]]; then
-  echo "parker-cli: TypeScript selection via PARKER_CLI_IMPL is no longer supported by this wrapper." >&2
-  echo "parker-cli: run apps/cli/src/index.ts directly if you need the legacy reference CLI." >&2
+  echo "parker-cli: legacy implementation selection via PARKER_CLI_IMPL is no longer supported by this wrapper." >&2
   exit 1
 fi
 
