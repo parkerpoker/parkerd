@@ -17,7 +17,7 @@ func TestTransportBootstrapAndState(t *testing.T) {
 	}
 	defer runtime.Close()
 
-	bootstrap, err := runtime.Bootstrap("Alice")
+	bootstrap, err := runtime.Bootstrap("Alice", "")
 	if err != nil {
 		t.Fatalf("bootstrap runtime: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
 		t.Fatalf("new remote daemon runtime adapter: %v", err)
 	}
 	defer remote.Close()
-	if _, err := remote.Bootstrap("Bob"); err != nil {
+	if _, err := remote.Bootstrap("Bob", ""); err != nil {
 		t.Fatalf("bootstrap remote daemon runtime adapter: %v", err)
 	}
 

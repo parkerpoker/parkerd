@@ -6,20 +6,20 @@ For wire surfaces, see [protocol.md](./protocol.md). For component topology, see
 
 ## Short Version
 
-- wallet keys stay local to each daemon profile
-- the browser client and controller do not hold wallet or protocol private keys
+- wallet, peer, protocol, and transport private keys stay local to each daemon profile
+- the browser client and controller do not hold wallet, protocol, or transport private keys
 - the current Go runtime is still host-authoritative for gameplay progression, hidden-card privacy, and replicated table state
-- the runtime signs events, advertisements, snapshots, and funds operations, but it does not yet enforce the stronger multi-party verification model described in older design docs
+- the runtime signs transport envelopes, request-auth payloads, events, advertisements, snapshots, and funds operations, but it does not yet enforce the stronger multi-party verification model described in older design docs
 - the indexer is informational only and does not authorize money movement
 
 ## Security Boundary Summary
 
 - Local wallet custody lives in each daemon profile.
 - The localhost controller is a local control plane, not a money-authorizing peer.
-- The browser client can trigger local actions, but only the daemon owns signing, persistence, and wallet operations.
+- The browser client can trigger local actions, but only the daemon owns peer transport, signing, persistence, and wallet operations.
 - The indexer and public browser surfaces are optional read surfaces only.
 - The host or failover successor is currently trusted as the active table authority.
-- Signed events and snapshots exist, but remote peers do not yet independently enforce full cryptographic replay and quorum validation on every replicated object.
+- Signed transport envelopes, events, and snapshots exist, but remote peers do not yet independently enforce full cryptographic replay and quorum validation on every replicated object.
 
 ## Assets
 
@@ -33,11 +33,13 @@ Each profile has a local wallet identity. The daemon uses it for:
 
 If a wallet private key is compromised, that player's bankroll can be controlled by the attacker.
 
-### Protocol and peer keys
+### Peer, protocol, and transport keys
 
-Each profile also has local peer and protocol identities used for:
+Each profile also has local peer, protocol, and transport identities used for:
 
 - peer addressability
+- transport-envelope signing via the protocol key
+- transport body decryption for traffic addressed to that daemon
 - event signing
 - snapshot signing
 - advertisement signing
@@ -79,11 +81,13 @@ This information is useful for discovery and spectatorship, but it is not wallet
 
 ## Actors
 
+These are runtime table roles, not separate network stacks. The same daemon binary can appear as a host, witness-listed participant, or player depending on table state and configuration.
+
 ### Player daemon
 
 A player daemon:
 
-- owns local wallet, peer, and protocol keys
+- owns local wallet, peer, protocol, and transport keys
 - joins tables
 - submits actions to the host
 - stores a replicated table copy
@@ -141,8 +145,8 @@ The browser client:
 
 It still does not:
 
-- hold wallet or protocol private keys
-- talk to peer `/native/*` routes directly
+- hold wallet, protocol, or transport private keys
+- talk to peer `parker://` transport directly
 - talk to the Unix socket directly
 
 ## Guarantees Provided Today
@@ -158,6 +162,12 @@ The browser only reaches the daemon through the localhost controller, which:
 - binds to loopback by default
 - checks allowed origins
 - requires the `X-Parker-Local-Controller` header for browser requests
+
+### Peer transport auth stays in the daemon
+
+Daemon-to-daemon envelopes are signed with the protocol key, and join/action/fetch/sync payloads carry wallet- or protocol-level auth when needed.
+
+The browser and controller never assemble or sign those peer messages directly.
 
 ### Local funds operations are signed
 
@@ -181,13 +191,15 @@ Today the host is trusted to:
 - replicate accurate table state
 - provide the current table copy to non-host peers
 
-### Peer requests use detached signatures
+### Signed peer transport does not remove host authority
 
-Join, action, and table-sync requests between daemons are JSON over HTTP with detached request signatures. The runtime still relies on HTTP transport semantics rather than an encrypted peer-to-peer channel.
+Daemon-to-daemon traffic no longer uses HTTP peer routes. Peers exchange signed transport envelopes over direct `parker://` TCP links, and request/response bodies are encrypted once the sender knows the recipient transport public key.
+
+Join requests still rely on wallet-signed identity bindings, action requests on wallet-signed turn bindings, and sync on a host protocol signature over the table hash. That authenticates messages, but it does not by itself make the runtime a fully trustless verified mesh.
 
 ### Replicated state is not fully re-verified on receipt
 
-Peers accept replicated table state through host polling and `/native/table/sync` after request-level auth and monotonicity checks. The current runtime does not yet re-run a full cryptographic replay and semantic verification pass before persisting that state.
+Peers accept replicated table state through host polling (`table.state.pull`) and host pushes (`table.state.push`) after envelope verification, request-level auth, and monotonicity checks. The current runtime does not yet re-run a full cryptographic replay and semantic verification pass before persisting that state.
 
 ### Snapshot quorum is not yet multi-party enforced
 
@@ -223,7 +235,7 @@ Because non-host peers currently rely on replicated table copies rather than a f
 Each participant machine is trusted to protect:
 
 - wallet keys
-- protocol and peer keys
+- peer, protocol, and transport keys
 - persisted table state
 - local private hand material
 - controller-origin protections when a browser client is in use

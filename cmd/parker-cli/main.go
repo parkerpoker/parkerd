@@ -49,11 +49,7 @@ func run(argv []string) error {
 
 	switch command {
 	case "bootstrap":
-		params := map[string]any{}
-		if len(positionals) > 0 && positionals[0] != "" {
-			params["nickname"] = positionals[0]
-		}
-		result, err := client.Request("bootstrap", paramsOrNil(params), true)
+		result, err := client.Request("bootstrap", paramsOrNil(buildBootstrapParams(positionals, flags)), true)
 		if err != nil {
 			return err
 		}
@@ -244,6 +240,12 @@ func runWalletCommand(client *parker.Client, positionals []string, outputJSON bo
 		subcommand = positionals[0]
 	}
 	switch subcommand {
+	case "nsec":
+		result, err := client.Request("walletNsec", nil, true)
+		if err != nil {
+			return err
+		}
+		return writeResult(outputJSON, result)
 	case "summary":
 		result, err := client.Request("walletSummary", nil, true)
 		if err != nil {
@@ -386,11 +388,8 @@ func runInteractive(client *parker.Client, outputJSON bool) error {
 		parts := strings.Fields(line)
 		switch parts[0] {
 		case "bootstrap":
-			params := map[string]any{}
-			if len(parts) > 1 {
-				params["nickname"] = parts[1]
-			}
-			result, err := client.Request("bootstrap", paramsOrNil(params), true)
+			_, flags, positionals := parker.ParseCommandArgv(parts)
+			result, err := client.Request("bootstrap", paramsOrNil(buildBootstrapParams(positionals, flags)), true)
 			if err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 				continue
@@ -503,6 +502,17 @@ func paramsOrNil(params map[string]any) any {
 	return params
 }
 
+func buildBootstrapParams(positionals []string, flags parker.FlagMap) map[string]any {
+	params := map[string]any{}
+	if len(positionals) > 0 && positionals[0] != "" {
+		params["nickname"] = positionals[0]
+	}
+	if walletNsec, ok := parker.FlagString(flags, "wallet-nsec"); ok {
+		params["walletNsec"] = walletNsec
+	}
+	return params
+}
+
 func optionalTableParams(positionals []string, index int) map[string]any {
 	if len(positionals) <= index || positionals[index] == "" {
 		return nil
@@ -609,8 +619,8 @@ func parseCSVFlag(flags parker.FlagMap, names ...string) []string {
 func printHelp() {
 	_, _ = fmt.Fprint(os.Stdout, strings.Join([]string{
 		"parker-cli commands:",
-		"  bootstrap [nickname] --profile <name>",
-		"  wallet [summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
+		"  bootstrap [nickname] [--wallet-nsec <nsec>] --profile <name>",
+		"  wallet [nsec|summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
 		"  network peers|bootstrap add <endpoint> [alias] --profile <name>",
 		"  table create [--name <name>] [--public] [--witness-peer-ids <id[,id]>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
 		"  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",

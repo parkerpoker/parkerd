@@ -78,8 +78,8 @@ func (runtime *daemonRuntimeAdapter) Close() error {
 	return joined
 }
 
-func (runtime *daemonRuntimeAdapter) Bootstrap(nickname string) (map[string]any, error) {
-	base, err := runtime.inner.Bootstrap(nickname)
+func (runtime *daemonRuntimeAdapter) Bootstrap(nickname, walletNsec string) (map[string]any, error) {
+	base, err := runtime.inner.Bootstrap(nickname, walletNsec)
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +131,10 @@ func (runtime *daemonRuntimeAdapter) QuickState() (map[string]any, error) {
 	}
 	base["transport"] = rawJSONMap(state)
 	return base, nil
+}
+
+func (runtime *daemonRuntimeAdapter) WalletNsec() (any, error) {
+	return runtime.walletRuntime.WalletNsec(runtime.profileName)
 }
 
 func (runtime *daemonRuntimeAdapter) WalletSummary() (any, error) {

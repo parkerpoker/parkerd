@@ -215,6 +215,7 @@ func (app *App) registerRoutes() {
 	})
 
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/bootstrap", app.daemonPassthrough("bootstrap"))
+	app.mux.HandleFunc("GET /api/local/profiles/{profile}/wallet/nsec", app.daemonPassthrough("walletNsec"))
 	app.mux.HandleFunc("GET /api/local/profiles/{profile}/wallet", app.daemonPassthrough("walletSummary"))
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/wallet/deposit", app.daemonPassthrough("walletDeposit"))
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/wallet/withdraw", app.daemonPassthrough("walletWithdraw"))

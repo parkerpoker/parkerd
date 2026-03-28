@@ -121,6 +121,18 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 		t.Fatalf("expected mock wallet sats, got %+v", wallet)
 	}
 
+	walletNsecResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/wallet/nsec", nil)
+	if walletNsecResponse.Code != http.StatusOK {
+		t.Fatalf("wallet nsec status = %d body=%s", walletNsecResponse.Code, walletNsecResponse.Body.String())
+	}
+	var walletNsec string
+	if err := json.Unmarshal(walletNsecResponse.Body.Bytes(), &walletNsec); err != nil {
+		t.Fatalf("decode wallet nsec: %v", err)
+	}
+	if !strings.HasPrefix(walletNsec, "nsec1") {
+		t.Fatalf("expected wallet nsec prefix, received %q", walletNsec)
+	}
+
 	networkBootstrapResponse := localRequest(t, app, http.MethodPost, "/api/local/profiles/alice/network/bootstrap", map[string]any{
 		"alias":    "ghost-host",
 		"endpoint": bootstrapResult.Transport.Peer.Endpoint,
@@ -272,7 +284,7 @@ func bootstrapProfile(t *testing.T, runtimeConfig cfg.RuntimeConfig, profileName
 		RunDir:            runtimeConfig.RunDir,
 		UseMockSettlement: runtimeConfig.UseMockSettlement,
 	})
-	if _, err := runtime.Bootstrap(profileName, nickname); err != nil {
+	if _, err := runtime.Bootstrap(profileName, nickname, ""); err != nil {
 		t.Fatalf("bootstrap profile %s: %v", profileName, err)
 	}
 }

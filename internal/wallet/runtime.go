@@ -43,16 +43,16 @@ func NewRuntime(config RuntimeConfig) *Runtime {
 	}
 }
 
-func (runtime *Runtime) EnsureProfile(profileName, nickname string) (PlayerProfileState, error) {
-	state, err := runtime.ensureBootstrap(profileName, nickname)
+func (runtime *Runtime) EnsureProfile(profileName, nickname, walletNsec string) (PlayerProfileState, error) {
+	state, err := runtime.ensureBootstrap(profileName, nickname, walletNsec)
 	if err != nil {
 		return PlayerProfileState{}, err
 	}
 	return *state, nil
 }
 
-func (runtime *Runtime) Bootstrap(profileName, nickname string) (BootstrapResult, error) {
-	state, err := runtime.EnsureProfile(profileName, nickname)
+func (runtime *Runtime) Bootstrap(profileName, nickname, walletNsec string) (BootstrapResult, error) {
+	state, err := runtime.EnsureProfile(profileName, nickname, walletNsec)
 	if err != nil {
 		return BootstrapResult{}, err
 	}
@@ -74,8 +74,16 @@ func (runtime *Runtime) Bootstrap(profileName, nickname string) (BootstrapResult
 	}, nil
 }
 
+func (runtime *Runtime) WalletNsec(profileName string) (string, error) {
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return "", err
+	}
+	return encodeWalletNsec(state.WalletPrivateKeyHex)
+}
+
 func (runtime *Runtime) GetWallet(profileName string) (WalletSummary, error) {
-	state, err := runtime.ensureBootstrap(profileName, "")
+	state, err := runtime.ensureBootstrap(profileName, "", "")
 	if err != nil {
 		return WalletSummary{}, err
 	}
@@ -135,7 +143,7 @@ func (runtime *Runtime) getWalletLocked(profileName string, state PlayerProfileS
 
 func (runtime *Runtime) Faucet(profileName string, amountSats int) error {
 	if runtime.config.UseMockSettlement {
-		state, err := runtime.ensureBootstrap(profileName, "")
+		state, err := runtime.ensureBootstrap(profileName, "", "")
 		if err != nil {
 			return err
 		}
@@ -149,7 +157,7 @@ func (runtime *Runtime) Faucet(profileName string, amountSats int) error {
 		return runtime.store.Save(*state)
 	}
 
-	state, err := runtime.ensureBootstrap(profileName, "")
+	state, err := runtime.ensureBootstrap(profileName, "", "")
 	if err != nil {
 		return err
 	}
@@ -185,7 +193,7 @@ func (runtime *Runtime) Onboard(profileName string) (string, error) {
 		return "", errors.New("onboard is not available in mock settlement mode")
 	}
 
-	state, err := runtime.ensureBootstrap(profileName, "")
+	state, err := runtime.ensureBootstrap(profileName, "", "")
 	if err != nil {
 		return "", err
 	}
@@ -245,7 +253,7 @@ func (runtime *Runtime) Offboard(profileName, address string, amountSats *int) (
 		return "", errors.New("offboard is not available in mock settlement mode")
 	}
 
-	state, err := runtime.ensureBootstrap(profileName, "")
+	state, err := runtime.ensureBootstrap(profileName, "", "")
 	if err != nil {
 		return "", err
 	}
@@ -281,20 +289,20 @@ func (runtime *Runtime) Offboard(profileName, address string, amountSats *int) (
 }
 
 func (runtime *Runtime) CreateDepositQuote(profileName string, amountSats int) (map[string]any, error) {
-	if _, err := runtime.ensureBootstrap(profileName, ""); err != nil {
+	if _, err := runtime.ensureBootstrap(profileName, "", ""); err != nil {
 		return nil, err
 	}
 	return nil, errors.New("native Go deposit quotes are not implemented yet")
 }
 
 func (runtime *Runtime) SubmitWithdrawal(profileName string, amountSats int, invoice string) (map[string]any, error) {
-	if _, err := runtime.ensureBootstrap(profileName, ""); err != nil {
+	if _, err := runtime.ensureBootstrap(profileName, "", ""); err != nil {
 		return nil, err
 	}
 	return nil, errors.New("native Go lightning withdrawals are not implemented yet")
 }
 
-func (runtime *Runtime) ensureBootstrap(profileName, nickname string) (*PlayerProfileState, error) {
+func (runtime *Runtime) ensureBootstrap(profileName, nickname, walletNsec string) (*PlayerProfileState, error) {
 	existing, err := runtime.store.Load(profileName)
 	if err != nil {
 		return nil, err
@@ -305,9 +313,9 @@ func (runtime *Runtime) ensureBootstrap(profileName, nickname string) (*PlayerPr
 		*state = *existing
 	}
 
-	seed := state.WalletPrivateKeyHex
-	if seed == "" {
-		seed = state.PrivateKeyHex
+	seed, err := resolveWalletPrivateKeyHex(*state, walletNsec)
+	if err != nil {
+		return nil, err
 	}
 	if seed == "" {
 		seed, err = randomHex(32)

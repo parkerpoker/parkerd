@@ -19,7 +19,7 @@ The peer runtime is host-authoritative today:
 
 - each participant runs a local daemon
 - the host accepts joins and actions, appends events, builds snapshots, and replicates table state
-- peer listeners expose JSON endpoints under `/native/*`
+- peer listeners expose a direct TCP transport on advertised `parker://` endpoints
 - public discovery remains optional through the indexer
 - the browser stays outside daemon custody and peer-to-peer transport
 
@@ -99,13 +99,18 @@ It does not:
 - join peer-to-peer table sync
 - reimplement gameplay or settlement logic
 
-### Host, witness, and player modes
+### Runtime roles and mode labels
 
-Host, witness, and player are daemon operating modes, not separate binaries.
+The daemon process can be started with a mode label (`player` by default; the CLI and controller can also pass `host`, `witness`, or `indexer`), but live table authority is derived from table state rather than from a separate binary or peer protocol.
 
-- host mode creates tables, accepts joins, sequences gameplay, appends events, and replicates table state
-- witness mode stores replicated tables and can take over after stale host heartbeats
-- player mode owns bankroll, joins tables, submits actions, and executes local funds operations
+Current runtime behavior is:
+
+- the current host is the peer recorded in `table.CurrentHost`
+- witness-listed peers are the peers recorded in `table.Witnesses`
+- seated players are the peers recorded in `table.Seats`
+- the host creates tables, accepts joins, sequences gameplay, appends events, and replicates table state
+- witness-listed peers store replicated tables and can take over after stale host heartbeats
+- seated players own bankroll, join tables, submit actions, and execute local funds operations
 
 If witnesses are configured, only witnesses take over automatically. If no witnesses are configured, the seated player with the lowest peer ID becomes the failover candidate.
 
@@ -145,9 +150,9 @@ In controller mode the browser can:
 
 Even in controller mode, the browser is still outside daemon custody:
 
-- it does not hold wallet or protocol private keys
+- it does not hold wallet, protocol, or transport private keys
 - it does not read profile files or Unix sockets
-- it does not talk to peer `/native/*` endpoints directly
+- it does not talk to peer `parker://` transport directly
 
 ### Arkade and Nigiri dependencies
 
@@ -183,13 +188,26 @@ No remote peer talks to another peer's CLI or controller.
 
 ### Peer replication boundary
 
-The current Go runtime exchanges JSON between daemons on these endpoints:
+The current Go runtime exchanges newline-delimited [`TransportEnvelope`](../internal/transport_types.go) JSON over direct TCP connections rather than `/native/*` HTTP routes.
 
-- `GET /native/peer`
-- `POST /native/table/join`
-- `POST /native/table/action`
-- `POST /native/table/sync`
-- `GET /native/table/{tableId}`
+Request message types are:
+
+- `peer.manifest.get`
+- `table.state.pull`
+- `table.join.request`
+- `table.action.request`
+- `table.state.push`
+
+Responses are:
+
+- `peer.manifest`
+- `table.state.push`
+- `table.join.response`
+- `table.action.response`
+- `ack`
+- `nack`
+
+Advertised peer endpoints use `parker://<host>:<port>`. The dialer also accepts `tcp://` and `tor://` bootstrap targets, and onion targets route through Tor when enabled.
 
 The host remains authoritative for joins, actions, and routine table replication. Other peers poll the host table when they are not the current host.
 
@@ -206,18 +224,18 @@ The indexer and public UI sit outside gameplay authority:
 ```mermaid
 flowchart LR
   subgraph "Host Machine"
-    HostDaemon["cmd/parker-daemon<br/>host mode"]
+    HostDaemon["cmd/parker-daemon<br/>current host"]
   end
 
   subgraph "Witness Machine"
-    WitnessDaemon["cmd/parker-daemon<br/>witness mode"]
+    WitnessDaemon["cmd/parker-daemon<br/>witness-listed peer"]
   end
 
   subgraph "Player Machine"
     PlayerCLI["cmd/parker-cli<br/>local RPC control"]
     Controller["cmd/parker-controller<br/>localhost HTTP + SSE"]
     BrowserUI["External browser client<br/>public browser + local player UI"]
-    PlayerDaemon["cmd/parker-daemon<br/>player mode"]
+    PlayerDaemon["cmd/parker-daemon<br/>seated player"]
     PlayerCLI -->|"Unix socket RPC"| PlayerDaemon
     Controller -->|"Unix socket RPC"| PlayerDaemon
     BrowserUI -->|"HTTP + SSE on localhost"| Controller
@@ -227,9 +245,9 @@ flowchart LR
   Arkade["Arkade / Boltz services"]
   Nigiri["Nigiri (regtest only)"]
 
-  HostDaemon <-->|"HTTP JSON on /native/*"| WitnessDaemon
-  HostDaemon <-->|"HTTP JSON on /native/*"| PlayerDaemon
-  WitnessDaemon <-->|"HTTP JSON on /native/*"| PlayerDaemon
+  HostDaemon <-->|"signed transport envelopes over parker://"| WitnessDaemon
+  HostDaemon <-->|"signed transport envelopes over parker://"| PlayerDaemon
+  WitnessDaemon <-->|"signed transport envelopes over parker://"| PlayerDaemon
 
   HostDaemon -->|"wallet + table-funds ops"| Arkade
   WitnessDaemon -->|"wallet + table-funds ops"| Arkade
@@ -245,10 +263,10 @@ flowchart LR
 
 ### Minimal private table
 
-A minimal private table can run with:
+A minimal private heads-up table can run with:
 
-- one host daemon
-- two player daemons
+- one daemon that hosts and also seats into the table
+- one second player daemon
 - no indexer
 - no browser client
 
@@ -280,15 +298,15 @@ The repository currently exercises these local shapes:
 1. A local CLI or controller asks the host daemon to create a table.
 2. The host daemon appends `TableAnnounce`, stores the invite code, and optionally builds an advertisement.
 3. If the table is public and an indexer is configured, the daemon publishes the advertisement and public snapshot.
-4. A player daemon decodes the invite and sends a JSON join request to the host.
-5. The host daemon accepts the seat, appends `SeatLocked`, and marks the table ready when seat count is reached.
+4. A player daemon decodes the invite, builds a wallet-signed identity binding, and sends `table.join.request` to the host's `parker://` endpoint.
+5. The host daemon validates the binding and live peer identity, accepts the seat, appends `SeatLocked`, and marks the table ready when seat count is reached.
 6. Once the table is ready, the host builds a snapshot and starts the first hand.
 
 ### Gameplay loop
 
 1. The host daemon starts the hand and derives hidden cards locally.
-2. Player daemons send JSON action requests to the current host.
-3. The host advances public state, appends `PlayerAction`, and persists the updated table.
+2. Player daemons send signed `table.action.request` envelopes to the current host.
+3. The host validates the action signature and turn binding, advances public state, appends `PlayerAction`, and persists the updated table.
 4. When the hand settles, the host appends `HandResult`, builds a snapshot, and schedules the next hand.
 5. Each participating daemon updates its local table-funds checkpoint state from the replicated table copy.
 
@@ -324,5 +342,5 @@ If the host disappears during an active hand and a snapshot already exists:
 
 ## Relationship To Other Docs
 
-- [protocol.md](./protocol.md): current local RPC surface, peer endpoints, signed objects, and public-read protocol
+- [protocol.md](./protocol.md): current controller routes, local RPC surface, peer transport, signed objects, and public-read protocol
 - [trust-model.md](./trust-model.md): guarantees, trust assumptions, and operational failure consequences

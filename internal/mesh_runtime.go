@@ -65,14 +65,14 @@ func newMeshRuntime(profileName string, config RuntimeConfig, mode string) (*mes
 		return nil, err
 	}
 	return &meshRuntime{
-		config:       config,
-		httpClient:   &http.Client{Timeout: 5 * time.Second},
-		lastSyncAt:   map[string]time.Time{},
-		mode:         mode,
+		config:        config,
+		httpClient:    &http.Client{Timeout: 5 * time.Second},
+		lastSyncAt:    map[string]time.Time{},
+		mode:          mode,
 		peerInfoCache: map[string]nativePeerSelf{},
-		profileName:  profileName,
-		profileStore: walletpkg.NewProfileStore(config.ProfileDir),
-		store:        store,
+		profileName:   profileName,
+		profileStore:  walletpkg.NewProfileStore(config.ProfileDir),
+		store:         store,
 		walletRuntime: walletpkg.NewRuntime(walletpkg.RuntimeConfig{
 			ArkServerURL:      config.ArkServerURL,
 			Network:           config.Network,
@@ -91,7 +91,7 @@ func (runtime *meshRuntime) Start() error {
 	if runtime.started {
 		return nil
 	}
-	if err := runtime.ensureBootstrapLocked(""); err != nil {
+	if err := runtime.ensureBootstrapLocked("", ""); err != nil {
 		return err
 	}
 	if err := runtime.startPeerServerLocked(); err != nil {
@@ -132,9 +132,9 @@ func (runtime *meshRuntime) Close() error {
 	return joined
 }
 
-func (runtime *meshRuntime) Bootstrap(nickname string) (map[string]any, error) {
+func (runtime *meshRuntime) Bootstrap(nickname, walletNsec string) (map[string]any, error) {
 	runtime.mu.Lock()
-	if err := runtime.ensureBootstrapLocked(nickname); err != nil {
+	if err := runtime.ensureBootstrapLocked(nickname, walletNsec); err != nil {
 		runtime.mu.Unlock()
 		return nil, err
 	}
@@ -690,14 +690,14 @@ func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState
 	return table, nil
 }
 
-func (runtime *meshRuntime) ensureBootstrapLocked(nickname string) error {
+func (runtime *meshRuntime) ensureBootstrapLocked(nickname, walletNsec string) error {
 	if runtime.walletID.PlayerID != "" && runtime.protocolID != "" {
-		if nickname == "" {
+		if nickname == "" && walletNsec == "" {
 			return nil
 		}
 	}
 
-	state, err := runtime.walletRuntime.EnsureProfile(runtime.profileName, nickname)
+	state, err := runtime.walletRuntime.EnsureProfile(runtime.profileName, nickname, walletNsec)
 	if err != nil {
 		return err
 	}

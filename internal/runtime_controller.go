@@ -5,10 +5,11 @@ import "github.com/danieldresner/arkade_fun/internal/game"
 type daemonRuntime interface {
 	Start() error
 	Close() error
-	Bootstrap(nickname string) (map[string]any, error)
+	Bootstrap(nickname, walletNsec string) (map[string]any, error)
 	Tick()
 	CurrentState() (map[string]any, error)
 	QuickState() (map[string]any, error)
+	WalletNsec() (any, error)
 	WalletSummary() (any, error)
 	WalletFaucet(amountSats int) (any, error)
 	WalletOnboard() (any, error)

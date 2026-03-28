@@ -28,6 +28,7 @@ var DaemonMethods = []string{
 	"watch",
 	"walletDeposit",
 	"walletFaucet",
+	"walletNsec",
 	"walletOffboard",
 	"walletOnboard",
 	"walletSummary",

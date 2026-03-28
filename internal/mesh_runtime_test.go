@@ -341,7 +341,7 @@ func newMeshTestRuntime(t *testing.T, profileName string) *meshRuntime {
 		_ = runtime.Close()
 	})
 
-	if _, err := runtime.Bootstrap(profileName); err != nil {
+	if _, err := runtime.Bootstrap(profileName, ""); err != nil {
 		t.Fatalf("bootstrap mesh runtime %s: %v", profileName, err)
 	}
 	return runtime

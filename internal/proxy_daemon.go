@@ -241,7 +241,12 @@ func (d *ProxyDaemon) dispatch(request RequestEnvelope, connection net.Conn) Res
 func (d *ProxyDaemon) handleRuntimeRequest(method string, params map[string]any) (any, error) {
 	switch method {
 	case "bootstrap":
-		return d.runtime.Bootstrap(stringFromMap(params, "nickname", ""))
+		return d.runtime.Bootstrap(
+			stringFromMap(params, "nickname", ""),
+			stringFromMap(params, "walletNsec", ""),
+		)
+	case "walletNsec":
+		return d.runtime.WalletNsec()
 	case "walletSummary":
 		return d.runtime.WalletSummary()
 	case "walletFaucet":
