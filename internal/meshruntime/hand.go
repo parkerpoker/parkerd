@@ -926,6 +926,43 @@ func startingBalancesForHand(table nativeTableState, handNumber int) map[string]
 	return balances
 }
 
+func acceptedAbortSeatIndex(table nativeTableState) (*int, bool) {
+	if table.ActiveHand == nil {
+		return nil, false
+	}
+	handID := table.ActiveHand.State.HandID
+	for index := len(table.Events) - 1; index >= 0; index-- {
+		event := table.Events[index]
+		if event.MessageType != "HandAbort" || stringValue(event.HandID) != handID {
+			continue
+		}
+		if event.Body == nil || event.Body["seatIndex"] == nil {
+			return nil, false
+		}
+		seatIndex := intFromMap(event.Body, "seatIndex", -1)
+		if seatIndex < 0 {
+			return nil, false
+		}
+		return &seatIndex, true
+	}
+	return nil, false
+}
+
+func replayAcceptedAbortIfPresent(table nativeTableState, hand game.HoldemState) (game.HoldemState, bool, error) {
+	if table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetSettled {
+		return hand, false, nil
+	}
+	seatIndex, ok := acceptedAbortSeatIndex(table)
+	if !ok {
+		return hand, false, nil
+	}
+	next, err := game.ForceFoldSeat(hand, *seatIndex)
+	if err != nil {
+		return hand, false, err
+	}
+	return next, true, nil
+}
+
 func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (game.HoldemState, error) {
 	if table.ActiveHand == nil {
 		return game.HoldemState{}, fmt.Errorf("hand is not active")
@@ -961,6 +998,12 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 	for {
 		if game.PhaseAllowsActions(hand.Phase) {
 			if actionIndex >= len(table.ActiveHand.State.ActionLog) {
+				if next, applied, err := replayAcceptedAbortIfPresent(table, hand); err != nil {
+					return game.HoldemState{}, err
+				} else if applied {
+					hand = next
+					continue
+				}
 				return hand, nil
 			}
 			record := table.ActiveHand.State.ActionLog[actionIndex]
@@ -981,6 +1024,12 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 		case game.StreetFlopReveal, game.StreetTurnReveal, game.StreetRiverReveal:
 			boardOpen, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageBoardOpen, nil, string(hand.Phase), nil)
 			if !ok {
+				if next, applied, err := replayAcceptedAbortIfPresent(table, hand); err != nil {
+					return game.HoldemState{}, err
+				} else if applied {
+					hand = next
+					continue
+				}
 				return hand, nil
 			}
 			next, err := game.ApplyBoardCards(hand, boardOpen.Cards)
@@ -990,6 +1039,7 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 			hand = next
 		case game.StreetShowdownReveal:
 			holeCardsByPlayerID := map[string][2]game.CardCode{}
+			replayedAbort := false
 			for _, player := range hand.Players {
 				if player.Status == game.PlayerStatusFolded {
 					continue
@@ -997,12 +1047,22 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 				seatIndex := player.SeatIndex
 				reveal, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageShowdownReveal, &seatIndex, string(game.StreetShowdownReveal), nil)
 				if !ok {
+					if next, applied, err := replayAcceptedAbortIfPresent(table, hand); err != nil {
+						return game.HoldemState{}, err
+					} else if applied {
+						hand = next
+						replayedAbort = true
+						break
+					}
 					return hand, nil
 				}
 				if len(reveal.Cards) != 2 {
 					return game.HoldemState{}, fmt.Errorf("showdown reveal for seat %d is incomplete", seatIndex)
 				}
 				holeCardsByPlayerID[player.PlayerID] = [2]game.CardCode{reveal.Cards[0], reveal.Cards[1]}
+			}
+			if replayedAbort {
+				continue
 			}
 			next, err := game.SettleHoldemShowdown(hand, holeCardsByPlayerID)
 			if err != nil {

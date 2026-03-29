@@ -289,6 +289,9 @@ func TestMissingRevealTimeoutAwardsPotAndAppendsAbort(t *testing.T) {
 			if len(table.ActiveHand.State.Winners) != 1 || table.ActiveHand.State.Winners[0].PlayerID != host.walletID.PlayerID {
 				t.Fatalf("expected host to win timeout-forfeited hand, got %+v", table.ActiveHand.State.Winners)
 			}
+			if _, err := host.CashOut(tableID); err != nil {
+				t.Fatalf("cash out after timeout-settled hand: %v", err)
+			}
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
