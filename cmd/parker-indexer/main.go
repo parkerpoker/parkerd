@@ -6,9 +6,9 @@ import (
 	"os"
 	"strconv"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	indexerpkg "github.com/danieldresner/arkade_fun/internal/indexer"
+	parker "github.com/parkerpoker/parkerd/internal"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	indexerpkg "github.com/parkerpoker/parkerd/internal/indexer"
 )
 
 func main() {

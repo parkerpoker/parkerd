@@ -11,7 +11,7 @@ import (
 	"strings"
 	"syscall"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
+	parker "github.com/parkerpoker/parkerd/internal"
 )
 
 func main() {

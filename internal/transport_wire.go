@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
 )
 
 const (

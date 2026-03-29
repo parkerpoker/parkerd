@@ -1,6 +1,6 @@
 package mesh
 
-import parker "github.com/danieldresner/arkade_fun/internal"
+import parker "github.com/parkerpoker/parkerd/internal"
 
 type RuntimeMode string
 

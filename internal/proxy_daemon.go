@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/danieldresner/arkade_fun/internal/game"
+	"github.com/parkerpoker/parkerd/internal/game"
 )
 
 const NativeStartupBanner = "go parker daemon starting"

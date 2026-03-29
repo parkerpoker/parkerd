@@ -1,6 +1,6 @@
 package parker
 
-import "github.com/danieldresner/arkade_fun/internal/game"
+import "github.com/parkerpoker/parkerd/internal/game"
 
 type daemonRuntime interface {
 	Start() error

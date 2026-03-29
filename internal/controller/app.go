@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	"github.com/danieldresner/arkade_fun/internal/mesh"
-	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
+	parker "github.com/parkerpoker/parkerd/internal"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	"github.com/parkerpoker/parkerd/internal/mesh"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 const (

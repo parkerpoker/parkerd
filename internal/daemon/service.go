@@ -1,8 +1,8 @@
 package daemon
 
 import (
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
+	parker "github.com/parkerpoker/parkerd/internal"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 type Service struct {

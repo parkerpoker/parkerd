@@ -6,8 +6,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	daemonpkg "github.com/danieldresner/arkade_fun/internal/daemon"
+	parker "github.com/parkerpoker/parkerd/internal"
+	daemonpkg "github.com/parkerpoker/parkerd/internal/daemon"
 )
 
 func main() {

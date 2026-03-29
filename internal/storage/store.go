@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/redis/go-redis/v9"
 

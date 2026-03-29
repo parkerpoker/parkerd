@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/danieldresner/arkade_fun/internal/game"
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/game"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
 )
 
 const (

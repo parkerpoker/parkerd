@@ -3,7 +3,7 @@ package game
 import (
 	"fmt"
 
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
 )
 
 func copySeatPointer(value *int) *int {

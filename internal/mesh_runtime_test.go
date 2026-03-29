@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	"github.com/danieldresner/arkade_fun/internal/game"
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	"github.com/parkerpoker/parkerd/internal/game"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
 )
 
 func TestTableTrafficKeepsHoleCardsOwnerLocalAndPushesTranscriptUpdates(t *testing.T) {

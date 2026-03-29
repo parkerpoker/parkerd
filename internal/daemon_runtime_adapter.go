@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/danieldresner/arkade_fun/internal/game"
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
-	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
+	"github.com/parkerpoker/parkerd/internal/game"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 const transportWireVersion = 2

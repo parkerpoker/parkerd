@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 func TestIndexerStoresAndServesPublicTables(t *testing.T) {

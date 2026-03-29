@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 const (

@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
+	parker "github.com/parkerpoker/parkerd/internal"
 )
 
 func TestBuildBootstrapParamsIncludesWalletNsec(t *testing.T) {

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
+	parker "github.com/parkerpoker/parkerd/internal"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 const testOrigin = "http://127.0.0.1:3010"

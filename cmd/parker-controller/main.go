@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	controllerpkg "github.com/danieldresner/arkade_fun/internal/controller"
+	parker "github.com/parkerpoker/parkerd/internal"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	controllerpkg "github.com/parkerpoker/parkerd/internal/controller"
 )
 
 func main() {
