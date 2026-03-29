@@ -99,7 +99,13 @@ Managed local stack:
 make local
 ```
 
-That target rebuilds the local binaries, starts Nigiri, the indexer, the localhost controller, and four local daemons: `dealer` in host mode plus `witness`, `alice`, and `bob`. The player and dealer profiles are left for manual bootstrap and funding flows.
+That target rebuilds the local binaries, starts Nigiri, the indexer, the localhost controller, and three local daemons: `witness`, `alice`, and `bob`. `HOST_PROFILE` chooses which player runs in host mode, and defaults to `alice`.
+
+For example:
+
+```bash
+HOST_PROFILE=bob make local
+```
 
 Useful lifecycle commands:
 
@@ -107,8 +113,8 @@ Useful lifecycle commands:
 make local-down
 make deps
 make deps-down
-make dealer
-make dealer-down
+make host
+make host-down
 make witness
 make witness-down
 make alice
@@ -118,6 +124,8 @@ make bob-down
 make fund-alice
 make fund-bob
 ```
+
+The `host` target starts whichever player matches `HOST_PROFILE`, and the `alice` or `bob` targets also switch to host mode automatically when that player is selected.
 
 The managed stack keeps its runtime under `.tmp/local-regtest`, including a stable exported env file at `.tmp/local-regtest/runtime.env`.
 

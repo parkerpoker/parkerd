@@ -1,14 +1,15 @@
 SHELL := /bin/bash
 
 PARKER_BIN_DIR ?= .tmp/parker-bin
+HOST_PROFILE ?= alice
 
-.PHONY: rebuild-binaries local local-down deps deps-down dealer dealer-down witness witness-down alice alice-down bob bob-down fund-bob fund-alice poker-regtest-round poker-regtest-round-rebuild poker-regtest-round-tor poker-regtest-round-rebuild-tor poker-regtest-round-host-player poker-regtest-round-host-player-rebuild poker-regtest-round-host-player-tor poker-regtest-round-host-player-rebuild-tor
+.PHONY: rebuild-binaries local local-down deps deps-down host host-down witness witness-down alice alice-down bob bob-down fund-bob fund-alice poker-regtest-round poker-regtest-round-rebuild poker-regtest-round-tor poker-regtest-round-rebuild-tor poker-regtest-round-host-player poker-regtest-round-host-player-rebuild poker-regtest-round-host-player-tor poker-regtest-round-host-player-rebuild-tor
 
 rebuild-binaries:
 	rm -rf "$(PARKER_BIN_DIR)"
 
 local: rebuild-binaries
-	./scripts/local-stack.sh local-up
+	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh local-up
 
 local-down:
 	./scripts/local-stack.sh local-down
@@ -19,26 +20,26 @@ deps:
 deps-down:
 	./scripts/local-stack.sh deps-down
 
-dealer:
-	./scripts/local-stack.sh start-daemon dealer
+host:
+	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh start-daemon "$(HOST_PROFILE)"
 
-dealer-down:
-	./scripts/local-stack.sh stop-daemon dealer
+host-down:
+	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh stop-daemon "$(HOST_PROFILE)"
 
 witness:
-	./scripts/local-stack.sh start-daemon witness
+	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh start-daemon witness
 
 witness-down:
 	./scripts/local-stack.sh stop-daemon witness
 
 alice:
-	./scripts/local-stack.sh start-daemon alice
+	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh start-daemon alice
 
 alice-down:
 	./scripts/local-stack.sh stop-daemon alice
 
 bob:
-	./scripts/local-stack.sh start-daemon bob
+	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh start-daemon bob
 
 bob-down:
 	./scripts/local-stack.sh stop-daemon bob

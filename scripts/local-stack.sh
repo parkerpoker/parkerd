@@ -19,7 +19,6 @@ WORK_DIR="$LOCAL_STATE_DIR/work"
 
 DEFAULT_INDEXER_PORT=3020
 DEFAULT_CONTROLLER_PORT=3030
-DEFAULT_DEALER_PORT=7060
 DEFAULT_WITNESS_PORT=7061
 DEFAULT_ALICE_PORT=7062
 DEFAULT_BOB_PORT=7063
@@ -44,9 +43,11 @@ commands:
   stop-indexer
   start-controller
   stop-controller
-  start-daemon <dealer|witness|alice|bob>
-  stop-daemon <dealer|witness|alice|bob>
+  start-daemon <witness|alice|bob>
+  stop-daemon <witness|alice|bob>
   fund <alice|bob>
+
+Set HOST_PROFILE=alice or HOST_PROFILE=bob to choose which player runs in host mode (default: alice).
 EOF
 }
 
@@ -154,11 +155,10 @@ choose_port() {
 write_runtime_env() {
   local indexer_port="$1"
   local controller_port="$2"
-  local dealer_port="$3"
-  local witness_port="$4"
-  local alice_port="$5"
-  local bob_port="$6"
-  local nigiri_datadir="$7"
+  local witness_port="$3"
+  local alice_port="$4"
+  local bob_port="$5"
+  local nigiri_datadir="$6"
 
   mkdir -p "$LOCAL_STATE_DIR" "$PID_DIR" "$LOG_DIR" "$WORK_DIR"
 
@@ -182,7 +182,6 @@ export LOCAL_INDEXER_LOG=$(printf '%q' "$LOG_DIR/indexer.log")
 export PARKER_INDEXER_URL=http://127.0.0.1:${indexer_port}
 export INDEXER_PORT=${indexer_port}
 export CONTROLLER_PORT=${controller_port}
-export DEALER_PORT=${dealer_port}
 export WITNESS_PORT=${witness_port}
 export ALICE_PORT=${alice_port}
 export BOB_PORT=${bob_port}
@@ -203,7 +202,6 @@ initialize_runtime_env() {
   local nigiri_datadir
   local indexer_port
   local controller_port
-  local dealer_port
   local witness_port
   local alice_port
   local bob_port
@@ -211,12 +209,11 @@ initialize_runtime_env() {
   nigiri_datadir="$(default_local_nigiri_datadir)"
   indexer_port="$(choose_port "$DEFAULT_INDEXER_PORT")"
   controller_port="$(choose_port "$DEFAULT_CONTROLLER_PORT")"
-  dealer_port="$(choose_port "$DEFAULT_DEALER_PORT")"
   witness_port="$(choose_port "$DEFAULT_WITNESS_PORT")"
   alice_port="$(choose_port "$DEFAULT_ALICE_PORT")"
   bob_port="$(choose_port "$DEFAULT_BOB_PORT")"
 
-  write_runtime_env "$indexer_port" "$controller_port" "$dealer_port" "$witness_port" "$alice_port" "$bob_port" "$nigiri_datadir"
+  write_runtime_env "$indexer_port" "$controller_port" "$witness_port" "$alice_port" "$bob_port" "$nigiri_datadir"
 }
 
 load_runtime_env() {
@@ -239,7 +236,6 @@ load_runtime_env() {
     write_runtime_env \
       "$INDEXER_PORT" \
       "$CONTROLLER_PORT" \
-      "$DEALER_PORT" \
       "$WITNESS_PORT" \
       "$ALICE_PORT" \
       "$BOB_PORT" \
@@ -521,12 +517,34 @@ ensure_deps_up() {
 }
 
 profile_mode() {
-  case "$1" in
-    dealer) printf 'host\n' ;;
+  local profile="$1"
+  local selected_host_profile=""
+
+  selected_host_profile="$(host_profile)"
+
+  case "$profile" in
     witness) printf 'witness\n' ;;
-    alice|bob) printf 'player\n' ;;
+    alice|bob)
+      if [[ "$profile" == "$selected_host_profile" ]]; then
+        printf 'host\n'
+        return 0
+      fi
+      printf 'player\n'
+      ;;
     *)
-      echo "unknown profile $1" >&2
+      echo "unknown profile $profile" >&2
+      exit 1
+      ;;
+  esac
+}
+
+host_profile() {
+  local profile="${HOST_PROFILE:-alice}"
+
+  case "$profile" in
+    alice|bob) printf '%s\n' "$profile" ;;
+    *)
+      echo "HOST_PROFILE must be alice or bob (received: $profile)." >&2
       exit 1
       ;;
   esac
@@ -534,7 +552,6 @@ profile_mode() {
 
 profile_port() {
   case "$1" in
-    dealer) printf '%s\n' "$DEALER_PORT" ;;
     witness) printf '%s\n' "$WITNESS_PORT" ;;
     alice) printf '%s\n' "$ALICE_PORT" ;;
     bob) printf '%s\n' "$BOB_PORT" ;;
@@ -547,7 +564,6 @@ profile_port() {
 
 profile_nickname() {
   case "$1" in
-    dealer) printf 'Dealer\n' ;;
     witness) printf 'Witness\n' ;;
     alice) printf 'Alice\n' ;;
     bob) printf 'Bob\n' ;;
@@ -618,6 +634,15 @@ daemon_is_reachable() {
   [[ "$reachable" == "true" ]]
 }
 
+profile_daemon_mode() {
+  local profile="$1"
+  local status=""
+
+  status="$(profile_cli "$profile" daemon status --json 2>/dev/null || true)"
+  [[ -n "$status" ]] || return 1
+  printf '%s' "$status" | json_field data.metadata.mode 2>/dev/null || true
+}
+
 wait_for_daemon_reachable() {
   local profile="$1"
   local status
@@ -641,13 +666,21 @@ wait_for_daemon_reachable() {
 start_daemon_profile() {
   local profile="$1"
   local mode
+  local running_mode=""
 
   load_runtime_env
+  start_controller
   mode="$(profile_mode "$profile")"
 
   if daemon_is_reachable "$profile"; then
-    echo "$profile daemon already running."
-    return 0
+    running_mode="$(profile_daemon_mode "$profile")"
+    if [[ "$running_mode" == "$mode" ]]; then
+      echo "$profile daemon already running in $mode mode."
+      return 0
+    fi
+
+    echo "Restarting $profile daemon in $mode mode."
+    stop_daemon_profile "$profile"
   fi
 
   profile_cli "$profile" daemon start --mode "$mode" --json >/dev/null
@@ -790,13 +823,16 @@ fund_profile() {
 }
 
 print_local_summary() {
+  local selected_host_profile=""
+
   load_runtime_env
+  selected_host_profile="$(host_profile)"
   cat <<EOF
 Local stack is ready.
 RUNTIME_ENV=$RUNTIME_ENV
 INDEXER_URL=http://127.0.0.1:${INDEXER_PORT}
 CONTROLLER_URL=http://127.0.0.1:${CONTROLLER_PORT}
-DEALER_PORT=${DEALER_PORT}
+HOST_PROFILE=${selected_host_profile}
 WITNESS_PORT=${WITNESS_PORT}
 ALICE_PORT=${ALICE_PORT}
 BOB_PORT=${BOB_PORT}
@@ -804,13 +840,20 @@ EOF
 }
 
 local_up() {
+  local selected_host_profile=""
+
   ensure_deps_up
   start_indexer
   start_controller
-  start_daemon_profile dealer
+  selected_host_profile="$(host_profile)"
+  start_daemon_profile "$selected_host_profile"
   start_daemon_profile witness
-  start_daemon_profile alice
-  start_daemon_profile bob
+  if [[ "$selected_host_profile" != "alice" ]]; then
+    start_daemon_profile alice
+  fi
+  if [[ "$selected_host_profile" != "bob" ]]; then
+    start_daemon_profile bob
+  fi
   print_local_summary
 }
 
@@ -818,7 +861,6 @@ local_down() {
   stop_daemon_profile bob || true
   stop_daemon_profile alice || true
   stop_daemon_profile witness || true
-  stop_daemon_profile dealer || true
   stop_controller || true
   stop_indexer || true
   stop_nigiri_stack || true
