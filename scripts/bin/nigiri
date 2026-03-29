@@ -26,7 +26,11 @@ find_real_nigiri() {
 }
 
 if [[ -n "${PARKER_NIGIRI_BIN:-}" ]]; then
-  REAL_NIGIRI_BIN="$PARKER_NIGIRI_BIN"
+  if [[ "$PARKER_NIGIRI_BIN" != "$SCRIPT_DIR/nigiri" ]]; then
+    REAL_NIGIRI_BIN="$PARKER_NIGIRI_BIN"
+  else
+    REAL_NIGIRI_BIN=""
+  fi
 elif [[ -x "$REPO_NIGIRI_BIN" ]]; then
   REAL_NIGIRI_BIN="$REPO_NIGIRI_BIN"
 else

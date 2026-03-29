@@ -22,6 +22,7 @@ type daemonRuntime interface {
 	NetworkPeers() (any, error)
 	BootstrapPeer(endpoint, alias string, roles []string) (any, error)
 	CreateTable(input map[string]any) (any, error)
+	CreatedTables(cursor string, limit int) (any, error)
 	AnnounceTable(tableID string) (any, error)
 	JoinTable(inviteCode string, buyInSats int) (any, error)
 	GetTable(tableID string) (any, error)

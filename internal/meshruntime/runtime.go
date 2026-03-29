@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,6 +57,8 @@ const (
 	nativeTableAuthSignatureHeader = "X-Parker-Signature"
 	nativeTableFetchAuthMaxAge     = 15 * time.Second
 	nativeTableSyncAuthMaxAge      = 15 * time.Second
+	defaultCreatedTablesLimit      = 10
+	maxCreatedTablesLimit          = 100
 )
 
 func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (*meshRuntime, error) {
@@ -372,9 +375,9 @@ func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, e
 		return nil, err
 	}
 	tableID := randomUUID()
-	visibility := "private"
-	if boolFromMap(input, "public") {
-		visibility = "public"
+	visibility, err := tableVisibilityFromInput(input)
+	if err != nil {
+		return nil, err
 	}
 	now := nowISO()
 	inviteCode, err := encodeInvite(tableID, runtime.config.Network, runtime.selfPeerID(), runtime.selfPeerURL())
@@ -444,9 +447,70 @@ func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, e
 	if err := runtime.persistAndReplicate(table, true); err != nil {
 		return nil, err
 	}
+	if err := runtime.saveCreatedTableReference(*table, inviteCode); err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"inviteCode": inviteCode,
 		"table":      rawJSONMap(config),
+	}, nil
+}
+
+func (runtime *meshRuntime) CreatedTables(cursor string, limit int) (NativeCreatedTablesPage, error) {
+	if err := runtime.Start(); err != nil {
+		return NativeCreatedTablesPage{}, err
+	}
+
+	profile, err := runtime.loadProfileState()
+	if err != nil {
+		return NativeCreatedTablesPage{}, err
+	}
+
+	entries := make([]NativeCreatedTableEntry, 0, len(profile.MeshTables))
+	for _, reference := range profile.MeshTables {
+		if !reference.CreatedByMe {
+			continue
+		}
+		entry, err := runtime.createdTableEntry(reference)
+		if err != nil {
+			return NativeCreatedTablesPage{}, err
+		}
+		entries = append(entries, entry)
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return compareCreatedTableEntries(entries[i], entries[j]) < 0
+	})
+
+	cursorValue, err := decodeCreatedTablesCursor(cursor)
+	if err != nil {
+		return NativeCreatedTablesPage{}, err
+	}
+	resolvedLimit := clampCreatedTablesLimit(limit)
+	page := make([]NativeCreatedTableEntry, 0, resolvedLimit)
+	nextCursor := ""
+
+	for _, entry := range entries {
+		if cursorValue != nil && compareCreatedTableEntryWithCursor(entry, *cursorValue) <= 0 {
+			continue
+		}
+		if len(page) == resolvedLimit {
+			lastIncluded := page[len(page)-1]
+			nextCursor, err = encodeCreatedTablesCursor(createdTablesCursor{
+				CreatedAt: lastIncluded.Config.CreatedAt,
+				TableID:   lastIncluded.Config.TableID,
+			})
+			if err != nil {
+				return NativeCreatedTablesPage{}, err
+			}
+			break
+		}
+		page = append(page, entry)
+	}
+
+	return NativeCreatedTablesPage{
+		Items:      page,
+		NextCursor: nextCursor,
 	}, nil
 }
 
@@ -2121,6 +2185,7 @@ func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error
 	if err != nil {
 		return err
 	}
+	previousReference := profile.MeshTables[accepted.Config.TableID]
 	profile.CurrentMeshTableID = accepted.Config.TableID
 	profile.CurrentTable = &walletpkg.TableSessionState{
 		InviteCode: accepted.InviteCode,
@@ -2130,8 +2195,11 @@ func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error
 	profile.MeshTables[accepted.Config.TableID] = walletpkg.MeshTableReferenceState{
 		Config:       MustMarshalJSON(accepted.Config),
 		CurrentEpoch: accepted.CurrentEpoch,
+		CreatedAt:    firstNonEmptyString(accepted.Config.CreatedAt, previousReference.CreatedAt),
+		CreatedByMe:  previousReference.CreatedByMe,
 		HostPeerID:   accepted.CurrentHost.Peer.PeerID,
 		HostPeerURL:  accepted.CurrentHost.Peer.PeerURL,
+		InviteCode:   firstNonEmptyString(accepted.InviteCode, previousReference.InviteCode),
 		Role:         runtime.roleForTable(accepted),
 		TableID:      accepted.Config.TableID,
 		Visibility:   accepted.Config.Visibility,
@@ -2144,6 +2212,62 @@ func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error
 	}
 	go runtime.driveLocalHandProtocol(accepted.Config.TableID)
 	return nil
+}
+
+func (runtime *meshRuntime) saveCreatedTableReference(table nativeTableState, inviteCode string) error {
+	profile, err := runtime.loadProfileState()
+	if err != nil {
+		return err
+	}
+	profile.MeshTables[table.Config.TableID] = walletpkg.MeshTableReferenceState{
+		Config:       MustMarshalJSON(table.Config),
+		CurrentEpoch: table.CurrentEpoch,
+		CreatedAt:    table.Config.CreatedAt,
+		CreatedByMe:  true,
+		HostPeerID:   table.CurrentHost.Peer.PeerID,
+		HostPeerURL:  table.CurrentHost.Peer.PeerURL,
+		InviteCode:   inviteCode,
+		Role:         "host",
+		TableID:      table.Config.TableID,
+		Visibility:   table.Config.Visibility,
+	}
+	return runtime.profileStore.Save(*profile)
+}
+
+func (runtime *meshRuntime) createdTableEntry(reference walletpkg.MeshTableReferenceState) (NativeCreatedTableEntry, error) {
+	config, err := decodeCreatedTableConfig(reference)
+	if err != nil {
+		return NativeCreatedTableEntry{}, err
+	}
+	summary := NativeTableSummary{
+		CurrentEpoch: reference.CurrentEpoch,
+		HostPeerID:   reference.HostPeerID,
+		Role:         reference.Role,
+		Status:       config.Status,
+		TableID:      reference.TableID,
+		TableName:    config.Name,
+		Visibility:   firstNonEmptyString(reference.Visibility, config.Visibility),
+	}
+
+	table, err := runtime.store.readTable(reference.TableID)
+	if err != nil {
+		return NativeCreatedTableEntry{}, err
+	}
+	if table != nil {
+		config = table.Config
+		summary = runtime.tableSummary(*table)
+	}
+
+	inviteCode := reference.InviteCode
+	if inviteCode == "" && table != nil {
+		inviteCode = table.InviteCode
+	}
+
+	return NativeCreatedTableEntry{
+		Config:     config,
+		InviteCode: inviteCode,
+		Summary:    summary,
+	}, nil
 }
 
 func (runtime *meshRuntime) seatIndexForPlayer(table nativeTableState) int {
@@ -2823,6 +2947,130 @@ func stringCards(cards []game.CardCode) []string {
 		values = append(values, string(card))
 	}
 	return values
+}
+
+type createdTablesCursor struct {
+	CreatedAt string `json:"createdAt"`
+	TableID   string `json:"tableId"`
+}
+
+func clampCreatedTablesLimit(limit int) int {
+	if limit <= 0 {
+		return defaultCreatedTablesLimit
+	}
+	if limit > maxCreatedTablesLimit {
+		return maxCreatedTablesLimit
+	}
+	return limit
+}
+
+func encodeCreatedTablesCursor(cursor createdTablesCursor) (string, error) {
+	data, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func decodeCreatedTablesCursor(raw string) (*createdTablesCursor, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	data, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode created tables cursor: %w", err)
+	}
+	var cursor createdTablesCursor
+	if err := json.Unmarshal(data, &cursor); err != nil {
+		return nil, fmt.Errorf("decode created tables cursor: %w", err)
+	}
+	if cursor.CreatedAt == "" || cursor.TableID == "" {
+		return nil, errors.New("decode created tables cursor: cursor is missing createdAt or tableId")
+	}
+	return &cursor, nil
+}
+
+func compareCreatedTableEntries(left, right NativeCreatedTableEntry) int {
+	if left.Config.CreatedAt > right.Config.CreatedAt {
+		return -1
+	}
+	if left.Config.CreatedAt < right.Config.CreatedAt {
+		return 1
+	}
+	if left.Config.TableID > right.Config.TableID {
+		return -1
+	}
+	if left.Config.TableID < right.Config.TableID {
+		return 1
+	}
+	return 0
+}
+
+func compareCreatedTableEntryWithCursor(entry NativeCreatedTableEntry, cursor createdTablesCursor) int {
+	return compareCreatedTableEntries(entry, NativeCreatedTableEntry{
+		Config: NativeMeshTableConfig{
+			CreatedAt: cursor.CreatedAt,
+			TableID:   cursor.TableID,
+		},
+	})
+}
+
+func decodeCreatedTableConfig(reference walletpkg.MeshTableReferenceState) (NativeMeshTableConfig, error) {
+	if len(reference.Config) == 0 {
+		return NativeMeshTableConfig{
+			CreatedAt:  reference.CreatedAt,
+			Name:       reference.TableID,
+			Status:     "announced",
+			TableID:    reference.TableID,
+			Visibility: reference.Visibility,
+		}, nil
+	}
+	var config NativeMeshTableConfig
+	if err := json.Unmarshal(reference.Config, &config); err != nil {
+		return NativeMeshTableConfig{}, err
+	}
+	if config.TableID == "" {
+		config.TableID = reference.TableID
+	}
+	if config.CreatedAt == "" {
+		config.CreatedAt = reference.CreatedAt
+	}
+	if config.Visibility == "" {
+		config.Visibility = reference.Visibility
+	}
+	return config, nil
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func tableVisibilityFromInput(input map[string]any) (string, error) {
+	visibility := strings.ToLower(strings.TrimSpace(stringFromMap(input, "visibility", "")))
+	hasVisibility := visibility != ""
+	if hasVisibility && visibility != "public" && visibility != "private" {
+		return "", fmt.Errorf("visibility must be public or private")
+	}
+
+	hasPublicFlag := input != nil && input["public"] != nil
+	publicValue := boolFromMap(input, "public")
+	if hasVisibility && hasPublicFlag {
+		if (visibility == "public") != publicValue {
+			return "", fmt.Errorf("visibility and public flag disagree")
+		}
+	}
+	if hasVisibility {
+		return visibility, nil
+	}
+	if publicValue {
+		return "public", nil
+	}
+	return "private", nil
 }
 
 func stringFromMap(input map[string]any, key, fallback string) string {

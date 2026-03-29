@@ -34,8 +34,11 @@ type KnownPeerState struct {
 type MeshTableReferenceState struct {
 	Config       json.RawMessage `json:"config,omitempty"`
 	CurrentEpoch int             `json:"currentEpoch"`
+	CreatedAt    string          `json:"createdAt,omitempty"`
+	CreatedByMe  bool            `json:"createdByMe,omitempty"`
 	HostPeerID   string          `json:"hostPeerId"`
 	HostPeerURL  string          `json:"hostPeerUrl"`
+	InviteCode   string          `json:"inviteCode,omitempty"`
 	Role         string          `json:"role"`
 	TableID      string          `json:"tableId"`
 	Visibility   string          `json:"visibility"`

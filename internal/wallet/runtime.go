@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -26,6 +27,8 @@ type Runtime struct {
 	mu     sync.Mutex
 	store  *ProfileStore
 }
+
+const nigiriFaucetTimeout = 45 * time.Second
 
 type RuntimeConfig struct {
 	ArkServerURL      string
@@ -175,14 +178,23 @@ func (runtime *Runtime) Faucet(profileName string, amountSats int) error {
 	if runtime.config.NigiriDatadir != "" {
 		args = append([]string{"--datadir", runtime.config.NigiriDatadir}, args...)
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), nigiriFaucetTimeout)
+	defer cancel()
+
 	commandName := runtime.nigiriCommandName()
-	command := exec.Command(commandName, args...)
-	command.Stdout = nil
-	command.Stderr = nil
+	command := exec.CommandContext(ctx, commandName, args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
 	err = command.Run()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("nigiri faucet timed out after %s%s", nigiriFaucetTimeout, formatCommandOutput(stdout.String(), stderr.String()))
+	}
 	if err != nil {
-		debugWalletf("wallet faucet failed profile=%s err=%v", profileName, err)
-		return err
+		details := formatCommandOutput(stdout.String(), stderr.String())
+		debugWalletf("wallet faucet failed profile=%s err=%v%s", profileName, err, details)
+		return fmt.Errorf("nigiri faucet failed: %w%s", err, details)
 	}
 	debugWalletf("wallet faucet complete profile=%s", profileName)
 	return nil
@@ -513,6 +525,29 @@ func debugWalletf(format string, args ...any) {
 		return
 	}
 	log.Printf("[wallet-debug] "+format, args...)
+}
+
+func formatCommandOutput(stdout, stderr string) string {
+	details := make([]string, 0, 2)
+
+	if value := truncateCommandOutput(stderr); value != "" {
+		details = append(details, fmt.Sprintf("stderr=%q", value))
+	}
+	if value := truncateCommandOutput(stdout); value != "" {
+		details = append(details, fmt.Sprintf("stdout=%q", value))
+	}
+	if len(details) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(details, ", ") + ")"
+}
+
+func truncateCommandOutput(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) <= 240 {
+		return trimmed
+	}
+	return trimmed[:240] + "..."
 }
 
 func onchainBalanceTotal(balance *arksdk.Balance) uint64 {

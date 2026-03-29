@@ -38,6 +38,17 @@ type NativeTableSummary struct {
 	Visibility       string `json:"visibility"`
 }
 
+type NativeCreatedTableEntry struct {
+	Config     NativeMeshTableConfig `json:"config"`
+	InviteCode string                `json:"inviteCode,omitempty"`
+	Summary    NativeTableSummary    `json:"summary"`
+}
+
+type NativeCreatedTablesPage struct {
+	Items      []NativeCreatedTableEntry `json:"items"`
+	NextCursor string                    `json:"nextCursor,omitempty"`
+}
+
 type NativeMeshRuntimeState struct {
 	FundsWarnings []map[string]any      `json:"fundsWarnings"`
 	Mode          string                `json:"mode"`

@@ -3,12 +3,13 @@ SHELL := /bin/bash
 PARKER_BIN_DIR ?= .tmp/parker-bin
 HOST_PROFILE ?= alice
 
-.PHONY: rebuild-binaries local local-down deps deps-down host host-down witness witness-down alice alice-down bob bob-down fund-bob fund-alice poker-regtest-round poker-regtest-round-rebuild poker-regtest-round-tor poker-regtest-round-rebuild-tor poker-regtest-round-host-player poker-regtest-round-host-player-rebuild poker-regtest-round-host-player-tor poker-regtest-round-host-player-rebuild-tor
+.PHONY: rebuild-binaries local local-down deps deps-down host host-down witness witness-down alice alice-down bob bob-down fund-bob fund-alice kill-floating poker-regtest-round poker-regtest-round-rebuild poker-regtest-round-tor poker-regtest-round-rebuild-tor poker-regtest-round-host-player poker-regtest-round-host-player-rebuild poker-regtest-round-host-player-tor poker-regtest-round-host-player-rebuild-tor
 
 rebuild-binaries:
 	rm -rf "$(PARKER_BIN_DIR)"
 
 local: rebuild-binaries
+	./scripts/local-stack.sh local-down
 	HOST_PROFILE="$(HOST_PROFILE)" ./scripts/local-stack.sh local-up
 
 local-down:
@@ -49,6 +50,9 @@ fund-bob:
 
 fund-alice:
 	./scripts/local-stack.sh fund alice
+
+kill-floating:
+	./scripts/kill-floating-parker-processes.sh
 
 poker-regtest-round:
 	./scripts/run-regtest-round.sh

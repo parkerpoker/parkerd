@@ -193,6 +193,10 @@ func (runtime *daemonRuntimeAdapter) CreateTable(input map[string]any) (any, err
 	return runtime.inner.CreateTable(input)
 }
 
+func (runtime *daemonRuntimeAdapter) CreatedTables(cursor string, limit int) (any, error) {
+	return runtime.inner.CreatedTables(cursor, limit)
+}
+
 func (runtime *daemonRuntimeAdapter) AnnounceTable(tableID string) (any, error) {
 	return runtime.inner.AnnounceTable(tableID)
 }

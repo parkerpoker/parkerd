@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -115,13 +116,34 @@ func runTableCommand(client *parker.Client, positionals []string, flags parker.F
 		if value, ok := parker.FlagString(flags, "name"); ok {
 			table["name"] = value
 		}
-		if parker.FlagBool(flags, "public") {
-			table["public"] = true
+		visibility, err := resolveTableVisibility(flags)
+		if err != nil {
+			return err
+		}
+		if visibility != "" {
+			table["visibility"] = visibility
 		}
 		if witnessPeerIDs := parseCSVFlag(flags, "witness-peer-ids", "witness-peer-id"); len(witnessPeerIDs) > 0 {
 			table["witnessPeerIds"] = witnessPeerIDs
 		}
 		result, err := client.Request("meshCreateTable", map[string]any{"table": table}, true)
+		if err != nil {
+			return err
+		}
+		return writeResult(outputJSON, result)
+	case "created":
+		params := map[string]any{}
+		if value, ok := parker.FlagString(flags, "cursor"); ok {
+			params["cursor"] = value
+		}
+		if value, ok := parker.FlagString(flags, "limit"); ok {
+			limit, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("limit must be a number")
+			}
+			params["limit"] = limit
+		}
+		result, err := client.Request("meshCreatedTables", paramsOrNil(params), true)
 		if err != nil {
 			return err
 		}
@@ -622,7 +644,7 @@ func printHelp() {
 		"  bootstrap [nickname] [--wallet-nsec <nsec>] --profile <name>",
 		"  wallet [nsec|summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
 		"  network peers|bootstrap add <endpoint> [alias] --profile <name>",
-		"  table create [--name <name>] [--public] [--witness-peer-ids <id[,id]>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
+		"  table create [--name <name>] [--visibility <public|private>] [--public|--private] [--witness-peer-ids <id[,id]>] | created [--cursor <cursor>] [--limit <n>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
 		"  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
 		"  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
 		"  interactive --profile <name>",
@@ -630,4 +652,38 @@ func printHelp() {
 		"  --network <regtest|mutinynet> --indexer-url <url> --ark-server-url <url> --boltz-url <url> --peer-host <host> --peer-port <port> --use-tor --tor-socks-addr <addr> --tor-control-addr <addr> --tor-cookie-auth <path|auto> --tor-target-host <host> --gossip-bootstrap-peers <csv> --mailbox-endpoints <csv> --mock --json",
 		"",
 	}, "\n"))
+}
+
+func resolveTableVisibility(flags parker.FlagMap) (string, error) {
+	visibility, hasVisibility := parker.FlagString(flags, "visibility")
+	if hasVisibility {
+		visibility = strings.ToLower(strings.TrimSpace(visibility))
+		switch visibility {
+		case "public", "private":
+		default:
+			return "", fmt.Errorf("visibility must be public or private")
+		}
+	}
+
+	publicFlag := parker.FlagBool(flags, "public")
+	privateFlag := parker.FlagBool(flags, "private")
+	if publicFlag && privateFlag {
+		return "", fmt.Errorf("cannot set both --public and --private")
+	}
+	if hasVisibility {
+		if publicFlag && visibility != "public" {
+			return "", fmt.Errorf("--public conflicts with --visibility=%s", visibility)
+		}
+		if privateFlag && visibility != "private" {
+			return "", fmt.Errorf("--private conflicts with --visibility=%s", visibility)
+		}
+		return visibility, nil
+	}
+	if publicFlag {
+		return "public", nil
+	}
+	if privateFlag {
+		return "private", nil
+	}
+	return "", nil
 }

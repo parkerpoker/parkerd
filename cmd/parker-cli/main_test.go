@@ -52,3 +52,25 @@ func TestPrintHelpMentionsWalletNsecCommand(t *testing.T) {
 		t.Fatalf("expected help to mention wallet nsec command, got %q", output.String())
 	}
 }
+
+func TestResolveTableVisibilityAcceptsExplicitVisibility(t *testing.T) {
+	visibility, err := resolveTableVisibility(parker.FlagMap{
+		"visibility": "private",
+	})
+	if err != nil {
+		t.Fatalf("resolve visibility: %v", err)
+	}
+	if visibility != "private" {
+		t.Fatalf("expected private visibility, got %q", visibility)
+	}
+}
+
+func TestResolveTableVisibilityRejectsConflictingFlags(t *testing.T) {
+	_, err := resolveTableVisibility(parker.FlagMap{
+		"visibility": "private",
+		"public":     "true",
+	})
+	if err == nil {
+		t.Fatal("expected visibility conflict error")
+	}
+}

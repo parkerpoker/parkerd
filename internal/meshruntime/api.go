@@ -26,6 +26,7 @@ type Runtime interface {
 	NetworkPeers() ([]NativePeerAddress, error)
 	BootstrapPeer(peerURL, alias string, roles []string) (NativePeerAddress, error)
 	CreateTable(input map[string]any) (map[string]any, error)
+	CreatedTables(cursor string, limit int) (NativeCreatedTablesPage, error)
 	AnnounceTable(tableID string) (map[string]any, error)
 	JoinTable(inviteCode string, buyInSats int) (NativeMeshTableView, error)
 	GetTable(tableID string) (NativeMeshTableView, error)

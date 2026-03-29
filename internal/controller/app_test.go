@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -16,7 +17,10 @@ import (
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
-const testOrigin = "http://127.0.0.1:3010"
+const (
+	testOrigin         = "http://127.0.0.1:3010"
+	testFallbackOrigin = "http://127.0.0.1:3011"
+)
 
 func TestControllerHeaderAndCORS(t *testing.T) {
 	runtimeConfig := newTestRuntimeConfig(t)
@@ -41,16 +45,40 @@ func TestControllerHeaderAndCORS(t *testing.T) {
 		t.Fatalf("expected 403 for rejected origin, got %d", rejectedRecorder.Code)
 	}
 
-	preflight := httptest.NewRequest(http.MethodOptions, "/api/local/profiles", nil)
-	preflight.Header.Set("Origin", testOrigin)
-	preflight.Header.Set("Access-Control-Request-Headers", LocalControllerHeader)
-	preflightRecorder := httptest.NewRecorder()
-	app.ServeHTTP(preflightRecorder, preflight)
-	if preflightRecorder.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 preflight, got %d", preflightRecorder.Code)
+	for _, origin := range []string{testOrigin, testFallbackOrigin} {
+		preflight := httptest.NewRequest(http.MethodOptions, "/api/local/profiles", nil)
+		preflight.Header.Set("Origin", origin)
+		preflight.Header.Set("Access-Control-Request-Headers", LocalControllerHeader)
+		preflightRecorder := httptest.NewRecorder()
+		app.ServeHTTP(preflightRecorder, preflight)
+		if preflightRecorder.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 preflight for %s, got %d", origin, preflightRecorder.Code)
+		}
+		if value := preflightRecorder.Header().Get("Access-Control-Allow-Origin"); value != origin {
+			t.Fatalf("expected allow origin %s, got %s", origin, value)
+		}
 	}
-	if value := preflightRecorder.Header().Get("Access-Control-Allow-Origin"); value != testOrigin {
-		t.Fatalf("expected allow origin %s, got %s", testOrigin, value)
+}
+
+func TestResolveAllowedOriginsIncludesControllerWebFallback(t *testing.T) {
+	t.Setenv("PARKER_CONTROLLER_ALLOWED_ORIGINS", "")
+	origins := resolveAllowedOrigins(defaultControllerPort)
+	for _, expected := range []string{
+		testOrigin,
+		testFallbackOrigin,
+		"http://localhost:3011",
+		fmt.Sprintf("http://127.0.0.1:%d", defaultControllerPort),
+	} {
+		found := false
+		for _, origin := range origins {
+			if origin == expected {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected %s in allowed origins, got %v", expected, origins)
+		}
 	}
 }
 
@@ -148,7 +176,7 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 			"buyInMaxSats":      4000,
 			"buyInMinSats":      4000,
 			"name":              "Controller Table",
-			"public":            true,
+			"visibility":        "public",
 			"smallBlindSats":    50,
 			"spectatorsAllowed": true,
 		},
@@ -157,8 +185,10 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 		t.Fatalf("create table status = %d body=%s", createTableResponse.Code, createTableResponse.Body.String())
 	}
 	var created struct {
-		Table struct {
-			TableID string `json:"tableId"`
+		InviteCode string `json:"inviteCode"`
+		Table      struct {
+			TableID    string `json:"tableId"`
+			Visibility string `json:"visibility"`
 		} `json:"table"`
 	}
 	if err := json.Unmarshal(createTableResponse.Body.Bytes(), &created); err != nil {
@@ -167,6 +197,121 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 	tableID := created.Table.TableID
 	if tableID == "" {
 		t.Fatalf("expected table ID in create table response")
+	}
+	if created.InviteCode == "" {
+		t.Fatalf("expected invite code in create table response")
+	}
+	if created.Table.Visibility != "public" {
+		t.Fatalf("expected public table visibility, got %q", created.Table.Visibility)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	privateCreateResponse := localRequest(t, app, http.MethodPost, "/api/local/profiles/alice/tables", map[string]any{
+		"table": map[string]any{
+			"buyInMaxSats":      5000,
+			"buyInMinSats":      5000,
+			"name":              "Controller Private Table",
+			"smallBlindSats":    100,
+			"bigBlindSats":      200,
+			"spectatorsAllowed": true,
+			"visibility":        "private",
+		},
+	})
+	if privateCreateResponse.Code != http.StatusOK {
+		t.Fatalf("private create table status = %d body=%s", privateCreateResponse.Code, privateCreateResponse.Body.String())
+	}
+	var privateCreated struct {
+		InviteCode string `json:"inviteCode"`
+		Table      struct {
+			TableID    string `json:"tableId"`
+			Visibility string `json:"visibility"`
+		} `json:"table"`
+	}
+	if err := json.Unmarshal(privateCreateResponse.Body.Bytes(), &privateCreated); err != nil {
+		t.Fatalf("decode private create table: %v", err)
+	}
+	if privateCreated.Table.TableID == "" {
+		t.Fatalf("expected private table ID in create response")
+	}
+	if privateCreated.InviteCode == "" {
+		t.Fatalf("expected private table invite code in create response")
+	}
+	if privateCreated.Table.Visibility != "private" {
+		t.Fatalf("expected private table visibility, got %q", privateCreated.Table.Visibility)
+	}
+
+	createdTablesResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/tables/created?limit=1", nil)
+	if createdTablesResponse.Code != http.StatusOK {
+		t.Fatalf("created tables status = %d body=%s", createdTablesResponse.Code, createdTablesResponse.Body.String())
+	}
+	var createdPage struct {
+		Items []struct {
+			InviteCode string `json:"inviteCode"`
+			Config     struct {
+				Name       string `json:"name"`
+				TableID    string `json:"tableId"`
+				Visibility string `json:"visibility"`
+			} `json:"config"`
+		} `json:"items"`
+		NextCursor string `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(createdTablesResponse.Body.Bytes(), &createdPage); err != nil {
+		t.Fatalf("decode created tables page one: %v", err)
+	}
+	if len(createdPage.Items) != 1 {
+		t.Fatalf("expected 1 created table on first page, got %d", len(createdPage.Items))
+	}
+	if createdPage.Items[0].Config.TableID != privateCreated.Table.TableID {
+		t.Fatalf("expected first created table to be newest private table, got %+v", createdPage.Items[0].Config)
+	}
+	if createdPage.Items[0].Config.Visibility != "private" {
+		t.Fatalf("expected private visibility on first created table page, got %q", createdPage.Items[0].Config.Visibility)
+	}
+	if createdPage.Items[0].InviteCode != privateCreated.InviteCode {
+		t.Fatalf("expected private invite code on created tables page, got %q", createdPage.Items[0].InviteCode)
+	}
+	if createdPage.NextCursor == "" {
+		t.Fatalf("expected created tables next cursor")
+	}
+
+	createdTablesSecondResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/tables/created?limit=1&cursor="+createdPage.NextCursor, nil)
+	if createdTablesSecondResponse.Code != http.StatusOK {
+		t.Fatalf("created tables second page status = %d body=%s", createdTablesSecondResponse.Code, createdTablesSecondResponse.Body.String())
+	}
+	var createdSecondPage struct {
+		Items []struct {
+			InviteCode string `json:"inviteCode"`
+			Config     struct {
+				Name       string `json:"name"`
+				TableID    string `json:"tableId"`
+				Visibility string `json:"visibility"`
+			} `json:"config"`
+		} `json:"items"`
+		NextCursor string `json:"nextCursor"`
+	}
+	if err := json.Unmarshal(createdTablesSecondResponse.Body.Bytes(), &createdSecondPage); err != nil {
+		t.Fatalf("decode created tables page two: %v", err)
+	}
+	if len(createdSecondPage.Items) != 1 {
+		t.Fatalf("expected 1 created table on second page, got %d", len(createdSecondPage.Items))
+	}
+	if createdSecondPage.Items[0].Config.TableID != tableID {
+		t.Fatalf("expected second created table to be original public table, got %+v", createdSecondPage.Items[0].Config)
+	}
+	if createdSecondPage.Items[0].Config.Visibility != "public" {
+		t.Fatalf("expected public visibility on second created table page, got %q", createdSecondPage.Items[0].Config.Visibility)
+	}
+	if createdSecondPage.Items[0].InviteCode != created.InviteCode {
+		t.Fatalf("expected public invite code on created tables page, got %q", createdSecondPage.Items[0].InviteCode)
+	}
+	if createdSecondPage.NextCursor != "" {
+		t.Fatalf("expected second created tables page to be terminal, got next cursor %q", createdSecondPage.NextCursor)
+	}
+
+	invalidCreatedTablesResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/tables/created?limit=oops", nil)
+	if invalidCreatedTablesResponse.Code != http.StatusBadRequest {
+		t.Fatalf("invalid created tables limit status = %d body=%s", invalidCreatedTablesResponse.Code, invalidCreatedTablesResponse.Body.String())
 	}
 
 	getTableResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/tables/"+tableID, nil)
@@ -195,6 +340,34 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 	publicTablesResponse := localRequest(t, app, http.MethodGet, "/api/local/profiles/alice/tables/public", nil)
 	if publicTablesResponse.Code != http.StatusOK {
 		t.Fatalf("public tables status = %d body=%s", publicTablesResponse.Code, publicTablesResponse.Body.String())
+	}
+	var publicTables []struct {
+		Advertisement struct {
+			TableID    string `json:"tableId"`
+			Visibility string `json:"visibility"`
+		} `json:"advertisement"`
+	}
+	if err := json.Unmarshal(publicTablesResponse.Body.Bytes(), &publicTables); err != nil {
+		t.Fatalf("decode public tables: %v", err)
+	}
+	foundPublicTable := false
+	foundPrivateTable := false
+	for _, publicTable := range publicTables {
+		if publicTable.Advertisement.TableID == tableID {
+			foundPublicTable = true
+			if publicTable.Advertisement.Visibility != "public" {
+				t.Fatalf("expected public table visibility in public browser, got %q", publicTable.Advertisement.Visibility)
+			}
+		}
+		if publicTable.Advertisement.TableID == privateCreated.Table.TableID {
+			foundPrivateTable = true
+		}
+	}
+	if !foundPublicTable {
+		t.Fatalf("expected public browser to include created public table, got %+v", publicTables)
+	}
+	if foundPrivateTable {
+		t.Fatalf("expected public browser to exclude private table %q, got %+v", privateCreated.Table.TableID, publicTables)
 	}
 
 	server := httptest.NewServer(app)
@@ -244,7 +417,7 @@ func TestControllerRoutesAndSSE(t *testing.T) {
 func newTestControllerApp(t *testing.T, runtimeConfig cfg.RuntimeConfig) *App {
 	t.Helper()
 	app, err := NewApp(Options{
-		AllowedOrigins: []string{testOrigin},
+		AllowedOrigins: []string{testOrigin, testFallbackOrigin},
 		Config:         runtimeConfig,
 	})
 	if err != nil {

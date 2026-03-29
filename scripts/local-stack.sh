@@ -159,6 +159,7 @@ write_runtime_env() {
   local alice_port="$4"
   local bob_port="$5"
   local nigiri_datadir="$6"
+  local selected_host_profile="$7"
 
   mkdir -p "$LOCAL_STATE_DIR" "$PID_DIR" "$LOG_DIR" "$WORK_DIR"
 
@@ -180,6 +181,7 @@ export LOCAL_INDEXER_DATADIR=$(printf '%q' "$WORK_DIR/indexer")
 export LOCAL_CONTROLLER_LOG=$(printf '%q' "$LOG_DIR/controller.log")
 export LOCAL_INDEXER_LOG=$(printf '%q' "$LOG_DIR/indexer.log")
 export PARKER_INDEXER_URL=http://127.0.0.1:${indexer_port}
+export LOCAL_HOST_PROFILE=$(printf '%q' "$selected_host_profile")
 export INDEXER_PORT=${indexer_port}
 export CONTROLLER_PORT=${controller_port}
 export WITNESS_PORT=${witness_port}
@@ -205,6 +207,7 @@ initialize_runtime_env() {
   local witness_port
   local alice_port
   local bob_port
+  local selected_host_profile
 
   nigiri_datadir="$(default_local_nigiri_datadir)"
   indexer_port="$(choose_port "$DEFAULT_INDEXER_PORT")"
@@ -212,13 +215,15 @@ initialize_runtime_env() {
   witness_port="$(choose_port "$DEFAULT_WITNESS_PORT")"
   alice_port="$(choose_port "$DEFAULT_ALICE_PORT")"
   bob_port="$(choose_port "$DEFAULT_BOB_PORT")"
+  selected_host_profile="$(host_profile)"
 
-  write_runtime_env "$indexer_port" "$controller_port" "$witness_port" "$alice_port" "$bob_port" "$nigiri_datadir"
+  write_runtime_env "$indexer_port" "$controller_port" "$witness_port" "$alice_port" "$bob_port" "$nigiri_datadir" "$selected_host_profile"
 }
 
 load_runtime_env() {
   local desired_nigiri_datadir=""
   local legacy_nigiri_datadir=""
+  local desired_host_profile=""
 
   if [[ ! -f "$RUNTIME_ENV" ]]; then
     initialize_runtime_env
@@ -239,7 +244,8 @@ load_runtime_env() {
       "$WITNESS_PORT" \
       "$ALICE_PORT" \
       "$BOB_PORT" \
-      "$desired_nigiri_datadir"
+      "$desired_nigiri_datadir" \
+      "$(host_profile)"
 
     # shellcheck disable=SC1090
     source "$RUNTIME_ENV"
@@ -268,6 +274,21 @@ load_runtime_env() {
     --profile-dir "$PARKER_PROFILE_DIR"
     --run-dir "$PARKER_RUN_DIR"
   )
+
+  desired_host_profile="$(host_profile)"
+  if [[ -z "${LOCAL_HOST_PROFILE:-}" || "${LOCAL_HOST_PROFILE}" != "$desired_host_profile" ]]; then
+    write_runtime_env \
+      "$INDEXER_PORT" \
+      "$CONTROLLER_PORT" \
+      "$WITNESS_PORT" \
+      "$ALICE_PORT" \
+      "$BOB_PORT" \
+      "$PARKER_NIGIRI_DATADIR" \
+      "$desired_host_profile"
+
+    # shellcheck disable=SC1090
+    source "$RUNTIME_ENV"
+  fi
 }
 
 launch_detached() {
@@ -451,6 +472,15 @@ cleanup_nigiri_data() {
   rm -rf "$PARKER_NIGIRI_DATADIR"
 }
 
+cleanup_local_runtime_state() {
+  load_runtime_env
+  rm -rf \
+    "$LOCAL_PID_DIR" \
+    "$LOCAL_WORK_DIR" \
+    "$LOCAL_STATE_DIR/nigiri"
+  mkdir -p "$LOCAL_STATE_DIR" "$LOCAL_LOG_DIR"
+}
+
 stop_nigiri_stack() {
   local pid=""
   local i
@@ -539,7 +569,7 @@ profile_mode() {
 }
 
 host_profile() {
-  local profile="${HOST_PROFILE:-alice}"
+  local profile="${HOST_PROFILE:-${LOCAL_HOST_PROFILE:-alice}}"
 
   case "$profile" in
     alice|bob) printf '%s\n' "$profile" ;;
@@ -548,6 +578,28 @@ host_profile() {
       exit 1
       ;;
   esac
+}
+
+ensure_daemon_profile_running() {
+  local profile="$1"
+  local running_mode=""
+  local desired_mode=""
+
+  load_runtime_env
+  start_controller
+  desired_mode="$(profile_mode "$profile")"
+
+  if daemon_is_reachable "$profile"; then
+    running_mode="$(profile_daemon_mode "$profile")"
+    if [[ "$running_mode" == "$desired_mode" ]]; then
+      echo "$profile daemon already running in $running_mode mode."
+      return 0
+    fi
+
+    echo "Restarting $profile daemon in $desired_mode mode."
+  fi
+
+  start_daemon_profile "$profile"
 }
 
 profile_port() {
@@ -613,12 +665,57 @@ retry_profile_json() {
       printf '%s\n' "$output"
       return 0
     fi
+    if wait_for_vtxo_ban_expiry "$output"; then
+      continue
+    fi
     sleep "$sleep_seconds"
   done
 
   echo "command failed after retries: $label" >&2
   printf '%s\n' "$output" >&2
   return 1
+}
+
+latest_vtxo_ban_epoch() {
+  LC_ALL=C LANG=C LC_CTYPE=C /usr/bin/perl -MTime::Piece -e '
+    use strict;
+    use warnings;
+
+    my $input = do { local $/; <STDIN> // q{} };
+    my $max = 0;
+
+    while ($input =~ /(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z?)/g) {
+      my $value = $1;
+      $value =~ s/Z$//;
+      my $tp = eval { Time::Piece->strptime($value, "%Y-%m-%dT%H:%M:%S") };
+      next unless $tp;
+      my $epoch = $tp->epoch;
+      $max = $epoch if $epoch > $max;
+    }
+
+    print $max if $max > 0;
+  '
+}
+
+wait_for_vtxo_ban_expiry() {
+  local output="$1"
+  local latest_epoch=""
+  local now_epoch=0
+  local sleep_seconds=0
+
+  [[ "$output" == *"VTXO_BANNED"* ]] || return 1
+
+  latest_epoch="$(printf '%s' "$output" | latest_vtxo_ban_epoch)"
+  [[ -n "$latest_epoch" ]] || return 1
+
+  now_epoch="$(date -u +%s)"
+  sleep_seconds=$((latest_epoch - now_epoch + 2))
+  if ((sleep_seconds > 0)); then
+    echo "Ark temporarily banned the onboarding script; waiting ${sleep_seconds}s before retrying..." >&2
+    sleep "$sleep_seconds"
+  fi
+
+  return 0
 }
 
 daemon_is_reachable() {
@@ -814,12 +911,31 @@ fund_profile() {
   nickname="$(profile_nickname "$profile")"
 
   ensure_deps_up
-  start_daemon_profile "$profile"
+  ensure_daemon_profile_running "$profile"
+  echo "Bootstrapping $profile wallet..."
   retry_profile_json "$profile" "$profile bootstrap" 20 1 bootstrap "$nickname" --json >/dev/null
+  echo "Requesting faucet funds for $profile..."
   retry_profile_json "$profile" "$profile faucet" 20 1 wallet faucet "$FAUCET_SATS" --json >/dev/null
+  echo "Onboarding $profile wallet..."
   retry_profile_json "$profile" "$profile onboard" 20 1 wallet onboard --json >/dev/null
   echo "Funded $profile wallet."
   profile_cli "$profile" wallet --json
+}
+
+ensure_profile_funded() {
+  local profile="$1"
+  local wallet_json=""
+  local total_sats=""
+
+  ensure_daemon_profile_running "$profile"
+  wallet_json="$(profile_cli "$profile" wallet --json 2>/dev/null || true)"
+  total_sats="$(printf '%s' "$wallet_json" | json_field data.totalSats 2>/dev/null || true)"
+  if [[ "$total_sats" =~ ^[0-9]+$ ]] && (( total_sats > 0 )); then
+    echo "$profile wallet already funded with $total_sats sats."
+    return 0
+  fi
+
+  fund_profile "$profile"
 }
 
 print_local_summary() {
@@ -854,16 +970,20 @@ local_up() {
   if [[ "$selected_host_profile" != "bob" ]]; then
     start_daemon_profile bob
   fi
+  ensure_profile_funded alice
+  ensure_profile_funded bob
   print_local_summary
 }
 
 local_down() {
+  load_runtime_env
   stop_daemon_profile bob || true
   stop_daemon_profile alice || true
   stop_daemon_profile witness || true
   stop_controller || true
   stop_indexer || true
   stop_nigiri_stack || true
+  cleanup_local_runtime_state
   echo "Local stack stopped."
 }
 

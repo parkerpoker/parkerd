@@ -282,6 +282,8 @@ func (d *ProxyDaemon) handleRuntimeRequest(method string, params map[string]any)
 	case "meshCreateTable":
 		tableParams := nestedMap(params, "table")
 		return d.runtime.CreateTable(tableParams)
+	case "meshCreatedTables":
+		return d.runtime.CreatedTables(stringFromMap(params, "cursor", ""), intFromMap(params, "limit", 0))
 	case "meshTableAnnounce":
 		return d.runtime.AnnounceTable(stringFromMap(params, "tableId", d.runtime.currentTableID()))
 	case "meshTableJoin":

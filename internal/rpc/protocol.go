@@ -13,6 +13,7 @@ var DaemonMethods = []string{
 	"meshBootstrapPeer",
 	"meshCashOut",
 	"meshCreateTable",
+	"meshCreatedTables",
 	"meshExit",
 	"meshGetTable",
 	"meshNetworkPeers",

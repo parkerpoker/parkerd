@@ -320,6 +320,72 @@ func TestHandleJoinRejectsPeerEndpointMismatch(t *testing.T) {
 	}
 }
 
+func TestCreatedTablesListsOwnedTablesWithPaginationAndInvites(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+
+	createTable := func(name, visibility string) string {
+		t.Helper()
+
+		result, err := host.CreateTable(map[string]any{
+			"name":       name,
+			"visibility": visibility,
+		})
+		if err != nil {
+			t.Fatalf("create table %q: %v", name, err)
+		}
+		inviteCode := stringValue(result["inviteCode"])
+		if inviteCode == "" {
+			t.Fatalf("expected invite code for %q", name)
+		}
+		return inviteCode
+	}
+
+	firstInvite := createTable("First Private Table", "private")
+	time.Sleep(1100 * time.Millisecond)
+	secondInvite := createTable("Second Public Table", "public")
+	time.Sleep(1100 * time.Millisecond)
+	thirdInvite := createTable("Third Private Table", "private")
+
+	pageOne, err := host.CreatedTables("", 2)
+	if err != nil {
+		t.Fatalf("created tables page one: %v", err)
+	}
+	if len(pageOne.Items) != 2 {
+		t.Fatalf("expected 2 created tables on first page, got %d", len(pageOne.Items))
+	}
+	if pageOne.Items[0].Config.Name != "Third Private Table" || pageOne.Items[1].Config.Name != "Second Public Table" {
+		t.Fatalf("unexpected first page order: %+v", pageOne.Items)
+	}
+	if pageOne.Items[0].Config.Visibility != "private" || pageOne.Items[1].Config.Visibility != "public" {
+		t.Fatalf("unexpected first page visibilities: %+v", pageOne.Items)
+	}
+	if pageOne.Items[0].InviteCode != thirdInvite || pageOne.Items[1].InviteCode != secondInvite {
+		t.Fatalf("unexpected first page invite codes: %+v", pageOne.Items)
+	}
+	if pageOne.NextCursor == "" {
+		t.Fatal("expected first page next cursor")
+	}
+
+	pageTwo, err := host.CreatedTables(pageOne.NextCursor, 2)
+	if err != nil {
+		t.Fatalf("created tables page two: %v", err)
+	}
+	if len(pageTwo.Items) != 1 {
+		t.Fatalf("expected 1 created table on second page, got %d", len(pageTwo.Items))
+	}
+	if pageTwo.Items[0].Config.Name != "First Private Table" {
+		t.Fatalf("unexpected second page item: %+v", pageTwo.Items[0])
+	}
+	if pageTwo.Items[0].InviteCode != firstInvite {
+		t.Fatalf("expected second page invite code %q, got %q", firstInvite, pageTwo.Items[0].InviteCode)
+	}
+	if pageTwo.NextCursor != "" {
+		t.Fatalf("expected second page next cursor to be empty, got %q", pageTwo.NextCursor)
+	}
+}
+
 func TestSyncRouteRejectsForgedEnvelope(t *testing.T) {
 	t.Parallel()
 

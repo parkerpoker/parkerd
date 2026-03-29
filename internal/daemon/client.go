@@ -550,6 +550,9 @@ func isClosedConnError(err error) bool {
 
 func daemonRequestTimeout(method string) time.Duration {
 	switch method {
+	case "walletFaucet":
+		// Funding can take longer than other wallet calls because Nigiri may need to broadcast and mine blocks.
+		return 60 * time.Second
 	case "walletOnboard":
 		// Give boarding funds time to appear, then allow a second phase for onboarding retries.
 		return 130 * time.Second

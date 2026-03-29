@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ const (
 	LocalControllerHeader      = "X-Parker-Local-Controller"
 	defaultControllerPort      = 3030
 	defaultDevWebPort          = 3010
+	defaultDevWebFallbackPort  = 3011
 	controllerKeepaliveSeconds = 15
 )
 
@@ -225,6 +227,7 @@ func (app *App) registerRoutes() {
 	app.mux.HandleFunc("GET /api/local/profiles/{profile}/network/peers", app.daemonPassthrough("meshNetworkPeers"))
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/network/bootstrap", app.daemonPassthrough("meshBootstrapPeer"))
 	app.mux.HandleFunc("GET /api/local/profiles/{profile}/tables/public", app.daemonPassthrough("meshPublicTables"))
+	app.mux.HandleFunc("GET /api/local/profiles/{profile}/tables/created", app.handleCreatedTables)
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/tables", app.handleCreateTable)
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/tables/join", app.daemonPassthrough("meshTableJoin"))
 	app.mux.HandleFunc("GET /api/local/profiles/{profile}/tables/{tableId}", app.tablePassthrough("meshGetTable"))
@@ -315,6 +318,28 @@ func (app *App) handleCreateTable(writer http.ResponseWriter, request *http.Requ
 			return client.Request("meshCreateTable", nil, true)
 		}
 		return client.Request("meshCreateTable", map[string]any{"table": tableValue}, true)
+	})
+	if err != nil {
+		writeControllerError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, response)
+}
+
+func (app *App) handleCreatedTables(writer http.ResponseWriter, request *http.Request) {
+	response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
+		params := map[string]any{}
+		if cursor := strings.TrimSpace(request.URL.Query().Get("cursor")); cursor != "" {
+			params["cursor"] = cursor
+		}
+		if rawLimit := strings.TrimSpace(request.URL.Query().Get("limit")); rawLimit != "" {
+			limit, err := strconv.Atoi(rawLimit)
+			if err != nil {
+				return nil, controllerError{statusCode: http.StatusBadRequest, message: "limit must be a number"}
+			}
+			params["limit"] = limit
+		}
+		return client.Request("meshCreatedTables", payloadOrNil(params), true)
 	})
 	if err != nil {
 		writeControllerError(writer, err)
@@ -575,12 +600,25 @@ func resolveAllowedOrigins(controllerPort int) []string {
 		}
 	}
 
-	return []string{
-		fmt.Sprintf("http://127.0.0.1:%d", defaultDevWebPort),
-		fmt.Sprintf("http://localhost:%d", defaultDevWebPort),
-		fmt.Sprintf("http://127.0.0.1:%d", controllerPort),
-		fmt.Sprintf("http://localhost:%d", controllerPort),
+	// Vite falls forward to the next port when 3010 is busy, so trust the
+	// first fallback port for the extracted controller-web dev server too.
+	return loopbackOriginsForPorts(defaultDevWebPort, defaultDevWebFallbackPort, controllerPort)
+}
+
+func loopbackOriginsForPorts(ports ...int) []string {
+	origins := make([]string, 0, len(ports)*2)
+	seen := make(map[string]struct{}, len(ports)*2)
+	for _, port := range ports {
+		for _, host := range []string{"127.0.0.1", "localhost"} {
+			origin := fmt.Sprintf("http://%s:%d", host, port)
+			if _, ok := seen[origin]; ok {
+				continue
+			}
+			seen[origin] = struct{}{}
+			origins = append(origins, origin)
+		}
 	}
+	return origins
 }
 
 func parseMode(value any) string {
