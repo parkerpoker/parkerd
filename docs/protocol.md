@@ -1,145 +1,66 @@
 # Current Protocol Surface
 
-This document describes the protocol and wire surface implemented today in this repository. It is intentionally current-state only.
+This document describes the protocol surface implemented today in this repository.
 
-For component topology, see [architecture.md](./architecture.md). For the dealerless hand flow, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
+For component topology, see [architecture.md](./architecture.md). For dealerless transcript flow, see [dealerless.md](./dealerless.md). For money movement, see [money-flows.md](./money-flows.md). For trust assumptions, see [trust-model.md](./trust-model.md).
 
-## Scope
+## Short Version
 
-The active implementation is split across:
+The current runtime is `poker/v2`.
 
-- [`cmd/parker-daemon`](../cmd/parker-daemon/main.go), [`internal/mesh_runtime.go`](../internal/mesh_runtime.go), and [`internal/transport_wire.go`](../internal/transport_wire.go) for daemon behavior and peer-to-peer table sync
-- [`internal/proxy_daemon.go`](../internal/proxy_daemon.go) and [`internal/client.go`](../internal/client.go) for local daemon RPC
-- [`cmd/parker-controller`](../cmd/parker-controller/main.go) and [`internal/controller/app.go`](../internal/controller/app.go) for localhost browser control
-- [`cmd/parker-indexer`](../cmd/parker-indexer/main.go) and [`internal/indexer/app.go`](../internal/indexer/app.go) for public ingest and spectator reads
-- [`internal/settlementcore/core.go`](../internal/settlementcore/core.go) for canonical JSON hashing and signatures
-- [`internal/native_types.go`](../internal/native_types.go) for the main runtime object shapes
+The important protocol changes in this generation are:
 
-Any browser client using the localhost controller is outside peer-to-peer protocol consensus.
+- money authority is the latest accepted `CustodyState`
+- local funds bookkeeping is `arkade-table-funds/v2`
+- join requests include funded buy-in refs
+- action requests are bound to `prevCustodyStateHash`
+- host sequencing is proposer-only; action and result events are appended only after custody finalization succeeds
+- the game engine is N-player-capable for money logic, but runtime table creation is still capped at 2 seats
 
-## Current Runtime Split
+## Runtime Surfaces
 
-The current implementation has four distinct protocol surfaces:
+The implementation is split across four protocol surfaces:
 
-1. local daemon RPC over Unix-socket NDJSON
-2. localhost controller HTTP and SSE for browser-safe local control
-3. peer-to-peer framed TCP messages over `parker://` endpoints with signed transport envelopes
-4. public indexer ingest/read over HTTP
+1. local daemon RPC over profile-local Unix sockets
+2. optional localhost controller HTTP/SSE
+3. peer-to-peer framed transport over `parker://` endpoints
+4. optional public indexer ingest/read HTTP
 
-Only the local daemon RPC and peer transport are required for direct CLI-driven table play. The controller and indexer are optional browser/public surfaces layered on top.
+Only the local daemon RPC and peer transport are required for direct table play.
 
 ## Local Daemon RPC
 
-The CLI and controller both talk to the daemon through profile-local Unix-socket RPC.
+The daemon still exposes the existing local RPC methods used by the CLI and controller, including:
 
-### Socket path
-
-The socket path is:
-
-- `<daemonDir>/<profile>.sock`
-
-### Envelope types
-
-The local wire envelopes live in [`internal/protocol.go`](../internal/protocol.go):
-
-- `RequestEnvelope`
-- `ResponseEnvelope`
-- `EventEnvelope`
-
-All frames are newline-delimited JSON.
-
-### Supported methods
-
-The active daemon methods are declared in [`internal/rpc/protocol.go`](../internal/rpc/protocol.go):
-
-- `bootstrap`
-- `meshBootstrapPeer`
-- `meshCashOut`
 - `meshCreateTable`
-- `meshExit`
-- `meshGetTable`
-- `meshNetworkPeers`
-- `meshPublicTables`
-- `meshRenew`
-- `meshRotateHost`
-- `meshSendAction`
-- `meshTableAnnounce`
 - `meshTableJoin`
-- `ping`
-- `status`
-- `stop`
-- `watch`
-- `walletDeposit`
-- `walletFaucet`
-- `walletOffboard`
-- `walletOnboard`
+- `meshGetTable`
+- `meshSendAction`
+- `meshRotateHost`
+- `meshCashOut`
+- `meshRenew`
+- `meshExit`
 - `walletSummary`
-- `walletWithdraw`
+- `walletOnboard`
+- `walletOffboard`
 
-### Watch semantics
+The local transport is still newline-delimited JSON request/response/event envelopes over the profile socket.
 
-`watch` behaves as follows:
+## Peer Transport
 
-1. the daemon sends one `response` frame containing the current state
-2. the connection stays open
-3. the daemon later emits `event` frames of type `log` and `state`
-
-This is the contract used by both the CLI watcher and the controller's SSE bridge.
-
-## Local Controller HTTP Surface
-
-The optional localhost controller in [`internal/controller/app.go`](../internal/controller/app.go) adapts daemon RPC into browser-safe HTTP and SSE.
-
-### Route shape
-
-The controller exposes:
-
-- `GET /health`
-- profile discovery and daemon status routes under `/api/local/profiles`
-- daemon-backed wallet, network, and table routes under `/api/local/profiles/{profile}/...`
-- `GET /api/local/profiles/{profile}/watch` as an SSE bridge over daemon `watch`
-- `GET /api/public/tables` and `GET /api/public/tables/{tableId}` as optional indexer proxies
-
-### Access control
-
-For `/api/local/*` routes:
-
-- the request must include `X-Parker-Local-Controller`
-- if an `Origin` header is present, it must match the controller's configured allowlist
-
-The controller does not speak peer transport itself. It forwards local requests to the profile daemon over the Unix socket described above.
-
-## Peer-To-Peer Runtime Protocol
-
-The current Go runtime does not implement the older signed WebSocket mesh described in earlier design docs. Instead, it exchanges signed transport envelopes over a framed TCP transport.
-
-### Peer address format
-
-Peer endpoints are stored and advertised as:
+Peer endpoints are still advertised as:
 
 - `parker://<host>:<port>`
 
-The runtime dials those endpoints directly over TCP and exchanges one newline-delimited JSON request envelope followed by one newline-delimited JSON response envelope per connection.
+Transport envelopes remain:
 
-The dialer also accepts:
+- protocol-key signed
+- encrypted with X25519 plus AES-256-GCM once the sender knows the recipient transport key
+- request/response framed as one NDJSON envelope each way per connection
 
-- `tcp://<host>:<port>` for direct TCP bootstrap
-- `tor://<host>:<port>` for Tor-routed bootstrap
+## Current Peer Message Types
 
-If the target host is an onion address, or the scheme is `tor://`, the runtime dials through Tor SOCKS when Tor is enabled.
-
-### Transport envelope auth and confidentiality
-
-All peer transport messages use [`TransportEnvelope`](../internal/transport_types.go):
-
-- every envelope is signed by the sender's protocol key
-- the `peer.manifest.get` bootstrap exchange is signed but typically unencrypted, because it establishes the recipient transport key
-- once the sender knows the recipient transport public key, request and response bodies are encrypted with an ephemeral X25519 shared secret plus AES-256-GCM (`x25519-aes256gcm`)
-- the receiver verifies the envelope signature and body hash before dispatch
-
-### Peer message types
-
-The active peer transport handlers live in [`internal/mesh_runtime.go`](../internal/mesh_runtime.go) and [`internal/transport_wire.go`](../internal/transport_wire.go):
+The runtime currently handles:
 
 - `peer.manifest.get`
 - `peer.manifest`
@@ -149,219 +70,169 @@ The active peer transport handlers live in [`internal/mesh_runtime.go`](../inter
 - `table.join.response`
 - `table.action.request`
 - `table.action.response`
+- `table.custody.request`
+- `table.custody.response`
+- `table.hand.request`
+- `table.hand.response`
 - `ack`
 - `nack`
 
-### Practical behavior
+The new pieces in the custody generation are the `table.custody.*` routes and the tighter coupling between table sync, action acceptance, and custody finalization.
 
-- `peer.manifest.get` requests the peer's current advertised identity, peer URL, wallet player id, protocol id, and transport public key.
-- `table.join.request` sends a join payload to the current host inside a signed transport envelope and returns the updated recipient-scoped table state.
-- `table.action.request` sends an action payload to the current host inside a signed transport envelope and returns the updated recipient-scoped table state.
-- `table.state.push` pushes a signed recipient-scoped table copy to another peer.
-- `table.state.pull` fetches the host's current recipient-scoped table copy; the request can include a fresh wallet-signed fetch auth payload so the caller receives its own hidden cards back.
+## Authoritative Table State
 
-### Host heartbeat and sync timing
+`nativeTableState` now carries both the derived UI/debug views and the custody history:
 
-The runtime tracks liveness with the table field `LastHostHeartbeatAt`.
+- `CustodyTransitions`
+- `LatestCustodyState`
+- `Events`
+- `LatestSnapshot`
+- `LatestFullySignedSnapshot`
+- `PublicState`
 
-Current timing constants in [`internal/mesh_store.go`](../internal/mesh_store.go):
+Interpretation:
 
-- host heartbeat interval: `1000ms`
-- host failure timeout: `3500ms`
-- non-host host-poll interval: `1s`
-- next-hand delay after settlement: `1000ms`
+- `LatestCustodyState` is monetary truth
+- `CustodyTransitions` are the accepted money-history chain
+- `Events`, `PublicState`, and snapshots are derived projections that must replay against that chain
 
-The current host updates its own table copy on each heartbeat tick. Non-host peers poll the host table periodically and can trigger failover when the heartbeat goes stale.
+Peers reject accepted tables that:
 
-## Current Signed Objects
+- rewrite custody history
+- roll back `custodySeq`
+- tamper with transcript-bound public state
+- rewrite snapshots or events
+- break replay between transcript, gameplay state, public state, and custody state
 
-The runtime uses canonical JSON signatures from [`internal/settlementcore/core.go`](../internal/settlementcore/core.go) for these object families:
+## Join Contract
 
-- peer transport envelopes
-- identity bindings and request-auth payloads
-- public table advertisements
-- canonical events
-- snapshots
-- table-funds operations
+`table.join.request` now includes:
 
-These signatures use deterministic canonicalization plus SHA-256 and compact secp256k1 signatures.
+- `BuyInSats`
+- `FundingRefs`
+- `FundingTotalSats`
+- `WalletPlayerID`
+- `WalletPubkeyHex`
+- `ArkAddress`
+- `Peer`
+- `ProtocolID`
+- wallet-signed `IdentityBinding`
 
-### Canonicalization rules
+The host will not accept `SeatLocked` unless:
 
-`StableStringify()` canonicalizes structured data before hashing.
+- identity binding validates
+- funding refs are present
+- funding total covers the buy-in
+- funding refs are not duplicated
 
-Important rules:
+Seat lock is then committed as a `buy-in-lock` custody transition.
 
-- `null` stays `null`
-- strings and booleans stay unchanged
-- finite numbers stay numeric
-- non-finite numbers become `null`
-- `time.Time` becomes a UTC millisecond timestamp string
-- arrays preserve order
-- maps and structs are serialized with lexicographically sorted keys
-- unsupported or invalid values collapse to `null`-like canonical forms
+## Action Contract
 
-### Event signing
+`table.action.request` now includes:
 
-`appendEvent()` in [`internal/mesh_runtime.go`](../internal/mesh_runtime.go) signs the full event object after removing the `signature` field.
-
-Each `NativeSignedTableEvent` includes:
-
-- `protocolVersion`
-- `networkId`
-- `tableId`
+- action payload
 - `handId`
 - `epoch`
-- `seq`
-- `prevEventHash`
-- `messageType`
-- `senderPeerId`
-- `senderRole`
-- `senderProtocolPubkeyHex`
-- `timestamp`
-- `body`
-- `signature`
+- `decisionIndex`
+- `prevCustodyStateHash`
+- wallet signature over the action plus that custody base hash
 
-Current event append behavior:
+The host rejects the action if the request is not anchored to the latest custody checkpoint.
 
-- `seq` is the current event slice length
-- `prevEventHash` points to the previous event hash when present
-- the host appends gameplay events during normal play
-- failover hosts append `HostRotated` and optionally `HandAbort`
+For an accepted action, the host:
 
-### Snapshot signing
+1. validates the current turn against transcript/game state
+2. applies Hold'em rules
+3. builds the next custody transition
+4. collects required approvals
+5. finalizes custody
+6. appends `PlayerAction`
 
-`buildSnapshot()` signs the full snapshot object after removing `signatures`.
+`PlayerAction` therefore reflects an already-finalized custody step.
 
-The current snapshot body includes:
+## Custody Transition Contract
 
-- `snapshotId`
+The custody layer lives in `internal/tablecustody`.
+
+`CustodyState` binds money to game context through:
+
 - `tableId`
 - `epoch`
 - `handId`
 - `handNumber`
-- `phase`
-- `seatedPlayers`
-- `chipBalances`
-- `potSats`
-- `sidePots`
-- `turnIndex`
-- `livePlayerIds`
-- `foldedPlayerIds`
-- `dealerCommitmentRoot`
-- `previousSnapshotHash`
-- `latestEventHash`
-- `createdAt`
+- `custodySeq`
+- `decisionIndex`
+- `prevStateHash`
+- `transcriptRoot`
+- `publicStateHash`
+- `actingPlayerId`
+- `legalActionsHash`
+- `timeoutPolicy`
+- `actionDeadlineAt`
+- `challengeAnchor`
+- stack claims
+- structural side-pot slices
 
-Current implementation detail:
+Transition kinds currently used by the runtime include:
 
-- snapshots currently contain the local builder's signature only
-- the runtime still stores them in fields named `LatestSnapshot` and `LatestFullySignedSnapshot`
-- no multi-party snapshot quorum is enforced in the current Go runtime
+- `buy-in-lock`
+- `blind-post`
+- `action`
+- `timeout`
+- `showdown-payout`
+- `cash-out`
+- `emergency-exit`
 
-### Funds-operation signing
+## Hand And Money Sequencing
 
-`buildFundsOperation()` signs wallet-level table-funds operations after removing `signatureHex`.
+The active runtime order is:
 
-The current provider id is:
+1. seat lock custody
+2. hand creation and blind-post custody
+3. dealerless transcript flow
+4. betting actions and timeout successors, each custody-backed
+5. settled replay/snapshot derivation
+6. payout custody only when the latest custody state does not already reflect the settled public money state
+7. `HandResult`
 
-- `arkade-table-funds/v1`
+That means:
 
-Operations are used for:
+- transcript-only steps can exist without a money transition
+- stake-changing steps fail closed if custody cannot finalize
+- `HandResult` is appended after the money checkpoint for that result is established
 
-- renewals
-- cash-out
-- emergency exit
+## Failover And Continuation
 
-### Request-level auth payloads
+The runtime still uses host heartbeat plus protocol deadlines for liveness:
 
-In addition to transport-envelope signatures, the runtime uses these request-specific signed payloads:
+- host heartbeat interval: `1000ms`
+- host failure timeout: `3500ms`
+- next-hand delay: `1000ms`
 
-- `settlementcore.IdentityBinding` in join requests, signed by the player's wallet key and binding `tableId`, `peerId`, `peerUrl`, `protocolId`, and wallet identity together
-- `nativeActionAuthPayload()` in action requests, signed by the player's wallet key and bound to `tableId`, `playerId`, `handId`, `epoch`, `decisionIndex`, and `signedAt`
-- `nativeTableFetchAuthPayload()` in table-pull requests, signed by the player's wallet key when the caller wants recipient-scoped hidden-card visibility
-- `nativeTableSyncAuthPayload()` in table-push requests, signed by the current host's protocol key over the table hash and send timestamp
+But failover now resumes from the latest accepted custody state, not from a snapshot overlay.
 
-## Table Lifecycle
+Witness or player failover behavior:
 
-### Table creation
+- best-effort sync the latest accepted table copy from known participants
+- rotate host authority when heartbeat or protocol deadlines require it
+- continue from the latest custody checkpoint
+- if a player is dead for a timeout successor, exclude that dead player from the successor approval set when appropriate
 
-The host daemon:
+## Runtime Scope And Limits
 
-1. creates a `NativeMeshTableConfig`
-2. generates an invite code containing table and host information
-3. optionally builds a signed advertisement for public tables
-4. appends `TableAnnounce`
-5. persists and replicates the table
+The money model and side-pot logic are N-player-capable, but the active dealerless runtime currently enforces:
 
-### Join flow
+- `seatCount <= 2`
 
-The current join flow is:
+Tables above 2 seats are rejected until a separate multi-player dealing/privacy protocol exists.
 
-1. the player decodes the invite and checks wallet availability
-2. the player builds `nativeJoinRequest`, including a wallet-signed identity binding over the claimed peer, protocol, and wallet identity
-3. the player sends that request inside `table.join.request` to the host's `parker://` endpoint
-4. the host verifies the identity binding and checks that the claimed peer endpoint serves the same peer/protocol/wallet identity
-5. the host appends `SeatLocked`
-6. when the table reaches seat count, the host marks it `ready`
-7. the host builds a snapshot, appends `TableReady`, and schedules the first hand
-8. the updated table is replicated to peers with public state, encrypted deck state, and accepted transcript records; owner-local plaintext hole cards stay outside replicated state
+## Practical Reading
 
-There is no separate buy-in-confirm side channel beyond the join request, signed events, and replicated table state.
+The safest way to interpret the current protocol is:
 
-### Action flow
-
-The current action flow is:
-
-1. the seated player builds `nativeActionRequest`; its wallet signature is bound to the current `tableId`, `handId`, `epoch`, and per-hand `decisionIndex` (`len(ActionLog)`)
-2. the player sends that request inside `table.action.request` to the current host's `parker://` endpoint
-3. the host verifies the wallet signature and current turn binding, then applies the action through the Hold'em engine
-4. the host appends `PlayerAction`
-5. when the hand settles, the host builds a snapshot and appends `HandResult`
-6. the updated table is replicated to peers without any owner-local plaintext hole cards in replicated state
-
-### Failover
-
-Failover is driven from replicated table state rather than a separate lease-signing protocol.
-
-Current rules:
-
-- witnesses can take over when configured
-- if no witnesses are configured, the seated player with the lowest peer ID is the failover candidate
-- the new host appends `HostRotated`
-- if a hand was in progress and a snapshot exists, the new host appends `HandAbort`, restores from that snapshot, and schedules the next hand
-
-## Public Indexer Protocol
-
-The public indexer surface is implemented in [`internal/indexer/app.go`](../internal/indexer/app.go).
-
-### Ingest routes
-
-- `POST /api/indexer/table-ads`
-- `POST /api/indexer/table-updates`
-
-### Public read routes
-
-- `GET /api/public/tables`
-- `GET /api/public/tables/{tableId}`
-
-The host publishes:
-
-- a signed advertisement
-- `PublicTableSnapshot` updates derived from the current public state
-
-The controller can proxy the public read routes for the browser.
-
-## Current Limitations
-
-For the current dealerless hand protocol itself, including transcript records and private card delivery, see [dealerless.md](./dealerless.md).
-
-These points are important for reading the current implementation accurately:
-
-- peer join, action, fetch, and sync now travel inside signed transport envelopes over direct TCP `parker://` links; join/action/fetch/sync payloads still add their own wallet- or protocol-level auth objects where needed
-- peers accept replicated table state through `table.state.push` and host polling via `table.state.pull` after envelope verification, request-level auth, transcript replay, public-state replay, and historical-ledger validation before persistence
-- snapshots are signed, but the runtime does not yet collect or enforce a multi-party signature quorum
-- the `latestFullySignedSnapshot` field name is historical; in current code it is populated with the latest locally built snapshot
-- the indexer validates required fields, but it does not verify advertisement or update signatures before storing them
-
-Those limitations are reflected again in [trust-model.md](./trust-model.md), because they materially affect the system's real trust boundary today.
+- transport envelopes authenticate and encrypt peer traffic
+- custody state, not snapshots, is the money-finality object
+- the host proposes transitions and orchestrates replication
+- money-changing steps are accepted only after custody finalization
+- non-host peers replay transcript, public state, snapshot history, and custody history before persistence

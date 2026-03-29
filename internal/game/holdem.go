@@ -1,12 +1,18 @@
 package game
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
 
-func nextSeat(seatIndex int) int {
-	if seatIndex == 0 {
-		return 1
-	}
-	return 0
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
+)
+
+func fmtErrorf(format string, args ...any) error {
+	return fmt.Errorf(format, args...)
+}
+
+func nextSeat(totalPlayers, seatIndex int) int {
+	return (seatIndex + 1) % totalPlayers
 }
 
 func copyIntPointer(value *int) *int {
@@ -36,6 +42,7 @@ func cloneState(state HoldemState) HoldemState {
 	clone.ActingSeatIndex = copyIntPointer(state.ActingSeatIndex)
 	clone.RaiseLockedSeatIndex = copyIntPointer(state.RaiseLockedSeatIndex)
 	clone.Board = append([]CardCode(nil), state.Board...)
+	clone.Players = append([]HoldemPlayerState(nil), state.Players...)
 	clone.Winners = append([]HoldemWinner(nil), state.Winners...)
 	clone.ActionLog = append([]HoldemActionRecord(nil), state.ActionLog...)
 	clone.ShowdownScores = map[string]HandScore{}
@@ -45,7 +52,7 @@ func cloneState(state HoldemState) HoldemState {
 	return clone
 }
 
-func recomputePot(players [2]HoldemPlayerState) int {
+func recomputePot(players []HoldemPlayerState) int {
 	total := 0
 	for _, player := range players {
 		total += player.TotalContributionSats
@@ -73,34 +80,98 @@ func getPlayersAbleToAct(state HoldemState) []HoldemPlayerState {
 	return players
 }
 
-func firstToActForStreet(state HoldemState) int {
-	return nextSeat(state.DealerSeatIndex)
+func smallBlindSeatIndex(state HoldemState) int {
+	if len(state.Players) == 2 {
+		return state.DealerSeatIndex
+	}
+	return nextSeat(len(state.Players), state.DealerSeatIndex)
 }
 
-func awardPot(state *HoldemState, winners []HoldemWinner) {
-	baseShare := 0
-	if len(winners) > 0 {
-		baseShare = state.PotSats / len(winners)
+func bigBlindSeatIndex(state HoldemState) int {
+	if len(state.Players) == 2 {
+		return nextSeat(len(state.Players), state.DealerSeatIndex)
 	}
-	remainder := 0
-	if len(winners) > 0 {
-		remainder = state.PotSats % len(winners)
-	}
+	return nextSeat(len(state.Players), smallBlindSeatIndex(state))
+}
 
-	for index := range winners {
-		seat := &state.Players[winners[index].SeatIndex]
-		share := baseShare
-		if remainder > 0 {
-			share++
-			remainder--
+func firstToActForStreet(state HoldemState, phase Street) int {
+	if len(state.Players) == 2 {
+		if phase == StreetPreflop {
+			return smallBlindSeatIndex(state)
 		}
-		seat.StackSats += share
-		winners[index].AmountSats = share
+		return bigBlindSeatIndex(state)
 	}
+	if phase == StreetPreflop {
+		return nextSeat(len(state.Players), bigBlindSeatIndex(state))
+	}
+	return smallBlindSeatIndex(state)
+}
 
+func nextSeatRequiringAction(state HoldemState, lastActorSeatIndex int) *int {
+	if len(state.Players) == 0 {
+		return nil
+	}
+	for offset := 1; offset <= len(state.Players); offset++ {
+		seatIndex := (lastActorSeatIndex + offset) % len(state.Players)
+		player := state.Players[seatIndex]
+		if player.Status != PlayerStatusActive {
+			continue
+		}
+		if !player.ActedThisRound || player.RoundContributionSats != state.CurrentBetSats {
+			return &seatIndex
+		}
+	}
+	return nil
+}
+
+func payoutCandidatesForSlice(state HoldemState, winners []HoldemWinner) []tablecustody.PayoutCandidate {
+	candidates := make([]tablecustody.PayoutCandidate, 0, len(winners))
+	for _, winner := range winners {
+		candidates = append(candidates, tablecustody.PayoutCandidate{
+			PlayerID:  winner.PlayerID,
+			SeatIndex: winner.SeatIndex,
+		})
+	}
+	return candidates
+}
+
+func awardPotPayouts(state *HoldemState, payouts map[string]int, winnersByPlayerID map[string]HoldemWinner) {
+	for playerID, amount := range payouts {
+		for index := range state.Players {
+			if state.Players[index].PlayerID != playerID {
+				continue
+			}
+			state.Players[index].StackSats += amount
+			break
+		}
+	}
+	winners := make([]HoldemWinner, 0, len(winnersByPlayerID))
+	for playerID, winner := range winnersByPlayerID {
+		winner.AmountSats = payouts[playerID]
+		winners = append(winners, winner)
+	}
+	sort.SliceStable(winners, func(left, right int) bool {
+		return winners[left].SeatIndex < winners[right].SeatIndex
+	})
 	state.Winners = winners
 	state.Phase = StreetSettled
 	state.ActingSeatIndex = nil
+}
+
+func refundContribution(state *HoldemState, playerID string, amountSats int) {
+	if amountSats <= 0 {
+		return
+	}
+	for index := range state.Players {
+		if state.Players[index].PlayerID != playerID {
+			continue
+		}
+		player := &state.Players[index]
+		player.StackSats += amountSats
+		player.TotalContributionSats = maxInt(0, player.TotalContributionSats-amountSats)
+		player.RoundContributionSats = maxInt(0, player.RoundContributionSats-amountSats)
+		return
+	}
 }
 
 func settleByFold(state *HoldemState) error {
@@ -109,27 +180,43 @@ func settleByFold(state *HoldemState) error {
 		return fmtErrorf("fold settlement requires exactly one remaining player")
 	}
 
-	var folded *HoldemPlayerState
-	for index := range state.Players {
-		if state.Players[index].Status == PlayerStatusFolded {
-			folded = &state.Players[index]
+	participants := make([]tablecustody.SliceParticipant, 0, len(state.Players))
+	for _, player := range state.Players {
+		participants = append(participants, tablecustody.SliceParticipant{
+			ContributionSats: player.TotalContributionSats,
+			Folded:           player.Status == PlayerStatusFolded,
+			PlayerID:         player.PlayerID,
+			SeatIndex:        player.SeatIndex,
+		})
+	}
+	potSlices, err := tablecustody.DerivePotSlices(participants)
+	if err != nil {
+		return err
+	}
+	payoutsByPlayerID := map[string]int{}
+	winnersByPlayerID := map[string]HoldemWinner{}
+	for _, slice := range potSlices {
+		if len(slice.EligiblePlayerIDs) == 0 {
+			for playerID, amount := range slice.Contributions {
+				refundContribution(state, playerID, amount)
+			}
+			continue
+		}
+		winnerID := slice.EligiblePlayerIDs[0]
+		payoutsByPlayerID[winnerID] += slice.TotalSats
+		for _, player := range remaining {
+			if player.PlayerID != winnerID {
+				continue
+			}
+			winnersByPlayerID[winnerID] = HoldemWinner{
+				PlayerID:  player.PlayerID,
+				SeatIndex: player.SeatIndex,
+			}
 			break
 		}
 	}
-
-	if folded != nil && remaining[0].TotalContributionSats > folded.TotalContributionSats {
-		unmatched := remaining[0].TotalContributionSats - folded.TotalContributionSats
-		seat := &state.Players[remaining[0].SeatIndex]
-		seat.StackSats += unmatched
-		seat.TotalContributionSats -= unmatched
-		seat.RoundContributionSats = minInt(seat.RoundContributionSats, folded.TotalContributionSats)
-		state.PotSats = recomputePot(state.Players)
-	}
-
-	awardPot(state, []HoldemWinner{{
-		PlayerID:  remaining[0].PlayerID,
-		SeatIndex: remaining[0].SeatIndex,
-	}})
+	state.PotSats = recomputePot(state.Players)
+	awardPotPayouts(state, payoutsByPlayerID, winnersByPlayerID)
 	return nil
 }
 
@@ -139,10 +226,7 @@ func settleShowdown(state *HoldemState, holeCardsByPlayerID map[string][2]CardCo
 		return fmtErrorf("showdown requires at least one contender")
 	}
 
-	scores := make([]struct {
-		player HoldemPlayerState
-		score  HandScore
-	}, 0, len(contenders))
+	scoresByPlayerID := map[string]HandScore{}
 	for _, player := range contenders {
 		holeCards, ok := holeCardsByPlayerID[player.PlayerID]
 		if !ok {
@@ -155,32 +239,77 @@ func settleShowdown(state *HoldemState, holeCardsByPlayerID map[string][2]CardCo
 			return err
 		}
 		state.ShowdownScores[player.PlayerID] = score
-		scores = append(scores, struct {
-			player HoldemPlayerState
-			score  HandScore
-		}{player: player, score: score})
+		scoresByPlayerID[player.PlayerID] = score
 	}
 
-	best := scores[0]
-	for _, contender := range scores[1:] {
-		if CompareScoredHands(contender.score, best.score) > 0 {
-			best = contender
-		}
+	participants := make([]tablecustody.SliceParticipant, 0, len(state.Players))
+	for _, player := range state.Players {
+		participants = append(participants, tablecustody.SliceParticipant{
+			ContributionSats: player.TotalContributionSats,
+			Folded:           player.Status == PlayerStatusFolded,
+			PlayerID:         player.PlayerID,
+			SeatIndex:        player.SeatIndex,
+		})
+	}
+	potSlices, err := tablecustody.DerivePotSlices(participants)
+	if err != nil {
+		return err
 	}
 
-	winners := make([]HoldemWinner, 0)
-	for _, contender := range scores {
-		if CompareScoredHands(contender.score, best.score) == 0 {
-			winners = append(winners, HoldemWinner{
-				PlayerID:  contender.player.PlayerID,
-				SeatIndex: contender.player.SeatIndex,
-				HandScore: &contender.score,
+	payoutsByPlayerID := map[string]int{}
+	winnersByPlayerID := map[string]HoldemWinner{}
+	for _, slice := range potSlices {
+		eligible := make([]HoldemWinner, 0, len(slice.EligiblePlayerIDs))
+		for _, contender := range contenders {
+			if !containsPlayerID(slice.EligiblePlayerIDs, contender.PlayerID) {
+				continue
+			}
+			score := scoresByPlayerID[contender.PlayerID]
+			eligible = append(eligible, HoldemWinner{
+				PlayerID:  contender.PlayerID,
+				SeatIndex: contender.SeatIndex,
+				HandScore: &score,
 			})
 		}
+		if len(eligible) == 0 {
+			for playerID, amount := range slice.Contributions {
+				refundContribution(state, playerID, amount)
+			}
+			continue
+		}
+		best := eligible[0]
+		for _, contender := range eligible[1:] {
+			if CompareScoredHands(*contender.HandScore, *best.HandScore) > 0 {
+				best = contender
+			}
+		}
+		winners := make([]HoldemWinner, 0, len(eligible))
+		for _, contender := range eligible {
+			if CompareScoredHands(*contender.HandScore, *best.HandScore) == 0 {
+				winners = append(winners, contender)
+			}
+		}
+		slicePayouts, _ := tablecustody.SplitAmount(slice.TotalSats, payoutCandidatesForSlice(*state, winners), state.DealerSeatIndex)
+		for _, winner := range winners {
+			payoutsByPlayerID[winner.PlayerID] += slicePayouts[winner.PlayerID]
+			existing := winnersByPlayerID[winner.PlayerID]
+			if existing.PlayerID == "" {
+				winnersByPlayerID[winner.PlayerID] = winner
+			}
+		}
 	}
 
-	awardPot(state, winners)
+	awardPotPayouts(state, payoutsByPlayerID, winnersByPlayerID)
 	return nil
+}
+
+func containsPlayerID(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func streetRevealPhase(phase Street) (Street, error) {
@@ -209,16 +338,12 @@ func resetStreetState(state *HoldemState, phase Street) {
 	state.RaiseLockedSeatIndex = nil
 	state.Phase = phase
 
-	nextActor := state.Players[firstToActForStreet(*state)]
-	if nextActor.Status == PlayerStatusActive {
-		seat := nextActor.SeatIndex
-		state.ActingSeatIndex = &seat
-	} else {
-		state.ActingSeatIndex = nil
-	}
+	firstActorSeatIndex := firstToActForStreet(*state, phase)
+	nextActor := nextSeatRequiringAction(*state, (firstActorSeatIndex+len(state.Players)-1)%len(state.Players))
+	state.ActingSeatIndex = nextActor
 }
 
-func closeActionRoundIfNeeded(state *HoldemState) error {
+func closeActionRoundIfNeeded(state *HoldemState, lastActorSeatIndex int) error {
 	if len(getActivePlayers(*state)) == 1 {
 		return settleByFold(state)
 	}
@@ -253,15 +378,7 @@ func closeActionRoundIfNeeded(state *HoldemState) error {
 		return nil
 	}
 
-	for _, player := range ableToAct {
-		if !player.ActedThisRound || player.RoundContributionSats != state.CurrentBetSats {
-			seat := player.SeatIndex
-			state.ActingSeatIndex = &seat
-			return nil
-		}
-	}
-
-	state.ActingSeatIndex = nil
+	state.ActingSeatIndex = nextSeatRequiringAction(*state, lastActorSeatIndex)
 	return nil
 }
 
@@ -277,7 +394,7 @@ func HoldemDealPositions(dealerSeatIndex int) (HoldemDealPlan, error) {
 	dealSeat := dealerSeatIndex
 	for deckIndex := 0; deckIndex < 4; deckIndex++ {
 		holeCardPositionsBySeat[dealSeat] = append(holeCardPositionsBySeat[dealSeat], deckIndex)
-		dealSeat = nextSeat(dealSeat)
+		dealSeat = nextSeat(2, dealSeat)
 	}
 
 	return HoldemDealPlan{
@@ -300,17 +417,17 @@ func PhaseAllowsActions(phase Street) bool {
 }
 
 func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
-	if config.DealerSeatIndex != 0 && config.DealerSeatIndex != 1 {
-		return HoldemState{}, fmtErrorf("dealer seat index must be 0 or 1")
+	if len(config.Seats) < 2 {
+		return HoldemState{}, fmtErrorf("at least two seats are required")
+	}
+	if config.DealerSeatIndex < 0 || config.DealerSeatIndex >= len(config.Seats) {
+		return HoldemState{}, fmtErrorf("dealer seat index %d is out of range", config.DealerSeatIndex)
 	}
 	if config.SmallBlindSats <= 0 || config.BigBlindSats <= 0 {
 		return HoldemState{}, fmtErrorf("blinds must be positive")
 	}
 
-	smallBlindSeat := config.DealerSeatIndex
-	bigBlindSeat := nextSeat(config.DealerSeatIndex)
-
-	players := [2]HoldemPlayerState{}
+	players := make([]HoldemPlayerState, len(config.Seats))
 	for seatIndex, seat := range config.Seats {
 		players[seatIndex] = HoldemPlayerState{
 			PlayerID:  seat.PlayerID,
@@ -320,8 +437,25 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 		}
 	}
 
-	smallBlindPlayer := &players[smallBlindSeat]
-	bigBlindPlayer := &players[bigBlindSeat]
+	state := HoldemState{
+		HandID:          config.HandID,
+		HandNumber:      config.HandNumber,
+		Phase:           StreetCommitment,
+		DealerSeatIndex: config.DealerSeatIndex,
+		ActingSeatIndex: nil,
+		SmallBlindSats:  config.SmallBlindSats,
+		BigBlindSats:    config.BigBlindSats,
+		Board:           nil,
+		Players:         players,
+		Winners:         nil,
+		ShowdownScores:  map[string]HandScore{},
+		ActionLog:       nil,
+	}
+
+	smallBlindSeat := smallBlindSeatIndex(state)
+	bigBlindSeat := bigBlindSeatIndex(state)
+	smallBlindPlayer := &state.Players[smallBlindSeat]
+	bigBlindPlayer := &state.Players[bigBlindSeat]
 	committedSmallBlind := minInt(smallBlindPlayer.StackSats, config.SmallBlindSats)
 	committedBigBlind := minInt(bigBlindPlayer.StackSats, config.BigBlindSats)
 
@@ -339,24 +473,11 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 		bigBlindPlayer.Status = PlayerStatusAllIn
 	}
 
-	return HoldemState{
-		HandID:            config.HandID,
-		HandNumber:        config.HandNumber,
-		Phase:             StreetCommitment,
-		DealerSeatIndex:   config.DealerSeatIndex,
-		ActingSeatIndex:   nil,
-		SmallBlindSats:    config.SmallBlindSats,
-		BigBlindSats:      config.BigBlindSats,
-		CurrentBetSats:    committedBigBlind,
-		MinRaiseToSats:    committedBigBlind + config.BigBlindSats,
-		LastFullRaiseSats: config.BigBlindSats,
-		PotSats:           committedSmallBlind + committedBigBlind,
-		Board:             nil,
-		Players:           players,
-		Winners:           nil,
-		ShowdownScores:    map[string]HandScore{},
-		ActionLog:         nil,
-	}, nil
+	state.CurrentBetSats = committedBigBlind
+	state.MinRaiseToSats = committedBigBlind + config.BigBlindSats
+	state.LastFullRaiseSats = config.BigBlindSats
+	state.PotSats = committedSmallBlind + committedBigBlind
+	return state, nil
 }
 
 func ActivateHoldemHand(state HoldemState) (HoldemState, error) {
@@ -368,13 +489,8 @@ func ActivateHoldemHand(state HoldemState) (HoldemState, error) {
 
 	next := cloneState(state)
 	next.Phase = StreetPreflop
-	smallBlindSeat := next.DealerSeatIndex
-	if next.Players[smallBlindSeat].Status == PlayerStatusActive {
-		seat := smallBlindSeat
-		next.ActingSeatIndex = &seat
-	} else {
-		next.ActingSeatIndex = nil
-	}
+	firstActorSeatIndex := firstToActForStreet(next, StreetPreflop)
+	next.ActingSeatIndex = nextSeatRequiringAction(next, (firstActorSeatIndex+len(next.Players)-1)%len(next.Players))
 	return next, nil
 }
 
@@ -404,7 +520,7 @@ func ApplyBoardCards(state HoldemState, cards []CardCode) (HoldemState, error) {
 	}
 
 	if len(getPlayersAbleToAct(next)) == 0 {
-		if err := closeActionRoundIfNeeded(&next); err != nil {
+		if err := closeActionRoundIfNeeded(&next, next.DealerSeatIndex); err != nil {
 			return HoldemState{}, err
 		}
 	}
@@ -415,7 +531,7 @@ func ForceFoldSeat(state HoldemState, seatIndex int) (HoldemState, error) {
 	if state.Phase == StreetSettled || state.Phase == StreetAborted {
 		return HoldemState{}, fmtErrorf("hand is already closed")
 	}
-	if seatIndex < 0 || seatIndex > 1 {
+	if seatIndex < 0 || seatIndex >= len(state.Players) {
 		return HoldemState{}, fmtErrorf("seat %d is out of range", seatIndex)
 	}
 
@@ -458,7 +574,7 @@ func GetLegalActions(state HoldemState, seatIndex *int) []LegalAction {
 	}
 
 	seat := *targetSeat
-	if seat < 0 || seat > 1 {
+	if seat < 0 || seat >= len(state.Players) {
 		return nil
 	}
 	player := state.Players[seat]
@@ -522,6 +638,17 @@ func expectLegal(state HoldemState, seatIndex int, action Action) error {
 	return nil
 }
 
+func markOtherPlayersPending(next *HoldemState, actorSeatIndex int) {
+	for index := range next.Players {
+		if index == actorSeatIndex {
+			continue
+		}
+		if next.Players[index].Status == PlayerStatusActive {
+			next.Players[index].ActedThisRound = false
+		}
+	}
+}
+
 func ApplyHoldemAction(state HoldemState, seatIndex int, action Action) (HoldemState, error) {
 	if state.Phase == StreetSettled {
 		return HoldemState{}, fmtErrorf("hand already settled")
@@ -541,7 +668,6 @@ func ApplyHoldemAction(state HoldemState, seatIndex int, action Action) (HoldemS
 
 	next := cloneState(state)
 	player := &next.Players[seatIndex]
-	opponent := &next.Players[nextSeat(seatIndex)]
 	next.ActionLog = append(next.ActionLog, HoldemActionRecord{
 		ActorPlayerID: player.PlayerID,
 		Action:        action,
@@ -574,7 +700,7 @@ func ApplyHoldemAction(state HoldemState, seatIndex int, action Action) (HoldemS
 		next.LastFullRaiseSats = action.TotalSats
 		next.MinRaiseToSats = action.TotalSats + next.LastFullRaiseSats
 		next.RaiseLockedSeatIndex = nil
-		opponent.ActedThisRound = false
+		markOtherPlayersPending(&next, seatIndex)
 		if player.StackSats == 0 {
 			player.Status = PlayerStatusAllIn
 		}
@@ -589,19 +715,26 @@ func ApplyHoldemAction(state HoldemState, seatIndex int, action Action) (HoldemS
 		if raiseSize >= next.LastFullRaiseSats {
 			next.LastFullRaiseSats = raiseSize
 			next.RaiseLockedSeatIndex = nil
-		} else if player.StackSats == 0 {
-			lockedSeat := opponent.SeatIndex
-			next.RaiseLockedSeatIndex = &lockedSeat
+		} else if player.StackSats == 0 && len(next.Players) == 2 {
+			for index := range next.Players {
+				if index == seatIndex {
+					continue
+				}
+				if next.Players[index].Status == PlayerStatusActive {
+					lockedSeat := index
+					next.RaiseLockedSeatIndex = &lockedSeat
+				}
+			}
 		}
 		next.MinRaiseToSats = next.CurrentBetSats + next.LastFullRaiseSats
-		opponent.ActedThisRound = false
+		markOtherPlayersPending(&next, seatIndex)
 		if player.StackSats == 0 {
 			player.Status = PlayerStatusAllIn
 		}
 	}
 
 	next.PotSats = recomputePot(next.Players)
-	if err := closeActionRoundIfNeeded(&next); err != nil {
+	if err := closeActionRoundIfNeeded(&next, seatIndex); err != nil {
 		return HoldemState{}, err
 	}
 	return next, nil
@@ -619,7 +752,7 @@ func ToCheckpointShape(state HoldemState) CheckpointShape {
 
 	return CheckpointShape{
 		Phase:              state.Phase,
-		ActingSeatIndex:    copyIntPointer(state.ActingSeatIndex),
+		ActingSeatIndex:    state.ActingSeatIndex,
 		DealerSeatIndex:    state.DealerSeatIndex,
 		Board:              append([]CardCode(nil), state.Board...),
 		PlayerStacks:       playerStacks,
@@ -629,8 +762,4 @@ func ToCheckpointShape(state HoldemState) CheckpointShape {
 		CurrentBetSats:     state.CurrentBetSats,
 		MinRaiseToSats:     state.MinRaiseToSats,
 	}
-}
-
-func fmtErrorf(format string, args ...any) error {
-	return fmt.Errorf(format, args...)
 }

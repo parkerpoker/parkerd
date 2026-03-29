@@ -177,7 +177,7 @@ func TestHoldemHandTransitions(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},
@@ -235,7 +235,7 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},
@@ -257,7 +257,7 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},
@@ -337,7 +337,7 @@ func TestApplyHoldemActionIncludesActingSeatNumberInTurnErrors(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},

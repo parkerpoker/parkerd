@@ -21,12 +21,15 @@ import (
 	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 type meshRuntime struct {
 	config           cfg.RuntimeConfig
 	clearPeerURL     string
+	custodyArkVerify func(refs []tablecustody.VTXORef, requireSpendable bool) error
+	custodySigners   map[string]walletpkg.CustodySignerSession
 	httpClient       *http.Client
 	lastSyncAt       map[string]time.Time
 	listener         net.Listener
@@ -70,14 +73,15 @@ func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (
 		return nil, err
 	}
 	return &meshRuntime{
-		config:        config,
-		httpClient:    &http.Client{Timeout: 5 * time.Second},
-		lastSyncAt:    map[string]time.Time{},
-		mode:          mode,
-		peerInfoCache: map[string]nativeCachedPeerInfo{},
-		profileName:   profileName,
-		profileStore:  walletpkg.NewProfileStore(config.ProfileDir),
-		store:         store,
+		config:         config,
+		custodySigners: map[string]walletpkg.CustodySignerSession{},
+		httpClient:     &http.Client{Timeout: 5 * time.Second},
+		lastSyncAt:     map[string]time.Time{},
+		mode:           mode,
+		peerInfoCache:  map[string]nativeCachedPeerInfo{},
+		profileName:    profileName,
+		profileStore:   walletpkg.NewProfileStore(config.ProfileDir),
+		store:          store,
 		walletRuntime: walletpkg.NewRuntime(walletpkg.RuntimeConfig{
 			ArkServerURL:      config.ArkServerURL,
 			Network:           config.Network,
@@ -217,11 +221,16 @@ func (runtime *meshRuntime) Tick() {
 				if err := runtime.acceptRemoteTable(*remote); err == nil {
 					runtime.lastSyncAt[tableID] = time.Now()
 					table, _ = runtime.store.readTable(tableID)
+				} else {
+					debugMeshf("accept remote table during host poll failed table=%s err=%v", tableID, err)
 				}
+			} else if err != nil {
+				debugMeshf("fetch remote table during host poll failed table=%s err=%v", tableID, err)
 			}
 		}
 
 		if table != nil && protocolDeadlineExpired(*table) && runtime.shouldHandleFailover(*table) {
+			debugMeshf("protocol failover check table=%s phase=%v deadline=%s host=%s", tableID, table.ActiveHand.State.Phase, table.ActiveHand.Cards.PhaseDeadlineAt, table.CurrentHost.Peer.PeerID)
 			if err := runtime.forceProtocolFailover(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
 				table, _ = runtime.store.readTable(tableID)
 			}
@@ -269,18 +278,130 @@ func (runtime *meshRuntime) walletSummary() (walletpkg.WalletSummary, error) {
 	if err != nil {
 		return walletpkg.WalletSummary{}, err
 	}
-	overlay := 0
+	tableLocked := 0
+	pendingExit := 0
 	for _, table := range funds.Tables {
 		switch table.Status {
+		case "pending-lock":
+			tableLocked += lockedFundsAmount(table)
 		case "locked":
-			overlay -= table.BuyInSats
-		case "completed", "exited":
-			overlay += table.CashoutSats - table.BuyInSats
+			tableLocked += lockedFundsAmount(table)
+		case "pending-exit":
+			pendingExit += table.CashoutSats
 		}
 	}
-	base.AvailableSats += overlay
-	base.TotalSats += overlay
+	base.WalletSpendableSats = base.AvailableSats
+	base.TableLockedSats = tableLocked
+	base.PendingExitSats = pendingExit
+	base.AvailableSats = maxInt(base.WalletSpendableSats-tableLocked-pendingExit, 0)
+	base.TotalSats = maxInt(base.WalletSpendableSats, base.AvailableSats+tableLocked+pendingExit)
 	return base, nil
+}
+
+func lockedFundsAmount(entry NativeTableFundsEntry) int {
+	if reserved := sumVTXORefs(entry.ReservedFundingRefs); reserved > 0 {
+		return reserved
+	}
+	return maxInt(entry.BuyInSats, latestStackAmountFromFunds(entry))
+}
+
+func sumVTXORefs(refs []tablecustody.VTXORef) int {
+	total := 0
+	for _, ref := range refs {
+		total += ref.AmountSats
+	}
+	return total
+}
+
+func fundingRefKey(ref tablecustody.VTXORef) string {
+	return fmt.Sprintf("%s:%d", ref.TxID, ref.VOut)
+}
+
+func (runtime *meshRuntime) reservedFundingRefKeys() (map[string]struct{}, error) {
+	funds, err := runtime.store.readTableFunds()
+	if err != nil {
+		return nil, err
+	}
+	keys := map[string]struct{}{}
+	for _, entry := range funds.Tables {
+		switch entry.Status {
+		case "pending-lock", "locked":
+			for _, ref := range entry.ReservedFundingRefs {
+				keys[fundingRefKey(ref)] = struct{}{}
+			}
+		}
+	}
+	return keys, nil
+}
+
+func (runtime *meshRuntime) selectJoinFundingBundle(buyInSats int) (walletpkg.CustodyFundingBundle, error) {
+	refs, err := runtime.walletRuntime.ListVtxoRefs(runtime.profileName)
+	if err != nil {
+		return walletpkg.CustodyFundingBundle{}, err
+	}
+	reserved, err := runtime.reservedFundingRefKeys()
+	if err != nil {
+		return walletpkg.CustodyFundingBundle{}, err
+	}
+	selected := make([]tablecustody.VTXORef, 0, len(refs))
+	total := 0
+	for _, ref := range refs {
+		if _, ok := reserved[fundingRefKey(ref)]; ok {
+			continue
+		}
+		selected = append(selected, ref)
+		total += ref.AmountSats
+		if total >= buyInSats {
+			break
+		}
+	}
+	if total < buyInSats {
+		return walletpkg.CustodyFundingBundle{}, fmt.Errorf("insufficient unreserved spendable vtxos: have %d need %d", total, buyInSats)
+	}
+	return walletpkg.CustodyFundingBundle{
+		PlayerID:  runtime.walletID.PlayerID,
+		Refs:      selected,
+		TotalSats: total,
+	}, nil
+}
+
+func (runtime *meshRuntime) reserveJoinFundingRefs(tableID string, buyInSats int, refs []tablecustody.VTXORef) error {
+	funds, err := runtime.store.readTableFunds()
+	if err != nil {
+		return err
+	}
+	entry := funds.Tables[tableID]
+	entry.BuyInSats = buyInSats
+	entry.LastUpdatedAt = nowISO()
+	entry.PlayerID = runtime.walletID.PlayerID
+	entry.ReservedFundingRefs = append([]tablecustody.VTXORef(nil), refs...)
+	entry.Status = "pending-lock"
+	entry.TableID = tableID
+	if entry.Operations == nil {
+		entry.Operations = []NativeTableFundsOperation{}
+	}
+	funds.Tables[tableID] = entry
+	return runtime.store.writeTableFunds(funds)
+}
+
+func (runtime *meshRuntime) releasePendingFundingReservation(tableID string) error {
+	funds, err := runtime.store.readTableFunds()
+	if err != nil {
+		return err
+	}
+	entry, ok := funds.Tables[tableID]
+	if !ok || entry.Status != "pending-lock" {
+		return nil
+	}
+	if len(entry.Operations) == 0 && entry.CheckpointHash == "" {
+		delete(funds.Tables, tableID)
+		return runtime.store.writeTableFunds(funds)
+	}
+	entry.ReservedFundingRefs = nil
+	entry.Status = ""
+	entry.LastUpdatedAt = nowISO()
+	funds.Tables[tableID] = entry
+	return runtime.store.writeTableFunds(funds)
 }
 
 func (runtime *meshRuntime) meshState() (NativeMeshRuntimeState, error) {
@@ -373,6 +494,9 @@ func provisionalPeerID(peerURL string) string {
 func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, error) {
 	if err := runtime.Start(); err != nil {
 		return nil, err
+	}
+	if requestedSeatCount := intFromMap(input, "seatCount", 2); requestedSeatCount > 2 {
+		return nil, errors.New("dealerless Ark custody tables currently support at most 2 seats")
 	}
 	tableID := randomUUID()
 	visibility, err := tableVisibilityFromInput(input)
@@ -545,6 +669,9 @@ func (runtime *meshRuntime) JoinTable(inviteCode string, buyInSats int) (NativeM
 	if tableID == "" || hostPeerURL == "" {
 		return NativeMeshTableView{}, errors.New("invite is missing host or table information")
 	}
+	if existing, err := runtime.store.readTable(tableID); err == nil && existing != nil && runtime.seatIndexForPlayer(*existing) >= 0 {
+		return runtime.localTableView(*existing), nil
+	}
 
 	profile, err := runtime.loadProfileState()
 	if err != nil {
@@ -557,16 +684,32 @@ func (runtime *meshRuntime) JoinTable(inviteCode string, buyInSats int) (NativeM
 	if wallet.AvailableSats < buyInSats {
 		return NativeMeshTableView{}, fmt.Errorf("insufficient available sats for buy-in: have %d need %d", wallet.AvailableSats, buyInSats)
 	}
+	funding, err := runtime.selectJoinFundingBundle(buyInSats)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	if err := runtime.reserveJoinFundingRefs(tableID, buyInSats, funding.Refs); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	releaseReservation := true
+	defer func() {
+		if !releaseReservation {
+			return
+		}
+		_ = runtime.releasePendingFundingReservation(tableID)
+	}()
 	request := nativeJoinRequest{
-		ArkAddress:      wallet.ArkAddress,
-		BuyInSats:       buyInSats,
-		Nickname:        profile.Nickname,
-		Peer:            runtime.self.Peer,
-		ProfileName:     runtime.profileName,
-		ProtocolID:      runtime.protocolID,
-		TableID:         tableID,
-		WalletPlayerID:  runtime.walletID.PlayerID,
-		WalletPubkeyHex: runtime.walletID.PublicKeyHex,
+		ArkAddress:       wallet.ArkAddress,
+		BuyInSats:        buyInSats,
+		FundingRefs:      funding.Refs,
+		FundingTotalSats: funding.TotalSats,
+		Nickname:         profile.Nickname,
+		Peer:             runtime.self.Peer,
+		ProfileName:      runtime.profileName,
+		ProtocolID:       runtime.protocolID,
+		TableID:          tableID,
+		WalletPlayerID:   runtime.walletID.PlayerID,
+		WalletPubkeyHex:  runtime.walletID.PublicKeyHex,
 	}
 	binding, err := settlementcore.BuildIdentityBinding(tableID, runtime.selfPeerID(), runtime.selfPeerURL(), runtime.protocolIdentity, runtime.walletID, nowISO())
 	if err != nil {
@@ -586,6 +729,7 @@ func (runtime *meshRuntime) JoinTable(inviteCode string, buyInSats int) (NativeM
 	if err := runtime.acceptRemoteTable(table); err != nil {
 		return NativeMeshTableView{}, err
 	}
+	releaseReservation = false
 	accepted, err := runtime.requireLocalTable(table.Config.TableID)
 	if err != nil {
 		return NativeMeshTableView{}, err
@@ -709,18 +853,14 @@ func (runtime *meshRuntime) Renew(tableID string) ([]map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if table == nil || table.LatestFullySignedSnapshot == nil {
-		return nil, errors.New("latest fully signed snapshot is unavailable")
+	if table == nil || table.LatestCustodyState == nil {
+		return nil, errors.New("latest custody state is unavailable")
 	}
-	amount := table.LatestFullySignedSnapshot.ChipBalances[runtime.walletID.PlayerID]
-	operation, err := runtime.buildFundsOperation(table.Config.TableID, amount, "renewal", "renewed", runtime.snapshotHash(*table.LatestFullySignedSnapshot))
-	if err != nil {
-		return nil, err
-	}
-	if err := runtime.appendFundsOperation(operation, 0, "locked"); err != nil {
-		return nil, err
-	}
-	return []map[string]any{rawJSONMap(operation)}, nil
+	return []map[string]any{{
+		"carryForward": true,
+		"custodySeq":   table.LatestCustodyState.CustodySeq,
+		"stateHash":    table.LatestCustodyState.StateHash,
+	}}, nil
 }
 
 func (runtime *meshRuntime) Exit(tableID string) (map[string]any, error) {
@@ -732,21 +872,157 @@ func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (ma
 	if err != nil {
 		return nil, err
 	}
-	if table == nil || table.LatestFullySignedSnapshot == nil {
-		return nil, errors.New("latest fully signed snapshot is unavailable")
+	if table == nil || table.LatestCustodyState == nil {
+		return nil, errors.New("latest custody state is unavailable")
 	}
-	amount := table.LatestFullySignedSnapshot.ChipBalances[runtime.walletID.PlayerID]
-	checkpointHash := runtime.snapshotHash(*table.LatestFullySignedSnapshot)
-	operation, err := runtime.buildFundsOperation(table.Config.TableID, amount, kind, finalStatus, checkpointHash)
+	if tableHasLiveHand(*table) {
+		return nil, errors.New("funds settlement requires the current hand to be settled first")
+	}
+
+	transitionKind := tablecustody.TransitionKindCashOut
+	if kind == "emergency-exit" {
+		transitionKind = tablecustody.TransitionKindEmergencyExit
+	}
+	amount := latestStackAmount(table.LatestCustodyState, runtime.walletID.PlayerID)
+	if amount <= 0 {
+		return nil, errors.New("latest custody state has no spendable stack to settle")
+	}
+	previousStateHash := table.LatestCustodyState.StateHash
+	sourceRefs := append([]tablecustody.VTXORef(nil), runtime.currentCustodyRefsByPlayer(*table)[runtime.walletID.PlayerID]...)
+	transition, err := runtime.buildFundsCustodyTransition(*table, transitionKind, finalStatus)
 	if err != nil {
 		return nil, err
 	}
-	if err := runtime.appendFundsOperation(operation, amount, finalStatus); err != nil {
+
+	receiptStatus := finalStatus
+	receiptIntentID := ""
+	receiptArkTxID := ""
+	exitProofRef := ""
+	receiptRefs := []tablecustody.VTXORef{}
+
+	if runtime.config.UseMockSettlement {
+		if err := runtime.finalizeCustodyTransition(table, &transition); err != nil {
+			return nil, err
+		}
+	} else if transitionKind == tablecustody.TransitionKindCashOut {
+		result, settledAmount, _, err := runtime.settleCurrentTableFunds(*table, kind)
+		if err != nil {
+			return nil, err
+		}
+		amount = settledAmount
+		receiptIntentID = result.IntentID
+		receiptArkTxID = result.ArkTxID
+		receiptRefs = append(receiptRefs, result.OutputRefs["wallet-return"]...)
+		transition.ArkIntentID = result.IntentID
+		transition.ArkTxID = result.ArkTxID
+		transition.Proof = tablecustody.CustodyProof{
+			ArkIntentID:     result.IntentID,
+			ArkTxID:         result.ArkTxID,
+			FinalizedAt:     result.FinalizedAt,
+			ReplayValidated: true,
+			StateHash:       transition.NextStateHash,
+			VTXORefs:        append(stackProofRefs(transition.NextState), receiptRefs...),
+		}
+		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+		approvals, err := runtime.collectCustodyApprovals(*table, transition, runtime.requiredCustodySigners(*table, transition))
+		if err != nil {
+			return nil, err
+		}
+		transition.Approvals = approvals
+		transition.Proof.Signatures = append([]tablecustody.CustodySignature(nil), approvals...)
+		if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
+			return nil, err
+		}
+	} else {
+		exitResult, err := runtime.walletRuntime.UnilateralExitCustodyRefs(runtime.profileName, sourceRefs, "")
+		if err != nil {
+			return nil, err
+		}
+		receiptStatus = finalStatus
+		if exitResult.Pending {
+			receiptStatus = "pending-exit"
+		}
+		receiptRefs = append(receiptRefs, sourceRefs...)
+		receiptArkTxID = exitResult.SweepTxID
+		if receiptArkTxID == "" && len(exitResult.BroadcastTxIDs) > 0 {
+			receiptArkTxID = exitResult.BroadcastTxIDs[0]
+		}
+		exitTxIDs := append([]string(nil), exitResult.BroadcastTxIDs...)
+		if exitResult.SweepTxID != "" {
+			exitTxIDs = append(exitTxIDs, exitResult.SweepTxID)
+		}
+		exitProofRef = tablecustody.BuildExitProofRef(*table.LatestCustodyState, runtime.walletID.PlayerID, sourceRefs, exitTxIDs)
+		transition.ArkTxID = receiptArkTxID
+		transition.Proof = tablecustody.CustodyProof{
+			ArkTxID:         receiptArkTxID,
+			ExitProofRef:    exitProofRef,
+			FinalizedAt:     nowISO(),
+			ReplayValidated: true,
+			StateHash:       transition.NextStateHash,
+			VTXORefs:        append(stackProofRefs(transition.NextState), sourceRefs...),
+		}
+		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+		approvals, err := runtime.collectCustodyApprovals(*table, transition, runtime.requiredCustodySigners(*table, transition))
+		if err != nil {
+			return nil, err
+		}
+		transition.Approvals = approvals
+		transition.Proof.Signatures = append([]tablecustody.CustodySignature(nil), approvals...)
+		if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
+			return nil, err
+		}
+	}
+
+	runtime.applyCustodyTransition(table, transition)
+	for index := range table.Seats {
+		if table.Seats[index].PlayerID == runtime.walletID.PlayerID {
+			table.Seats[index].Status = finalStatus
+			table.Seats[index].NativeSeatedPlayer.Status = finalStatus
+		}
+	}
+	table.ActiveHand = nil
+	table.NextHandAt = ""
+	table.PublicState = runtime.publicStateFromLatestCustody(*table, "ready")
+	if activeCustodySeatCount(*table) < 2 {
+		table.Config.Status = "seating"
+	} else {
+		table.Config.Status = "ready"
+	}
+	eventType := "CashOut"
+	if transitionKind == tablecustody.TransitionKindEmergencyExit {
+		eventType = "EmergencyExit"
+	}
+	if err := runtime.appendEvent(table, map[string]any{
+		"amountSats":             amount,
+		"custodySeq":             transition.CustodySeq,
+		"exitProofRef":           exitProofRef,
+		"latestCustodyStateHash": transition.NextStateHash,
+		"playerId":               runtime.walletID.PlayerID,
+		"status":                 receiptStatus,
+		"type":                   eventType,
+		"transitionHash":         transition.Proof.TransitionHash,
+	}); err != nil {
+		return nil, err
+	}
+	if err := runtime.persistAndReplicate(table, true); err != nil {
+		return nil, err
+	}
+
+	operation, err := runtime.buildFundsOperation(table.Config.TableID, amount, kind, receiptStatus, transition.NextStateHash, receiptIntentID, receiptArkTxID, exitProofRef, receiptRefs)
+	if err != nil {
+		return nil, err
+	}
+	if err := runtime.appendFundsOperation(operation, amount, receiptStatus); err != nil {
 		return nil, err
 	}
 	return map[string]any{
-		"checkpointHash": checkpointHash,
-		"receipt":        rawJSONMap(operation),
+		"prevStateHash": previousStateHash,
+		"stateHash":     transition.NextStateHash,
+		"custodySeq":    transition.CustodySeq,
+		"receipt":       rawJSONMap(operation),
+		"transitionHash": transition.Proof.TransitionHash,
+		"settledArkTx":  receiptArkTxID,
+		"status":        receiptStatus,
 	}, nil
 }
 
@@ -918,7 +1194,7 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
 			return errors.New("join request must be sent to the current host")
 		}
-		if err := runtime.validateJoinRequest(join); err != nil {
+		if err := runtime.validateJoinRequest(*table, join); err != nil {
 			return err
 		}
 		peer := join.Peer
@@ -940,6 +1216,7 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 			NativeSeatedPlayer: NativeSeatedPlayer{
 				ArkAddress:        join.ArkAddress,
 				BuyInSats:         join.BuyInSats,
+				FundingRefs:       append([]tablecustody.VTXORef(nil), join.FundingRefs...),
 				Nickname:          join.Nickname,
 				PeerID:            join.Peer.PeerID,
 				PlayerID:          join.WalletPlayerID,
@@ -953,12 +1230,23 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 		}
 		table.Seats = append(table.Seats, seat)
 		table.Config.OccupiedSeats = len(table.Seats)
+		seatLockTransition, err := runtime.buildSeatLockTransition(*table)
+		if err != nil {
+			return err
+		}
+		if err := runtime.finalizeCustodyTransition(table, &seatLockTransition); err != nil {
+			return err
+		}
+		runtime.applyCustodyTransition(table, seatLockTransition)
 		if err := runtime.appendEvent(table, map[string]any{
-			"type":      "SeatLocked",
-			"buyInSats": join.BuyInSats,
-			"peerId":    join.Peer.PeerID,
-			"playerId":  join.WalletPlayerID,
-			"seatIndex": seatIndex,
+			"custodySeq":             seatLockTransition.CustodySeq,
+			"fundingRefs":            join.FundingRefs,
+			"latestCustodyStateHash": seatLockTransition.NextStateHash,
+			"type":                   "SeatLocked",
+			"buyInSats":              join.BuyInSats,
+			"peerId":                 join.Peer.PeerID,
+			"playerId":               join.WalletPlayerID,
+			"seatIndex":              seatIndex,
 		}); err != nil {
 			return err
 		}
@@ -1017,11 +1305,26 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (n
 			return err
 		}
 		seatIndex := seat.SeatIndex
+		requiredSigners := runtime.requiredCustodySigners(*table, tablecustody.CustodyTransition{
+			Kind:    tablecustody.TransitionKindAction,
+			TableID: table.Config.TableID,
+		})
+		if err := runtime.syncTableToCustodySigners(*table, requiredSigners); err != nil {
+			return err
+		}
 		nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, seatIndex, request.Action)
 		if err != nil {
 			return err
 		}
 		table.ActiveHand.State = nextState
+		custodyTransition, err := runtime.buildCustodyTransition(*table, tablecustody.TransitionKindAction, &nextState, &request.Action, nil)
+		if err != nil {
+			return err
+		}
+		if err := runtime.finalizeCustodyTransition(table, &custodyTransition); err != nil {
+			return err
+		}
+		runtime.applyCustodyTransition(table, custodyTransition)
 		if err := runtime.appendEvent(table, map[string]any{
 			"type": "PlayerAction",
 			"intent": map[string]any{
@@ -1029,12 +1332,15 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (n
 					"type":      request.Action.Type,
 					"totalSats": request.Action.TotalSats,
 				}),
-				"epoch":       table.CurrentEpoch,
-				"handId":      nextState.HandID,
-				"playerId":    request.PlayerID,
-				"requestedAt": nowISO(),
-				"seatIndex":   seatIndex,
-				"tableId":     table.Config.TableID,
+				"custodySeq":           custodyTransition.CustodySeq,
+				"epoch":                table.CurrentEpoch,
+				"handId":               nextState.HandID,
+				"prevCustodyStateHash": request.PrevCustodyStateHash,
+				"playerId":             request.PlayerID,
+				"requestedAt":          nowISO(),
+				"seatIndex":            seatIndex,
+				"tableId":              table.Config.TableID,
+				"transitionHash":       custodyTransition.Proof.TransitionHash,
 			},
 		}); err != nil {
 			return err
@@ -1055,11 +1361,15 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	if table.NextHandAt != "" && elapsedMillis(table.NextHandAt) < 0 {
 		return nil
 	}
-	if len(table.Seats) < 2 {
+	if len(table.Seats) < 2 || activeCustodySeatCount(*table) < 2 {
 		return nil
 	}
 	chips := map[string]int{}
-	if table.LatestFullySignedSnapshot != nil {
+	if table.LatestCustodyState != nil {
+		for _, claim := range table.LatestCustodyState.StackClaims {
+			chips[claim.PlayerID] = claim.AmountSats
+		}
+	} else if table.LatestFullySignedSnapshot != nil {
 		for playerID, amount := range table.LatestFullySignedSnapshot.ChipBalances {
 			chips[playerID] = amount
 		}
@@ -1078,7 +1388,7 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 		DealerSeatIndex: dealerSeat,
 		HandID:          randomUUID(),
 		HandNumber:      handNumber,
-		Seats: [2]game.HoldemSeatConfig{
+		Seats: []game.HoldemSeatConfig{
 			{PlayerID: table.Seats[0].PlayerID, StackSats: chips[table.Seats[0].PlayerID]},
 			{PlayerID: table.Seats[1].PlayerID, StackSats: chips[table.Seats[1].PlayerID]},
 		},
@@ -1100,9 +1410,18 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 		},
 		State: hand,
 	}
+	blindTransition, err := runtime.buildCustodyTransition(*table, tablecustody.TransitionKindBlindPost, &hand, nil, nil)
+	if err != nil {
+		return err
+	}
+	if err := runtime.finalizeCustodyTransition(table, &blindTransition); err != nil {
+		return err
+	}
+	runtime.applyCustodyTransition(table, blindTransition)
 	table.Config.Status = "active"
 	table.NextHandAt = ""
 	if err := runtime.appendEvent(table, map[string]any{
+		"custodySeq":      blindTransition.CustodySeq,
 		"type":            "HandStart",
 		"dealerSeatIndex": dealerSeat,
 		"handId":          hand.HandID,
@@ -1113,16 +1432,61 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	return runtime.advanceHandProtocolLocked(table)
 }
 
+func (runtime *meshRuntime) syncTableBeforeFailover(tableID string) {
+	table, err := runtime.store.readTable(tableID)
+	if err != nil || table == nil {
+		return
+	}
+	seen := map[string]struct{}{}
+	peerURLs := []string{}
+	addPeerURL := func(peerURL string) {
+		if peerURL == "" || peerURL == runtime.selfPeerURL() {
+			return
+		}
+		if _, ok := seen[peerURL]; ok {
+			return
+		}
+		seen[peerURL] = struct{}{}
+		peerURLs = append(peerURLs, peerURL)
+	}
+	for _, seat := range table.Seats {
+		addPeerURL(firstNonEmptyString(seat.PeerURL, runtime.knownPeerURL(seat.PeerID)))
+	}
+	for _, witness := range table.Witnesses {
+		addPeerURL(firstNonEmptyString(witness.Peer.PeerURL, runtime.knownPeerURL(witness.Peer.PeerID)))
+	}
+	addPeerURL(firstNonEmptyString(table.CurrentHost.Peer.PeerURL, runtime.knownPeerURL(table.CurrentHost.Peer.PeerID)))
+	for _, peerURL := range peerURLs {
+		remote, fetchErr := runtime.fetchRemoteTable(peerURL, tableID)
+		if fetchErr != nil || remote == nil {
+			continue
+		}
+		if acceptErr := runtime.acceptRemoteTable(*remote); acceptErr != nil {
+			debugMeshf("failover pre-sync rejected remote table=%s peer=%s err=%v", tableID, peerURL, acceptErr)
+		}
+	}
+}
+
 func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostFailure bool, resetProtocolDeadline bool) error {
+	observedHostFailure := false
+	if requireHostFailure {
+		if table, err := runtime.store.readTable(tableID); err == nil && table != nil {
+			observedHostFailure = elapsedMillis(table.LastHostHeartbeatAt) > nativeHostFailureMS
+		}
+	}
+	debugMeshf("rotate host start table=%s reason=%s requireHostFailure=%t observedHostFailure=%t", tableID, reason, requireHostFailure, observedHostFailure)
+	runtime.syncTableBeforeFailover(tableID)
 	return runtime.store.withTableLock(tableID, func() error {
 		table, err := runtime.store.readTable(tableID)
 		if err != nil || table == nil {
 			return err
 		}
-		if requireHostFailure && elapsedMillis(table.LastHostHeartbeatAt) <= nativeHostFailureMS {
+		if requireHostFailure && !observedHostFailure && elapsedMillis(table.LastHostHeartbeatAt) <= nativeHostFailureMS {
+			debugMeshf("rotate host skipped table=%s reason=%s heartbeatAge=%d", tableID, reason, elapsedMillis(table.LastHostHeartbeatAt))
 			return nil
 		}
 		if !runtime.shouldHandleFailover(*table) {
+			debugMeshf("rotate host skipped table=%s reason=%s handler=false host=%s", tableID, reason, table.CurrentHost.Peer.PeerID)
 			return nil
 		}
 		previousHost := table.CurrentHost
@@ -1154,14 +1518,22 @@ func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostF
 				setProtocolDeadline(table)
 			}
 			if err := runtime.advanceHandProtocolLocked(table); err != nil {
+				debugMeshf("rotate host advance failed table=%s reason=%s err=%v", tableID, reason, err)
 				return err
 			}
 		} else {
 			table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
 			if err := runtime.startNextHandLocked(table); err != nil {
+				debugMeshf("rotate host restart hand failed table=%s reason=%s err=%v", tableID, reason, err)
 				return err
 			}
 		}
+		debugMeshf("rotate host complete table=%s reason=%s newHost=%s phase=%v", tableID, reason, table.CurrentHost.Peer.PeerID, func() any {
+			if table.ActiveHand == nil {
+				return nil
+			}
+			return table.ActiveHand.State.Phase
+		}())
 		return runtime.persistAndReplicate(table, true)
 	})
 }
@@ -1214,13 +1586,22 @@ func (runtime *meshRuntime) syncPrivateAndFunds(table nativeTableState) error {
 			TableID:       table.Config.TableID,
 		}
 	}
+	frozenStatus := entry.Status == "completed" || entry.Status == "exited" || entry.Status == "pending-exit"
 	for _, seat := range table.Seats {
-		if seat.PlayerID == runtime.walletID.PlayerID && entry.BuyInSats == 0 {
-			entry.BuyInSats = seat.BuyInSats
-			entry.Status = "locked"
+		if seat.PlayerID == runtime.walletID.PlayerID {
+			if entry.BuyInSats == 0 {
+				entry.BuyInSats = seat.BuyInSats
+			}
+			if !frozenStatus {
+				entry.ReservedFundingRefs = append([]tablecustody.VTXORef(nil), seat.FundingRefs...)
+				entry.Status = "locked"
+			}
 		}
 	}
-	if table.LatestFullySignedSnapshot != nil {
+	if table.LatestCustodyState != nil {
+		entry.CheckpointHash = table.LatestCustodyState.StateHash
+		entry.LastUpdatedAt = nowISO()
+	} else if table.LatestFullySignedSnapshot != nil {
 		entry.CheckpointHash = runtime.snapshotHash(*table.LatestFullySignedSnapshot)
 		entry.LastUpdatedAt = nowISO()
 	}
@@ -1804,6 +2185,9 @@ func (runtime *meshRuntime) validateAcceptedHistoricalLedger(existing *nativeTab
 	if err != nil {
 		return err
 	}
+	if err := runtime.validateAcceptedCustodyHistory(existing, incoming); err != nil {
+		return err
+	}
 	if err := runtime.validateAcceptedSnapshotHistory(incoming, history); err != nil {
 		return err
 	}
@@ -1827,6 +2211,211 @@ func (runtime *meshRuntime) validateAcceptedHistoricalLedger(existing *nativeTab
 	for index := range existing.Snapshots {
 		if !reflect.DeepEqual(comparableSnapshotForHistory(&existing.Snapshots[index]), comparableSnapshotForHistory(&incoming.Snapshots[index])) {
 			return fmt.Errorf("historical snapshot %d was rewritten", index)
+		}
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTableState, incoming nativeTableState) error {
+	if len(incoming.CustodyTransitions) == 0 {
+		if incoming.LatestCustodyState != nil {
+			return errors.New("latest custody state is not anchored by custody history")
+		}
+		return nil
+	}
+	var previous *tablecustody.CustodyState
+	for index := range incoming.CustodyTransitions {
+		transition := incoming.CustodyTransitions[index]
+		if err := tablecustody.ValidateTransition(previous, transition); err != nil {
+			return fmt.Errorf("custody transition %d is invalid: %w", index, err)
+		}
+		if err := runtime.validateAcceptedCustodyTransition(incoming, previous, transition); err != nil {
+			return fmt.Errorf("custody transition %d proof is invalid: %w", index, err)
+		}
+		nextState := transition.NextState
+		previous = &nextState
+	}
+	if incoming.LatestCustodyState == nil {
+		return errors.New("latest custody state is missing from accepted custody history")
+	}
+	if previous != nil && !reflect.DeepEqual(cloneCustodyState(incoming.LatestCustodyState), cloneCustodyState(previous)) {
+		return errors.New("latest custody state does not match accepted custody history")
+	}
+	if existing == nil {
+		return nil
+	}
+	if len(incoming.CustodyTransitions) < len(existing.CustodyTransitions) {
+		return errors.New("accepted history would roll back custody transitions")
+	}
+	for index := range existing.CustodyTransitions {
+		if !reflect.DeepEqual(cloneJSON(existing.CustodyTransitions[index]), cloneJSON(incoming.CustodyTransitions[index])) {
+			return fmt.Errorf("historical custody transition %d was rewritten", index)
+		}
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableState, previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) error {
+	if transition.Proof.StateHash != transition.NextStateHash {
+		return errors.New("custody proof state hash mismatch")
+	}
+	if transition.Proof.TransitionHash == "" {
+		return errors.New("custody proof transition hash is missing")
+	}
+	if transition.Proof.ReplayValidated != true {
+		return errors.New("custody proof must mark replay validation")
+	}
+	if transition.ArkIntentID != "" && transition.Proof.ArkIntentID != "" && transition.Proof.ArkIntentID != transition.ArkIntentID {
+		return errors.New("custody proof intent id mismatch")
+	}
+	if transition.ArkTxID != "" && transition.Proof.ArkTxID != "" && transition.Proof.ArkTxID != transition.ArkTxID {
+		return errors.New("custody proof txid mismatch")
+	}
+	if !runtime.config.UseMockSettlement &&
+		transition.Kind != tablecustody.TransitionKindEmergencyExit &&
+		(strings.TrimSpace(transition.ArkIntentID) == "" || strings.TrimSpace(transition.ArkTxID) == "") {
+		return errors.New("custody proof is missing Ark settlement ids")
+	}
+	required := runtime.requiredCustodySigners(table, transition)
+	if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
+		return err
+	}
+	if err := validateAcceptedCustodyRefs(previous, transition, !runtime.config.UseMockSettlement); err != nil {
+		return err
+	}
+	return runtime.validateCustodyTransitionArkProof(previous, transition, false)
+}
+
+func (runtime *meshRuntime) validateCustodyApprovals(table nativeTableState, transition tablecustody.CustodyTransition, required []string) error {
+	approvalByPlayer := map[string]tablecustody.CustodySignature{}
+	for _, approval := range transition.Approvals {
+		if approval.PlayerID == "" {
+			return errors.New("custody approval is missing player id")
+		}
+		if approval.SignatureHex == "" || approval.SignedAt == "" {
+			return fmt.Errorf("custody approval for %s is incomplete", approval.PlayerID)
+		}
+		if approval.ApprovalHash != transition.NextStateHash {
+			return fmt.Errorf("custody approval for %s targets the wrong state", approval.PlayerID)
+		}
+		if _, ok := approvalByPlayer[approval.PlayerID]; ok {
+			return fmt.Errorf("custody approval for %s is duplicated", approval.PlayerID)
+		}
+		seat, ok := seatRecordForPlayer(table, approval.PlayerID)
+		if !ok {
+			return fmt.Errorf("custody approval for unknown player %s", approval.PlayerID)
+		}
+		if approval.WalletPubkeyHex != "" && approval.WalletPubkeyHex != seat.WalletPubkeyHex {
+			return fmt.Errorf("custody approval pubkey mismatch for %s", approval.PlayerID)
+		}
+		if err := verifyCustodyApproval(seat, transition, approval); err != nil {
+			return fmt.Errorf("custody approval verification failed for %s: %w", approval.PlayerID, err)
+		}
+		approvalByPlayer[approval.PlayerID] = approval
+	}
+	if len(required) > 0 {
+		if len(approvalByPlayer) != len(required) {
+			return errors.New("custody approval set is incomplete")
+		}
+		for _, playerID := range required {
+			if _, ok := approvalByPlayer[playerID]; !ok {
+				return fmt.Errorf("missing custody approval for %s", playerID)
+			}
+		}
+	}
+	if len(transition.Proof.Signatures) != len(transition.Approvals) {
+		return errors.New("custody proof signatures do not match approvals")
+	}
+	for _, signature := range transition.Proof.Signatures {
+		approval, ok := approvalByPlayer[signature.PlayerID]
+		if !ok || !reflect.DeepEqual(signature, approval) {
+			return fmt.Errorf("custody proof signature mismatch for %s", signature.PlayerID)
+		}
+	}
+	return nil
+}
+
+func validateAcceptedCustodyRefs(previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition, requireArkProof bool) error {
+	stackRefs := []tablecustody.VTXORef{}
+	stackRefByKey := map[string]tablecustody.VTXORef{}
+	seenRefs := map[string]tablecustody.VTXORef{}
+	previousRefs := previousCustodyRefSet(previous)
+	for _, claim := range transition.NextState.StackClaims {
+		if sumVTXORefs(claim.VTXORefs) != claim.AmountSats {
+			return fmt.Errorf("custody stack refs do not match amount for %s", claim.PlayerID)
+		}
+		for _, ref := range claim.VTXORefs {
+			if requireArkProof {
+				if strings.TrimSpace(ref.ArkIntentID) == "" || strings.TrimSpace(ref.ArkTxID) == "" {
+					return fmt.Errorf("custody stack ref is missing Ark ids for %s", claim.PlayerID)
+				}
+				if previousRef, carried := previousRefs[fundingRefKey(ref)]; !carried || !reflect.DeepEqual(previousRef, ref) {
+					if ref.ArkIntentID != transition.ArkIntentID || ref.ArkTxID != transition.ArkTxID {
+						return fmt.Errorf("custody stack ref Ark ids do not match transition for %s", claim.PlayerID)
+					}
+				}
+				if strings.TrimSpace(ref.Script) == "" || len(ref.Tapscripts) == 0 {
+					return fmt.Errorf("custody stack ref is missing script material for %s", claim.PlayerID)
+				}
+			}
+			if ref.OwnerPlayerID != "" && ref.OwnerPlayerID != claim.PlayerID {
+				return fmt.Errorf("custody stack ref owner mismatch for %s", claim.PlayerID)
+			}
+			key := fundingRefKey(ref)
+			if existing, ok := seenRefs[key]; ok && !reflect.DeepEqual(existing, ref) {
+				return fmt.Errorf("custody ref %s is reused inconsistently", key)
+			}
+			seenRefs[key] = ref
+			stackRefByKey[key] = ref
+			stackRefs = append(stackRefs, ref)
+		}
+	}
+	for _, slice := range transition.NextState.PotSlices {
+		if sumVTXORefs(slice.VTXORefs) != slice.TotalSats {
+			return fmt.Errorf("custody pot slice refs do not match total for %s", slice.PotID)
+		}
+		for _, ref := range slice.VTXORefs {
+			if requireArkProof {
+				if strings.TrimSpace(ref.ArkIntentID) == "" || strings.TrimSpace(ref.ArkTxID) == "" {
+					return fmt.Errorf("custody pot ref is missing Ark ids for %s", slice.PotID)
+				}
+				if previousRef, carried := previousRefs[fundingRefKey(ref)]; !carried || !reflect.DeepEqual(previousRef, ref) {
+					if ref.ArkIntentID != transition.ArkIntentID || ref.ArkTxID != transition.ArkTxID {
+						return fmt.Errorf("custody pot ref Ark ids do not match transition for %s", slice.PotID)
+					}
+				}
+				if strings.TrimSpace(ref.Script) == "" || len(ref.Tapscripts) == 0 {
+					return fmt.Errorf("custody pot ref is missing script material for %s", slice.PotID)
+				}
+			}
+			key := fundingRefKey(ref)
+			if existing, ok := seenRefs[key]; ok && !reflect.DeepEqual(existing, ref) {
+				return fmt.Errorf("custody ref %s is reused inconsistently", key)
+			}
+			seenRefs[key] = ref
+		}
+	}
+	if len(transition.Proof.VTXORefs) < len(stackRefs) {
+		return errors.New("custody proof vtxo refs do not cover stack claims")
+	}
+	for _, ref := range transition.Proof.VTXORefs {
+		key := fundingRefKey(ref)
+		existing, ok := stackRefByKey[key]
+		if ok && !reflect.DeepEqual(existing, ref) {
+			return fmt.Errorf("custody proof references unknown vtxo %s", key)
+		}
+	}
+	for _, ref := range stackRefs {
+		key := fundingRefKey(ref)
+		found := false
+		for _, proofRef := range transition.Proof.VTXORefs {
+			if fundingRefKey(proofRef) == key && reflect.DeepEqual(proofRef, ref) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("custody proof is missing stack ref %s", key)
 		}
 	}
 	return nil
@@ -1980,7 +2569,9 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 
 	return NativeMeshTableView{
 		Config:                    table.Config,
+		CustodyTransitions:        cloneJSON(table.CustodyTransitions),
 		Events:                    cloneJSON(table.Events),
+		LatestCustodyState:        cloneCustodyState(table.LatestCustodyState),
 		LatestFullySignedSnapshot: cloneSnapshot(table.LatestFullySignedSnapshot),
 		LatestSnapshot:            cloneSnapshot(table.LatestSnapshot),
 		Local: NativeTableLocalView{
@@ -2005,17 +2596,24 @@ func (runtime *meshRuntime) tableSummary(table nativeTableState) NativeTableSumm
 	if table.LatestSnapshot != nil {
 		snapshotID = table.LatestSnapshot.SnapshotID
 	}
+	custodyHash := latestCustodyStateHash(table)
+	custodySeq := 0
+	if table.LatestCustodyState != nil {
+		custodySeq = table.LatestCustodyState.CustodySeq
+	}
 	return NativeTableSummary{
-		CurrentEpoch:     table.CurrentEpoch,
-		HandNumber:       handNumber,
-		HostPeerID:       table.CurrentHost.Peer.PeerID,
-		LatestSnapshotID: snapshotID,
-		Phase:            phase,
-		Role:             runtime.roleForTable(table),
-		Status:           table.Config.Status,
-		TableID:          table.Config.TableID,
-		TableName:        table.Config.Name,
-		Visibility:       table.Config.Visibility,
+		CurrentEpoch:           table.CurrentEpoch,
+		CustodySeq:             custodySeq,
+		HandNumber:             handNumber,
+		HostPeerID:             table.CurrentHost.Peer.PeerID,
+		LatestCustodyStateHash: custodyHash,
+		LatestSnapshotID:       snapshotID,
+		Phase:                  phase,
+		Role:                   runtime.roleForTable(table),
+		Status:                 table.Config.Status,
+		TableID:                table.Config.TableID,
+		TableName:              table.Config.Name,
+		Visibility:             table.Config.Visibility,
 	}
 }
 
@@ -2392,16 +2990,17 @@ func (runtime *meshRuntime) buildSignedActionRequest(table nativeTableState, act
 	}
 	signedAt := nowISO()
 	request := nativeActionRequest{
-		Action:        action,
-		DecisionIndex: decisionIndex,
-		Epoch:         table.CurrentEpoch,
-		HandID:        handID,
-		PlayerID:      runtime.walletID.PlayerID,
-		ProfileName:   runtime.profileName,
-		SignedAt:      signedAt,
-		TableID:       table.Config.TableID,
+		Action:               action,
+		DecisionIndex:        decisionIndex,
+		Epoch:                table.CurrentEpoch,
+		HandID:               handID,
+		PlayerID:             runtime.walletID.PlayerID,
+		PrevCustodyStateHash: latestCustodyStateHash(table),
+		ProfileName:          runtime.profileName,
+		SignedAt:             signedAt,
+		TableID:              table.Config.TableID,
 	}
-	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.PrevCustodyStateHash, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
@@ -2409,7 +3008,54 @@ func (runtime *meshRuntime) buildSignedActionRequest(table nativeTableState, act
 	return request, nil
 }
 
-func (runtime *meshRuntime) validateJoinRequest(join nativeJoinRequest) error {
+func (runtime *meshRuntime) validateJoinRequest(table nativeTableState, join nativeJoinRequest) error {
+	if join.BuyInSats <= 0 {
+		return errors.New("join request buy-in must be positive")
+	}
+	if len(join.FundingRefs) == 0 || join.FundingTotalSats < join.BuyInSats {
+		return errors.New("join request is missing funded buy-in refs")
+	}
+	seenFundingRefs := map[string]struct{}{}
+	for _, ref := range join.FundingRefs {
+		if strings.TrimSpace(ref.TxID) == "" {
+			return errors.New("join request funding ref is missing txid")
+		}
+		if ref.AmountSats <= 0 {
+			return errors.New("join request funding ref amount must be positive")
+		}
+		if !runtime.config.UseMockSettlement {
+			if strings.TrimSpace(ref.ArkTxID) == "" {
+				return errors.New("join request funding ref is missing Ark txid")
+			}
+			if strings.TrimSpace(ref.Script) == "" || len(ref.Tapscripts) == 0 {
+				return errors.New("join request funding ref is missing Ark script material")
+			}
+		}
+		if ref.OwnerPlayerID != "" && ref.OwnerPlayerID != join.WalletPlayerID {
+			return errors.New("join request funding ref owner mismatch")
+		}
+		key := fundingRefKey(ref)
+		if _, ok := seenFundingRefs[key]; ok {
+			return errors.New("join request reuses a funding ref")
+		}
+		seenFundingRefs[key] = struct{}{}
+	}
+	for _, seat := range table.Seats {
+		for _, ref := range seat.FundingRefs {
+			if _, ok := seenFundingRefs[fundingRefKey(ref)]; ok {
+				return errors.New("join request funding refs are already locked at this table")
+			}
+		}
+	}
+	if table.LatestCustodyState != nil {
+		for _, claim := range table.LatestCustodyState.StackClaims {
+			for _, ref := range claim.VTXORefs {
+				if _, ok := seenFundingRefs[fundingRefKey(ref)]; ok {
+					return errors.New("join request funding refs overlap active custody claims")
+				}
+			}
+		}
+	}
 	if join.IdentityBinding.TableID == "" || join.IdentityBinding.SignatureHex == "" {
 		return errors.New("join request is missing identity binding")
 	}
@@ -2519,10 +3165,13 @@ func (runtime *meshRuntime) validateActionRequest(table nativeTableState, seat n
 	if request.DecisionIndex != expectedDecisionIndex {
 		return errors.New("action request decision mismatch")
 	}
+	if request.PrevCustodyStateHash != latestCustodyStateHash(table) {
+		return errors.New("action request custody mismatch")
+	}
 	if request.SignedAt == "" || request.SignatureHex == "" {
 		return errors.New("action request is missing player signature")
 	}
-	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt), request.SignatureHex)
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.PrevCustodyStateHash, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt), request.SignatureHex)
 	if err != nil {
 		return err
 	}
@@ -2748,10 +3397,13 @@ func (runtime *meshRuntime) appendFundsOperation(operation NativeTableFundsOpera
 	}
 	entry.BuyInSats = maxInt(entry.BuyInSats, 0)
 	entry.CashoutSats = cashoutSats
-	entry.CheckpointHash = operation.CheckpointHash
+	entry.CheckpointHash = firstNonEmptyString(operation.StateHash, operation.CheckpointHash)
 	entry.LastUpdatedAt = nowISO()
 	entry.Operations = append(entry.Operations, operation)
 	entry.PlayerID = runtime.walletID.PlayerID
+	if status != "locked" && status != "pending-lock" {
+		entry.ReservedFundingRefs = nil
+	}
 	entry.Status = status
 	entry.TableID = operation.TableID
 	if entry.BuyInSats == 0 {
@@ -2768,19 +3420,42 @@ func (runtime *meshRuntime) appendFundsOperation(operation NativeTableFundsOpera
 	return runtime.store.writeTableFunds(funds)
 }
 
-func (runtime *meshRuntime) buildFundsOperation(tableID string, amountSats int, kind, status, checkpointHash string) (NativeTableFundsOperation, error) {
+func (runtime *meshRuntime) buildFundsOperation(tableID string, amountSats int, kind, status, checkpointHash, arkIntentID, arkTxID, exitProofRef string, vtxoRefs []tablecustody.VTXORef) (NativeTableFundsOperation, error) {
+	custodyStateHash := checkpointHash
+	prevStateHash := ""
+	custodySeq := 0
+	recordedRefs := append([]tablecustody.VTXORef(nil), vtxoRefs...)
+	if table, _ := runtime.store.readTable(tableID); table != nil && table.LatestCustodyState != nil {
+		custodyStateHash = table.LatestCustodyState.StateHash
+		prevStateHash = table.LatestCustodyState.PrevStateHash
+		custodySeq = table.LatestCustodyState.CustodySeq
+		if len(recordedRefs) == 0 {
+			for _, claim := range table.LatestCustodyState.StackClaims {
+				if claim.PlayerID == runtime.walletID.PlayerID {
+					recordedRefs = append(recordedRefs, claim.VTXORefs...)
+				}
+			}
+		}
+	}
 	unsigned := map[string]any{
 		"amountSats":      amountSats,
+		"arkIntentId":     arkIntentID,
+		"arkTxid":         arkTxID,
 		"checkpointHash":  checkpointHash,
 		"createdAt":       nowISO(),
+		"custodySeq":      custodySeq,
+		"exitProofRef":    exitProofRef,
+		"prevStateHash":   prevStateHash,
 		"kind":            kind,
 		"networkId":       runtime.config.Network,
 		"operationId":     randomUUID(),
 		"playerId":        runtime.walletID.PlayerID,
 		"provider":        nativeFundsProvider,
 		"signerPubkeyHex": runtime.walletID.PublicKeyHex,
+		"stateHash":       custodyStateHash,
 		"status":          status,
 		"tableId":         tableID,
+		"vtxoRefs":        recordedRefs,
 	}
 	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, unsigned)
 	if err != nil {
@@ -2788,8 +3463,13 @@ func (runtime *meshRuntime) buildFundsOperation(tableID string, amountSats int, 
 	}
 	return NativeTableFundsOperation{
 		AmountSats:      amountSats,
+		ArkIntentID:     arkIntentID,
+		ArkTxID:         arkTxID,
+		CustodySeq:      custodySeq,
 		CheckpointHash:  checkpointHash,
 		CreatedAt:       stringValue(unsigned["createdAt"]),
+		ExitProofRef:    exitProofRef,
+		PrevStateHash:   prevStateHash,
 		Kind:            kind,
 		NetworkID:       runtime.config.Network,
 		OperationID:     stringValue(unsigned["operationId"]),
@@ -2797,8 +3477,10 @@ func (runtime *meshRuntime) buildFundsOperation(tableID string, amountSats int, 
 		Provider:        nativeFundsProvider,
 		SignatureHex:    signatureHex,
 		SignerPubkeyHex: runtime.walletID.PublicKeyHex,
+		StateHash:       custodyStateHash,
 		Status:          status,
 		TableID:         tableID,
+		VTXORefs:        recordedRefs,
 	}, nil
 }
 
@@ -2842,6 +3524,14 @@ func sanitizeActiveHandForNetwork(active *nativeActiveHand, visiblePlayerID stri
 
 func sanitizeHoldemStateForNetwork(state game.HoldemState) game.HoldemState {
 	return cloneJSON(state)
+}
+
+func cloneCustodyState(state *tablecustody.CustodyState) *tablecustody.CustodyState {
+	if state == nil {
+		return nil
+	}
+	cloned := cloneJSON(*state)
+	return &cloned
 }
 
 func cloneSnapshot(snapshot *NativeCooperativeTableSnapshot) *NativeCooperativeTableSnapshot {
@@ -2895,17 +3585,19 @@ func nativeActionDecisionIndex(table nativeTableState) (int, error) {
 	return len(table.ActiveHand.State.ActionLog), nil
 }
 
-func nativeActionAuthPayload(tableID, playerID, handID string, epoch int, decisionIndex int, action game.Action, signedAt string) map[string]any {
-	return map[string]any{
-		"action":        rawJSONMap(action),
-		"decisionIndex": decisionIndex,
-		"epoch":         epoch,
-		"handId":        handID,
-		"playerId":      playerID,
-		"signedAt":      signedAt,
-		"tableId":       tableID,
-		"type":          "table-action",
+func nativeActionAuthPayload(tableID, playerID, handID, prevCustodyStateHash string, epoch int, decisionIndex int, action game.Action, signedAt string) map[string]any {
+	payload := map[string]any{
+		"action":               rawJSONMap(action),
+		"decisionIndex":        decisionIndex,
+		"epoch":                epoch,
+		"handId":               handID,
+		"playerId":             playerID,
+		"signedAt":             signedAt,
+		"tableId":              tableID,
+		"type":                 "table-action",
+		"prevCustodyStateHash": prevCustodyStateHash,
 	}
+	return payload
 }
 
 func nativeTableFetchAuthPayload(tableID, playerID, signedAt string) map[string]any {
@@ -3050,6 +3742,13 @@ func firstNonEmptyString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func latestStackAmountFromFunds(entry NativeTableFundsEntry) int {
+	if entry.CashoutSats > 0 {
+		return entry.CashoutSats
+	}
+	return entry.BuyInSats
 }
 
 func tableVisibilityFromInput(input map[string]any) (string, error) {

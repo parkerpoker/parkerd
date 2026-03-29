@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
 	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
 
@@ -27,20 +28,30 @@ const (
 	nativeTransportChannelTable     = "table"
 	nativeTransportChannelSync      = "sync"
 
-	nativeTransportEncryptionNone       = "none"
-	nativeTransportEncryptionX25519GCM  = "x25519-aes256gcm"
-	nativeTransportMessagePeerManifest  = "peer.manifest"
-	nativeTransportMessagePeerProbe     = "peer.manifest.get"
-	nativeTransportMessageTablePull     = "table.state.pull"
-	nativeTransportMessageTablePush     = "table.state.push"
-	nativeTransportMessageTableJoinReq  = "table.join.request"
-	nativeTransportMessageTableJoinResp = "table.join.response"
-	nativeTransportMessageTableActReq   = "table.action.request"
-	nativeTransportMessageTableActResp  = "table.action.response"
-	nativeTransportMessageTableHandReq  = "table.hand.request"
-	nativeTransportMessageTableHandResp = "table.hand.response"
-	nativeTransportMessageAck           = "ack"
-	nativeTransportMessageNack          = "nack"
+	nativeTransportEncryptionNone          = "none"
+	nativeTransportEncryptionX25519GCM     = "x25519-aes256gcm"
+	nativeTransportMessagePeerManifest     = "peer.manifest"
+	nativeTransportMessagePeerProbe        = "peer.manifest.get"
+	nativeTransportMessageTablePull        = "table.state.pull"
+	nativeTransportMessageTablePush        = "table.state.push"
+	nativeTransportMessageTableJoinReq     = "table.join.request"
+	nativeTransportMessageTableJoinResp    = "table.join.response"
+	nativeTransportMessageTableActReq      = "table.action.request"
+	nativeTransportMessageTableActResp     = "table.action.response"
+	nativeTransportMessageTableCustodyReq  = "table.custody.request"
+	nativeTransportMessageTableCustodyResp = "table.custody.response"
+	nativeTransportMessageTableCustodySignReq = "table.custody.sign.request"
+	nativeTransportMessageTableCustodySignResp = "table.custody.sign.response"
+	nativeTransportMessageTableCustodySignerPrepareReq = "table.custody.signer.prepare.request"
+	nativeTransportMessageTableCustodySignerPrepareResp = "table.custody.signer.prepare.response"
+	nativeTransportMessageTableCustodySignerStartReq = "table.custody.signer.start.request"
+	nativeTransportMessageTableCustodySignerStartResp = "table.custody.signer.start.response"
+	nativeTransportMessageTableCustodySignerNoncesReq = "table.custody.signer.nonces.request"
+	nativeTransportMessageTableCustodySignerNoncesResp = "table.custody.signer.nonces.response"
+	nativeTransportMessageTableHandReq     = "table.hand.request"
+	nativeTransportMessageTableHandResp    = "table.hand.response"
+	nativeTransportMessageAck              = "ack"
+	nativeTransportMessageNack             = "nack"
 
 	nativeTransportRequestTTL      = 30 * time.Second
 	nativeTransportReadTimeout     = 10 * time.Second
@@ -152,6 +163,56 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 			return transportpkg.TransportEnvelope{}, err
 		}
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableHandResp, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(table, handMessage.PlayerID))
+	case nativeTransportMessageTableCustodyReq:
+		var approvalRequest nativeCustodyApprovalRequest
+		if err := json.Unmarshal(body, &approvalRequest); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		response, err := runtime.handleCustodyApprovalFromPeer(approvalRequest)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodyResp, nativeTransportChannelTable, sharedSecret, response)
+	case nativeTransportMessageTableCustodySignReq:
+		var signRequest nativeCustodyTxSignRequest
+		if err := json.Unmarshal(body, &signRequest); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		response, err := runtime.handleCustodyTxSignFromPeer(signRequest)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodySignResp, nativeTransportChannelTable, sharedSecret, response)
+	case nativeTransportMessageTableCustodySignerPrepareReq:
+		var prepareRequest nativeCustodySignerPrepareRequest
+		if err := json.Unmarshal(body, &prepareRequest); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		response, err := runtime.handleCustodySignerPrepareFromPeer(prepareRequest)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodySignerPrepareResp, nativeTransportChannelTable, sharedSecret, response)
+	case nativeTransportMessageTableCustodySignerStartReq:
+		var startRequest nativeCustodySignerStartRequest
+		if err := json.Unmarshal(body, &startRequest); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		response, err := runtime.handleCustodySignerStartFromPeer(startRequest)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodySignerStartResp, nativeTransportChannelTable, sharedSecret, response)
+	case nativeTransportMessageTableCustodySignerNoncesReq:
+		var noncesRequest nativeCustodySignerNoncesRequest
+		if err := json.Unmarshal(body, &noncesRequest); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		response, err := runtime.handleCustodySignerNoncesFromPeer(noncesRequest)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodySignerNoncesResp, nativeTransportChannelTable, sharedSecret, response)
 	case nativeTransportMessageTablePush:
 		var syncRequest nativeTableSyncRequest
 		if err := json.Unmarshal(body, &syncRequest); err != nil {
@@ -305,6 +366,147 @@ func (runtime *meshRuntime) remoteAction(peerURL string, input nativeActionReque
 
 func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
 	return runtime.sendPeerTableRequest(peerURL, nativeTransportMessageTableHandReq, nativeTransportMessageTableHandResp, input.TableID, input)
+}
+
+func (runtime *meshRuntime) remoteApproveCustody(peerURL string, input nativeCustodyApprovalRequest) (tablecustody.CustodySignature, error) {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return tablecustody.CustodySignature{}, err
+	}
+	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodyReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
+	if err != nil {
+		return tablecustody.CustodySignature{}, err
+	}
+	response, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return tablecustody.CustodySignature{}, err
+	}
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		return tablecustody.CustodySignature{}, err
+	}
+	if response.MessageType != nativeTransportMessageTableCustodyResp {
+		return tablecustody.CustodySignature{}, fmt.Errorf("unexpected transport response %q", response.MessageType)
+	}
+	var decoded nativeCustodyApprovalResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return tablecustody.CustodySignature{}, err
+	}
+	return decoded.Approval, nil
+}
+
+func (runtime *meshRuntime) remoteSignCustodyPSBT(peerURL string, input nativeCustodyTxSignRequest) (string, error) {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return "", err
+	}
+	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
+	if err != nil {
+		return "", err
+	}
+	response, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return "", err
+	}
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		return "", err
+	}
+	if response.MessageType != nativeTransportMessageTableCustodySignResp {
+		return "", fmt.Errorf("unexpected transport response %q", response.MessageType)
+	}
+	var decoded nativeCustodyTxSignResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return "", err
+	}
+	return decoded.SignedPSBT, nil
+}
+
+func (runtime *meshRuntime) remotePrepareCustodySigner(peerURL string, input nativeCustodySignerPrepareRequest) (nativeCustodySignerPrepareResponse, error) {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return nativeCustodySignerPrepareResponse{}, err
+	}
+	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerPrepareReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
+	if err != nil {
+		return nativeCustodySignerPrepareResponse{}, err
+	}
+	response, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return nativeCustodySignerPrepareResponse{}, err
+	}
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		return nativeCustodySignerPrepareResponse{}, err
+	}
+	if response.MessageType != nativeTransportMessageTableCustodySignerPrepareResp {
+		return nativeCustodySignerPrepareResponse{}, fmt.Errorf("unexpected transport response %q", response.MessageType)
+	}
+	var decoded nativeCustodySignerPrepareResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nativeCustodySignerPrepareResponse{}, err
+	}
+	return decoded, nil
+}
+
+func (runtime *meshRuntime) remoteStartCustodySigner(peerURL string, input nativeCustodySignerStartRequest) error {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return err
+	}
+	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerStartReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
+	if err != nil {
+		return err
+	}
+	response, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return err
+	}
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		return err
+	}
+	if response.MessageType != nativeTransportMessageTableCustodySignerStartResp {
+		return fmt.Errorf("unexpected transport response %q", response.MessageType)
+	}
+	var decoded nativeCustodyAckResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return err
+	}
+	if !decoded.OK {
+		return errors.New("remote custody signer start was not acknowledged")
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, input nativeCustodySignerNoncesRequest) error {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return err
+	}
+	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
+	if err != nil {
+		return err
+	}
+	response, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return err
+	}
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		return err
+	}
+	if response.MessageType != nativeTransportMessageTableCustodySignerNoncesResp {
+		return fmt.Errorf("unexpected transport response %q", response.MessageType)
+	}
+	var decoded nativeCustodyAckResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return err
+	}
+	if !decoded.OK {
+		return errors.New("remote custody signer nonces were not acknowledged")
+	}
+	return nil
 }
 
 func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseType, tableID string, input any) (nativeTableState, error) {

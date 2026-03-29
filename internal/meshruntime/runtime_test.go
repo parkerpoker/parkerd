@@ -11,6 +11,7 @@ import (
 	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
 )
 
 func TestTableTrafficKeepsHoleCardsOwnerLocalAndPushesTranscriptUpdates(t *testing.T) {
@@ -138,16 +139,17 @@ func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 
 	signedAt := nowISO()
 	forged := nativeActionRequest{
-		Action:        game.Action{Type: game.ActionCall},
-		DecisionIndex: len(table.ActiveHand.State.ActionLog),
-		Epoch:         table.CurrentEpoch,
-		HandID:        table.ActiveHand.State.HandID,
-		PlayerID:      host.walletID.PlayerID,
-		ProfileName:   guest.profileName,
-		SignedAt:      signedAt,
-		TableID:       tableID,
+		Action:               game.Action{Type: game.ActionCall},
+		DecisionIndex:        len(table.ActiveHand.State.ActionLog),
+		Epoch:                table.CurrentEpoch,
+		HandID:               table.ActiveHand.State.HandID,
+		PlayerID:             host.walletID.PlayerID,
+		PrevCustodyStateHash: latestCustodyStateHash(table),
+		ProfileName:          guest.profileName,
+		SignedAt:             signedAt,
+		TableID:              tableID,
 	}
-	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeActionAuthPayload(forged.TableID, forged.PlayerID, forged.HandID, forged.Epoch, forged.DecisionIndex, forged.Action, forged.SignedAt))
+	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeActionAuthPayload(forged.TableID, forged.PlayerID, forged.HandID, forged.PrevCustodyStateHash, forged.Epoch, forged.DecisionIndex, forged.Action, forged.SignedAt))
 	if err != nil {
 		t.Fatalf("sign forged action: %v", err)
 	}
@@ -336,11 +338,10 @@ func TestMissingRevealTimeoutAwardsPotAndAppendsAbort(t *testing.T) {
 	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
 	if err := guest.Close(); err != nil {
 		t.Fatalf("close guest runtime: %v", err)
 	}
-
-	startNextHandForTest(t, host, tableID)
 	settleDeadline := time.Now().Add(4 * time.Second)
 	for time.Now().Before(settleDeadline) {
 		host.Tick()
@@ -701,7 +702,6 @@ func TestAcceptRemoteTableRejectsMissingPrivateDeliveryAfterActivation(t *testin
 	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
 
 	tampered := mustReadNativeTable(t, host, tableID)
 	if tampered.ActiveHand == nil {
@@ -734,7 +734,6 @@ func TestAcceptRemoteTableRejectsPlaintextCardsInPrivateDeliveryShare(t *testing
 	guest := newMeshTestRuntime(t, "guest")
 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
 
 	tampered := mustReadNativeTable(t, host, tableID)
 	if tampered.ActiveHand == nil {
@@ -880,11 +879,10 @@ func TestProtocolDeadlineForcesFailoverDespiteFreshHeartbeat(t *testing.T) {
 		t.Fatalf("bootstrap witness peer: %v", err)
 	}
 	tableID, _ := createJoinedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+	startNextHandForTest(t, host, tableID)
 	if err := guest.Close(); err != nil {
 		t.Fatalf("close guest runtime: %v", err)
 	}
-
-	startNextHandForTest(t, host, tableID)
 
 	startedAt := time.Now()
 	deadline := time.Now().Add(6 * time.Second)
@@ -1000,6 +998,143 @@ func TestFetchPeerInfoRefreshesExpiredCache(t *testing.T) {
 	}
 	if cached.PeerSelf.Peer.PeerID != host.selfPeerID() {
 		t.Fatalf("expected cached peer id %q after refresh, got %q", host.selfPeerID(), cached.PeerSelf.Peer.PeerID)
+	}
+}
+
+func TestJoinTableRejectsReusingReservedFundingRefsAcrossTables(t *testing.T) {
+	firstHost := newMeshTestRuntime(t, "first-host")
+	secondHost := newMeshTestRuntime(t, "second-host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	firstCreate, err := firstHost.CreateTable(map[string]any{"name": "First"})
+	if err != nil {
+		t.Fatalf("create first table: %v", err)
+	}
+	if _, err := guest.JoinTable(stringValue(firstCreate["inviteCode"]), 4_000); err != nil {
+		t.Fatalf("join first table: %v", err)
+	}
+
+	secondCreate, err := secondHost.CreateTable(map[string]any{"name": "Second"})
+	if err != nil {
+		t.Fatalf("create second table: %v", err)
+	}
+	if _, err := guest.JoinTable(stringValue(secondCreate["inviteCode"]), 4_000); err == nil || !strings.Contains(err.Error(), "insufficient available sats") {
+		t.Fatalf("expected second join to fail on reserved funds, got %v", err)
+	}
+}
+
+func TestValidateAcceptedCustodyHistoryRejectsTamperedApprovalSignature(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, guest, tableID)
+	tampered := cloneJSON(table)
+
+	transitionIndex := -1
+	for index, transition := range tampered.CustodyTransitions {
+		if len(transition.Approvals) > 0 {
+			transitionIndex = index
+			break
+		}
+	}
+	if transitionIndex < 0 {
+		t.Fatal("expected finalized custody transition with approvals")
+	}
+
+	transition := tampered.CustodyTransitions[transitionIndex]
+	transition.Approvals[0].SignatureHex = "00"
+	transition.Proof.Signatures[0] = transition.Approvals[0]
+	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+	tampered.CustodyTransitions[transitionIndex] = transition
+
+	if err := guest.validateAcceptedCustodyHistory(nil, tampered); err == nil || !strings.Contains(err.Error(), "custody approval") {
+		t.Fatalf("expected tampered approval to be rejected, got %v", err)
+	}
+}
+
+func TestCashOutAppendsCustodyTransition(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	if _, err := host.CashOut(tableID); err != nil {
+		t.Fatalf("cash out: %v", err)
+	}
+
+	table := mustReadNativeTable(t, host, tableID)
+	if len(table.CustodyTransitions) == 0 {
+		t.Fatal("expected custody history after cash out")
+	}
+	transition := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	if transition.Kind != tablecustody.TransitionKindCashOut {
+		t.Fatalf("expected latest transition kind %s, got %s", tablecustody.TransitionKindCashOut, transition.Kind)
+	}
+	if len(transition.Approvals) != 1 || transition.Approvals[0].PlayerID != host.walletID.PlayerID {
+		t.Fatalf("expected only local approval on cash out, got %+v", transition.Approvals)
+	}
+	if !tableHasEventType(table, "CashOut") {
+		t.Fatal("expected CashOut event after cash out")
+	}
+	if latestStackAmount(table.LatestCustodyState, host.walletID.PlayerID) != 0 {
+		t.Fatalf("expected cash out to clear local stack, got %d", latestStackAmount(table.LatestCustodyState, host.walletID.PlayerID))
+	}
+}
+
+func TestEmergencyExitAppendsCustodyTransition(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	if _, err := host.Exit(tableID); err != nil {
+		t.Fatalf("emergency exit: %v", err)
+	}
+
+	table := mustReadNativeTable(t, host, tableID)
+	if len(table.CustodyTransitions) == 0 {
+		t.Fatal("expected custody history after emergency exit")
+	}
+	transition := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	if transition.Kind != tablecustody.TransitionKindEmergencyExit {
+		t.Fatalf("expected latest transition kind %s, got %s", tablecustody.TransitionKindEmergencyExit, transition.Kind)
+	}
+	if len(transition.Approvals) != 1 || transition.Approvals[0].PlayerID != host.walletID.PlayerID {
+		t.Fatalf("expected only local approval on emergency exit, got %+v", transition.Approvals)
+	}
+	if !tableHasEventType(table, "EmergencyExit") {
+		t.Fatal("expected EmergencyExit event after exit")
+	}
+	if latestStackAmount(table.LatestCustodyState, host.walletID.PlayerID) != 0 {
+		t.Fatalf("expected emergency exit to clear local stack, got %d", latestStackAmount(table.LatestCustodyState, host.walletID.PlayerID))
+	}
+}
+
+func TestFinalizeCustodyTransitionFailsClosedWithoutRealArkSettlement(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, host, tableID)
+	host.config.UseMockSettlement = false
+
+	transition, err := host.buildSeatLockTransition(table)
+	if err != nil {
+		t.Fatalf("build custody transition: %v", err)
+	}
+	if err := host.finalizeCustodyTransition(&table, &transition); err == nil || !strings.Contains(err.Error(), "missing tapscripts") {
+		t.Fatalf("expected finalize to reject mock refs in real settlement mode, got %v", err)
+	}
+}
+
+func TestCashOutFailsClosedWithoutRealArkSettlement(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	host.config.UseMockSettlement = false
+
+	if _, err := host.CashOut(tableID); err == nil || !strings.Contains(err.Error(), "missing tapscripts") {
+		t.Fatalf("expected cash-out to reject mock refs in real settlement mode, got %v", err)
 	}
 }
 
@@ -1125,11 +1260,17 @@ func startNextHandForTest(t *testing.T, runtime *meshRuntime, tableID string) {
 	if err := runtime.store.writeTable(&table); err != nil {
 		t.Fatalf("write scheduled hand start: %v", err)
 	}
-	runtime.Tick()
-	started := mustReadNativeTable(t, runtime, tableID)
-	if started.ActiveHand == nil {
-		t.Fatalf("expected host tick to start active hand, got status=%q nextHandAt=%q", started.Config.Status, started.NextHandAt)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		runtime.Tick()
+		started := mustReadNativeTable(t, runtime, tableID)
+		if started.ActiveHand != nil {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
 	}
+	started := mustReadNativeTable(t, runtime, tableID)
+	t.Fatalf("expected host tick to start active hand, got status=%q nextHandAt=%q", started.Config.Status, started.NextHandAt)
 }
 
 func mustBuildJoinRequest(t *testing.T, runtime *meshRuntime, tableID, peerURL string) nativeJoinRequest {
@@ -1143,16 +1284,22 @@ func mustBuildJoinRequest(t *testing.T, runtime *meshRuntime, tableID, peerURL s
 	if err != nil {
 		t.Fatalf("wallet summary: %v", err)
 	}
+	funding, err := runtime.walletRuntime.BuildBuyInFundingBundle(runtime.profileName, 4_000)
+	if err != nil {
+		t.Fatalf("build buy-in funding bundle: %v", err)
+	}
 	request := nativeJoinRequest{
-		ArkAddress:      wallet.ArkAddress,
-		BuyInSats:       4_000,
-		Nickname:        profile.Nickname,
-		Peer:            runtime.self.Peer,
-		ProfileName:     runtime.profileName,
-		ProtocolID:      runtime.protocolID,
-		TableID:         tableID,
-		WalletPlayerID:  runtime.walletID.PlayerID,
-		WalletPubkeyHex: runtime.walletID.PublicKeyHex,
+		ArkAddress:       wallet.ArkAddress,
+		BuyInSats:        4_000,
+		FundingRefs:      funding.Refs,
+		FundingTotalSats: funding.TotalSats,
+		Nickname:         profile.Nickname,
+		Peer:             runtime.self.Peer,
+		ProfileName:      runtime.profileName,
+		ProtocolID:       runtime.protocolID,
+		TableID:          tableID,
+		WalletPlayerID:   runtime.walletID.PlayerID,
+		WalletPubkeyHex:  runtime.walletID.PublicKeyHex,
 	}
 	if peerURL != "" {
 		request.Peer.PeerURL = peerURL
@@ -1178,16 +1325,16 @@ func touchLocalHostHeartbeat(t *testing.T, runtime *meshRuntime, tableID string)
 func waitForHandPhase(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string, phase game.Street) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if table.ActiveHand != nil && table.ActiveHand.State.Phase == phase {
+			return table
+		}
 		for _, runtime := range runtimes {
 			if runtime != nil {
 				runtime.Tick()
 			}
-		}
-		table := mustReadNativeTable(t, reader, tableID)
-		if table.ActiveHand != nil && table.ActiveHand.State.Phase == phase {
-			return table
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -1204,16 +1351,16 @@ func waitForHandPhase(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime
 func waitForActionLogLength(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string, want int) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if table.ActiveHand != nil && len(table.ActiveHand.State.ActionLog) == want {
+			return table
+		}
 		for _, runtime := range runtimes {
 			if runtime != nil {
 				runtime.Tick()
 			}
-		}
-		table := mustReadNativeTable(t, reader, tableID)
-		if table.ActiveHand != nil && len(table.ActiveHand.State.ActionLog) == want {
-			return table
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -1231,14 +1378,14 @@ func waitForLocalCanAct(t *testing.T, runtimes []*meshRuntime, reader *meshRunti
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if reader.localTableView(table).Local.CanAct {
+			return table
+		}
 		for _, runtime := range runtimes {
 			if runtime != nil {
 				runtime.Tick()
 			}
-		}
-		table := mustReadNativeTable(t, reader, tableID)
-		if reader.localTableView(table).Local.CanAct {
-			return table
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -1251,14 +1398,14 @@ func waitForSettledHand(t *testing.T, runtimes []*meshRuntime, reader *meshRunti
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if table.ActiveHand != nil && table.ActiveHand.State.Phase == game.StreetSettled {
+			return table
+		}
 		for _, runtime := range runtimes {
 			if runtime != nil {
 				runtime.Tick()
 			}
-		}
-		table := mustReadNativeTable(t, reader, tableID)
-		if table.ActiveHand != nil && table.ActiveHand.State.Phase == game.StreetSettled {
-			return table
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

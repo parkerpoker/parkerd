@@ -11,12 +11,13 @@ import (
 )
 
 const (
-	nativeProtocolVersion       = "poker/v1"
+	nativeProtocolVersion       = "poker/v2"
 	nativeDealerMode            = "dealerless-transcript-v1"
-	nativeFundsProvider         = "arkade-table-funds/v1"
+	nativeFundsProvider         = "arkade-table-funds/v2"
 	nativeHostHeartbeatMS       = 1000
 	nativeHostFailureMS         = 3500
 	nativeHandProtocolTimeoutMS = 1500
+	nativeActionTimeoutMS       = 4000
 	nativeNextHandDelayMS       = 1000
 	nativePollIntervalMS        = 500
 	nativeTableSyncInterval     = 1 * time.Second
