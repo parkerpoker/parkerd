@@ -305,7 +305,7 @@ The current join flow is:
 5. the host appends `SeatLocked`
 6. when the table reaches seat count, the host marks it `ready`
 7. the host builds a snapshot, appends `TableReady`, and schedules the first hand
-8. the updated table is replicated to peers with active-hand secrets redacted per recipient
+8. the updated table is replicated to peers with public state, encrypted deck state, and accepted transcript records; owner-local plaintext hole cards stay outside replicated state
 
 There is no separate buy-in-confirm side channel beyond the join request, signed events, and replicated table state.
 
@@ -318,7 +318,7 @@ The current action flow is:
 3. the host verifies the wallet signature and current turn binding, then applies the action through the Hold'em engine
 4. the host appends `PlayerAction`
 5. when the hand settles, the host builds a snapshot and appends `HandResult`
-6. the updated table is replicated to peers with only the caller's hole cards included in replicated state
+6. the updated table is replicated to peers without any owner-local plaintext hole cards in replicated state
 
 ### Failover
 

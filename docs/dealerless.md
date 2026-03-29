@@ -12,14 +12,16 @@ The current runtime enforces the hidden-card invariant more strongly than the ol
 
 - `game.HoldemState` does not contain hole-card fields at all.
 - `nativeActiveHand` only carries public hand state, the encrypted final deck, deadlines, and the transcript.
+- honest daemons never transmit non-public hole cards in plaintext.
+- `private-delivery-share` and `board-share` carry only `partialCiphertexts`, so peers receive partial decryptions rather than usable plaintext card values.
 - accepted transcript records may contain plaintext `cards` only for `board-open` and `showdown-reveal`.
 - `private-delivery-share`, `fairness-commit`, `fairness-reveal`, `finalization`, and `board-share` are rejected if they try to carry plaintext `cards`.
 - plaintext owner-local hole cards are persisted only in table private state under `MyHoleCardsByHandID[handID]`.
 - those owner-local hole cards are derived only from the opponent's `private-delivery-share` that explicitly targets the local recipient seat.
 
-In other words: within the accepted runtime table model and transcript validation path, no daemon can persist plaintext non-owned hole cards.
+In other words: the honest protocol flow never asks a daemon to reveal non-public hole cards in plaintext to another daemon, and within the accepted runtime table model and transcript validation path no daemon can persist plaintext non-owned hole cards.
 
-That is also why the network sanitizer can currently clone `activeHand` without per-recipient redaction: the replicated `activeHand` shape simply does not have a place for owner-local plaintext hole cards.
+That is also why the network sanitizer can currently clone `activeHand` without per-recipient redaction: the replicated `activeHand` shape simply does not have a place for owner-local plaintext hole cards, and the replicated dealerless transcript carries only partial ciphertext shares until a card is intentionally public.
 
 ## Current Roles
 
@@ -42,12 +44,14 @@ The coordinator is still important for liveness and ordering. It is not a specia
 
 The mental deck encodes card `i` as integer `i + 2`, so the first few encodings are:
 
+
 | Card | Encoded integer | Hex |
-| --- | ---: | --- |
-| `2c` | 2 | `2` |
-| `3c` | 3 | `3` |
-| `Ac` | 14 | `e` |
-| `2d` | 15 | `f` |
+| ---- | --------------- | --- |
+| `2c` | 2               | `2` |
+| `3c` | 3               | `3` |
+| `Ac` | 14              | `e` |
+| `2d` | 15              | `f` |
+
 
 The deck starts as the ordered encoded vector:
 
@@ -64,7 +68,7 @@ p = 0x7fffffffffffffffffffffffffffffff = 2^127 - 1
 phi(p) = p - 1
 ```
 
-Each seat samples a public exponent `e` such that:
+*Each seat samples a public exponent* `e` *such that:*
 
 ```text
 2 <= e <= phi(p) - 2
@@ -273,14 +277,16 @@ That root is mirrored into public state as `DealerCommitment.RootHash` and into 
 
 For heads-up with dealer seat `0`, `HoldemDealPositions(0)` yields:
 
-| Meaning | Positions |
-| --- | --- |
-| seat `0` hole cards | `[0, 2]` |
-| seat `1` hole cards | `[1, 3]` |
-| burn cards | `4`, `8`, `10` |
-| flop | `[5, 6, 7]` |
-| turn | `[9]` |
-| river | `[11]` |
+
+| Meaning             | Positions      |
+| ------------------- | -------------- |
+| seat `0` hole cards | `[0, 2]`       |
+| seat `1` hole cards | `[1, 3]`       |
+| burn cards          | `4`, `8`, `10` |
+| flop                | `[5, 6, 7]`    |
+| turn                | `[9]`          |
+| river               | `[11]`         |
+
 
 If dealer seat is `1`, the hole-card positions swap between the seats, but board positions stay the same.
 
@@ -371,8 +377,8 @@ Once all reveals are present:
 1. every verifier can replay the full encrypted final deck locally
 2. the host appends `finalization`
 3. the record carries:
-   - `deckStage = finalDeck`
-   - `deckStageRoot = MentalDeckStageRoot(finalDeck)`
+  - `deckStage = finalDeck`
+  - `deckStageRoot = MentalDeckStageRoot(finalDeck)`
 4. `activeHand.Cards.FinalDeck` is set to the same deck
 5. the hand moves to `private-delivery`
 
@@ -399,6 +405,8 @@ Verifiers check:
 ```text
 Encrypt_es(partialCiphertexts[i]) == finalDeck[cardPositions[i]]
 ```
+
+This is the key privacy property for non-public hole cards: the sender does not send plaintext card codes to the recipient or the host. It sends only its own decryption share, and that share is not enough to recover the card without the recipient's private exponent.
 
 The recipient then locally completes decryption:
 
@@ -592,6 +600,8 @@ sequenceDiagram
   H->>T: append HandResult event
 ```
 
+
+
 ## Dataflow Diagram
 
 ```mermaid
@@ -617,6 +627,8 @@ flowchart TD
   H0 --> PERSIST["Persisted locally only:<br/>SecretsByHandID<br/>MyHoleCardsByHandID"]
   H1 --> PERSIST
 ```
+
+
 
 ## Practical Source Map
 

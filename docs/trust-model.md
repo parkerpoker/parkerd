@@ -221,10 +221,11 @@ The indexer validates required fields, but it does not currently cryptographical
 Current dealing is `dealerless-transcript-v1`. The coordinator:
 
 - orders the hand transcript and timeout transitions
+- is not supposed to receive plaintext non-owned hole cards from honest peers in the first place
 - does not derive or persist plaintext non-owned hole cards
-- only sees encrypted or redacted card material for other seats
+- only sees encrypted deck state, partial ciphertext shares, and later intentionally public card opens for other seats
 
-Each owning daemon can decrypt and locally store only its own hole cards after private delivery.
+Each owning daemon can decrypt and locally store only its own hole cards after private delivery. Honest daemons exchange only partial decryptions for non-public cards, not plaintext hole-card values.
 
 ### Trust the host or failover successor for ordering and liveness
 
