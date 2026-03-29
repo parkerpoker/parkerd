@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"encoding/base64"
@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 	storepkg "github.com/parkerpoker/parkerd/internal/storage"
 )
 
@@ -22,13 +23,13 @@ const (
 )
 
 type meshStore struct {
-	config      RuntimeConfig
+	config      cfg.RuntimeConfig
 	profileName string
-	paths       ProfileDaemonPaths
+	paths       cfg.ProfileDaemonPaths
 	repository  *storepkg.RuntimeRepository
 }
 
-func newMeshStore(profileName string, config RuntimeConfig) (*meshStore, error) {
+func newMeshStore(profileName string, config cfg.RuntimeConfig) (*meshStore, error) {
 	repository, err := storepkg.OpenRuntimeRepository(config, profileName)
 	if err != nil {
 		return nil, err
@@ -36,7 +37,7 @@ func newMeshStore(profileName string, config RuntimeConfig) (*meshStore, error) 
 	return &meshStore{
 		config:      config,
 		profileName: profileName,
-		paths:       BuildProfileDaemonPaths(config.DaemonDir, profileName),
+		paths:       cfg.BuildProfileDaemonPaths(config.DaemonDir, profileName),
 		repository:  repository,
 	}, nil
 }

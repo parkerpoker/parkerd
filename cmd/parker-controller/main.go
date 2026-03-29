@@ -21,7 +21,7 @@ func main() {
 
 func run(argv []string) error {
 	flags := parker.ParseFlagsOnly(argv)
-	runtimeConfig, err := cfg.ResolveRuntimeConfig(map[string]string(flags))
+	runtimeConfig, err := parker.ResolveRuntimeConfig(flags)
 	if err != nil {
 		return err
 	}

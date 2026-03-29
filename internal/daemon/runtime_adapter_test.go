@@ -1,9 +1,15 @@
-package parker
+package daemon
 
-import "testing"
+import (
+	"testing"
+
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	"github.com/parkerpoker/parkerd/internal/meshruntime"
+	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
+)
 
 func TestTransportBootstrapAndState(t *testing.T) {
-	config, err := ResolveRuntimeConfig(FlagMap{
+	config, err := cfg.ResolveRuntimeConfig(map[string]string{
 		"datadir": t.TempDir(),
 		"mock":    "true",
 	})
@@ -34,13 +40,13 @@ func TestTransportBootstrapAndState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current state: %v", err)
 	}
-	if normalizeStateMap(state["transport"])["transportWireVersion"] != float64(transportWireVersion) {
-		t.Fatalf("expected transport wire version %d", transportWireVersion)
+	if normalizeStateMap(state["transport"])["transportWireVersion"] != float64(meshruntime.TransportWireVersion) {
+		t.Fatalf("expected transport wire version %d", meshruntime.TransportWireVersion)
 	}
 }
 
 func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
-	config, err := ResolveRuntimeConfig(FlagMap{
+	config, err := cfg.ResolveRuntimeConfig(map[string]string{
 		"datadir": t.TempDir(),
 		"mock":    "true",
 	})
@@ -66,12 +72,12 @@ func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
 		t.Fatalf("start runtime: %v", err)
 	}
 
-	peerEndpoint := remote.inner.selfPeerURL()
+	peerEndpoint := remote.inner.SelfPeerURL()
 	peer, err := runtime.BootstrapPeer(peerEndpoint, "Bob", []string{"witness"})
 	if err != nil {
 		t.Fatalf("bootstrap peer: %v", err)
 	}
-	summary, ok := peer.(TransportPeerSummary)
+	summary, ok := peer.(transportpkg.TransportPeerSummary)
 	if !ok {
 		t.Fatalf("expected transport peer summary, received %T", peer)
 	}
@@ -83,7 +89,7 @@ func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("network peers: %v", err)
 	}
-	peers, ok := peersValue.([]TransportPeerSummary)
+	peers, ok := peersValue.([]transportpkg.TransportPeerSummary)
 	if !ok {
 		t.Fatalf("expected transport peer list, received %T", peersValue)
 	}

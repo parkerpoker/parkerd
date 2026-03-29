@@ -7,7 +7,6 @@ import (
 	"strconv"
 
 	parker "github.com/parkerpoker/parkerd/internal"
-	cfg "github.com/parkerpoker/parkerd/internal/config"
 	indexerpkg "github.com/parkerpoker/parkerd/internal/indexer"
 )
 
@@ -20,7 +19,7 @@ func main() {
 
 func run(argv []string) error {
 	flags := parker.ParseFlagsOnly(argv)
-	runtimeConfig, err := cfg.ResolveRuntimeConfig(map[string]string(flags))
+	runtimeConfig, err := parker.ResolveRuntimeConfig(flags)
 	if err != nil {
 		return err
 	}

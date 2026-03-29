@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"bytes"
@@ -17,13 +17,14 @@ import (
 	"sync"
 	"time"
 
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 type meshRuntime struct {
-	config           RuntimeConfig
+	config           cfg.RuntimeConfig
 	clearPeerURL     string
 	httpClient       *http.Client
 	lastSyncAt       map[string]time.Time
@@ -57,7 +58,7 @@ const (
 	nativeTableSyncAuthMaxAge      = 15 * time.Second
 )
 
-func newMeshRuntime(profileName string, config RuntimeConfig, mode string) (*meshRuntime, error) {
+func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (*meshRuntime, error) {
 	if mode == "" {
 		mode = "player"
 	}

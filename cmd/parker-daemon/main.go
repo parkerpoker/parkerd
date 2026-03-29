@@ -7,7 +7,6 @@ import (
 	"syscall"
 
 	parker "github.com/parkerpoker/parkerd/internal"
-	daemonpkg "github.com/parkerpoker/parkerd/internal/daemon"
 )
 
 func main() {
@@ -39,7 +38,7 @@ func run(argv []string) error {
 		}
 	}
 
-	daemon, err := daemonpkg.New(profile, config, mode)
+	daemon, err := parker.NewProxyDaemon(profile, config, mode)
 	if err != nil {
 		return err
 	}

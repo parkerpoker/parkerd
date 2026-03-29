@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	parker "github.com/parkerpoker/parkerd/internal"
 	cfg "github.com/parkerpoker/parkerd/internal/config"
+	daemonpkg "github.com/parkerpoker/parkerd/internal/daemon"
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
@@ -356,7 +356,7 @@ func readSSEEvent(t *testing.T, reader *bufio.Reader) string {
 
 func stopDaemon(t *testing.T, runtimeConfig cfg.RuntimeConfig, profile string) {
 	t.Helper()
-	client := parker.NewClient(profile, runtimeConfig)
+	client := daemonpkg.NewClient(profile, runtimeConfig)
 	defer client.Close()
 
 	status, err := client.Inspect(false)

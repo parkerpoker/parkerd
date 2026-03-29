@@ -1,4 +1,4 @@
-package parker
+package daemon
 
 import (
 	"errors"
@@ -6,47 +6,43 @@ import (
 	"strings"
 	"sync"
 
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/parkerpoker/parkerd/internal/game"
+	"github.com/parkerpoker/parkerd/internal/meshruntime"
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
-	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
+	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
 
-const transportWireVersion = 2
-
 type daemonRuntimeAdapter struct {
-	config           RuntimeConfig
-	inner            *meshRuntime
+	config           cfg.RuntimeConfig
+	inner            meshruntime.Runtime
 	mode             string
 	mu               sync.Mutex
 	profileName      string
-	profileStore     *walletpkg.ProfileStore
 	protocolIdentity settlementcore.ScopedIdentity
 	peerIdentity     settlementcore.ScopedIdentity
 	started          bool
-	store            *transportStore
+	store            *meshruntime.TransportStore
 	transportKeyID   string
 	transportPrivate string
 	transportPublic  string
 	walletID         settlementcore.LocalIdentity
-	walletRuntime    *walletpkg.Runtime
 }
 
-func newDaemonRuntimeAdapter(profileName string, config RuntimeConfig, mode string) (*daemonRuntimeAdapter, error) {
+func newDaemonRuntimeAdapter(profileName string, config cfg.RuntimeConfig, mode string) (*daemonRuntimeAdapter, error) {
 	if mode == "" {
 		mode = "player"
 	}
-	inner, err := newMeshRuntime(profileName, config, mode)
+	inner, err := meshruntime.NewRuntime(profileName, config, mode)
 	if err != nil {
 		return nil, err
 	}
 	return &daemonRuntimeAdapter{
-		config:        config,
-		inner:         inner,
-		mode:          mode,
-		profileName:   profileName,
-		profileStore:  inner.profileStore,
-		store:         newTransportStoreWithRepository(profileName, config, inner.store.repository, false),
-		walletRuntime: inner.walletRuntime,
+		config:      config,
+		inner:       inner,
+		mode:        mode,
+		profileName: profileName,
+		store:       meshruntime.NewTransportStoreWithRepository(profileName, config, inner.Repository(), false),
 	}, nil
 }
 
@@ -68,9 +64,10 @@ func (runtime *daemonRuntimeAdapter) Close() error {
 	runtime.mu.Lock()
 	runtime.started = false
 	runtime.mu.Unlock()
+
 	var joined error
 	if runtime.store != nil {
-		joined = errors.Join(joined, runtime.store.close())
+		joined = errors.Join(joined, runtime.store.Close())
 	}
 	if runtime.inner != nil {
 		joined = errors.Join(joined, runtime.inner.Close())
@@ -134,41 +131,38 @@ func (runtime *daemonRuntimeAdapter) QuickState() (map[string]any, error) {
 }
 
 func (runtime *daemonRuntimeAdapter) WalletNsec() (any, error) {
-	return runtime.walletRuntime.WalletNsec(runtime.profileName)
+	return runtime.inner.WalletNsec()
 }
 
 func (runtime *daemonRuntimeAdapter) WalletSummary() (any, error) {
-	return runtime.inner.walletSummary()
+	return runtime.inner.WalletSummary()
 }
 
 func (runtime *daemonRuntimeAdapter) WalletFaucet(amountSats int) (any, error) {
-	if err := runtime.walletRuntime.Faucet(runtime.profileName, amountSats); err != nil {
-		return nil, err
-	}
-	return runtime.inner.walletSummary()
+	return runtime.inner.WalletFaucet(amountSats)
 }
 
 func (runtime *daemonRuntimeAdapter) WalletOnboard() (any, error) {
-	return runtime.walletRuntime.Onboard(runtime.profileName)
+	return runtime.inner.WalletOnboard()
 }
 
 func (runtime *daemonRuntimeAdapter) WalletOffboard(address string, amountSats *int) (any, error) {
-	return runtime.walletRuntime.Offboard(runtime.profileName, address, amountSats)
+	return runtime.inner.WalletOffboard(address, amountSats)
 }
 
 func (runtime *daemonRuntimeAdapter) WalletDeposit(amountSats int) (any, error) {
-	return runtime.walletRuntime.CreateDepositQuote(runtime.profileName, amountSats)
+	return runtime.inner.WalletDeposit(amountSats)
 }
 
 func (runtime *daemonRuntimeAdapter) WalletWithdraw(amountSats int, invoice string) (any, error) {
-	return runtime.walletRuntime.SubmitWithdrawal(runtime.profileName, amountSats, invoice)
+	return runtime.inner.WalletWithdraw(amountSats, invoice)
 }
 
 func (runtime *daemonRuntimeAdapter) NetworkPeers() (any, error) {
 	if err := runtime.refreshTransportState(""); err != nil {
 		return nil, err
 	}
-	return runtime.store.listPeers()
+	return runtime.store.ListPeers()
 }
 
 func (runtime *daemonRuntimeAdapter) BootstrapPeer(endpoint, alias string, roles []string) (any, error) {
@@ -178,7 +172,7 @@ func (runtime *daemonRuntimeAdapter) BootstrapPeer(endpoint, alias string, roles
 	if _, err := runtime.inner.BootstrapPeer(endpoint, alias, roles); err != nil {
 		return nil, err
 	}
-	peerInfo, err := runtime.inner.fetchPeerInfo(endpoint)
+	peerInfo, err := runtime.inner.FetchPeerInfo(endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +183,7 @@ func (runtime *daemonRuntimeAdapter) BootstrapPeer(endpoint, alias string, roles
 	if len(roles) > 0 {
 		peer.Roles = append([]string{}, roles...)
 	}
-	if err := runtime.store.writePeer(peer); err != nil {
+	if err := runtime.store.WritePeer(peer); err != nil {
 		return nil, err
 	}
 	return peer, nil
@@ -236,30 +230,30 @@ func (runtime *daemonRuntimeAdapter) Exit(tableID string) (any, error) {
 }
 
 func (runtime *daemonRuntimeAdapter) currentTableID() string {
-	return runtime.inner.currentTableID()
+	return runtime.inner.CurrentTableID()
 }
 
-func (runtime *daemonRuntimeAdapter) transportState() (TransportRuntimeState, error) {
-	peers, err := runtime.store.listPeers()
+func (runtime *daemonRuntimeAdapter) transportState() (transportpkg.TransportRuntimeState, error) {
+	peers, err := runtime.store.ListPeers()
 	if err != nil {
-		return TransportRuntimeState{}, err
+		return transportpkg.TransportRuntimeState{}, err
 	}
 	sort.Slice(peers, func(i, j int) bool { return peers[i].PeerID < peers[j].PeerID })
 
-	manifest, err := runtime.store.readManifest()
+	manifest, err := runtime.store.ReadManifest()
 	if err != nil {
-		return TransportRuntimeState{}, err
+		return transportpkg.TransportRuntimeState{}, err
 	}
-	queues, err := runtime.store.queueState()
+	queues, err := runtime.store.QueueState()
 	if err != nil {
-		return TransportRuntimeState{}, err
+		return transportpkg.TransportRuntimeState{}, err
 	}
 
-	peerState := TransportLocalPeerState{
+	peerState := transportpkg.TransportLocalPeerState{
 		PeerID:               runtime.peerIdentity.ID,
 		ProtocolID:           runtime.protocolIdentity.ID,
 		TransportKeyID:       runtime.transportKeyID,
-		TransportWireVersion: transportWireVersion,
+		TransportWireVersion: meshruntime.TransportWireVersion,
 		WalletPlayerID:       runtime.walletID.PlayerID,
 	}
 	if manifest != nil {
@@ -268,14 +262,14 @@ func (runtime *daemonRuntimeAdapter) transportState() (TransportRuntimeState, er
 		peerState.GossipOnion = manifest.GossipOnion
 	}
 
-	return TransportRuntimeState{
+	return transportpkg.TransportRuntimeState{
 		BootstrapPeers:       append([]string{}, runtime.config.GossipBootstrap...),
 		Mailboxes:            append([]string{}, runtime.config.MailboxEndpoints...),
 		Mode:                 runtime.mode,
 		Peer:                 peerState,
 		Peers:                peers,
 		Queues:               queues,
-		TransportWireVersion: transportWireVersion,
+		TransportWireVersion: meshruntime.TransportWireVersion,
 	}, nil
 }
 
@@ -286,55 +280,44 @@ func (runtime *daemonRuntimeAdapter) refreshTransportState(nickname string) erro
 }
 
 func (runtime *daemonRuntimeAdapter) refreshTransportStateLocked(nickname string) error {
-	if nickname != "" {
-		profile, err := runtime.loadProfileState()
-		if err == nil && profile != nil {
-			profile.Nickname = nickname
-			if saveErr := runtime.profileStore.Save(*profile); saveErr != nil {
-				return saveErr
-			}
-		}
-	}
-	profile, err := runtime.loadProfileState()
-	if err != nil {
+	if err := runtime.inner.UpdateNickname(nickname); err != nil {
 		return err
 	}
-	if profile == nil {
-		return errors.New("profile state is required")
-	}
-	runtime.walletID = runtime.inner.walletID
-	runtime.peerIdentity = runtime.inner.peerIdentity
-	runtime.protocolIdentity = runtime.inner.protocolIdentity
-	runtime.transportPrivate = runtime.inner.transportPrivate
-	runtime.transportPublic = runtime.inner.transportPublic
-	runtime.transportKeyID = runtime.inner.transportKeyID
+
+	identity := runtime.inner.Identity()
+	runtime.walletID = identity.WalletID
+	runtime.peerIdentity = identity.PeerIdentity
+	runtime.protocolIdentity = identity.ProtocolIdentity
+	runtime.transportPrivate = identity.TransportPrivate
+	runtime.transportPublic = identity.TransportPublic
+	runtime.transportKeyID = identity.TransportKeyID
 
 	manifest, err := runtime.buildManifest()
 	if err != nil {
 		return err
 	}
-	if err := runtime.store.writeManifest(manifest); err != nil {
+	if err := runtime.store.WriteManifest(manifest); err != nil {
 		return err
 	}
-	peers, err := runtime.inner.knownPeers()
+	peers, err := runtime.inner.KnownPeers()
 	if err != nil {
 		return err
 	}
 	for _, peer := range peers {
-		if err := runtime.store.writePeer(runtime.transportPeerFromKnownPeer(peer)); err != nil {
+		if err := runtime.store.WritePeer(runtime.transportPeerFromKnownPeer(peer)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (runtime *daemonRuntimeAdapter) buildManifest() (TransportPeerManifest, error) {
-	endpoint := runtime.inner.selfPeerURL()
+func (runtime *daemonRuntimeAdapter) buildManifest() (transportpkg.TransportPeerManifest, error) {
+	endpoint := runtime.inner.SelfPeerURL()
 	if endpoint == "" {
 		endpoint = "parker://" + runtime.peerIdentity.ID
 	}
 	transportEndpoints := transportEndpointsForPeerURL(endpoint, runtime.config.MailboxEndpoints)
-	manifest := TransportPeerManifest{
+	manifest := transportpkg.TransportPeerManifest{
 		Capabilities:         []string{"direct", "state-sync", "table"},
 		CreatedAt:            nowISO(),
 		DirectOnion:          transportEndpoints.DirectOnion,
@@ -348,22 +331,22 @@ func (runtime *daemonRuntimeAdapter) buildManifest() (TransportPeerManifest, err
 		SigningKey:           runtime.protocolIdentity.PublicKeyHex,
 		TransportEncKey:      runtime.transportPublic,
 		TransportEndpoints:   transportEndpoints,
-		TransportWireVersion: transportWireVersion,
+		TransportWireVersion: meshruntime.TransportWireVersion,
 	}
 	unsigned := rawJSONMap(manifest)
 	delete(unsigned, "signature")
 	signature, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
 	if err != nil {
-		return TransportPeerManifest{}, err
+		return transportpkg.TransportPeerManifest{}, err
 	}
 	manifest.Signature = signature
 	return manifest, nil
 }
 
-func (runtime *daemonRuntimeAdapter) transportPeerFromSelf(peer nativePeerSelf) TransportPeerSummary {
+func (runtime *daemonRuntimeAdapter) transportPeerFromSelf(peer meshruntime.PeerInfo) transportpkg.TransportPeerSummary {
 	endpoint := peer.Peer.PeerURL
 	transportEndpoints := transportEndpointsForPeerURL(endpoint, nil)
-	return TransportPeerSummary{
+	return transportpkg.TransportPeerSummary{
 		Alias:              peer.Alias,
 		Capabilities:       []string{"direct", "state-sync", "table"},
 		DirectOnion:        transportEndpoints.DirectOnion,
@@ -377,9 +360,9 @@ func (runtime *daemonRuntimeAdapter) transportPeerFromSelf(peer nativePeerSelf) 
 	}
 }
 
-func (runtime *daemonRuntimeAdapter) transportPeerFromKnownPeer(peer NativePeerAddress) TransportPeerSummary {
+func (runtime *daemonRuntimeAdapter) transportPeerFromKnownPeer(peer meshruntime.NativePeerAddress) transportpkg.TransportPeerSummary {
 	transportEndpoints := transportEndpointsForPeerURL(peer.PeerURL, nil)
-	return TransportPeerSummary{
+	return transportpkg.TransportPeerSummary{
 		Alias:              peer.Alias,
 		Capabilities:       []string{"direct", "state-sync", "table"},
 		DirectOnion:        transportEndpoints.DirectOnion,
@@ -392,34 +375,6 @@ func (runtime *daemonRuntimeAdapter) transportPeerFromKnownPeer(peer NativePeerA
 	}
 }
 
-func transportEndpointsForPeerURL(endpoint string, mailboxes []string) TransportPeerEndpoints {
-	transportEndpoints := TransportPeerEndpoints{
-		Endpoint:         endpoint,
-		MailboxEndpoints: append([]string{}, mailboxes...),
-	}
-	if isOnionPeerURL(endpoint) {
-		transportEndpoints.DirectOnion = endpoint
-	}
-	return transportEndpoints
-}
-
-func (runtime *daemonRuntimeAdapter) loadProfileState() (*walletpkg.PlayerProfileState, error) {
-	state, err := runtime.profileStore.Load(runtime.profileName)
-	if err != nil || state == nil {
-		return state, err
-	}
-	if state.KnownPeers == nil {
-		state.KnownPeers = []walletpkg.KnownPeerState{}
-	}
-	if state.MeshTables == nil {
-		state.MeshTables = map[string]walletpkg.MeshTableReferenceState{}
-	}
-	return state, nil
-}
-
-func transportKeyID(publicKeyHex string) string {
-	if len(publicKeyHex) <= 16 {
-		return "transport-" + publicKeyHex
-	}
-	return "transport-" + publicKeyHex[:16]
+func transportEndpointsForPeerURL(endpoint string, mailboxes []string) transportpkg.TransportPeerEndpoints {
+	return meshruntime.TransportEndpointsForPeerURL(endpoint, mailboxes)
 }

@@ -1,8 +1,10 @@
-package parker
+package meshruntime
 
 import (
 	"net"
 	"testing"
+
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 func TestHiddenServiceTargetAddressUsesOverrideHost(t *testing.T) {
@@ -15,7 +17,7 @@ func TestHiddenServiceTargetAddressUsesOverrideHost(t *testing.T) {
 	defer listener.Close()
 
 	runtime := &meshRuntime{
-		config: RuntimeConfig{
+		config: cfg.RuntimeConfig{
 			PeerHost:      "0.0.0.0",
 			TorTargetHost: "host.docker.internal",
 		},

@@ -1,6 +1,9 @@
-package parker
+package daemon
 
-import "github.com/parkerpoker/parkerd/internal/game"
+import (
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	"github.com/parkerpoker/parkerd/internal/game"
+)
 
 type daemonRuntime interface {
 	Start() error
@@ -31,6 +34,6 @@ type daemonRuntime interface {
 	currentTableID() string
 }
 
-func newDaemonRuntime(profileName string, config RuntimeConfig, mode string) (daemonRuntime, error) {
+func newDaemonRuntime(profileName string, config cfg.RuntimeConfig, mode string) (daemonRuntime, error) {
 	return newDaemonRuntimeAdapter(profileName, config, mode)
 }
