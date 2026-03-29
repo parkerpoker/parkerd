@@ -49,7 +49,20 @@ type custodySettlementPlan struct {
 }
 
 func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, error) {
-	return runtime.walletRuntime.ArkConfig(runtime.profileName)
+	config, err := runtime.walletRuntime.ArkConfig(runtime.profileName)
+	if err != nil {
+		return walletpkg.CustodyArkConfig{}, err
+	}
+	if strings.TrimSpace(config.SignerPubkeyHex) == "" {
+		config.SignerPubkeyHex = runtime.protocolIdentity.PublicKeyHex
+	}
+	if strings.TrimSpace(config.ForfeitPubkeyHex) == "" {
+		config.ForfeitPubkeyHex = runtime.protocolIdentity.PublicKeyHex
+	}
+	if config.UnilateralExitDelay.Value == 0 {
+		config.UnilateralExitDelay = arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512}
+	}
+	return config, nil
 }
 
 func compressedPubkeyFromHex(value string) (*btcec.PublicKey, error) {
@@ -371,6 +384,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 }
 
 func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, transition tablecustody.CustodyTransition) (*custodySettlementPlan, error) {
+	transition = cloneJSON(transition)
 	prevStacks := map[string]tablecustody.StackClaim{}
 	prevPots := map[string]tablecustody.PotSlice{}
 	if table.LatestCustodyState != nil {

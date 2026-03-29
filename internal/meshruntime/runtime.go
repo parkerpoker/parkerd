@@ -26,32 +26,34 @@ import (
 )
 
 type meshRuntime struct {
-	config           cfg.RuntimeConfig
-	clearPeerURL     string
-	custodyArkVerify func(refs []tablecustody.VTXORef, requireSpendable bool) error
-	custodySigners   map[string]walletpkg.CustodySignerSession
-	httpClient       *http.Client
-	lastSyncAt       map[string]time.Time
-	listener         net.Listener
-	mode             string
-	mu               sync.Mutex
-	peerInfoCache    map[string]nativeCachedPeerInfo
-	peerIdentity     settlementcore.ScopedIdentity
-	profileName      string
-	profileStore     *walletpkg.ProfileStore
-	protocolID       string
-	protocolIdentity settlementcore.ScopedIdentity
-	self             nativePeerSelf
-	server           *http.Server
-	tableSyncSender  func(peerURL string, input nativeTableSyncRequest) error
-	started          bool
-	store            *meshStore
-	torService       *runtimeHiddenService
-	transportKeyID   string
-	transportPrivate string
-	transportPublic  string
-	walletID         settlementcore.LocalIdentity
-	walletRuntime    *walletpkg.Runtime
+	config                 cfg.RuntimeConfig
+	clearPeerURL           string
+	custodyArkVerify       func(refs []tablecustody.VTXORef, requireSpendable bool) error
+	custodyBatchExecute    func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
+	custodySignerAuth      map[string]custodySignerAuthorization
+	custodySigners         map[string]walletpkg.CustodySignerSession
+	httpClient             *http.Client
+	lastSyncAt             map[string]time.Time
+	listener               net.Listener
+	mode                   string
+	mu                     sync.Mutex
+	peerInfoCache          map[string]nativeCachedPeerInfo
+	peerIdentity           settlementcore.ScopedIdentity
+	profileName            string
+	profileStore           *walletpkg.ProfileStore
+	protocolID             string
+	protocolIdentity       settlementcore.ScopedIdentity
+	self                   nativePeerSelf
+	server                 *http.Server
+	tableSyncSender        func(peerURL string, input nativeTableSyncRequest) error
+	started                bool
+	store                  *meshStore
+	torService             *runtimeHiddenService
+	transportKeyID         string
+	transportPrivate       string
+	transportPublic        string
+	walletID               settlementcore.LocalIdentity
+	walletRuntime          *walletpkg.Runtime
 }
 
 const (
@@ -73,15 +75,16 @@ func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (
 		return nil, err
 	}
 	return &meshRuntime{
-		config:         config,
-		custodySigners: map[string]walletpkg.CustodySignerSession{},
-		httpClient:     &http.Client{Timeout: 5 * time.Second},
-		lastSyncAt:     map[string]time.Time{},
-		mode:           mode,
-		peerInfoCache:  map[string]nativeCachedPeerInfo{},
-		profileName:    profileName,
-		profileStore:   walletpkg.NewProfileStore(config.ProfileDir),
-		store:          store,
+		config:              config,
+		custodySignerAuth:   map[string]custodySignerAuthorization{},
+		custodySigners:      map[string]walletpkg.CustodySignerSession{},
+		httpClient:          &http.Client{Timeout: 5 * time.Second},
+		lastSyncAt:          map[string]time.Time{},
+		mode:                mode,
+		peerInfoCache:       map[string]nativeCachedPeerInfo{},
+		profileName:         profileName,
+		profileStore:        walletpkg.NewProfileStore(config.ProfileDir),
+		store:               store,
 		walletRuntime: walletpkg.NewRuntime(walletpkg.RuntimeConfig{
 			ArkServerURL:      config.ArkServerURL,
 			Network:           config.Network,
@@ -2256,6 +2259,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTable
 }
 
 func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableState, previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) error {
+	requireArkSettlement := !runtime.config.UseMockSettlement && custodyTransitionRequiresArkSettlement(previous, transition)
 	if transition.Proof.StateHash != transition.NextStateHash {
 		return errors.New("custody proof state hash mismatch")
 	}
@@ -2271,7 +2275,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if transition.ArkTxID != "" && transition.Proof.ArkTxID != "" && transition.Proof.ArkTxID != transition.ArkTxID {
 		return errors.New("custody proof txid mismatch")
 	}
-	if !runtime.config.UseMockSettlement &&
+	if requireArkSettlement &&
 		transition.Kind != tablecustody.TransitionKindEmergencyExit &&
 		(strings.TrimSpace(transition.ArkIntentID) == "" || strings.TrimSpace(transition.ArkTxID) == "") {
 		return errors.New("custody proof is missing Ark settlement ids")
@@ -2280,8 +2284,11 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
 		return err
 	}
-	if err := validateAcceptedCustodyRefs(previous, transition, !runtime.config.UseMockSettlement); err != nil {
+	if err := validateAcceptedCustodyRefs(previous, transition, requireArkSettlement); err != nil {
 		return err
+	}
+	if !requireArkSettlement {
+		return nil
 	}
 	return runtime.validateCustodyTransitionArkProof(previous, transition, false)
 }
@@ -2419,6 +2426,64 @@ func validateAcceptedCustodyRefs(previous *tablecustody.CustodyState, transition
 		}
 	}
 	return nil
+}
+
+func canonicalCustodyMoneyStacks(state *tablecustody.CustodyState) []tablecustody.StackClaim {
+	if state == nil {
+		return nil
+	}
+	stacks := append([]tablecustody.StackClaim(nil), state.StackClaims...)
+	sort.SliceStable(stacks, func(left, right int) bool {
+		if stacks[left].SeatIndex != stacks[right].SeatIndex {
+			return stacks[left].SeatIndex < stacks[right].SeatIndex
+		}
+		return stacks[left].PlayerID < stacks[right].PlayerID
+	})
+	for index := range stacks {
+		stacks[index].VTXORefs = append([]tablecustody.VTXORef(nil), stacks[index].VTXORefs...)
+		sort.SliceStable(stacks[index].VTXORefs, func(left, right int) bool {
+			return fundingRefKey(stacks[index].VTXORefs[left]) < fundingRefKey(stacks[index].VTXORefs[right])
+		})
+	}
+	return stacks
+}
+
+func canonicalCustodyMoneyPots(state *tablecustody.CustodyState) []tablecustody.PotSlice {
+	if state == nil {
+		return nil
+	}
+	pots := append([]tablecustody.PotSlice(nil), state.PotSlices...)
+	sort.SliceStable(pots, func(left, right int) bool {
+		if pots[left].Sequence != pots[right].Sequence {
+			return pots[left].Sequence < pots[right].Sequence
+		}
+		return pots[left].PotID < pots[right].PotID
+	})
+	for index := range pots {
+		pots[index].EligiblePlayerIDs = append([]string(nil), pots[index].EligiblePlayerIDs...)
+		sort.Strings(pots[index].EligiblePlayerIDs)
+		pots[index].ContributedPlayerIDs = append([]string(nil), pots[index].ContributedPlayerIDs...)
+		sort.Strings(pots[index].ContributedPlayerIDs)
+		pots[index].WinnerPlayerIDs = append([]string(nil), pots[index].WinnerPlayerIDs...)
+		sort.Strings(pots[index].WinnerPlayerIDs)
+		pots[index].OddChipPlayerIDs = append([]string(nil), pots[index].OddChipPlayerIDs...)
+		sort.Strings(pots[index].OddChipPlayerIDs)
+		pots[index].VTXORefs = append([]tablecustody.VTXORef(nil), pots[index].VTXORefs...)
+		sort.SliceStable(pots[index].VTXORefs, func(left, right int) bool {
+			return fundingRefKey(pots[index].VTXORefs[left]) < fundingRefKey(pots[index].VTXORefs[right])
+		})
+	}
+	return pots
+}
+
+func custodyTransitionRequiresArkSettlement(previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) bool {
+	if previous == nil {
+		return true
+	}
+	if !reflect.DeepEqual(canonicalCustodyMoneyStacks(previous), canonicalCustodyMoneyStacks(&transition.NextState)) {
+		return true
+	}
+	return !reflect.DeepEqual(canonicalCustodyMoneyPots(previous), canonicalCustodyMoneyPots(&transition.NextState))
 }
 
 func previousSnapshotForCurrentState(table nativeTableState) nativeTableState {

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
 	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
 	arktree "github.com/arkade-os/arkd/pkg/ark-lib/tree"
 	arksdk "github.com/arkade-os/go-sdk"
@@ -121,8 +122,11 @@ func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) 
 	}
 	if runtime.config.UseMockSettlement {
 		return CustodyArkConfig{
-			ArkServerURL: runtime.config.ArkServerURL,
-			DustSats:     1,
+			ArkServerURL:        runtime.config.ArkServerURL,
+			DustSats:            1,
+			ForfeitPubkeyHex:    mockCustodyPubkeyHex("parker-mock-ark-forfeit"),
+			SignerPubkeyHex:     mockCustodyPubkeyHex("parker-mock-ark-signer"),
+			UnilateralExitDelay: arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512},
 		}, nil
 	}
 
@@ -205,13 +209,56 @@ func (runtime *Runtime) ListVtxoRefs(profileName string) ([]tablecustody.VTXORef
 		if err != nil {
 			return nil, err
 		}
+		arkConfig, err := runtime.ArkConfig(profileName)
+		if err != nil {
+			return nil, err
+		}
+		identity, err := localIdentity(state.WalletPrivateKeyHex)
+		if err != nil {
+			return nil, err
+		}
+		ownerPubkeyBytes, err := hex.DecodeString(identity.PublicKeyHex)
+		if err != nil {
+			return nil, err
+		}
+		ownerPubkey, err := btcec.ParsePubKey(ownerPubkeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		signerPubkeyBytes, err := hex.DecodeString(arkConfig.SignerPubkeyHex)
+		if err != nil {
+			return nil, err
+		}
+		signerPubkey, err := btcec.ParsePubKey(signerPubkeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		defaultScript := arkscript.NewDefaultVtxoScript(ownerPubkey, signerPubkey, arkConfig.UnilateralExitDelay)
+		defaultTapscripts, err := defaultScript.Encode()
+		if err != nil {
+			return nil, err
+		}
+		tapKey, _, err := defaultScript.TapTree()
+		if err != nil {
+			return nil, err
+		}
+		pkScript, err := arkscript.P2TRScript(tapKey)
+		if err != nil {
+			return nil, err
+		}
+		arkTxID := tablecustody.HashValue(map[string]any{
+			"profile": profileName,
+			"type":    "mock-ark-vtxo",
+		})
 		return []tablecustody.VTXORef{{
 			AmountSats:    wallet.AvailableSats,
 			ArkIntentID:   "mock-intent-" + suffix(profileName, 8),
-			ArkTxID:       "mock-arktx-" + suffix(profileName, 8),
+			ArkTxID:       arkTxID,
 			ExpiresAt:     addDurationISO(24 * time.Hour),
 			OwnerPlayerID: derivePlayerIDFromState(*state),
-			TxID:          "mock-vtxo-" + suffix(profileName, 8),
+			Script:        hex.EncodeToString(pkScript),
+			Tapscripts:    append([]string(nil), defaultTapscripts...),
+			TxID:          arkTxID,
 			VOut:          0,
 		}}, nil
 	}
@@ -875,6 +922,12 @@ func localIdentity(seedHex string) (LocalIdentity, error) {
 		PrivateKeyHex: hex.EncodeToString(privateKey.Serialize()),
 		PublicKeyHex:  hex.EncodeToString(publicKey.SerializeCompressed()),
 	}, nil
+}
+
+func mockCustodyPubkeyHex(label string) string {
+	seed := sha256.Sum256([]byte(label))
+	_, publicKey := btcec.PrivKeyFromBytes(seed[:])
+	return hex.EncodeToString(publicKey.SerializeCompressed())
 }
 
 func derivePlayerID(publicKey []byte) string {

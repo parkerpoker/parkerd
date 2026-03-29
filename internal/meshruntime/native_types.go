@@ -366,8 +366,10 @@ type nativeCustodyTxSignRequest struct {
 	ExpectedPrevStateHash string `json:"expectedPrevStateHash,omitempty"`
 	PSBT                  string `json:"psbt"`
 	PlayerID              string `json:"playerId"`
+	Purpose               string `json:"purpose,omitempty"`
 	TableID               string `json:"tableId"`
 	TransitionHash        string `json:"transitionHash,omitempty"`
+	Transition            tablecustody.CustodyTransition `json:"transition"`
 }
 
 type nativeCustodyTxSignResponse struct {
@@ -380,6 +382,7 @@ type nativeCustodySignerPrepareRequest struct {
 	PlayerID              string `json:"playerId"`
 	TableID               string `json:"tableId"`
 	TransitionHash        string `json:"transitionHash,omitempty"`
+	Transition            tablecustody.CustodyTransition `json:"transition"`
 }
 
 type nativeCustodySignerPrepareResponse struct {
@@ -388,12 +391,16 @@ type nativeCustodySignerPrepareResponse struct {
 
 type nativeCustodySignerStartRequest struct {
 	BatchID                string             `json:"batchId"`
+	BatchExpiryType        string             `json:"batchExpiryType,omitempty"`
+	BatchExpiryValue       uint32             `json:"batchExpiryValue"`
 	BatchOutputAmountSats  int64              `json:"batchOutputAmountSats"`
 	DerivationPath         string             `json:"derivationPath"`
+	ExpectedPrevStateHash  string             `json:"expectedPrevStateHash,omitempty"`
 	PlayerID               string             `json:"playerId"`
 	SweepTapTreeRootHex    string             `json:"sweepTapTreeRootHex"`
 	TableID                string             `json:"tableId"`
 	TransitionHash         string             `json:"transitionHash,omitempty"`
+	UnsignedCommitmentTx   string             `json:"unsignedCommitmentTx,omitempty"`
 	VtxoTree               arktree.FlatTxTree `json:"vtxoTree"`
 }
 

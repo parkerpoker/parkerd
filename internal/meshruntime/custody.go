@@ -3,6 +3,7 @@ package meshruntime
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -173,7 +174,45 @@ func (runtime *meshRuntime) buildCustodyTransition(table nativeTableState, kind 
 	if action != nil {
 		descriptor = &tablecustody.ActionDescriptor{Type: string(action.Type), TotalSats: action.TotalSats}
 	}
-	return tablecustody.BuildTransition(kind, binding, runtime.custodyBalancesFromHand(table, hand), table.LatestCustodyState, descriptor, timeout)
+	transition, err := tablecustody.BuildTransition(kind, binding, runtime.custodyBalancesFromHand(table, hand), table.LatestCustodyState, descriptor, timeout)
+	if err != nil {
+		return tablecustody.CustodyTransition{}, err
+	}
+	carryForwardUnchangedCustodyRefs(table.LatestCustodyState, &transition)
+	transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
+	transition.NextStateHash = transition.NextState.StateHash
+	transition.Proof.StateHash = transition.NextStateHash
+	transition.Proof.VTXORefs = stackProofRefs(transition.NextState)
+	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+	return transition, nil
+}
+
+func carryForwardUnchangedCustodyRefs(previous *tablecustody.CustodyState, transition *tablecustody.CustodyTransition) {
+	if previous == nil || transition == nil {
+		return
+	}
+	prevStacks := map[string]tablecustody.StackClaim{}
+	for _, claim := range previous.StackClaims {
+		prevStacks[claim.PlayerID] = claim
+	}
+	for index := range transition.NextState.StackClaims {
+		nextClaim := transition.NextState.StackClaims[index]
+		prevClaim, ok := prevStacks[nextClaim.PlayerID]
+		if ok && reflect.DeepEqual(comparableStackClaim(prevClaim), comparableStackClaim(nextClaim)) {
+			transition.NextState.StackClaims[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
+		}
+	}
+	prevPots := map[string]tablecustody.PotSlice{}
+	for _, slice := range previous.PotSlices {
+		prevPots[slice.PotID] = slice
+	}
+	for index := range transition.NextState.PotSlices {
+		nextSlice := transition.NextState.PotSlices[index]
+		prevSlice, ok := prevPots[nextSlice.PotID]
+		if ok && reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(nextSlice)) {
+			transition.NextState.PotSlices[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevSlice.VTXORefs...)
+		}
+	}
 }
 
 func (runtime *meshRuntime) buildSeatLockTransition(table nativeTableState) (tablecustody.CustodyTransition, error) {
@@ -232,11 +271,14 @@ func (runtime *meshRuntime) handleCustodyApprovalFromPeer(request nativeCustodyA
 	if err := tablecustody.ValidateTransition(table.LatestCustodyState, request.Transition); err != nil {
 		return nativeCustodyApprovalResponse{}, err
 	}
-	if err := validateAcceptedCustodyRefs(table.LatestCustodyState, request.Transition, !runtime.config.UseMockSettlement); err != nil {
+	requireArkSettlement := !runtime.config.UseMockSettlement && custodyTransitionRequiresArkSettlement(table.LatestCustodyState, request.Transition)
+	if err := validateAcceptedCustodyRefs(table.LatestCustodyState, request.Transition, requireArkSettlement); err != nil {
 		return nativeCustodyApprovalResponse{}, err
 	}
-	if err := runtime.validateCustodyTransitionArkProof(table.LatestCustodyState, request.Transition, true); err != nil {
-		return nativeCustodyApprovalResponse{}, err
+	if requireArkSettlement {
+		if err := runtime.validateCustodyTransitionArkProof(table.LatestCustodyState, request.Transition, true); err != nil {
+			return nativeCustodyApprovalResponse{}, err
+		}
 	}
 	approval, err := runtime.localCustodyApproval(request.Transition)
 	if err != nil {
@@ -337,15 +379,26 @@ func (runtime *meshRuntime) finalizeCustodyTransition(table *nativeTableState, t
 		return runtime.finalizeRealCustodyTransition(table, transition)
 	}
 	intentID := "mock-intent-" + randomUUID()
-	txID := "mock-arktx-" + randomUUID()
+	txID := tablecustody.HashValue(map[string]any{
+		"tableId":    table.Config.TableID,
+		"custodySeq": transition.CustodySeq,
+		"kind":       transition.Kind,
+		"nonce":      randomUUID(),
+	})
 	stackRefs := make([]tablecustody.VTXORef, 0, len(transition.NextState.StackClaims))
 	for index := range transition.NextState.StackClaims {
+		spec, err := runtime.stackOutputSpec(*table, transition.NextState.StackClaims[index].PlayerID, transition.NextState.StackClaims[index].AmountSats)
+		if err != nil {
+			return err
+		}
 		ref := tablecustody.VTXORef{
 			AmountSats:    transition.NextState.StackClaims[index].AmountSats,
 			ArkIntentID:   intentID,
 			ArkTxID:       txID,
 			ExpiresAt:     addMillis(nowISO(), 86_400_000),
 			OwnerPlayerID: transition.NextState.StackClaims[index].PlayerID,
+			Script:        spec.Script,
+			Tapscripts:    append([]string(nil), spec.Tapscripts...),
 			TxID:          txID,
 			VOut:          uint32(index),
 		}
@@ -353,11 +406,17 @@ func (runtime *meshRuntime) finalizeCustodyTransition(table *nativeTableState, t
 		stackRefs = append(stackRefs, ref)
 	}
 	for index := range transition.NextState.PotSlices {
+		spec, err := runtime.potOutputSpec(*table, *transition, transition.NextState.PotSlices[index], runtime.requiredCustodySigners(*table, *transition))
+		if err != nil {
+			return err
+		}
 		transition.NextState.PotSlices[index].VTXORefs = []tablecustody.VTXORef{{
 			AmountSats:  transition.NextState.PotSlices[index].TotalSats,
 			ArkIntentID: intentID,
 			ArkTxID:     txID,
 			ExpiresAt:   addMillis(nowISO(), 86_400_000),
+			Script:      spec.Script,
+			Tapscripts:  append([]string(nil), spec.Tapscripts...),
 			TxID:        txID,
 			VOut:        uint32(len(transition.NextState.StackClaims) + index),
 		}}
