@@ -241,6 +241,44 @@ func TestHandleHandMessageRejectsReplayedCommit(t *testing.T) {
 	}
 }
 
+func TestHandleHandMessageRejectsPlaintextCardsInCommit(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+
+	table := mustReadNativeTable(t, host, tableID)
+	if table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetCommitment {
+		t.Fatalf("expected commitment phase, got %+v", table.ActiveHand)
+	}
+
+	record, err := guest.buildLocalContributionRecord(table)
+	if err != nil {
+		t.Fatalf("build guest local contribution record: %v", err)
+	}
+	if record == nil || record.Kind != nativeHandMessageFairnessCommit {
+		t.Fatalf("expected guest fairness commit record, got %#v", record)
+	}
+
+	request, err := guest.buildSignedHandMessageRequest(table, *record)
+	if err != nil {
+		t.Fatalf("build guest hand message request: %v", err)
+	}
+	request.Cards = []string{"As", "Kd"}
+	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeHandMessageAuthPayload(request))
+	if err != nil {
+		t.Fatalf("sign tampered hand message: %v", err)
+	}
+	request.SignatureHex = signatureHex
+
+	if _, err := host.handleHandMessageFromPeer(request); err == nil || !strings.Contains(err.Error(), "plaintext cards") {
+		t.Fatalf("expected plaintext-card hand message to be rejected, got %v", err)
+	}
+}
+
 func TestFailoverKeepsActiveTranscriptDrivenHandRunning(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	player := newMeshTestRuntime(t, "player")
@@ -688,6 +726,41 @@ func TestAcceptRemoteTableRejectsMissingPrivateDeliveryAfterActivation(t *testin
 
 	if err := guest.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "missing private delivery shares") {
 		t.Fatalf("expected missing private delivery shares to be rejected, got %v", err)
+	}
+}
+
+func TestAcceptRemoteTableRejectsPlaintextCardsInPrivateDeliveryShare(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
+
+	tampered := mustReadNativeTable(t, host, tableID)
+	if tampered.ActiveHand == nil {
+		t.Fatal("expected active hand to tamper")
+	}
+
+	found := false
+	for index := range tampered.ActiveHand.Cards.Transcript.Records {
+		record := &tampered.ActiveHand.Cards.Transcript.Records[index]
+		if record.Kind != nativeHandMessagePrivateDelivery {
+			continue
+		}
+		record.Cards = []game.CardCode{"As", "Kd"}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatal("expected private delivery record to tamper")
+	}
+	tampered.ActiveHand.Cards.Transcript = rebuildTranscriptForTest(t, tampered.ActiveHand.Cards.Transcript)
+	if tampered.PublicState != nil && tampered.PublicState.DealerCommitment != nil {
+		tampered.PublicState.DealerCommitment.RootHash = tampered.ActiveHand.Cards.Transcript.RootHash
+	}
+
+	if err := guest.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "plaintext cards") {
+		t.Fatalf("expected plaintext-card private delivery share to be rejected, got %v", err)
 	}
 }
 

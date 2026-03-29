@@ -2,7 +2,7 @@
 
 This document describes the architecture implemented today in this repository. It is intentionally current-state only.
 
-For protocol details, see [protocol.md](./protocol.md). For the current dealerless hand flow, see [dealerless.md](./dealerless.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
+For protocol details, see [protocol.md](./protocol.md). For the current dealerless hand flow, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Overview
 

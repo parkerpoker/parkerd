@@ -2,7 +2,7 @@
 
 This document describes the trust model implemented today in this repository. It is intentionally current-state only.
 
-For wire surfaces, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md). For the dealerless hand flow itself, see [dealerless.md](./dealerless.md).
+For wire surfaces, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md). For the dealerless hand flow itself, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md).
 
 ## Short Version
 

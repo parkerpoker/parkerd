@@ -2,7 +2,7 @@
 
 This document describes the protocol and wire surface implemented today in this repository. It is intentionally current-state only.
 
-For component topology, see [architecture.md](./architecture.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
+For component topology, see [architecture.md](./architecture.md). For the dealerless hand flow, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Scope
 

@@ -435,6 +435,18 @@ func compareCardCodes(recordCards []game.CardCode, expectedCards []string) bool 
 	return true
 }
 
+func validateTranscriptRecordPlaintext(record game.HandTranscriptRecord) error {
+	if len(record.Cards) == 0 {
+		return nil
+	}
+	switch record.Kind {
+	case nativeHandMessageBoardOpen, nativeHandMessageShowdownReveal:
+		return nil
+	default:
+		return fmt.Errorf("hand transcript %s must not include plaintext cards", record.Kind)
+	}
+}
+
 func (runtime *meshRuntime) validateAcceptedHandTranscript(table nativeTableState) error {
 	if table.ActiveHand == nil {
 		return nil
@@ -469,6 +481,9 @@ func (runtime *meshRuntime) validateAcceptedHandTranscript(table nativeTableStat
 
 	seenKeys := map[string]struct{}{}
 	for _, record := range transcript.Records {
+		if err := validateTranscriptRecordPlaintext(record); err != nil {
+			return err
+		}
 		if record.SeatIndex != nil {
 			seat, ok := seatRecordByIndex(table, *record.SeatIndex)
 			if !ok {
@@ -1596,6 +1611,13 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 	if !ok {
 		return fmt.Errorf("hand message signature is invalid")
 	}
+	record, err := transcriptRecordFromHandMessage(request)
+	if err != nil {
+		return err
+	}
+	if err := validateTranscriptRecordPlaintext(record); err != nil {
+		return err
+	}
 
 	switch request.Kind {
 	case nativeHandMessageFairnessCommit:
@@ -1628,10 +1650,6 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 			return fmt.Errorf("reveal already recorded for seat %d", seat.SeatIndex)
 		}
 		if err := game.VerifyFairnessReveal(table.Config.TableID, table.ActiveHand.State.HandNumber, seat.SeatIndex, seat.PlayerID, string(game.StreetCommitment), commit.CommitmentHash, request.ShuffleSeedHex, request.LockPublicExponentHex); err != nil {
-			return err
-		}
-		record, err := transcriptRecordFromHandMessage(request)
-		if err != nil {
 			return err
 		}
 		reveals := []game.MentalDeckReveal{}
