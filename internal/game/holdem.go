@@ -529,8 +529,11 @@ func ApplyHoldemAction(state HoldemState, seatIndex int, action Action) (HoldemS
 	if !PhaseAllowsActions(state.Phase) {
 		return HoldemState{}, fmtErrorf("hand is still starting")
 	}
-	if state.ActingSeatIndex == nil || *state.ActingSeatIndex != seatIndex {
-		return HoldemState{}, fmtErrorf("seat %d cannot act while seat %v is up", seatIndex, state.ActingSeatIndex)
+	if state.ActingSeatIndex == nil {
+		return HoldemState{}, fmtErrorf("seat %d cannot act while no seat is up", seatIndex)
+	}
+	if *state.ActingSeatIndex != seatIndex {
+		return HoldemState{}, fmtErrorf("seat %d cannot act while seat %d is up", seatIndex, *state.ActingSeatIndex)
 	}
 	if err := expectLegal(state, seatIndex, action); err != nil {
 		return HoldemState{}, err

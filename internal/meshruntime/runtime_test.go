@@ -101,6 +101,31 @@ func TestGuestSendActionWaitsForSlowReplicationTargetsInParallel(t *testing.T) {
 	}
 }
 
+func TestLocalTableViewHidesLegalActionsWhenItIsNotYourTurn(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	hostLocal := host.localTableView(table).Local
+	if !hostLocal.CanAct {
+		t.Fatal("expected host to be able to act")
+	}
+	if len(hostLocal.LegalActions) == 0 {
+		t.Fatal("expected acting seat to receive legal actions")
+	}
+
+	guestTable := mustReadNativeTable(t, guest, tableID)
+	guestLocal := guest.localTableView(guestTable).Local
+	if guestLocal.CanAct {
+		t.Fatal("expected guest to be waiting")
+	}
+	if len(guestLocal.LegalActions) != 0 {
+		t.Fatalf("expected waiting seat legal actions to be hidden, got %#v", guestLocal.LegalActions)
+	}
+}
+
 func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 	t.Parallel()
 

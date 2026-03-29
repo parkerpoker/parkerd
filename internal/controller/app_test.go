@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -79,6 +80,20 @@ func TestResolveAllowedOriginsIncludesControllerWebFallback(t *testing.T) {
 		if !found {
 			t.Fatalf("expected %s in allowed origins, got %v", expected, origins)
 		}
+	}
+}
+
+func TestNormalizeTableActionErrorMarksValidationFailuresBadRequest(t *testing.T) {
+	err := normalizeTableActionError(fmt.Errorf("seat 1 cannot act while seat 0 is up"))
+	var controllerErr controllerError
+	if !errors.As(err, &controllerErr) {
+		t.Fatalf("expected controllerError, got %T", err)
+	}
+	if controllerErr.statusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 status, got %d", controllerErr.statusCode)
+	}
+	if controllerErr.message != "seat 1 cannot act while seat 0 is up" {
+		t.Fatalf("unexpected controller error message %q", controllerErr.message)
 	}
 }
 

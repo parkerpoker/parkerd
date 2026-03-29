@@ -330,6 +330,35 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	}
 }
 
+func TestApplyHoldemActionIncludesActingSeatNumberInTurnErrors(t *testing.T) {
+	state, err := CreateHoldemHand(HoldemHandConfig{
+		HandID:          "770e8400-e29b-41d4-a716-446655440001",
+		HandNumber:      2,
+		DealerSeatIndex: 0,
+		SmallBlindSats:  50,
+		BigBlindSats:    100,
+		Seats: [2]HoldemSeatConfig{
+			{PlayerID: "alpha", StackSats: 2000},
+			{PlayerID: "beta", StackSats: 2000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create hand: %v", err)
+	}
+	state, err = ActivateHoldemHand(state)
+	if err != nil {
+		t.Fatalf("activate hand: %v", err)
+	}
+
+	_, err = ApplyHoldemAction(state, 1, Action{Type: ActionCheck})
+	if err == nil {
+		t.Fatal("expected out-of-turn action to fail")
+	}
+	if got := err.Error(); got != "seat 1 cannot act while seat 0 is up" {
+		t.Fatalf("unexpected out-of-turn error %q", got)
+	}
+}
+
 func TestScoreSevenCardHand(t *testing.T) {
 	straightFlush, err := ScoreSevenCardHand([]CardCode{"Ah", "Kh", "Qh", "Jh", "Th", "2c", "3d"})
 	if err != nil {

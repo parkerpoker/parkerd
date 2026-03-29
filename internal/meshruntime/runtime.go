@@ -1969,8 +1969,10 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 					}
 				}
 				seatIndex := seat.SeatIndex
-				legalActions = game.GetLegalActions(table.ActiveHand.State, &seatIndex)
 				canAct = table.ActiveHand.State.ActingSeatIndex != nil && *table.ActiveHand.State.ActingSeatIndex == seat.SeatIndex
+				if canAct {
+					legalActions = game.GetLegalActions(table.ActiveHand.State, &seatIndex)
+				}
 			}
 			break
 		}

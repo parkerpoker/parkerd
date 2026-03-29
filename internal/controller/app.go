@@ -363,10 +363,14 @@ func (app *App) handleTableAction(writer http.ResponseWriter, request *http.Requ
 			return nil, controllerError{statusCode: http.StatusBadRequest, message: "payload.type is required"}
 		}
 		actionValue["type"] = actionType
-		return client.Request("meshSendAction", map[string]any{
+		response, err := client.Request("meshSendAction", map[string]any{
 			"payload": actionValue,
 			"tableId": request.PathValue("tableId"),
 		}, true)
+		if err != nil {
+			return nil, normalizeTableActionError(err)
+		}
+		return response, nil
 	})
 	if err != nil {
 		writeControllerError(writer, err)
@@ -645,6 +649,42 @@ func writeControllerError(writer http.ResponseWriter, err error) {
 		"error":      message,
 		"statusCode": statusCode,
 	})
+}
+
+func normalizeTableActionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := strings.TrimSpace(err.Error())
+	switch {
+	case message == "":
+		return err
+	case isTableActionBadRequest(message):
+		return controllerError{statusCode: http.StatusBadRequest, message: message}
+	default:
+		return err
+	}
+}
+
+func isTableActionBadRequest(message string) bool {
+	switch {
+	case strings.Contains(message, "cannot act while "):
+		return true
+	case strings.HasPrefix(message, "illegal "):
+		return true
+	case strings.HasPrefix(message, "action total "):
+		return true
+	case message == "hand already settled":
+		return true
+	case message == "hand is still starting":
+		return true
+	case message == "hand is not active":
+		return true
+	case strings.HasPrefix(message, "action request "):
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeBodyMap(request *http.Request) (map[string]any, error) {
