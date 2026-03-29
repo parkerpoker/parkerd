@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/dgraph-io/badger/v4"
 	"github.com/redis/go-redis/v9"
 
@@ -430,6 +430,21 @@ func openSQLStore(driverName, dsn string) (*sqlStore, error) {
 	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, err
+	}
+	if driverName == "sqlite" {
+		// The runtime drives table replication and protocol progress from multiple goroutines.
+		// Serializing the SQLite handle and enabling a small busy timeout keeps those internal
+		// races from surfacing as spurious SQLITE_BUSY errors during local reads and writes.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	store := &sqlStore{
 		db:         db,

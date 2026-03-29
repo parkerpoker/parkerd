@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"bytes"
@@ -10,26 +10,28 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/danieldresner/arkade_fun/internal/game"
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
-	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	"github.com/parkerpoker/parkerd/internal/game"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 type meshRuntime struct {
-	config           RuntimeConfig
+	config           cfg.RuntimeConfig
 	clearPeerURL     string
 	httpClient       *http.Client
 	lastSyncAt       map[string]time.Time
 	listener         net.Listener
 	mode             string
 	mu               sync.Mutex
-	peerInfoCache    map[string]nativePeerSelf
+	peerInfoCache    map[string]nativeCachedPeerInfo
 	peerIdentity     settlementcore.ScopedIdentity
 	profileName      string
 	profileStore     *walletpkg.ProfileStore
@@ -56,7 +58,7 @@ const (
 	nativeTableSyncAuthMaxAge      = 15 * time.Second
 )
 
-func newMeshRuntime(profileName string, config RuntimeConfig, mode string) (*meshRuntime, error) {
+func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (*meshRuntime, error) {
 	if mode == "" {
 		mode = "player"
 	}
@@ -69,7 +71,7 @@ func newMeshRuntime(profileName string, config RuntimeConfig, mode string) (*mes
 		httpClient:    &http.Client{Timeout: 5 * time.Second},
 		lastSyncAt:    map[string]time.Time{},
 		mode:          mode,
-		peerInfoCache: map[string]nativePeerSelf{},
+		peerInfoCache: map[string]nativeCachedPeerInfo{},
 		profileName:   profileName,
 		profileStore:  walletpkg.NewProfileStore(config.ProfileDir),
 		store:         store,
@@ -198,6 +200,9 @@ func (runtime *meshRuntime) Tick() {
 							return err
 						}
 					}
+					if err := runtime.advanceHandProtocolLocked(latest); err != nil {
+						return err
+					}
 					return runtime.persistAndReplicate(latest, true)
 				})
 			}
@@ -206,14 +211,23 @@ func (runtime *meshRuntime) Tick() {
 
 		if runtime.shouldPollHost(tableID) && table.CurrentHost.Peer.PeerURL != "" {
 			if remote, err := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID); err == nil && remote != nil {
-				_ = runtime.acceptRemoteTable(*remote)
-				runtime.lastSyncAt[tableID] = time.Now()
-				table = remote
+				if err := runtime.acceptRemoteTable(*remote); err == nil {
+					runtime.lastSyncAt[tableID] = time.Now()
+					table, _ = runtime.store.readTable(tableID)
+				}
 			}
 		}
 
+		if table != nil && protocolDeadlineExpired(*table) && runtime.shouldHandleFailover(*table) {
+			if err := runtime.forceProtocolFailover(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
+				table, _ = runtime.store.readTable(tableID)
+			}
+		}
 		if table != nil && elapsedMillis(table.LastHostHeartbeatAt) > nativeHostFailureMS && runtime.shouldHandleFailover(*table) {
 			_ = runtime.failoverTable(tableID, "missed host heartbeats")
+		}
+		if table != nil {
+			go runtime.driveLocalHandProtocol(tableID)
 		}
 	}
 }
@@ -508,7 +522,11 @@ func (runtime *meshRuntime) JoinTable(inviteCode string, buyInSats int) (NativeM
 	if err := runtime.acceptRemoteTable(table); err != nil {
 		return NativeMeshTableView{}, err
 	}
-	return runtime.localTableView(table), nil
+	accepted, err := runtime.requireLocalTable(table.Config.TableID)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	return runtime.localTableView(*accepted), nil
 }
 
 func (runtime *meshRuntime) GetTable(tableID string) (NativeMeshTableView, error) {
@@ -542,6 +560,14 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (Nati
 	if table == nil {
 		return NativeMeshTableView{}, fmt.Errorf("table %s not found", tableID)
 	}
+	if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && table.ActiveHand != nil && !game.PhaseAllowsActions(table.ActiveHand.State.Phase) && table.CurrentHost.Peer.PeerURL != "" {
+		remote, fetchErr := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
+		if fetchErr == nil && remote != nil {
+			if acceptErr := runtime.acceptRemoteTable(*remote); acceptErr == nil {
+				table, _ = runtime.store.readTable(tableID)
+			}
+		}
+	}
 	request, err := runtime.buildSignedActionRequest(*table, action)
 	if err != nil {
 		return NativeMeshTableView{}, err
@@ -558,7 +584,11 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (Nati
 	if err := runtime.acceptRemoteTable(updated); err != nil {
 		return NativeMeshTableView{}, err
 	}
-	return runtime.localTableView(updated), nil
+	accepted, err := runtime.requireLocalTable(updated.Config.TableID)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	return runtime.localTableView(*accepted), nil
 }
 
 func (runtime *meshRuntime) RotateHost(tableID string) (NativeMeshTableView, error) {
@@ -679,7 +709,15 @@ func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState
 				return nil, err
 			}
 			runtime.lastSyncAt[tableID] = time.Now()
-			table = remote
+			table, err = runtime.store.readTable(tableID)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if table != nil && protocolDeadlineExpired(*table) && runtime.shouldHandleFailover(*table) {
+		if err := runtime.forceProtocolFailover(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
+			table, _ = runtime.store.readTable(tableID)
 		}
 	}
 	if table != nil && elapsedMillis(table.LastHostHeartbeatAt) > nativeHostFailureMS && runtime.shouldHandleFailover(*table) {
@@ -846,6 +884,7 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 				Status:            "active",
 				WalletPubkeyHex:   join.WalletPubkeyHex,
 			},
+			PeerURL:     join.Peer.PeerURL,
 			ProfileName: join.ProfileName,
 		}
 		table.Seats = append(table.Seats, seat)
@@ -919,8 +958,6 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (n
 			return err
 		}
 		table.ActiveHand.State = nextState
-		publicState := runtime.publicStateFromHand(*table, nextState)
-		table.PublicState = &publicState
 		if err := runtime.appendEvent(table, map[string]any{
 			"type": "PlayerAction",
 			"intent": map[string]any{
@@ -938,26 +975,8 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (n
 		}); err != nil {
 			return err
 		}
-		if nextState.Phase == game.StreetSettled {
-			table.Config.Status = "active"
-			snapshot, err := runtime.buildSnapshot(*table, publicState)
-			if err != nil {
-				return err
-			}
-			table.LatestSnapshot = &snapshot
-			table.LatestFullySignedSnapshot = &snapshot
-			table.Snapshots = append(table.Snapshots, snapshot)
-			if err := runtime.appendEvent(table, map[string]any{
-				"type":           "HandResult",
-				"balances":       publicState.ChipBalances,
-				"checkpointHash": runtime.snapshotHash(snapshot),
-				"handId":         nextState.HandID,
-				"publicState":    rawJSONMap(publicState),
-				"winners":        rawJSONMap(nextState.Winners),
-			}); err != nil {
-				return err
-			}
-			table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
+		if err := runtime.advanceHandProtocolLocked(table); err != nil {
+			return err
 		}
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
@@ -990,14 +1009,9 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 		handNumber = table.PublicState.HandNumber + 1
 	}
 	dealerSeat := (handNumber - 1) % 2
-	deckSeed, err := settlementcore.RandomHex(32)
-	if err != nil {
-		return err
-	}
 	hand, err := game.CreateHoldemHand(game.HoldemHandConfig{
 		BigBlindSats:    table.Config.BigBlindSats,
 		DealerSeatIndex: dealerSeat,
-		DeckSeedHex:     deckSeed,
 		HandID:          randomUUID(),
 		HandNumber:      handNumber,
 		Seats: [2]game.HoldemSeatConfig{
@@ -1009,42 +1023,39 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	if err != nil {
 		return err
 	}
-	commitmentRoot, err := settlementcore.HashStructuredDataHex(map[string]any{
-		"deckSeedHex": deckSeed,
-		"tableId":     table.Config.TableID,
-	})
-	if err != nil {
-		return err
-	}
-	holeCards := map[string][]string{}
-	for _, player := range hand.Players {
-		holeCards[player.PlayerID] = []string{string(player.HoleCards[0]), string(player.HoleCards[1])}
-	}
 	table.ActiveHand = &nativeActiveHand{
-		CommitmentRoot:      commitmentRoot,
-		HoleCardsByPlayerID: holeCards,
-		State:               hand,
+		Cards: nativeHandCardState{
+			PhaseDeadlineAt: addMillis(nowISO(), nativeHandProtocolTimeoutMS),
+			Transcript: game.HandTranscript{
+				HandID:     hand.HandID,
+				HandNumber: hand.HandNumber,
+				Records:    []game.HandTranscriptRecord{},
+				RootHash:   "",
+				TableID:    table.Config.TableID,
+			},
+		},
+		State: hand,
 	}
-	publicState := runtime.publicStateFromHand(*table, hand)
-	table.PublicState = &publicState
 	table.Config.Status = "active"
 	table.NextHandAt = ""
-	return runtime.appendEvent(table, map[string]any{
+	if err := runtime.appendEvent(table, map[string]any{
 		"type":            "HandStart",
 		"dealerSeatIndex": dealerSeat,
 		"handId":          hand.HandID,
 		"handNumber":      hand.HandNumber,
-		"publicState":     rawJSONMap(publicState),
-	})
+	}); err != nil {
+		return err
+	}
+	return runtime.advanceHandProtocolLocked(table)
 }
 
-func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
+func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostFailure bool, resetProtocolDeadline bool) error {
 	return runtime.store.withTableLock(tableID, func() error {
 		table, err := runtime.store.readTable(tableID)
 		if err != nil || table == nil {
 			return err
 		}
-		if elapsedMillis(table.LastHostHeartbeatAt) <= nativeHostFailureMS {
+		if requireHostFailure && elapsedMillis(table.LastHostHeartbeatAt) <= nativeHostFailureMS {
 			return nil
 		}
 		if !runtime.shouldHandleFailover(*table) {
@@ -1073,29 +1084,14 @@ func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
 		}); err != nil {
 			return err
 		}
-		active := table.PublicState != nil && table.PublicState.HandID != nil && table.PublicState.Phase != nil && table.PublicState.Phase != "settled"
-		if active && table.PublicState != nil && table.LatestFullySignedSnapshot != nil {
-			rollbackHash := runtime.snapshotHash(*table.LatestFullySignedSnapshot)
-			if err := runtime.appendEvent(table, map[string]any{
-				"type":                 "HandAbort",
-				"handId":               table.PublicState.HandID,
-				"reason":               reason,
-				"rollbackSnapshotHash": rollbackHash,
-			}); err != nil {
+		active := table.ActiveHand != nil && table.ActiveHand.State.Phase != game.StreetSettled && table.ActiveHand.State.Phase != game.StreetAborted
+		if active {
+			if resetProtocolDeadline {
+				setProtocolDeadline(table)
+			}
+			if err := runtime.advanceHandProtocolLocked(table); err != nil {
 				return err
 			}
-			restored := runtime.publicStateFromSnapshot(*table, *table.LatestFullySignedSnapshot)
-			table.PublicState = &restored
-			table.ActiveHand = nil
-			table.Config.Status = "ready"
-			table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
-			snapshot, err := runtime.buildSnapshot(*table, restored)
-			if err != nil {
-				return err
-			}
-			table.LatestSnapshot = &snapshot
-			table.LatestFullySignedSnapshot = &snapshot
-			table.Snapshots = append(table.Snapshots, snapshot)
 		} else {
 			table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
 			if err := runtime.startNextHandLocked(table); err != nil {
@@ -1104,6 +1100,14 @@ func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
 		}
 		return runtime.persistAndReplicate(table, true)
 	})
+}
+
+func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
+	return runtime.rotateHostTable(tableID, reason, true, true)
+}
+
+func (runtime *meshRuntime) forceProtocolFailover(tableID, reason string) error {
+	return runtime.rotateHostTable(tableID, reason, false, false)
 }
 
 func (runtime *meshRuntime) persistAndReplicate(table *nativeTableState, publish bool) error {
@@ -1129,18 +1133,7 @@ func (runtime *meshRuntime) persistAndReplicate(table *nativeTableState, publish
 }
 
 func (runtime *meshRuntime) syncPrivateAndFunds(table nativeTableState) error {
-	localState := map[string]any{
-		"auditBundlesByHandId": map[string]any{},
-		"myHoleCardsByHandId":  map[string]any{},
-	}
-	if table.ActiveHand != nil {
-		if cards, ok := table.ActiveHand.HoleCardsByPlayerID[runtime.walletID.PlayerID]; ok && len(cards) == 2 {
-			localState["myHoleCardsByHandId"] = map[string]any{
-				table.ActiveHand.State.HandID: cards,
-			}
-		}
-	}
-	if err := runtime.store.writePrivateState(table.Config.TableID, localState); err != nil {
+	if err := runtime.storeLocalHoleCards(table); err != nil {
 		return err
 	}
 	funds, err := runtime.store.readTableFunds()
@@ -1182,7 +1175,11 @@ func (runtime *meshRuntime) replicateTable(table nativeTableState) {
 		if seat.PeerID == runtime.selfPeerID() {
 			continue
 		}
-		if peerURL := runtime.knownPeerURL(seat.PeerID); peerURL != "" {
+		peerURL := seat.PeerURL
+		if peerURL == "" {
+			peerURL = runtime.knownPeerURL(seat.PeerID)
+		}
+		if peerURL != "" {
 			targets[peerURL] = seat.PlayerID
 		}
 	}
@@ -1386,16 +1383,20 @@ func (runtime *meshRuntime) publicStateFromHand(table nativeTableState, hand gam
 		actingSeat = *hand.ActingSeatIndex
 	}
 	phase := any(string(hand.Phase))
-	return NativePublicTableState{
-		ActingSeatIndex: actingSeat,
-		Board:           stringCards(hand.Board),
-		ChipBalances:    chipBalances,
-		CurrentBetSats:  hand.CurrentBetSats,
-		DealerCommitment: &NativeDealerCommitment{
+	var dealerCommitment *NativeDealerCommitment
+	if table.ActiveHand != nil && table.ActiveHand.Cards.Transcript.RootHash != "" {
+		dealerCommitment = &NativeDealerCommitment{
 			CommittedAt: nowISO(),
 			Mode:        nativeDealerMode,
-			RootHash:    table.ActiveHand.CommitmentRoot,
-		},
+			RootHash:    table.ActiveHand.Cards.Transcript.RootHash,
+		}
+	}
+	return NativePublicTableState{
+		ActingSeatIndex:      actingSeat,
+		Board:                stringCards(hand.Board),
+		ChipBalances:         chipBalances,
+		CurrentBetSats:       hand.CurrentBetSats,
+		DealerCommitment:     dealerCommitment,
 		DealerSeatIndex:      hand.DealerSeatIndex,
 		Epoch:                table.CurrentEpoch,
 		FoldedPlayerIDs:      folded,
@@ -1443,6 +1444,394 @@ func (runtime *meshRuntime) publicStateFromSnapshot(table nativeTableState, snap
 		TotalContributions:   zeroContributionsFromPlayers(snapshot.SeatedPlayers),
 		UpdatedAt:            nowISO(),
 	}
+}
+
+func comparableDealerCommitment(commitment *NativeDealerCommitment) *NativeDealerCommitment {
+	if commitment == nil {
+		return nil
+	}
+	comparable := cloneJSON(*commitment)
+	comparable.CommittedAt = ""
+	if strings.TrimSpace(comparable.RootHash) == "" {
+		return nil
+	}
+	return &comparable
+}
+
+func comparablePublicState(state *NativePublicTableState) *NativePublicTableState {
+	if state == nil {
+		return nil
+	}
+	comparable := cloneJSON(*state)
+	comparable.DealerCommitment = comparableDealerCommitment(comparable.DealerCommitment)
+	comparable.SnapshotID = ""
+	comparable.UpdatedAt = ""
+	return &comparable
+}
+
+func comparableSnapshotForReplay(snapshot *NativeCooperativeTableSnapshot) *NativeCooperativeTableSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	comparable := cloneJSON(*snapshot)
+	comparable.CreatedAt = ""
+	comparable.LatestEventHash = nil
+	comparable.Signatures = nil
+	comparable.SnapshotID = ""
+	return &comparable
+}
+
+func comparableSnapshotForHistory(snapshot *NativeCooperativeTableSnapshot) *NativeCooperativeTableSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	comparable := cloneJSON(*snapshot)
+	comparable.CreatedAt = ""
+	comparable.Signatures = nil
+	return &comparable
+}
+
+func comparableSnapshotForRollbackAnchor(snapshot *NativeCooperativeTableSnapshot) *NativeCooperativeTableSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	comparable := cloneJSON(*snapshot)
+	comparable.CreatedAt = ""
+	comparable.PreviousSnapshotHash = nil
+	comparable.Signatures = nil
+	comparable.SnapshotID = ""
+	return &comparable
+}
+
+func comparableSignedEvent(event NativeSignedTableEvent) NativeSignedTableEvent {
+	return cloneJSON(event)
+}
+
+func unsignedSignedTableEvent(event NativeSignedTableEvent) map[string]any {
+	unsigned := rawJSONMap(event)
+	delete(unsigned, "signature")
+	return unsigned
+}
+
+func unsignedSnapshot(snapshot NativeCooperativeTableSnapshot) map[string]any {
+	unsigned := rawJSONMap(snapshot)
+	delete(unsigned, "signatures")
+	return unsigned
+}
+
+type nativeAcceptedEventHistory struct {
+	ByHash   map[string]NativeSignedTableEvent
+	Hashes   []string
+	LastHash string
+}
+
+func (runtime *meshRuntime) acceptedEventHistory(table nativeTableState) (nativeAcceptedEventHistory, error) {
+	history := nativeAcceptedEventHistory{
+		ByHash: map[string]NativeSignedTableEvent{},
+		Hashes: []string{},
+	}
+	expectedPrevHash := ""
+	for index, event := range table.Events {
+		if event.TableID != table.Config.TableID {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d table id mismatch", index)
+		}
+		if event.NetworkID != table.Config.NetworkID {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d network mismatch", index)
+		}
+		if event.ProtocolVersion != nativeProtocolVersion {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d protocol version mismatch", index)
+		}
+		if event.Seq != index {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d sequence mismatch", index)
+		}
+		if event.MessageType != stringValue(event.Body["type"]) {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d message type mismatch", index)
+		}
+		if prevHash := strings.TrimSpace(stringValue(event.PrevEventHash)); prevHash != expectedPrevHash {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d previous hash mismatch", index)
+		}
+		unsigned := unsignedSignedTableEvent(event)
+		ok, err := settlementcore.VerifyStructuredData(event.SenderProtocolPubkeyHex, unsigned, event.Signature)
+		if err != nil {
+			return nativeAcceptedEventHistory{}, err
+		}
+		if !ok {
+			return nativeAcceptedEventHistory{}, fmt.Errorf("event %d signature is invalid", index)
+		}
+		eventHash, err := settlementcore.HashStructuredDataHex(unsigned)
+		if err != nil {
+			return nativeAcceptedEventHistory{}, err
+		}
+		expectedPrevHash = eventHash
+		history.ByHash[eventHash] = event
+		history.Hashes = append(history.Hashes, eventHash)
+	}
+	if strings.TrimSpace(table.LastEventHash) != expectedPrevHash {
+		return nativeAcceptedEventHistory{}, errors.New("table last event hash does not match accepted event history")
+	}
+	history.LastHash = expectedPrevHash
+	return history, nil
+}
+
+func (runtime *meshRuntime) validateAcceptedEventHistory(table nativeTableState) error {
+	_, err := runtime.acceptedEventHistory(table)
+	return err
+}
+
+func validateAcceptedEventAnchor(label string, anchor any, history nativeAcceptedEventHistory) error {
+	anchorHash := strings.TrimSpace(stringValue(anchor))
+	if anchorHash == "" {
+		if len(history.Hashes) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%s latest event hash is missing", label)
+	}
+	if _, ok := history.ByHash[anchorHash]; !ok {
+		return fmt.Errorf("%s latest event hash does not match accepted event history", label)
+	}
+	return nil
+}
+
+func findEventByType(events []NativeSignedTableEvent, eventType string) (NativeSignedTableEvent, bool) {
+	for _, event := range events {
+		if stringValue(event.Body["type"]) == eventType {
+			return event, true
+		}
+	}
+	return NativeSignedTableEvent{}, false
+}
+
+func findHandResultEventByCheckpoint(events []NativeSignedTableEvent, checkpointHash string) (NativeSignedTableEvent, bool) {
+	for _, event := range events {
+		if stringValue(event.Body["type"]) != "HandResult" {
+			continue
+		}
+		if strings.TrimSpace(stringValue(event.Body["checkpointHash"])) == checkpointHash {
+			return event, true
+		}
+	}
+	return NativeSignedTableEvent{}, false
+}
+
+func (runtime *meshRuntime) validateAcceptedEventAnchors(table nativeTableState, history nativeAcceptedEventHistory) error {
+	if table.PublicState != nil {
+		if err := validateAcceptedEventAnchor("public state", table.PublicState.LatestEventHash, history); err != nil {
+			return err
+		}
+		if table.ActiveHand != nil && strings.TrimSpace(stringValue(table.PublicState.LatestEventHash)) != history.LastHash {
+			return errors.New("active hand public state latest event hash does not match accepted event history")
+		}
+	}
+
+	for index, snapshot := range table.Snapshots {
+		if err := validateAcceptedEventAnchor(fmt.Sprintf("snapshot %d", index), snapshot.LatestEventHash, history); err != nil {
+			return err
+		}
+		checkpointHash := runtime.snapshotHash(snapshot)
+		if resultEvent, ok := findHandResultEventByCheckpoint(table.Events, checkpointHash); ok {
+			if strings.TrimSpace(stringValue(snapshot.LatestEventHash)) != strings.TrimSpace(stringValue(resultEvent.PrevEventHash)) {
+				return fmt.Errorf("snapshot %d latest event hash does not match its hand result anchor", index)
+			}
+			continue
+		}
+		if snapshot.HandNumber == 0 && stringValue(snapshot.HandID) == "" {
+			readyEvent, ok := findEventByType(table.Events, "TableReady")
+			if !ok {
+				return fmt.Errorf("snapshot %d is missing its table-ready event anchor", index)
+			}
+			if strings.TrimSpace(stringValue(snapshot.LatestEventHash)) != strings.TrimSpace(stringValue(readyEvent.PrevEventHash)) {
+				return fmt.Errorf("snapshot %d latest event hash does not match its table-ready anchor", index)
+			}
+			continue
+		}
+		if index > 0 {
+			previous := table.Snapshots[index-1]
+			if reflect.DeepEqual(comparableSnapshotForRollbackAnchor(&snapshot), comparableSnapshotForRollbackAnchor(&previous)) {
+				if strings.TrimSpace(stringValue(snapshot.LatestEventHash)) != strings.TrimSpace(stringValue(previous.LatestEventHash)) {
+					return fmt.Errorf("snapshot %d latest event hash does not match its rollback anchor", index)
+				}
+				continue
+			}
+		}
+		return fmt.Errorf("snapshot %d is not anchored by accepted event history", index)
+	}
+
+	if table.ActiveHand == nil && table.PublicState != nil && table.LatestSnapshot != nil {
+		if table.LatestSnapshot.HandNumber == 0 && stringValue(table.LatestSnapshot.HandID) == "" {
+			if strings.TrimSpace(stringValue(table.PublicState.LatestEventHash)) != history.LastHash {
+				return errors.New("ready public state latest event hash does not match accepted event history")
+			}
+		} else if strings.TrimSpace(stringValue(table.PublicState.LatestEventHash)) != strings.TrimSpace(stringValue(table.LatestSnapshot.LatestEventHash)) {
+			return errors.New("public state latest event hash does not match latest snapshot")
+		}
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) validateAcceptedSnapshotHistory(table nativeTableState, history nativeAcceptedEventHistory) error {
+	expectedPreviousSnapshotID := ""
+	seenSnapshotIDs := map[string]struct{}{}
+	snapshotsByID := map[string]NativeCooperativeTableSnapshot{}
+	for index, snapshot := range table.Snapshots {
+		if snapshot.TableID != table.Config.TableID {
+			return fmt.Errorf("snapshot %d table id mismatch", index)
+		}
+		if snapshot.Epoch > table.CurrentEpoch {
+			return fmt.Errorf("snapshot %d epoch exceeds table epoch", index)
+		}
+		if previousSnapshotID := strings.TrimSpace(stringValue(snapshot.PreviousSnapshotHash)); previousSnapshotID != expectedPreviousSnapshotID {
+			return fmt.Errorf("snapshot %d previous snapshot id mismatch", index)
+		}
+		if strings.TrimSpace(snapshot.SnapshotID) == "" {
+			return fmt.Errorf("snapshot %d is missing snapshot id", index)
+		}
+		if _, exists := seenSnapshotIDs[snapshot.SnapshotID]; exists {
+			return fmt.Errorf("duplicate snapshot id %q", snapshot.SnapshotID)
+		}
+		seenSnapshotIDs[snapshot.SnapshotID] = struct{}{}
+		snapshotsByID[snapshot.SnapshotID] = snapshot
+
+		unsigned := unsignedSnapshot(snapshot)
+		if len(snapshot.Signatures) == 0 {
+			return fmt.Errorf("snapshot %d is missing signatures", index)
+		}
+		for _, signature := range snapshot.Signatures {
+			ok, err := settlementcore.VerifyStructuredData(signature.SignerPubkeyHex, unsigned, signature.SignatureHex)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("snapshot %d signature is invalid", index)
+			}
+		}
+		expectedPreviousSnapshotID = snapshot.SnapshotID
+	}
+
+	if len(table.Snapshots) == 0 {
+		if table.LatestSnapshot != nil || table.LatestFullySignedSnapshot != nil {
+			return errors.New("latest snapshot pointers cannot be set without snapshot history")
+		}
+		return nil
+	}
+	if table.LatestSnapshot == nil {
+		return errors.New("latest snapshot is missing from accepted snapshot history")
+	}
+	latestSnapshot, ok := snapshotsByID[table.LatestSnapshot.SnapshotID]
+	if !ok {
+		return errors.New("latest snapshot does not belong to accepted snapshot history")
+	}
+	if !reflect.DeepEqual(comparableSnapshotForHistory(table.LatestSnapshot), comparableSnapshotForHistory(&latestSnapshot)) {
+		return errors.New("latest snapshot does not match accepted snapshot history")
+	}
+	if table.LatestFullySignedSnapshot != nil {
+		latestFullySignedSnapshot, ok := snapshotsByID[table.LatestFullySignedSnapshot.SnapshotID]
+		if !ok {
+			return errors.New("latest fully signed snapshot does not belong to accepted snapshot history")
+		}
+		if !reflect.DeepEqual(comparableSnapshotForHistory(table.LatestFullySignedSnapshot), comparableSnapshotForHistory(&latestFullySignedSnapshot)) {
+			return errors.New("latest fully signed snapshot does not match accepted snapshot history")
+		}
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) validateAcceptedHistoricalLedger(existing *nativeTableState, incoming nativeTableState) error {
+	history, err := runtime.acceptedEventHistory(incoming)
+	if err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedSnapshotHistory(incoming, history); err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedEventAnchors(incoming, history); err != nil {
+		return err
+	}
+	if existing == nil {
+		return nil
+	}
+	if len(incoming.Events) < len(existing.Events) {
+		return errors.New("accepted history would roll back table events")
+	}
+	if len(incoming.Snapshots) < len(existing.Snapshots) {
+		return errors.New("accepted history would roll back table snapshots")
+	}
+	for index := range existing.Events {
+		if !reflect.DeepEqual(comparableSignedEvent(existing.Events[index]), comparableSignedEvent(incoming.Events[index])) {
+			return fmt.Errorf("historical event %d was rewritten", index)
+		}
+	}
+	for index := range existing.Snapshots {
+		if !reflect.DeepEqual(comparableSnapshotForHistory(&existing.Snapshots[index]), comparableSnapshotForHistory(&incoming.Snapshots[index])) {
+			return fmt.Errorf("historical snapshot %d was rewritten", index)
+		}
+	}
+	return nil
+}
+
+func previousSnapshotForCurrentState(table nativeTableState) nativeTableState {
+	base := cloneJSON(table)
+	if base.ActiveHand == nil || base.ActiveHand.State.Phase != game.StreetSettled {
+		return base
+	}
+	handID := base.ActiveHand.State.HandID
+	if base.LatestSnapshot == nil || stringValue(base.LatestSnapshot.HandID) != handID {
+		return base
+	}
+	if len(base.Snapshots) > 0 && stringValue(base.Snapshots[len(base.Snapshots)-1].HandID) == handID {
+		base.Snapshots = append([]NativeCooperativeTableSnapshot(nil), base.Snapshots[:len(base.Snapshots)-1]...)
+	}
+	if len(base.Snapshots) == 0 {
+		base.LatestSnapshot = nil
+		base.LatestFullySignedSnapshot = nil
+		return base
+	}
+	latest := cloneJSON(base.Snapshots[len(base.Snapshots)-1])
+	base.LatestSnapshot = &latest
+	base.LatestFullySignedSnapshot = &latest
+	return base
+}
+
+func (runtime *meshRuntime) validateAcceptedPublicReplay(table nativeTableState) error {
+	if table.ActiveHand == nil {
+		return nil
+	}
+	replayedState, err := runtime.replayAcceptedHandState(table)
+	if err != nil {
+		return fmt.Errorf("active hand replay validation failed: %w", err)
+	}
+	if !reflect.DeepEqual(cloneJSON(table.ActiveHand.State), cloneJSON(replayedState)) {
+		return fmt.Errorf("active hand state does not match transcript replay: phase=%s expectedBoard=%v gotBoard=%v expectedWinners=%+v gotWinners=%+v expectedPlayers=%+v gotPlayers=%+v", replayedState.Phase, replayedState.Board, table.ActiveHand.State.Board, replayedState.Winners, table.ActiveHand.State.Winners, replayedState.Players, table.ActiveHand.State.Players)
+	}
+	if table.PublicState == nil {
+		return errors.New("active hand is missing public state")
+	}
+
+	base := previousSnapshotForCurrentState(table)
+	expectedPublic := runtime.publicStateFromHand(base, replayedState)
+	if !reflect.DeepEqual(comparablePublicState(table.PublicState), comparablePublicState(&expectedPublic)) {
+		return errors.New("public state does not match transcript replay")
+	}
+	if replayedState.Phase != game.StreetSettled {
+		return nil
+	}
+
+	if table.LatestSnapshot == nil {
+		return errors.New("settled hand is missing latest snapshot")
+	}
+	if table.LatestFullySignedSnapshot == nil {
+		return errors.New("settled hand is missing latest fully signed snapshot")
+	}
+	expectedSnapshot, err := runtime.buildSnapshot(base, expectedPublic)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(comparableSnapshotForReplay(table.LatestSnapshot), comparableSnapshotForReplay(&expectedSnapshot)) {
+		return errors.New("latest snapshot does not match transcript replay")
+	}
+	if !reflect.DeepEqual(comparableSnapshotForReplay(table.LatestFullySignedSnapshot), comparableSnapshotForReplay(&expectedSnapshot)) {
+		return errors.New("latest fully signed snapshot does not match transcript replay")
+	}
+	return nil
 }
 
 func (runtime *meshRuntime) buildSnapshot(table nativeTableState, publicState NativePublicTableState) (NativeCooperativeTableSnapshot, error) {
@@ -1510,8 +1899,10 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 			mySeatIndex = seat.SeatIndex
 			myPlayerID = seat.PlayerID
 			if table.ActiveHand != nil {
-				if cards, ok := table.ActiveHand.HoleCardsByPlayerID[seat.PlayerID]; ok && len(cards) == 2 {
-					myHoleCards = cards
+				if privateState, err := runtime.readTablePrivateState(table.Config.TableID); err == nil {
+					if cards, ok := privateState.MyHoleCardsByHandID[table.ActiveHand.State.HandID]; ok && len(cards) == 2 {
+						myHoleCards = append([]string(nil), cards...)
+					}
 				}
 				seatIndex := seat.SeatIndex
 				legalActions = game.GetLegalActions(table.ActiveHand.State, &seatIndex)
@@ -1676,49 +2067,83 @@ func (runtime *meshRuntime) currentTableID() string {
 	return profile.CurrentMeshTableID
 }
 
-func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) error {
+func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("accept remote table: %v", recovered)
+		}
+	}()
+
 	existing, err := runtime.store.readTable(table.Config.TableID)
 	if err != nil {
 		return err
 	}
-	if err := runtime.validateAcceptedRemoteTable(existing, table); err != nil {
+	accepted := cloneJSON(table)
+	if err := runtime.normalizeAcceptedActiveHand(existing, &accepted); err != nil {
 		return err
 	}
-	if err := runtime.store.writeTable(&table); err != nil {
+	if err := runtime.validateAcceptedRemoteTable(existing, accepted); err != nil {
 		return err
 	}
-	if err := runtime.store.rewriteEvents(table.Config.TableID, table.Events); err != nil {
+	if err := runtime.store.writeTable(&accepted); err != nil {
 		return err
 	}
-	if err := runtime.store.rewriteSnapshots(table.Config.TableID, table.Snapshots); err != nil {
+	if err := runtime.store.rewriteEvents(accepted.Config.TableID, accepted.Events); err != nil {
 		return err
 	}
-	if table.Advertisement != nil {
-		_ = runtime.store.upsertPublicAd(*table.Advertisement)
+	if err := runtime.store.rewriteSnapshots(accepted.Config.TableID, accepted.Snapshots); err != nil {
+		return err
+	}
+	if accepted.Advertisement != nil {
+		_ = runtime.store.upsertPublicAd(*accepted.Advertisement)
+	}
+	if accepted.CurrentHost.Peer.PeerURL != "" {
+		_ = runtime.saveKnownPeer(accepted.CurrentHost.Peer)
+	}
+	for _, witness := range accepted.Witnesses {
+		if witness.Peer.PeerURL != "" {
+			_ = runtime.saveKnownPeer(witness.Peer)
+		}
+	}
+	for _, seat := range accepted.Seats {
+		if seat.PeerURL == "" {
+			continue
+		}
+		_ = runtime.saveKnownPeer(NativePeerAddress{
+			Alias:             seat.Nickname,
+			LastSeenAt:        nowISO(),
+			PeerID:            seat.PeerID,
+			PeerURL:           seat.PeerURL,
+			ProtocolPubkeyHex: seat.ProtocolPubkeyHex,
+		})
 	}
 	profile, err := runtime.loadProfileState()
 	if err != nil {
 		return err
 	}
-	profile.CurrentMeshTableID = table.Config.TableID
+	profile.CurrentMeshTableID = accepted.Config.TableID
 	profile.CurrentTable = &walletpkg.TableSessionState{
-		InviteCode: table.InviteCode,
-		SeatIndex:  runtime.seatIndexForPlayer(table),
-		TableID:    table.Config.TableID,
+		InviteCode: accepted.InviteCode,
+		SeatIndex:  runtime.seatIndexForPlayer(accepted),
+		TableID:    accepted.Config.TableID,
 	}
-	profile.MeshTables[table.Config.TableID] = walletpkg.MeshTableReferenceState{
-		Config:       MustMarshalJSON(table.Config),
-		CurrentEpoch: table.CurrentEpoch,
-		HostPeerID:   table.CurrentHost.Peer.PeerID,
-		HostPeerURL:  table.CurrentHost.Peer.PeerURL,
-		Role:         runtime.roleForTable(table),
-		TableID:      table.Config.TableID,
-		Visibility:   table.Config.Visibility,
+	profile.MeshTables[accepted.Config.TableID] = walletpkg.MeshTableReferenceState{
+		Config:       MustMarshalJSON(accepted.Config),
+		CurrentEpoch: accepted.CurrentEpoch,
+		HostPeerID:   accepted.CurrentHost.Peer.PeerID,
+		HostPeerURL:  accepted.CurrentHost.Peer.PeerURL,
+		Role:         runtime.roleForTable(accepted),
+		TableID:      accepted.Config.TableID,
+		Visibility:   accepted.Config.Visibility,
 	}
 	if err := runtime.profileStore.Save(*profile); err != nil {
 		return err
 	}
-	return runtime.syncPrivateAndFunds(table)
+	if err := runtime.syncPrivateAndFunds(accepted); err != nil {
+		return err
+	}
+	go runtime.driveLocalHandProtocol(accepted.Config.TableID)
+	return nil
 }
 
 func (runtime *meshRuntime) seatIndexForPlayer(table nativeTableState) int {
@@ -2006,6 +2431,19 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 	if !runtime.isLocalTableParticipant(incoming) {
 		return errors.New("sync request does not target this daemon")
 	}
+	normalized := cloneJSON(incoming)
+	if err := runtime.normalizeAcceptedActiveHand(existing, &normalized); err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedHandTranscript(normalized); err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedPublicReplay(normalized); err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedHistoricalLedger(existing, normalized); err != nil {
+		return err
+	}
 	if existing == nil {
 		return nil
 	}
@@ -2016,9 +2454,6 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 		if senderPeerID != existing.CurrentHost.Peer.PeerID {
 			return errors.New("sync request sender does not match the current host")
 		}
-		if incoming.CurrentHost.Peer.PeerID != existing.CurrentHost.Peer.PeerID {
-			return errors.New("sync request changed host without advancing epoch")
-		}
 		if len(incoming.Events) < len(existing.Events) {
 			return errors.New("sync request would roll back table events")
 		}
@@ -2026,8 +2461,8 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 			return errors.New("sync request would roll back table snapshots")
 		}
 	}
-	if incoming.CurrentEpoch > existing.CurrentEpoch && !runtime.isAuthorizedRemoteHost(existing, incoming.CurrentHost.Peer.PeerID) {
-		return errors.New("sync request advanced to an unauthorized host")
+	if err := runtime.validateAcceptedHostTransition(existing, incoming, "sync request"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2035,6 +2470,15 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
 	if !runtime.isLocalTableParticipant(incoming) {
 		return errors.New("remote table does not target this daemon")
+	}
+	if err := runtime.validateAcceptedHandTranscript(incoming); err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedPublicReplay(incoming); err != nil {
+		return err
+	}
+	if err := runtime.validateAcceptedHistoricalLedger(existing, incoming); err != nil {
+		return err
 	}
 	if existing == nil {
 		return nil
@@ -2048,6 +2492,47 @@ func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableSta
 		}
 		if len(incoming.Snapshots) < len(existing.Snapshots) {
 			return errors.New("remote table would roll back table snapshots")
+		}
+	}
+	if err := runtime.validateAcceptedHostTransition(existing, incoming, "remote table"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) validateAcceptedHostTransition(existing *nativeTableState, incoming nativeTableState, source string) error {
+	if existing == nil {
+		return nil
+	}
+	if incoming.CurrentEpoch == existing.CurrentEpoch && incoming.CurrentHost.Peer.PeerID != existing.CurrentHost.Peer.PeerID {
+		return fmt.Errorf("%s changed host without advancing epoch", source)
+	}
+	if incoming.CurrentEpoch > existing.CurrentEpoch && incoming.CurrentHost.Peer.PeerID == existing.CurrentHost.Peer.PeerID {
+		return fmt.Errorf("%s advanced epoch without rotating host", source)
+	}
+	if incoming.CurrentEpoch > existing.CurrentEpoch {
+		expectedHost, ok := runtime.authorizedRemoteHostPeer(existing, incoming.CurrentHost.Peer.PeerID)
+		if !ok {
+			return fmt.Errorf("%s advanced to an unauthorized host", source)
+		}
+		if strings.TrimSpace(expectedHost.ProtocolPubkeyHex) == "" || strings.TrimSpace(expectedHost.PeerURL) == "" {
+			return fmt.Errorf("%s advanced to host without a verifiable endpoint identity", source)
+		}
+		if incoming.CurrentHost.Peer.ProtocolPubkeyHex != expectedHost.ProtocolPubkeyHex {
+			return fmt.Errorf("%s advanced to host with unexpected protocol key", source)
+		}
+		if incoming.CurrentHost.Peer.PeerURL != expectedHost.PeerURL {
+			return fmt.Errorf("%s advanced to host with unexpected endpoint", source)
+		}
+		peerSelf, err := runtime.fetchPeerInfo(incoming.CurrentHost.Peer.PeerURL)
+		if err != nil {
+			return fmt.Errorf("%s host endpoint verification failed: %w", source, err)
+		}
+		if peerSelf.Peer.PeerID != incoming.CurrentHost.Peer.PeerID {
+			return fmt.Errorf("%s host endpoint peer id mismatch", source)
+		}
+		if peerSelf.Peer.ProtocolPubkeyHex != incoming.CurrentHost.Peer.ProtocolPubkeyHex {
+			return fmt.Errorf("%s host endpoint protocol key mismatch", source)
 		}
 	}
 	return nil
@@ -2066,27 +2551,43 @@ func (runtime *meshRuntime) isLocalTableParticipant(table nativeTableState) bool
 }
 
 func (runtime *meshRuntime) isAuthorizedRemoteHost(table *nativeTableState, candidatePeerID string) bool {
+	_, ok := runtime.authorizedRemoteHostPeer(table, candidatePeerID)
+	return ok
+}
+
+func (runtime *meshRuntime) authorizedRemoteHostPeer(table *nativeTableState, candidatePeerID string) (NativePeerAddress, bool) {
 	if table == nil || candidatePeerID == "" {
-		return false
+		return NativePeerAddress{}, false
 	}
 	if candidatePeerID == table.CurrentHost.Peer.PeerID {
-		return true
+		return cloneJSON(table.CurrentHost.Peer), true
 	}
 	for _, witness := range table.Witnesses {
 		if witness.Peer.PeerID == candidatePeerID {
-			return true
+			return cloneJSON(witness.Peer), true
 		}
 	}
 	if len(table.Witnesses) > 0 {
-		return false
+		return NativePeerAddress{}, false
 	}
 	lowestPeerID := ""
+	var lowestSeat *nativeSeatRecord
 	for _, seat := range table.Seats {
 		if lowestPeerID == "" || seat.PeerID < lowestPeerID {
 			lowestPeerID = seat.PeerID
+			seatClone := seat
+			lowestSeat = &seatClone
 		}
 	}
-	return candidatePeerID == lowestPeerID
+	if candidatePeerID != lowestPeerID || lowestSeat == nil {
+		return NativePeerAddress{}, false
+	}
+	return NativePeerAddress{
+		Alias:             lowestSeat.Nickname,
+		PeerID:            lowestSeat.PeerID,
+		PeerURL:           lowestSeat.PeerURL,
+		ProtocolPubkeyHex: lowestSeat.ProtocolPubkeyHex,
+	}, true
 }
 
 func timestampWithinWindow(timestamp string, maxAge time.Duration) bool {
@@ -2207,25 +2708,14 @@ func sanitizeActiveHandForNetwork(active *nativeActiveHand, visiblePlayerID stri
 	if active == nil {
 		return nil
 	}
+	_ = visiblePlayerID
 	sanitized := cloneJSON(*active)
 	sanitized.State = sanitizeHoldemStateForNetwork(sanitized.State)
-	sanitized.HoleCardsByPlayerID = map[string][]string{}
-	if visiblePlayerID != "" {
-		if cards, ok := active.HoleCardsByPlayerID[visiblePlayerID]; ok && len(cards) > 0 {
-			sanitized.HoleCardsByPlayerID[visiblePlayerID] = append([]string{}, cards...)
-		}
-	}
 	return &sanitized
 }
 
 func sanitizeHoldemStateForNetwork(state game.HoldemState) game.HoldemState {
-	sanitized := cloneJSON(state)
-	sanitized.DeckSeedHex = ""
-	sanitized.Runout = game.HoldemRunout{}
-	for index := range sanitized.Players {
-		sanitized.Players[index].HoleCards = [2]game.CardCode{}
-	}
-	return sanitized
+	return cloneJSON(state)
 }
 
 func cloneSnapshot(snapshot *NativeCooperativeTableSnapshot) *NativeCooperativeTableSnapshot {
@@ -2272,6 +2762,9 @@ func seatRecordForPlayer(table nativeTableState, playerID string) (nativeSeatRec
 func nativeActionDecisionIndex(table nativeTableState) (int, error) {
 	if table.ActiveHand == nil {
 		return 0, errors.New("hand is not active")
+	}
+	if !game.PhaseAllowsActions(table.ActiveHand.State.Phase) {
+		return 0, errors.New("hand is still starting")
 	}
 	return len(table.ActiveHand.State.ActionLog), nil
 }

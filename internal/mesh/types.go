@@ -1,6 +1,6 @@
 package mesh
 
-import parker "github.com/danieldresner/arkade_fun/internal"
+import "github.com/parkerpoker/parkerd/internal/meshruntime"
 
 type RuntimeMode string
 
@@ -11,16 +11,16 @@ const (
 	RuntimeModeIndexer RuntimeMode = "indexer"
 )
 
-type PeerAddress = parker.NativePeerAddress
-type RuntimeState = parker.NativeMeshRuntimeState
-type TableConfig = parker.NativeMeshTableConfig
-type TableSummary = parker.NativeTableSummary
-type SeatedPlayer = parker.NativeSeatedPlayer
-type DealerCommitment = parker.NativeDealerCommitment
-type PublicTableState = parker.NativePublicTableState
-type TableSnapshotSignature = parker.NativeTableSnapshotSignature
-type CooperativeTableSnapshot = parker.NativeCooperativeTableSnapshot
-type SignedTableEvent = parker.NativeSignedTableEvent
-type TableFundsOperation = parker.NativeTableFundsOperation
-type TableLocalView = parker.NativeTableLocalView
-type TableView = parker.NativeMeshTableView
+type PeerAddress = meshruntime.NativePeerAddress
+type RuntimeState = meshruntime.NativeMeshRuntimeState
+type TableConfig = meshruntime.NativeMeshTableConfig
+type TableSummary = meshruntime.NativeTableSummary
+type SeatedPlayer = meshruntime.NativeSeatedPlayer
+type DealerCommitment = meshruntime.NativeDealerCommitment
+type PublicTableState = meshruntime.NativePublicTableState
+type TableSnapshotSignature = meshruntime.NativeTableSnapshotSignature
+type CooperativeTableSnapshot = meshruntime.NativeCooperativeTableSnapshot
+type SignedTableEvent = meshruntime.NativeSignedTableEvent
+type TableFundsOperation = meshruntime.NativeTableFundsOperation
+type TableLocalView = meshruntime.NativeTableLocalView
+type TableView = meshruntime.NativeMeshTableView

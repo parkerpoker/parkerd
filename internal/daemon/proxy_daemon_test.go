@@ -1,4 +1,4 @@
-package parker
+package daemon
 
 import (
 	"encoding/hex"
@@ -6,10 +6,11 @@ import (
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil/bech32"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 func TestBootstrapRPCRejectsInvalidWalletNsec(t *testing.T) {
-	config, err := ResolveRuntimeConfig(FlagMap{
+	config, err := cfg.ResolveRuntimeConfig(map[string]string{
 		"datadir": t.TempDir(),
 		"mock":    "true",
 	})
@@ -37,7 +38,7 @@ func TestBootstrapRPCRejectsInvalidWalletNsec(t *testing.T) {
 }
 
 func TestWalletNsecRPCReturnsStoredSeed(t *testing.T) {
-	config, err := ResolveRuntimeConfig(FlagMap{
+	config, err := cfg.ResolveRuntimeConfig(map[string]string{
 		"datadir": t.TempDir(),
 		"mock":    "true",
 	})

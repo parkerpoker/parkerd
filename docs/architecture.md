@@ -2,7 +2,7 @@
 
 This document describes the architecture implemented today in this repository. It is intentionally current-state only.
 
-For protocol details, see [protocol.md](./protocol.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
+For protocol details, see [protocol.md](./protocol.md). For the current dealerless hand flow, see [dealerless.md](./dealerless.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Overview
 
@@ -15,10 +15,13 @@ Parker currently runs as a Go-first daemon workspace:
 - external browser clients can talk to the localhost controller
 - `scripts/bin/*` wrappers build and run the Go binaries on demand
 
-The peer runtime is host-authoritative today:
+The peer runtime is coordinator-led and dealerless today:
 
 - each participant runs a local daemon
-- the host accepts joins and actions, appends events, builds snapshots, and replicates table state
+- the current host coordinates joins, actions, failover, event append order, and replication
+- hidden cards flow through `dealerless-transcript-v1`, not a host-dealt deck seed
+- only the owning seat stores its own hole cards in plaintext locally after private delivery
+- non-host peers replay the accepted hand transcript, public state, and historical ledger before persistence
 - peer listeners expose a direct TCP transport on advertised `parker://` endpoints
 - public discovery remains optional through the indexer
 - the browser stays outside daemon custody and peer-to-peer transport
@@ -27,20 +30,20 @@ Daemons now advertise direct peer endpoints shaped like `parker://host:port` and
 
 ## Practical Repo Mapping
 
-- `cmd/parker-daemon` plus [`internal/mesh_runtime.go`](../internal/mesh_runtime.go) and [`internal/transport_wire.go`](../internal/transport_wire.go) are the gameplay and peer-transport runtime
-- `cmd/parker-cli` plus [`internal/client.go`](../internal/client.go) are the local CLI control surface
-- `cmd/parker-controller` plus [`internal/controller/app.go`](../internal/controller/app.go) are the localhost browser bridge
-- `cmd/parker-indexer` plus [`internal/indexer/app.go`](../internal/indexer/app.go) are the optional public ingest/read model
-- [`internal/storage/store.go`](../internal/storage/store.go) provides the runtime and indexer storage backends
-- [`internal/settlementcore/core.go`](../internal/settlementcore/core.go) implements canonical JSON hashing and signatures
-- [`internal/game`](../internal/game) contains the current heads-up Hold'em engine
+- `cmd/parker-daemon` plus `[internal/mesh_runtime.go](../internal/mesh_runtime.go)` and `[internal/transport_wire.go](../internal/transport_wire.go)` are the gameplay and peer-transport runtime
+- `cmd/parker-cli` plus `[internal/client.go](../internal/client.go)` are the local CLI control surface
+- `cmd/parker-controller` plus `[internal/controller/app.go](../internal/controller/app.go)` are the localhost browser bridge
+- `cmd/parker-indexer` plus `[internal/indexer/app.go](../internal/indexer/app.go)` are the optional public ingest/read model
+- `[internal/storage/store.go](../internal/storage/store.go)` provides the runtime and indexer storage backends
+- `[internal/settlementcore/core.go](../internal/settlementcore/core.go)` implements canonical JSON hashing and signatures
+- `[internal/game](../internal/game)` contains the current heads-up Hold'em engine
 - browser clients are maintained outside this repository
 
 ## Component Roles
 
 ### Daemon process
 
-`cmd/parker-daemon` starts [`internal/daemon.Service`](../internal/daemon/service.go), which currently wraps [`internal.ProxyDaemon`](../internal/proxy_daemon.go), the daemon runtime adapter in [`internal/daemon_runtime_adapter.go`](../internal/daemon_runtime_adapter.go), and the gameplay engine in [`internal/mesh_runtime.go`](../internal/mesh_runtime.go).
+`cmd/parker-daemon` starts `[internal/daemon.Service](../internal/daemon/service.go)`, which currently wraps `[internal.ProxyDaemon](../internal/proxy_daemon.go)`, the daemon runtime adapter in `[internal/daemon_runtime_adapter.go](../internal/daemon_runtime_adapter.go)`, and the gameplay engine in `[internal/mesh_runtime.go](../internal/mesh_runtime.go)`.
 
 This process owns:
 
@@ -108,7 +111,7 @@ Current runtime behavior is:
 - the current host is the peer recorded in `table.CurrentHost`
 - witness-listed peers are the peers recorded in `table.Witnesses`
 - seated players are the peers recorded in `table.Seats`
-- the host creates tables, accepts joins, sequences gameplay, appends events, and replicates table state
+- the host creates tables, accepts joins, coordinates gameplay, appends events, and replicates table state
 - witness-listed peers store replicated tables and can take over after stale host heartbeats
 - seated players own bankroll, join tables, submit actions, and execute local funds operations
 
@@ -118,7 +121,7 @@ The CLI still accepts `--mode indexer` for compatibility, but the actual public 
 
 ### Optional indexer
 
-`cmd/parker-indexer` is a standalone Go `net/http` service with a public read model stored through [`internal/storage/store.go`](../internal/storage/store.go).
+`cmd/parker-indexer` is a standalone Go `net/http` service with a public read model stored through `[internal/storage/store.go](../internal/storage/store.go)`.
 
 It accepts:
 
@@ -188,7 +191,7 @@ No remote peer talks to another peer's CLI or controller.
 
 ### Peer replication boundary
 
-The current Go runtime exchanges newline-delimited [`TransportEnvelope`](../internal/transport_types.go) JSON over direct TCP connections rather than `/native/*` HTTP routes.
+The current Go runtime exchanges newline-delimited `[TransportEnvelope](../internal/transport_types.go)` JSON over direct TCP connections rather than `/native/*` HTTP routes.
 
 Request message types are:
 
@@ -259,6 +262,8 @@ flowchart LR
   Nigiri -.->|"local regtest backing"| Arkade
 ```
 
+
+
 ## Example Deployment Topologies
 
 ### Minimal private table
@@ -307,11 +312,12 @@ The repository currently exercises these local shapes:
 
 ### Gameplay loop
 
-1. The host daemon starts the hand and derives hidden cards locally.
+1. The host daemon starts the hand, coordinates the dealerless transcript phases, and records the resulting transcript root in public state.
 2. Player daemons send signed `table.action.request` envelopes to the current host.
 3. The host validates the action signature and turn binding, advances public state, appends `PlayerAction`, and persists the updated table.
-4. When the hand settles, the host appends `HandResult`, builds a snapshot, and schedules the next hand.
-5. Each participating daemon updates its local table-funds checkpoint state from the replicated table copy.
+4. Each receiving daemon verifies the accepted hand transcript, public replay, and historical ledger before persisting the replicated table.
+5. When the hand settles, the host appends `HandResult`, builds a snapshot, and schedules the next hand.
+6. Each participating daemon updates its local table-funds checkpoint state from the replicated table copy.
 
 ### Public read flow
 
@@ -339,11 +345,12 @@ If the host stops updating `LastHostHeartbeatAt`:
 If the host disappears during an active hand and a snapshot already exists:
 
 - the failover daemon appends `HostRotated`
-- it appends `HandAbort`
-- it restores public state from the latest stored snapshot
-- it writes a fresh snapshot and continues from there
+- it replays the accepted transcript plus snapshot to decide whether the hand can continue
+- if required protocol records are missing or invalid, it appends `HandAbort`
+- it restores from the latest stored snapshot when abort is required
 
 ## Relationship To Other Docs
 
 - [protocol.md](./protocol.md): current controller routes, local RPC surface, peer transport, signed objects, and public-read protocol
+- [dealerless.md](./dealerless.md): current dealerless transcript flow, private card delivery, board opening, showdown, and failover semantics
 - [trust-model.md](./trust-model.md): guarantees, trust assumptions, and operational failure consequences

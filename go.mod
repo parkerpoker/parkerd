@@ -1,4 +1,4 @@
-module github.com/danieldresner/arkade_fun
+module github.com/parkerpoker/parkerd
 
 go 1.25.3
 

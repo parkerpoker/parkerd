@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"encoding/base64"
@@ -6,28 +6,30 @@ import (
 	"strings"
 	"time"
 
-	storepkg "github.com/danieldresner/arkade_fun/internal/storage"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	storepkg "github.com/parkerpoker/parkerd/internal/storage"
 )
 
 const (
-	nativeProtocolVersion   = "poker/v1"
-	nativeDealerMode        = "host-dealer-v1"
-	nativeFundsProvider     = "arkade-table-funds/v1"
-	nativeHostHeartbeatMS   = 1000
-	nativeHostFailureMS     = 3500
-	nativeNextHandDelayMS   = 1000
-	nativePollIntervalMS    = 500
-	nativeTableSyncInterval = 1 * time.Second
+	nativeProtocolVersion       = "poker/v1"
+	nativeDealerMode            = "dealerless-transcript-v1"
+	nativeFundsProvider         = "arkade-table-funds/v1"
+	nativeHostHeartbeatMS       = 1000
+	nativeHostFailureMS         = 3500
+	nativeHandProtocolTimeoutMS = 1500
+	nativeNextHandDelayMS       = 1000
+	nativePollIntervalMS        = 500
+	nativeTableSyncInterval     = 1 * time.Second
 )
 
 type meshStore struct {
-	config      RuntimeConfig
+	config      cfg.RuntimeConfig
 	profileName string
-	paths       ProfileDaemonPaths
+	paths       cfg.ProfileDaemonPaths
 	repository  *storepkg.RuntimeRepository
 }
 
-func newMeshStore(profileName string, config RuntimeConfig) (*meshStore, error) {
+func newMeshStore(profileName string, config cfg.RuntimeConfig) (*meshStore, error) {
 	repository, err := storepkg.OpenRuntimeRepository(config, profileName)
 	if err != nil {
 		return nil, err
@@ -35,7 +37,7 @@ func newMeshStore(profileName string, config RuntimeConfig) (*meshStore, error) 
 	return &meshStore{
 		config:      config,
 		profileName: profileName,
-		paths:       BuildProfileDaemonPaths(config.DaemonDir, profileName),
+		paths:       cfg.BuildProfileDaemonPaths(config.DaemonDir, profileName),
 		repository:  repository,
 	}, nil
 }

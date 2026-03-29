@@ -6,8 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	daemonpkg "github.com/danieldresner/arkade_fun/internal/daemon"
+	parker "github.com/parkerpoker/parkerd/internal"
 )
 
 func main() {
@@ -39,7 +38,7 @@ func run(argv []string) error {
 		}
 	}
 
-	daemon, err := daemonpkg.New(profile, config, mode)
+	daemon, err := parker.NewProxyDaemon(profile, config, mode)
 	if err != nil {
 		return err
 	}

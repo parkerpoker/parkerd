@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	controllerpkg "github.com/danieldresner/arkade_fun/internal/controller"
+	parker "github.com/parkerpoker/parkerd/internal"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	controllerpkg "github.com/parkerpoker/parkerd/internal/controller"
 )
 
 func main() {
@@ -21,7 +21,7 @@ func main() {
 
 func run(argv []string) error {
 	flags := parker.ParseFlagsOnly(argv)
-	runtimeConfig, err := cfg.ResolveRuntimeConfig(map[string]string(flags))
+	runtimeConfig, err := parker.ResolveRuntimeConfig(flags)
 	if err != nil {
 		return err
 	}

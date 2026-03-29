@@ -1,47 +1,49 @@
-package parker
+package meshruntime
 
 import (
 	"encoding/json"
 	"sort"
 	"strings"
 
-	storepkg "github.com/danieldresner/arkade_fun/internal/storage"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	storepkg "github.com/parkerpoker/parkerd/internal/storage"
+	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
 
-type transportStore struct {
-	config      RuntimeConfig
+type TransportStore struct {
+	config      cfg.RuntimeConfig
 	ownsRepo    bool
 	profileName string
-	paths       ProfileDaemonPaths
+	paths       cfg.ProfileDaemonPaths
 	repository  *storepkg.RuntimeRepository
 }
 
-func newTransportStore(profileName string, config RuntimeConfig) (*transportStore, error) {
+func NewTransportStore(profileName string, config cfg.RuntimeConfig) (*TransportStore, error) {
 	repository, err := storepkg.OpenRuntimeRepository(config, profileName)
 	if err != nil {
 		return nil, err
 	}
-	return newTransportStoreWithRepository(profileName, config, repository, true), nil
+	return NewTransportStoreWithRepository(profileName, config, repository, true), nil
 }
 
-func newTransportStoreWithRepository(profileName string, config RuntimeConfig, repository *storepkg.RuntimeRepository, ownsRepo bool) *transportStore {
-	return &transportStore{
+func NewTransportStoreWithRepository(profileName string, config cfg.RuntimeConfig, repository *storepkg.RuntimeRepository, ownsRepo bool) *TransportStore {
+	return &TransportStore{
 		config:      config,
 		ownsRepo:    ownsRepo,
 		profileName: profileName,
-		paths:       BuildProfileDaemonPaths(config.DaemonDir, profileName),
+		paths:       cfg.BuildProfileDaemonPaths(config.DaemonDir, profileName),
 		repository:  repository,
 	}
 }
 
-func (store *transportStore) close() error {
+func (store *TransportStore) Close() error {
 	if !store.ownsRepo {
 		return nil
 	}
 	return store.repository.Close()
 }
 
-func (store *transportStore) readManifest() (*TransportPeerManifest, error) {
+func (store *TransportStore) ReadManifest() (*transportpkg.TransportPeerManifest, error) {
 	data, err := store.repository.LoadTransportManifest()
 	if err != nil {
 		return nil, err
@@ -49,14 +51,14 @@ func (store *transportStore) readManifest() (*TransportPeerManifest, error) {
 	if len(strings.TrimSpace(string(data))) == 0 {
 		return nil, nil
 	}
-	var manifest TransportPeerManifest
+	var manifest transportpkg.TransportPeerManifest
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, err
 	}
 	return &manifest, nil
 }
 
-func (store *transportStore) writeManifest(manifest TransportPeerManifest) error {
+func (store *TransportStore) WriteManifest(manifest transportpkg.TransportPeerManifest) error {
 	data, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
@@ -65,17 +67,17 @@ func (store *transportStore) writeManifest(manifest TransportPeerManifest) error
 	return store.repository.SaveTransportManifest(data)
 }
 
-func (store *transportStore) listPeers() ([]TransportPeerSummary, error) {
+func (store *TransportStore) ListPeers() ([]transportpkg.TransportPeerSummary, error) {
 	records, err := store.repository.ListTransportPeers()
 	if err != nil {
 		return nil, err
 	}
-	peers := make([]TransportPeerSummary, 0, len(records))
+	peers := make([]transportpkg.TransportPeerSummary, 0, len(records))
 	for _, raw := range records {
 		if len(raw) == 0 {
 			continue
 		}
-		var peer TransportPeerSummary
+		var peer transportpkg.TransportPeerSummary
 		if err := json.Unmarshal(raw, &peer); err != nil {
 			return nil, err
 		}
@@ -85,7 +87,7 @@ func (store *transportStore) listPeers() ([]TransportPeerSummary, error) {
 	return peers, nil
 }
 
-func (store *transportStore) writePeer(peer TransportPeerSummary) error {
+func (store *TransportStore) WritePeer(peer transportpkg.TransportPeerSummary) error {
 	data, err := json.MarshalIndent(peer, "", "  ")
 	if err != nil {
 		return err
@@ -94,24 +96,24 @@ func (store *transportStore) writePeer(peer TransportPeerSummary) error {
 	return store.repository.SaveTransportPeer(peer.PeerID, data)
 }
 
-func (store *transportStore) queueState() (TransportQueueState, error) {
+func (store *TransportStore) QueueState() (transportpkg.TransportQueueState, error) {
 	outbox, err := store.repository.ListTransportOutbox()
 	if err != nil {
-		return TransportQueueState{}, err
+		return transportpkg.TransportQueueState{}, err
 	}
 	inbox, err := store.repository.ListTransportInbox()
 	if err != nil {
-		return TransportQueueState{}, err
+		return transportpkg.TransportQueueState{}, err
 	}
 	dedupe, err := store.repository.ListTransportDedupe()
 	if err != nil {
-		return TransportQueueState{}, err
+		return transportpkg.TransportQueueState{}, err
 	}
 	deadLetters, err := store.repository.ListTransportDeadLetters()
 	if err != nil {
-		return TransportQueueState{}, err
+		return transportpkg.TransportQueueState{}, err
 	}
-	return TransportQueueState{
+	return transportpkg.TransportQueueState{
 		DeadLetter: len(deadLetters),
 		Dedupe:     len(dedupe),
 		Inbox:      len(inbox),
@@ -119,7 +121,7 @@ func (store *transportStore) queueState() (TransportQueueState, error) {
 	}, nil
 }
 
-func (store *transportStore) saveOutbox(envelope TransportEnvelope) error {
+func (store *TransportStore) SaveOutbox(envelope transportpkg.TransportEnvelope) error {
 	data, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {
 		return err
@@ -128,7 +130,7 @@ func (store *transportStore) saveOutbox(envelope TransportEnvelope) error {
 	return store.repository.SaveTransportOutboxEntry(envelope.MessageID, data)
 }
 
-func (store *transportStore) saveInbox(envelope TransportEnvelope) error {
+func (store *TransportStore) SaveInbox(envelope transportpkg.TransportEnvelope) error {
 	data, err := json.MarshalIndent(envelope, "", "  ")
 	if err != nil {
 		return err
@@ -137,7 +139,7 @@ func (store *transportStore) saveInbox(envelope TransportEnvelope) error {
 	return store.repository.SaveTransportInboxEntry(envelope.MessageID, data)
 }
 
-func (store *transportStore) saveDedupe(record TransportDedupeRecord) error {
+func (store *TransportStore) SaveDedupe(record transportpkg.TransportDedupeRecord) error {
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
 		return err
@@ -146,7 +148,7 @@ func (store *transportStore) saveDedupe(record TransportDedupeRecord) error {
 	return store.repository.SaveTransportDedupeEntry(record.SenderPeerID+":"+record.DedupeKey, data)
 }
 
-func (store *transportStore) saveDeadLetter(entry TransportDeadLetter) error {
+func (store *TransportStore) SaveDeadLetter(entry transportpkg.TransportDeadLetter) error {
 	data, err := json.MarshalIndent(entry, "", "  ")
 	if err != nil {
 		return err

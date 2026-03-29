@@ -6,9 +6,8 @@ import (
 	"os"
 	"strconv"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	indexerpkg "github.com/danieldresner/arkade_fun/internal/indexer"
+	parker "github.com/parkerpoker/parkerd/internal"
+	indexerpkg "github.com/parkerpoker/parkerd/internal/indexer"
 )
 
 func main() {
@@ -20,7 +19,7 @@ func main() {
 
 func run(argv []string) error {
 	flags := parker.ParseFlagsOnly(argv)
-	runtimeConfig, err := cfg.ResolveRuntimeConfig(map[string]string(flags))
+	runtimeConfig, err := parker.ResolveRuntimeConfig(flags)
 	if err != nil {
 		return err
 	}

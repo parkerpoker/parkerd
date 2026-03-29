@@ -11,10 +11,11 @@ import (
 	"strings"
 	"time"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	"github.com/danieldresner/arkade_fun/internal/mesh"
-	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	daemonpkg "github.com/parkerpoker/parkerd/internal/daemon"
+	"github.com/parkerpoker/parkerd/internal/mesh"
+	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 const (
@@ -40,9 +41,9 @@ type App struct {
 }
 
 type DaemonRuntimeState struct {
-	Mesh      *mesh.RuntimeState            `json:"mesh,omitempty"`
-	Transport *parker.TransportRuntimeState `json:"transport,omitempty"`
-	Wallet    *walletpkg.WalletSummary      `json:"wallet,omitempty"`
+	Mesh      *mesh.RuntimeState                  `json:"mesh,omitempty"`
+	Transport *transportpkg.TransportRuntimeState `json:"transport,omitempty"`
+	Wallet    *walletpkg.WalletSummary            `json:"wallet,omitempty"`
 }
 
 type ProfileDaemonStatus struct {
@@ -144,7 +145,7 @@ func (app *App) registerRoutes() {
 	})
 
 	app.mux.HandleFunc("GET /api/local/profiles/{profile}/status", func(writer http.ResponseWriter, request *http.Request) {
-		response, err := app.withProfile(request.PathValue("profile"), func(summary walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+		response, err := app.withProfile(request.PathValue("profile"), func(summary walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 			status, err := typedInspect(client, false)
 			if err != nil {
 				return nil, err
@@ -167,7 +168,7 @@ func (app *App) registerRoutes() {
 			writeControllerError(writer, controllerError{statusCode: http.StatusBadRequest, message: err.Error()})
 			return
 		}
-		response, err := app.withProfile(request.PathValue("profile"), func(summary walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+		response, err := app.withProfile(request.PathValue("profile"), func(summary walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 			if err := client.EnsureRunning(parseMode(payload["mode"])); err != nil {
 				return nil, err
 			}
@@ -188,7 +189,7 @@ func (app *App) registerRoutes() {
 	})
 
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/daemon/stop", func(writer http.ResponseWriter, request *http.Request) {
-		response, err := app.withRunningProfile(request.PathValue("profile"), func(summary walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+		response, err := app.withRunningProfile(request.PathValue("profile"), func(summary walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 			if err := client.StopDaemon(); err != nil {
 				return nil, err
 			}
@@ -235,7 +236,7 @@ func (app *App) registerRoutes() {
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/tables/{tableId}/exit", app.tablePassthrough("meshExit"))
 
 	app.mux.HandleFunc("POST /api/local/profiles/{profile}/wallet/faucet", func(writer http.ResponseWriter, request *http.Request) {
-		response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+		response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 			payload, err := decodeBodyMap(request)
 			if err != nil {
 				return nil, controllerError{statusCode: http.StatusBadRequest, message: err.Error()}
@@ -272,7 +273,7 @@ func (app *App) registerRoutes() {
 
 func (app *App) daemonPassthrough(method string) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+		response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 			payload, err := decodeBodyMap(request)
 			if err != nil {
 				return nil, controllerError{statusCode: http.StatusBadRequest, message: err.Error()}
@@ -289,7 +290,7 @@ func (app *App) daemonPassthrough(method string) http.HandlerFunc {
 
 func (app *App) tablePassthrough(method string) http.HandlerFunc {
 	return func(writer http.ResponseWriter, request *http.Request) {
-		response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+		response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 			return client.Request(method, map[string]any{"tableId": request.PathValue("tableId")}, true)
 		})
 		if err != nil {
@@ -301,7 +302,7 @@ func (app *App) tablePassthrough(method string) http.HandlerFunc {
 }
 
 func (app *App) handleCreateTable(writer http.ResponseWriter, request *http.Request) {
-	response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+	response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 		payload, err := decodeBodyMap(request)
 		if err != nil {
 			return nil, controllerError{statusCode: http.StatusBadRequest, message: err.Error()}
@@ -323,7 +324,7 @@ func (app *App) handleCreateTable(writer http.ResponseWriter, request *http.Requ
 }
 
 func (app *App) handleTableAction(writer http.ResponseWriter, request *http.Request) {
-	response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+	response, err := app.withRunningProfile(request.PathValue("profile"), func(_ walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 		payload, err := decodeBodyMap(request)
 		if err != nil {
 			return nil, controllerError{statusCode: http.StatusBadRequest, message: err.Error()}
@@ -354,7 +355,7 @@ func (app *App) handleWatch(writer http.ResponseWriter, request *http.Request) e
 		return err
 	}
 
-	client := parker.NewClient(request.PathValue("profile"), app.config)
+	client := daemonpkg.NewClient(request.PathValue("profile"), app.config)
 	status, err := typedInspect(client, false)
 	if err != nil {
 		return err
@@ -486,18 +487,18 @@ func (app *App) requireProfileSummary(profile string) (walletpkg.LocalProfileSum
 	return *summary, nil
 }
 
-func (app *App) withProfile(profile string, fn func(walletpkg.LocalProfileSummary, *parker.Client) (any, error)) (any, error) {
+func (app *App) withProfile(profile string, fn func(walletpkg.LocalProfileSummary, *daemonpkg.Client) (any, error)) (any, error) {
 	summary, err := app.requireProfileSummary(profile)
 	if err != nil {
 		return nil, err
 	}
-	client := parker.NewClient(profile, app.config)
+	client := daemonpkg.NewClient(profile, app.config)
 	defer client.Close()
 	return fn(summary, client)
 }
 
-func (app *App) withRunningProfile(profile string, fn func(walletpkg.LocalProfileSummary, *parker.Client) (any, error)) (any, error) {
-	return app.withProfile(profile, func(summary walletpkg.LocalProfileSummary, client *parker.Client) (any, error) {
+func (app *App) withRunningProfile(profile string, fn func(walletpkg.LocalProfileSummary, *daemonpkg.Client) (any, error)) (any, error) {
+	return app.withProfile(profile, func(summary walletpkg.LocalProfileSummary, client *daemonpkg.Client) (any, error) {
 		status, err := typedInspect(client, false)
 		if err != nil {
 			return nil, err
@@ -509,7 +510,7 @@ func (app *App) withRunningProfile(profile string, fn func(walletpkg.LocalProfil
 	})
 }
 
-func typedInspect(client *parker.Client, autoStart bool) (ProfileDaemonStatus, error) {
+func typedInspect(client *daemonpkg.Client, autoStart bool) (ProfileDaemonStatus, error) {
 	rawStatus, err := client.Inspect(autoStart)
 	if err != nil {
 		return ProfileDaemonStatus{}, err
@@ -543,7 +544,7 @@ func typedInspect(client *parker.Client, autoStart bool) (ProfileDaemonStatus, e
 	}, nil
 }
 
-func waitForDaemonReachability(client *parker.Client, reachable bool, timeout time.Duration) (ProfileDaemonStatus, error) {
+func waitForDaemonReachability(client *daemonpkg.Client, reachable bool, timeout time.Duration) (ProfileDaemonStatus, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		status, err := typedInspect(client, false)

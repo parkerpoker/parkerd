@@ -76,11 +76,23 @@ func runSelectTableAction(argv []string) error {
 
 	alicePlayerID := flags.String("alice", "", "alice player id")
 	bobPlayerID := flags.String("bob", "", "bob player id")
+	avoidShowdown := flags.Bool("avoid-showdown", false, "prefer a fold before showdown")
+	var players namedPlayersFlag
+	flags.Var(&players, "player", "player mapping in the form profile=playerId")
 	if err := flags.Parse(argv); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*alicePlayerID) == "" || strings.TrimSpace(*bobPlayerID) == "" {
-		return errors.New("select-table-action requires --alice and --bob")
+	if len(players) == 0 {
+		if strings.TrimSpace(*alicePlayerID) == "" || strings.TrimSpace(*bobPlayerID) == "" {
+			return errors.New("select-table-action requires either two --player profile=playerId values or both --alice and --bob")
+		}
+		players = append(players,
+			namedPlayer{Profile: "alice", PlayerID: *alicePlayerID},
+			namedPlayer{Profile: "bob", PlayerID: *bobPlayerID},
+		)
+	}
+	if len(players) != 2 {
+		return errors.New("select-table-action requires exactly two players")
 	}
 
 	var envelope tableEnvelope
@@ -103,25 +115,31 @@ func runSelectTableAction(argv []string) error {
 		_, err := fmt.Fprintln(os.Stdout, "settled")
 		return err
 	}
-
-	aliceSeat, ok := findSeat(state.SeatedPlayers, *alicePlayerID)
-	if !ok {
-		return errors.New("missing alice seat")
-	}
-	bobSeat, ok := findSeat(state.SeatedPlayers, *bobPlayerID)
-	if !ok {
-		return errors.New("missing bob seat")
+	if !phaseAllowsTableActions(state.Phase) {
+		return nil
 	}
 
-	actor := "bob"
-	actorPlayerID := *bobPlayerID
+	firstPlayer := players[0]
+	secondPlayer := players[1]
+
+	firstSeat, ok := findSeat(state.SeatedPlayers, firstPlayer.PlayerID)
+	if !ok {
+		return fmt.Errorf("missing seat for %s", firstPlayer.Profile)
+	}
+	secondSeat, ok := findSeat(state.SeatedPlayers, secondPlayer.PlayerID)
+	if !ok {
+		return fmt.Errorf("missing seat for %s", secondPlayer.Profile)
+	}
+
+	actor := secondPlayer.Profile
+	actorPlayerID := secondPlayer.PlayerID
 	switch state.ActingSeatIndex {
-	case aliceSeat.SeatIndex:
-		actor = "alice"
-		actorPlayerID = *alicePlayerID
-	case bobSeat.SeatIndex:
+	case firstSeat.SeatIndex:
+		actor = firstPlayer.Profile
+		actorPlayerID = firstPlayer.PlayerID
+	case secondSeat.SeatIndex:
 	default:
-		return fmt.Errorf("acting seat %d does not match alice or bob", state.ActingSeatIndex)
+		return fmt.Errorf("acting seat %d does not match the configured players", state.ActingSeatIndex)
 	}
 
 	contribution := state.RoundContributions[actorPlayerID]
@@ -129,11 +147,18 @@ func runSelectTableAction(argv []string) error {
 
 	action := "check"
 	amount := ""
-	if state.Phase == "preflop" && toCall == 0 {
+	if *avoidShowdown && state.Phase == "river" && toCall == 0 {
+		action = "bet"
+		amount = strconv.Itoa(maxInt(state.MinRaiseToSats, 800))
+	} else if state.Phase == "preflop" && toCall == 0 {
 		action = "bet"
 		amount = strconv.Itoa(maxInt(state.MinRaiseToSats, 800))
 	} else if toCall > 0 {
-		action = "call"
+		if *avoidShowdown && state.Phase == "river" {
+			action = "fold"
+		} else {
+			action = "call"
+		}
 	}
 
 	if amount == "" {
@@ -142,6 +167,44 @@ func runSelectTableAction(argv []string) error {
 	}
 	_, err = fmt.Fprintf(os.Stdout, "%s %s %s\n", actor, action, amount)
 	return err
+}
+
+func phaseAllowsTableActions(phase string) bool {
+	switch phase {
+	case "preflop", "flop", "turn", "river":
+		return true
+	default:
+		return false
+	}
+}
+
+type namedPlayer struct {
+	Profile  string
+	PlayerID string
+}
+
+type namedPlayersFlag []namedPlayer
+
+func (flagValue *namedPlayersFlag) String() string {
+	parts := make([]string, 0, len(*flagValue))
+	for _, player := range *flagValue {
+		parts = append(parts, player.Profile+"="+player.PlayerID)
+	}
+	return strings.Join(parts, ",")
+}
+
+func (flagValue *namedPlayersFlag) Set(value string) error {
+	parts := strings.SplitN(strings.TrimSpace(value), "=", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("player mapping must be profile=playerId, got %q", value)
+	}
+	profile := strings.TrimSpace(parts[0])
+	playerID := strings.TrimSpace(parts[1])
+	if profile == "" || playerID == "" {
+		return fmt.Errorf("player mapping must be profile=playerId, got %q", value)
+	}
+	*flagValue = append(*flagValue, namedPlayer{Profile: profile, PlayerID: playerID})
+	return nil
 }
 
 type tableEnvelope struct {

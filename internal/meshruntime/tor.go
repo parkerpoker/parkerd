@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/danieldresner/arkade_fun/internal/torcontrol"
+	"github.com/parkerpoker/parkerd/internal/torcontrol"
 )
 
 type runtimeHiddenService struct {

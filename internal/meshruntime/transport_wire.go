@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"bufio"
@@ -16,10 +16,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/danieldresner/arkade_fun/internal/settlementcore"
+	"github.com/parkerpoker/parkerd/internal/settlementcore"
+	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
 
 const (
+	TransportWireVersion = 2
+
 	nativeTransportChannelDiscovery = "discovery"
 	nativeTransportChannelTable     = "table"
 	nativeTransportChannelSync      = "sync"
@@ -34,6 +37,8 @@ const (
 	nativeTransportMessageTableJoinResp = "table.join.response"
 	nativeTransportMessageTableActReq   = "table.action.request"
 	nativeTransportMessageTableActResp  = "table.action.response"
+	nativeTransportMessageTableHandReq  = "table.hand.request"
+	nativeTransportMessageTableHandResp = "table.hand.response"
 	nativeTransportMessageAck           = "ack"
 	nativeTransportMessageNack          = "nack"
 
@@ -41,6 +46,7 @@ const (
 	nativeTransportReadTimeout     = 10 * time.Second
 	nativeTransportWriteTimeout    = 20 * time.Second
 	nativeTransportExchangeTimeout = 20 * time.Second
+	nativePeerInfoCacheTTL         = 30 * time.Second
 )
 
 type nativeTransportError struct {
@@ -74,7 +80,7 @@ func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	}
 	_ = connection.SetReadDeadline(time.Time{})
 
-	var request TransportEnvelope
+	var request transportpkg.TransportEnvelope
 	if err := json.Unmarshal([]byte(line), &request); err != nil {
 		_ = connection.SetWriteDeadline(time.Now().Add(nativeTransportWriteTimeout))
 		_ = writeJSONLine(connection, runtime.plainNack("", err))
@@ -89,10 +95,17 @@ func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	_ = writeJSONLine(connection, response)
 }
 
-func (runtime *meshRuntime) handlePeerTransportEnvelope(request TransportEnvelope) (TransportEnvelope, error) {
+func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.TransportEnvelope) (response transportpkg.TransportEnvelope, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			response = transportpkg.TransportEnvelope{}
+			err = fmt.Errorf("transport handler panic: %v", recovered)
+		}
+	}()
+
 	body, sharedSecret, err := runtime.decodeIncomingEnvelope(request)
 	if err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
 
 	switch request.MessageType {
@@ -101,67 +114,77 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request TransportEnvelop
 	case nativeTransportMessageTablePull:
 		var fetch nativeTableFetchRequest
 		if err := json.Unmarshal(body, &fetch); err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		table, err := runtime.store.readTable(fetch.TableID)
 		if err != nil || table == nil {
-			return TransportEnvelope{}, fmt.Errorf("table %s not found", fetch.TableID)
+			return transportpkg.TransportEnvelope{}, fmt.Errorf("table %s not found", fetch.TableID)
 		}
 		viewerPlayerID := runtime.tableViewerPlayerIDFromFetch(fetch, *table)
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTablePush, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(*table, viewerPlayerID))
 	case nativeTransportMessageTableJoinReq:
 		var join nativeJoinRequest
 		if err := json.Unmarshal(body, &join); err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		table, err := runtime.handleJoinFromPeer(join)
 		if err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableJoinResp, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(table, join.WalletPlayerID))
 	case nativeTransportMessageTableActReq:
 		var action nativeActionRequest
 		if err := json.Unmarshal(body, &action); err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		table, err := runtime.handleActionFromPeer(action)
 		if err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableActResp, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(table, action.PlayerID))
+	case nativeTransportMessageTableHandReq:
+		var handMessage nativeHandMessageRequest
+		if err := json.Unmarshal(body, &handMessage); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		table, err := runtime.handleHandMessageFromPeer(handMessage)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableHandResp, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(table, handMessage.PlayerID))
 	case nativeTransportMessageTablePush:
 		var syncRequest nativeTableSyncRequest
 		if err := json.Unmarshal(body, &syncRequest); err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		if err := runtime.acceptTableSync(syncRequest); err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageAck, nativeTransportChannelSync, sharedSecret, map[string]any{"ok": true})
 	default:
-		return TransportEnvelope{}, fmt.Errorf("unsupported transport message type %q", request.MessageType)
+		return transportpkg.TransportEnvelope{}, fmt.Errorf("unsupported transport message type %q", request.MessageType)
 	}
 }
 
-func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request TransportEnvelope) (TransportEnvelope, error) {
+func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
 	connection, err := runtime.dialPeerTransport(peerURL)
 	if err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
 	defer connection.Close()
 
 	_ = connection.SetDeadline(time.Now().Add(nativeTransportExchangeTimeout))
 	if err := writeJSONLine(connection, request); err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
 
 	line, err := readTrimmedLine(bufio.NewReader(connection))
 	if err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
-	var response TransportEnvelope
+	var response transportpkg.TransportEnvelope
 	if err := json.Unmarshal([]byte(line), &response); err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
 	return response, nil
 }
@@ -186,6 +209,16 @@ func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return nativePeerSelf{}, err
 	}
+	if strings.TrimSpace(response.SignatureKeyID) == "" || response.SignatureKeyID != decoded.Peer.ProtocolPubkeyHex {
+		return nativePeerSelf{}, errors.New("peer manifest protocol key mismatch")
+	}
+	expectedProtocolID, err := settlementcore.DeriveScopedID(settlementcore.ProtocolIdentityScope, decoded.Peer.ProtocolPubkeyHex)
+	if err != nil {
+		return nativePeerSelf{}, err
+	}
+	if decoded.ProtocolID != expectedProtocolID {
+		return nativePeerSelf{}, errors.New("peer manifest protocol id mismatch")
+	}
 	runtime.cachePeerInfo(peerURL, decoded)
 	return decoded, nil
 }
@@ -194,11 +227,18 @@ func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 
-	peerInfo, ok := runtime.peerInfoCache[peerURL]
+	cached, ok := runtime.peerInfoCache[peerURL]
 	if !ok {
 		return nativePeerSelf{}, false
 	}
-	return peerInfo, true
+	if time.Since(cached.FetchedAt) > nativePeerInfoCacheTTL {
+		delete(runtime.peerInfoCache, peerURL)
+		if canonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); canonical != "" {
+			delete(runtime.peerInfoCache, canonical)
+		}
+		return nativePeerSelf{}, false
+	}
+	return cached.PeerSelf, true
 }
 
 func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
@@ -206,13 +246,17 @@ func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSel
 	defer runtime.mu.Unlock()
 
 	if runtime.peerInfoCache == nil {
-		runtime.peerInfoCache = map[string]nativePeerSelf{}
+		runtime.peerInfoCache = map[string]nativeCachedPeerInfo{}
+	}
+	cached := nativeCachedPeerInfo{
+		FetchedAt: time.Now(),
+		PeerSelf:  peerInfo,
 	}
 	if strings.TrimSpace(peerURL) != "" {
-		runtime.peerInfoCache[peerURL] = peerInfo
+		runtime.peerInfoCache[peerURL] = cached
 	}
 	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" {
-		runtime.peerInfoCache[canonical] = peerInfo
+		runtime.peerInfoCache[canonical] = cached
 	}
 }
 
@@ -257,6 +301,10 @@ func (runtime *meshRuntime) remoteJoin(peerURL string, input nativeJoinRequest) 
 
 func (runtime *meshRuntime) remoteAction(peerURL string, input nativeActionRequest) (nativeTableState, error) {
 	return runtime.sendPeerTableRequest(peerURL, nativeTransportMessageTableActReq, nativeTransportMessageTableActResp, input.TableID, input)
+}
+
+func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+	return runtime.sendPeerTableRequest(peerURL, nativeTransportMessageTableHandReq, nativeTransportMessageTableHandResp, input.TableID, input)
 }
 
 func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseType, tableID string, input any) (nativeTableState, error) {
@@ -315,15 +363,15 @@ func (runtime *meshRuntime) sendTableSync(peerURL string, input nativeTableSyncR
 	return nil
 }
 
-func (runtime *meshRuntime) encodeResponseEnvelope(request TransportEnvelope, messageType, channel string, sharedSecret []byte, body any) (TransportEnvelope, error) {
+func (runtime *meshRuntime) encodeResponseEnvelope(request transportpkg.TransportEnvelope, messageType, channel string, sharedSecret []byte, body any) (transportpkg.TransportEnvelope, error) {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
 	return runtime.buildEnvelope(messageType, channel, request.TableID, request.SenderPeerID, bodyBytes, sharedSecret, request.MessageID)
 }
 
-func (runtime *meshRuntime) nackFromRequest(request TransportEnvelope, err error) TransportEnvelope {
+func (runtime *meshRuntime) nackFromRequest(request transportpkg.TransportEnvelope, err error) transportpkg.TransportEnvelope {
 	sharedSecret, _ := runtime.sharedSecretForInbound(request)
 	envelope, nackErr := runtime.encodeResponseEnvelope(request, nativeTransportMessageNack, nativeTransportChannelSync, sharedSecret, nativeTransportError{Error: err.Error()})
 	if nackErr == nil {
@@ -332,19 +380,19 @@ func (runtime *meshRuntime) nackFromRequest(request TransportEnvelope, err error
 	return runtime.plainNack(request.MessageID, err)
 }
 
-func (runtime *meshRuntime) plainNack(retryOf string, err error) TransportEnvelope {
+func (runtime *meshRuntime) plainNack(retryOf string, err error) transportpkg.TransportEnvelope {
 	body, _ := json.Marshal(nativeTransportError{Error: err.Error()})
 	envelope, encodeErr := runtime.buildEnvelope(nativeTransportMessageNack, nativeTransportChannelSync, "", "", body, nil, retryOf)
 	if encodeErr != nil {
-		return TransportEnvelope{MessageType: nativeTransportMessageNack, RetryOf: retryOf}
+		return transportpkg.TransportEnvelope{MessageType: nativeTransportMessageNack, RetryOf: retryOf}
 	}
 	return envelope
 }
 
-func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, recipientID string, body any, recipientTransportPub string) (TransportEnvelope, string, error) {
+func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, recipientID string, body any, recipientTransportPub string) (transportpkg.TransportEnvelope, string, error) {
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return TransportEnvelope{}, "", err
+		return transportpkg.TransportEnvelope{}, "", err
 	}
 	var sharedSecret []byte
 	var requestKey string
@@ -352,18 +400,18 @@ func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, r
 		var ephemeralPub string
 		sharedSecret, requestKey, ephemeralPub, err = deriveOutboundSharedSecret(recipientTransportPub)
 		if err != nil {
-			return TransportEnvelope{}, "", err
+			return transportpkg.TransportEnvelope{}, "", err
 		}
 		envelope, err := runtime.buildEnvelope(messageType, channel, tableID, recipientID, bodyBytes, sharedSecret, "")
 		if err != nil {
-			return TransportEnvelope{}, "", err
+			return transportpkg.TransportEnvelope{}, "", err
 		}
 		envelope.EncryptionEphemeral = ephemeralPub
 		unsigned := rawJSONMap(envelope)
 		delete(unsigned, "signature")
 		envelope.Signature, err = settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
 		if err != nil {
-			return TransportEnvelope{}, "", err
+			return transportpkg.TransportEnvelope{}, "", err
 		}
 		return envelope, requestKey, nil
 	}
@@ -371,14 +419,14 @@ func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, r
 	return envelope, "", err
 }
 
-func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipientID string, body []byte, sharedSecret []byte, retryOf string) (TransportEnvelope, error) {
+func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipientID string, body []byte, sharedSecret []byte, retryOf string) (transportpkg.TransportEnvelope, error) {
 	messageID := randomUUID()
 	if retryOf != "" {
 		messageID = randomUUID()
 	}
 	createdAt := nowISO()
 	bodyHash := sha256.Sum256(body)
-	envelope := TransportEnvelope{
+	envelope := transportpkg.TransportEnvelope{
 		Attempt:              1,
 		BodyHash:             hex.EncodeToString(bodyHash[:]),
 		Channel:              channel,
@@ -393,12 +441,12 @@ func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipie
 		SenderPeerID:         runtime.selfPeerID(),
 		SignatureKeyID:       runtime.protocolIdentity.PublicKeyHex,
 		TableID:              tableID,
-		TransportWireVersion: transportWireVersion,
+		TransportWireVersion: TransportWireVersion,
 	}
 	if sharedSecret != nil {
 		nonce, ciphertext, err := encryptSharedSecret(sharedSecret, body)
 		if err != nil {
-			return TransportEnvelope{}, err
+			return transportpkg.TransportEnvelope{}, err
 		}
 		envelope.BodyCiphertext = base64.RawStdEncoding.EncodeToString(ciphertext)
 		envelope.EncryptionMode = nativeTransportEncryptionX25519GCM
@@ -411,14 +459,14 @@ func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipie
 	delete(unsigned, "signature")
 	signature, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
 	if err != nil {
-		return TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, err
 	}
 	envelope.Signature = signature
 	return envelope, nil
 }
 
-func (runtime *meshRuntime) decodeIncomingEnvelope(envelope TransportEnvelope) ([]byte, []byte, error) {
-	if envelope.TransportWireVersion != transportWireVersion {
+func (runtime *meshRuntime) decodeIncomingEnvelope(envelope transportpkg.TransportEnvelope) ([]byte, []byte, error) {
+	if envelope.TransportWireVersion != TransportWireVersion {
 		return nil, nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
@@ -441,11 +489,11 @@ func (runtime *meshRuntime) decodeIncomingEnvelope(envelope TransportEnvelope) (
 	return body, sharedSecret, nil
 }
 
-func (runtime *meshRuntime) decodeResponseEnvelope(envelope TransportEnvelope, requestKey string) ([]byte, error) {
+func (runtime *meshRuntime) decodeResponseEnvelope(envelope transportpkg.TransportEnvelope, requestKey string) ([]byte, error) {
 	if envelope.MessageType == nativeTransportMessageNack && strings.TrimSpace(envelope.Signature) == "" {
 		return nil, errors.New("transport request failed")
 	}
-	if envelope.TransportWireVersion != transportWireVersion {
+	if envelope.TransportWireVersion != TransportWireVersion {
 		return nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
@@ -478,14 +526,14 @@ func (runtime *meshRuntime) decodeResponseEnvelope(envelope TransportEnvelope, r
 	return body, nil
 }
 
-func (runtime *meshRuntime) sharedSecretForInbound(envelope TransportEnvelope) ([]byte, error) {
+func (runtime *meshRuntime) sharedSecretForInbound(envelope transportpkg.TransportEnvelope) ([]byte, error) {
 	if envelope.EncryptionMode == nativeTransportEncryptionNone {
 		return nil, nil
 	}
 	return deriveSharedSecretFromPrivate(runtime.transportPrivate, envelope.EncryptionEphemeral)
 }
 
-func decodeEnvelopeBody(envelope TransportEnvelope, sharedSecret []byte) ([]byte, error) {
+func decodeEnvelopeBody(envelope transportpkg.TransportEnvelope, sharedSecret []byte) ([]byte, error) {
 	body, err := base64.RawStdEncoding.DecodeString(envelope.BodyCiphertext)
 	if err != nil {
 		return nil, err

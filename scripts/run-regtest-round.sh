@@ -14,6 +14,7 @@ ALICE_PORT="${ALICE_PORT:-}"
 BOB_PORT="${BOB_PORT:-}"
 USE_TOR="${USE_TOR:-false}"
 SETUP_ONLY="${SETUP_ONLY:-false}"
+ROUND_SCENARIO="${ROUND_SCENARIO:-standard-4d}"
 PCLI_TIMEOUT_SECONDS="${PCLI_TIMEOUT_SECONDS:-}"
 TOR_TARGET_HOST="${TOR_TARGET_HOST:-host.docker.internal}"
 HOST_TOR_SOCKS_PORT="${HOST_TOR_SOCKS_PORT:-}"
@@ -30,6 +31,8 @@ NIGIRI_DATADIR="${NIGIRI_DATADIR:-$HOME/Library/Application Support/Nigiri/parke
 TOR_PROJECT="parker-round-$(printf '%s' "$BASE" | tr -cs '[:alnum:]' '-')"
 TOR_COMPOSE_FILE="$BASE/tor/docker-compose.yml"
 TOR_STATE_BASE="${TOR_STATE_BASE:-$ROOT_DIR/.tmp/tor-round/$TOR_PROJECT}"
+ROUND_SCENARIO_STANDARD="standard-4d"
+ROUND_SCENARIO_HOST_PLAYER="host-player-2d"
 
 common_flags=(
   --network regtest
@@ -55,6 +58,20 @@ tor_enabled() {
 
 setup_only_enabled() {
   setting_enabled "$SETUP_ONLY"
+}
+
+host_player_scenario_enabled() {
+  [[ "$ROUND_SCENARIO" == "$ROUND_SCENARIO_HOST_PLAYER" ]]
+}
+
+validate_round_scenario() {
+  case "$ROUND_SCENARIO" in
+    "$ROUND_SCENARIO_STANDARD"|"$ROUND_SCENARIO_HOST_PLAYER") ;;
+    *)
+      echo "unsupported ROUND_SCENARIO=$ROUND_SCENARIO" >&2
+      exit 1
+      ;;
+  esac
 }
 
 ensure_toolchains() {
@@ -148,6 +165,7 @@ cleanup() {
 trap cleanup EXIT INT TERM HUP
 
 ensure_toolchains
+validate_round_scenario
 
 command_timeout_seconds() {
   if [[ -n "$PCLI_TIMEOUT_SECONDS" ]]; then
@@ -686,7 +704,43 @@ start_nigiri_stack() {
 }
 
 select_table_action() {
-  pdevtool select-table-action --alice "$ALICE_PLAYER_ID" --bob "$BOB_PLAYER_ID"
+  local args=(
+    select-table-action
+    --player "$PLAYER_ONE_PROFILE=$PLAYER_ONE_PLAYER_ID"
+    --player "$PLAYER_TWO_PROFILE=$PLAYER_TWO_PLAYER_ID"
+  )
+  if host_player_scenario_enabled; then
+    args+=(--avoid-showdown)
+  fi
+  pdevtool "${args[@]}"
+}
+
+fund_and_onboard_profile() {
+  local profile="$1"
+  retry_pcli_json "$profile faucet" 20 1 wallet faucet "$FAUCET_SATS" --profile "$profile" --json >/dev/null
+  retry_pcli_json "$profile onboard" 20 1 wallet onboard --profile "$profile" --json >/dev/null
+}
+
+buy_in_profile() {
+  local profile="$1"
+
+  if tor_enabled; then
+    retry_pcli_json "$profile buy-in over Tor" 180 1 funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile "$profile" --json >/dev/null
+    return 0
+  fi
+
+  pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile "$profile" --json >/dev/null
+}
+
+cashout_profile() {
+  local profile="$1"
+
+  if tor_enabled; then
+    retry_pcli_json "$profile cashout over Tor" 60 1 funds cashout "$TABLE_ID" --profile "$profile" --json >/dev/null
+    return 0
+  fi
+
+  pcli funds cashout "$TABLE_ID" --profile "$profile" --json >/dev/null
 }
 
 send_table_action_with_retry() {
@@ -800,6 +854,7 @@ write_runtime_env() {
   local runtime_env_path="$BASE/runtime.env"
 
   {
+    printf 'export ROUND_SCENARIO=%q\n' "$ROUND_SCENARIO"
     printf 'export ROOT_DIR=%q\n' "$ROOT_DIR"
     printf 'export BASE=%q\n' "$BASE"
     printf 'export USE_TOR=%q\n' "$USE_TOR"
@@ -830,8 +885,13 @@ write_runtime_env() {
     printf 'export WITNESS_PEER_URL=%q\n' "${WITNESS_PEER_URL:-}"
     printf 'export ALICE_PEER_URL=%q\n' "${ALICE_PEER_URL:-}"
     printf 'export BOB_PEER_URL=%q\n' "${BOB_PEER_URL:-}"
+    printf 'export HOST_PLAYER_ID=%q\n' "${HOST_PLAYER_ID:-}"
     printf 'export ALICE_PLAYER_ID=%q\n' "${ALICE_PLAYER_ID:-}"
     printf 'export BOB_PLAYER_ID=%q\n' "${BOB_PLAYER_ID:-}"
+    printf 'export PLAYER_ONE_PROFILE=%q\n' "${PLAYER_ONE_PROFILE:-}"
+    printf 'export PLAYER_ONE_PLAYER_ID=%q\n' "${PLAYER_ONE_PLAYER_ID:-}"
+    printf 'export PLAYER_TWO_PROFILE=%q\n' "${PLAYER_TWO_PROFILE:-}"
+    printf 'export PLAYER_TWO_PLAYER_ID=%q\n' "${PLAYER_TWO_PLAYER_ID:-}"
     printf 'export INVITE_CODE=%q\n' "${INVITE_CODE:-}"
     printf 'export TABLE_ID=%q\n' "${TABLE_ID:-}"
     printf 'export TOR_PROJECT=%q\n' "$TOR_PROJECT"
@@ -852,6 +912,7 @@ print_local_stack_summary() {
   local runtime_env_path="$BASE/runtime.env"
 
   echo "Local regtest stack is ready."
+  printf 'ROUND_SCENARIO=%s\n' "$ROUND_SCENARIO"
   printf 'BASE=%s\n' "$BASE"
   printf 'RUNTIME_ENV=%s\n' "$runtime_env_path"
   printf 'INDEXER_URL=http://127.0.0.1:%s\n' "$INDEXER_PORT"
@@ -879,19 +940,15 @@ play_hand_automatically() {
   local amount=""
   local current_bet=""
   local pot_sats=""
-  local turns=30
+  local turns=60
   local turn
 
   if tor_enabled; then
-    turns=120
+    turns=180
   fi
 
   for ((turn = 0; turn < turns; turn += 1)); do
-    if tor_enabled; then
-      state_json="$(watch_table_state_with_retry host)"
-    else
-      state_json="$(watch_table_state_with_retry alice)"
-    fi
+    state_json="$(watch_table_state_with_retry "$WATCH_PROFILE")"
     hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId)"
     hand_number="$(printf '%s' "$state_json" | json_field data.publicState.handNumber)"
     phase="$(printf '%s' "$state_json" | json_field data.publicState.phase)"
@@ -984,6 +1041,25 @@ if tor_enabled; then
   )
 fi
 
+PLAYER_ONE_PROFILE="alice"
+PLAYER_ONE_PLAYER_ID=""
+PLAYER_ONE_PEER_ID=""
+PLAYER_ONE_PEER_URL=""
+PLAYER_TWO_PROFILE="bob"
+PLAYER_TWO_PLAYER_ID=""
+PLAYER_TWO_PEER_ID=""
+PLAYER_TWO_PEER_URL=""
+WATCH_PROFILE="alice"
+
+if host_player_scenario_enabled; then
+  PLAYER_ONE_PROFILE="host"
+  PLAYER_TWO_PROFILE="alice"
+  WATCH_PROFILE="host"
+fi
+if tor_enabled; then
+  WATCH_PROFILE="host"
+fi
+
 start_nigiri_stack
 
 if tor_enabled; then
@@ -1006,73 +1082,119 @@ sleep 2
 echo "Starting daemons..."
 start_profile_daemon host host "$HOST_PORT" "$BASE/host.log" "$HOST_TOR_SOCKS_PORT" "$HOST_TOR_CONTROL_PORT" "$TOR_STATE_BASE/host/control_auth_cookie"
 HOST_DAEMON_PID="$LAUNCHED_PID"
-start_profile_daemon witness witness "$WITNESS_PORT" "$BASE/witness.log" "$WITNESS_TOR_SOCKS_PORT" "$WITNESS_TOR_CONTROL_PORT" "$TOR_STATE_BASE/witness/control_auth_cookie"
-WITNESS_DAEMON_PID="$LAUNCHED_PID"
+if ! host_player_scenario_enabled; then
+  start_profile_daemon witness witness "$WITNESS_PORT" "$BASE/witness.log" "$WITNESS_TOR_SOCKS_PORT" "$WITNESS_TOR_CONTROL_PORT" "$TOR_STATE_BASE/witness/control_auth_cookie"
+  WITNESS_DAEMON_PID="$LAUNCHED_PID"
+fi
 start_profile_daemon alice player "$ALICE_PORT" "$BASE/alice.log" "$ALICE_TOR_SOCKS_PORT" "$ALICE_TOR_CONTROL_PORT" "$TOR_STATE_BASE/alice/control_auth_cookie"
 ALICE_DAEMON_PID="$LAUNCHED_PID"
-start_profile_daemon bob player "$BOB_PORT" "$BASE/bob.log" "$BOB_TOR_SOCKS_PORT" "$BOB_TOR_CONTROL_PORT" "$TOR_STATE_BASE/bob/control_auth_cookie"
-BOB_DAEMON_PID="$LAUNCHED_PID"
+if ! host_player_scenario_enabled; then
+  start_profile_daemon bob player "$BOB_PORT" "$BASE/bob.log" "$BOB_TOR_SOCKS_PORT" "$BOB_TOR_CONTROL_PORT" "$TOR_STATE_BASE/bob/control_auth_cookie"
+  BOB_DAEMON_PID="$LAUNCHED_PID"
+fi
 
 sleep 2
 
 assert_go_daemon_active host
-assert_go_daemon_active witness
 assert_go_daemon_active alice
-assert_go_daemon_active bob
 wait_for_daemon_reachable host
-wait_for_daemon_reachable witness
 wait_for_daemon_reachable alice
-wait_for_daemon_reachable bob
+if ! host_player_scenario_enabled; then
+  assert_go_daemon_active witness
+  assert_go_daemon_active bob
+  wait_for_daemon_reachable witness
+  wait_for_daemon_reachable bob
+fi
 echo "Verified Go daemon ownership via metadata PID, startup banner, and live socket reachability."
 
 echo "Bootstrapping identities..."
 HOST_BOOT="$(pcli bootstrap Host --profile host --json)"
-WITNESS_BOOT="$(pcli bootstrap Witness --profile witness --json)"
 ALICE_BOOT="$(pcli bootstrap Alice --profile alice --json)"
-BOB_BOOT="$(pcli bootstrap Bob --profile bob --json)"
+if ! host_player_scenario_enabled; then
+  WITNESS_BOOT="$(pcli bootstrap Witness --profile witness --json)"
+  BOB_BOOT="$(pcli bootstrap Bob --profile bob --json)"
+fi
 HOST_PEER_ID="$(printf '%s' "$HOST_BOOT" | json_field data.transport.peer.peerId)"
+HOST_PLAYER_ID="$(printf '%s' "$HOST_BOOT" | json_field data.transport.peer.walletPlayerId)"
 HOST_PEER_URL="$(wait_for_peer_url host "$(if tor_enabled; then printf 'true'; else printf 'false'; fi)")"
 if tor_enabled; then
-  WITNESS_PEER_URL="$(wait_for_peer_url witness true)"
   ALICE_PEER_URL="$(wait_for_peer_url alice true)"
-  BOB_PEER_URL="$(wait_for_peer_url bob true)"
+  if ! host_player_scenario_enabled; then
+    WITNESS_PEER_URL="$(wait_for_peer_url witness true)"
+    BOB_PEER_URL="$(wait_for_peer_url bob true)"
+  fi
   echo "Tor peer URLs:"
-  printf '  host=%s\n  witness=%s\n  alice=%s\n  bob=%s\n' "$HOST_PEER_URL" "$WITNESS_PEER_URL" "$ALICE_PEER_URL" "$BOB_PEER_URL"
+  printf '  host=%s\n' "$HOST_PEER_URL"
+  if ! host_player_scenario_enabled; then
+    printf '  witness=%s\n' "$WITNESS_PEER_URL"
+  fi
+  printf '  alice=%s\n' "$ALICE_PEER_URL"
+  if ! host_player_scenario_enabled; then
+    printf '  bob=%s\n' "$BOB_PEER_URL"
+  fi
 else
-  WITNESS_PEER_URL="$(wait_for_peer_url witness false)"
   ALICE_PEER_URL="$(wait_for_peer_url alice false)"
-  BOB_PEER_URL="$(wait_for_peer_url bob false)"
+  if ! host_player_scenario_enabled; then
+    WITNESS_PEER_URL="$(wait_for_peer_url witness false)"
+    BOB_PEER_URL="$(wait_for_peer_url bob false)"
+  fi
 fi
-WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field data.transport.peer.peerId)"
 ALICE_PEER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.transport.peer.peerId)"
-BOB_PEER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.transport.peer.peerId)"
 ALICE_PLAYER_ID="$(printf '%s' "$ALICE_BOOT" | json_field data.transport.peer.walletPlayerId)"
-BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.transport.peer.walletPlayerId)"
+if ! host_player_scenario_enabled; then
+  WITNESS_PEER_ID="$(printf '%s' "$WITNESS_BOOT" | json_field data.transport.peer.peerId)"
+  BOB_PEER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.transport.peer.peerId)"
+  BOB_PLAYER_ID="$(printf '%s' "$BOB_BOOT" | json_field data.transport.peer.walletPlayerId)"
+fi
+
+PLAYER_ONE_PLAYER_ID="$ALICE_PLAYER_ID"
+PLAYER_ONE_PEER_ID="$ALICE_PEER_ID"
+PLAYER_ONE_PEER_URL="$ALICE_PEER_URL"
+PLAYER_TWO_PLAYER_ID="${BOB_PLAYER_ID:-}"
+PLAYER_TWO_PEER_ID="${BOB_PEER_ID:-}"
+PLAYER_TWO_PEER_URL="${BOB_PEER_URL:-}"
+if host_player_scenario_enabled; then
+  PLAYER_ONE_PLAYER_ID="$HOST_PLAYER_ID"
+  PLAYER_ONE_PEER_ID="$HOST_PEER_ID"
+  PLAYER_ONE_PEER_URL="$HOST_PEER_URL"
+  PLAYER_TWO_PLAYER_ID="$ALICE_PLAYER_ID"
+  PLAYER_TWO_PEER_ID="$ALICE_PEER_ID"
+  PLAYER_TWO_PEER_URL="$ALICE_PEER_URL"
+fi
 
 if tor_enabled; then
   echo "Waiting for Tor peer reachability..."
-  wait_for_bootstrap_peer_id host "$WITNESS_PEER_URL" "$WITNESS_PEER_ID" witness "host -> witness" >/dev/null
-  wait_for_bootstrap_peer_id host "$ALICE_PEER_URL" "$ALICE_PEER_ID" alice "host -> alice" >/dev/null
-  wait_for_bootstrap_peer_id host "$BOB_PEER_URL" "$BOB_PEER_ID" bob "host -> bob" >/dev/null
-  wait_for_bootstrap_peer_id alice "$HOST_PEER_URL" "$HOST_PEER_ID" host "alice -> host" >/dev/null
-  wait_for_bootstrap_peer_id bob "$HOST_PEER_URL" "$HOST_PEER_ID" host "bob -> host" >/dev/null
+  if host_player_scenario_enabled; then
+    wait_for_bootstrap_peer_id host "$ALICE_PEER_URL" "$ALICE_PEER_ID" alice "host -> alice" >/dev/null
+    wait_for_bootstrap_peer_id alice "$HOST_PEER_URL" "$HOST_PEER_ID" host "alice -> host" >/dev/null
+  else
+    wait_for_bootstrap_peer_id host "$WITNESS_PEER_URL" "$WITNESS_PEER_ID" witness "host -> witness" >/dev/null
+    wait_for_bootstrap_peer_id host "$ALICE_PEER_URL" "$ALICE_PEER_ID" alice "host -> alice" >/dev/null
+    wait_for_bootstrap_peer_id host "$BOB_PEER_URL" "$BOB_PEER_ID" bob "host -> bob" >/dev/null
+    wait_for_bootstrap_peer_id alice "$HOST_PEER_URL" "$HOST_PEER_ID" host "alice -> host" >/dev/null
+    wait_for_bootstrap_peer_id bob "$HOST_PEER_URL" "$HOST_PEER_ID" host "bob -> host" >/dev/null
+  fi
 fi
 
 echo "Funding wallets..."
-retry_pcli_json "alice faucet" 20 1 wallet faucet "$FAUCET_SATS" --profile alice --json >/dev/null
-retry_pcli_json "alice onboard" 20 1 wallet onboard --profile alice --json >/dev/null
-retry_pcli_json "bob faucet" 20 1 wallet faucet "$FAUCET_SATS" --profile bob --json >/dev/null
-retry_pcli_json "bob onboard" 20 1 wallet onboard --profile bob --json >/dev/null
+fund_and_onboard_profile "$PLAYER_ONE_PROFILE"
+fund_and_onboard_profile "$PLAYER_TWO_PROFILE"
 
-echo "Connecting host to witness..."
-if tor_enabled; then
-  retry_pcli_json "host bootstrap witness over Tor" 180 1 network bootstrap add "$WITNESS_PEER_URL" witness --profile host --json >/dev/null
-else
-  pcli network bootstrap add "$WITNESS_PEER_URL" witness --profile host --json >/dev/null
+if ! host_player_scenario_enabled; then
+  echo "Connecting host to witness..."
+  if tor_enabled; then
+    retry_pcli_json "host bootstrap witness over Tor" 180 1 network bootstrap add "$WITNESS_PEER_URL" witness --profile host --json >/dev/null
+  else
+    pcli network bootstrap add "$WITNESS_PEER_URL" witness --profile host --json >/dev/null
+  fi
 fi
 
 echo "Creating table..."
-CREATE_JSON="$(pcli table create --name auto-regtest-table --witness-peer-ids "$WITNESS_PEER_ID" --profile host --json)"
+create_table_args=(table create --name auto-regtest-table --profile host --json)
+if ! host_player_scenario_enabled; then
+  create_table_args+=(--witness-peer-ids "$WITNESS_PEER_ID")
+fi
+CREATE_JSON="$(pcli "${create_table_args[@]}")"
 
 INVITE_CODE="$(printf '%s' "$CREATE_JSON" | json_field data.inviteCode)"
 TABLE_ID="$(printf '%s' "$CREATE_JSON" | json_field data.table.tableId)"
@@ -1080,16 +1202,11 @@ TABLE_ID="$(printf '%s' "$CREATE_JSON" | json_field data.table.tableId)"
 echo "TABLE_ID=$TABLE_ID"
 
 echo "Joining players..."
-if tor_enabled; then
-  retry_pcli_json "alice buy-in over Tor" 180 1 funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile alice --json >/dev/null
-  retry_pcli_json "bob buy-in over Tor" 180 1 funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile bob --json >/dev/null
-  echo "Waiting for players to observe the active table over Tor..."
-  wait_for_table_status alice active 2 >/dev/null
-  wait_for_table_status bob active 2 >/dev/null
-else
-  pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile alice --json >/dev/null
-  pcli funds buy-in "$INVITE_CODE" "$BUY_IN_SATS" --profile bob   --json >/dev/null
-fi
+buy_in_profile "$PLAYER_ONE_PROFILE"
+buy_in_profile "$PLAYER_TWO_PROFILE"
+echo "Waiting for players to observe the active table..."
+wait_for_table_status "$PLAYER_ONE_PROFILE" active 2 >/dev/null
+wait_for_table_status "$PLAYER_TWO_PROFILE" active 2 >/dev/null
 
 write_runtime_env
 
@@ -1103,19 +1220,14 @@ echo "Playing one hand automatically..."
 play_hand_automatically >/dev/null
 
 echo "Final table state:"
-watch_table_state_with_retry alice
+watch_table_state_with_retry "$WATCH_PROFILE"
 
 echo "Cashing out..."
-if tor_enabled; then
-  retry_pcli_json "alice cashout over Tor" 60 1 funds cashout "$TABLE_ID" --profile alice --json
-  retry_pcli_json "bob cashout over Tor" 60 1 funds cashout "$TABLE_ID" --profile bob --json
-else
-  pcli funds cashout "$TABLE_ID" --profile alice --json
-  pcli funds cashout "$TABLE_ID" --profile bob   --json
-fi
+cashout_profile "$PLAYER_ONE_PROFILE"
+cashout_profile "$PLAYER_TWO_PROFILE"
 
 echo "Final wallet summaries:"
-pcli wallet --profile alice --json
-pcli wallet --profile bob   --json
+pcli wallet --profile "$PLAYER_ONE_PROFILE" --json
+pcli wallet --profile "$PLAYER_TWO_PROFILE" --json
 
 echo "Done. Logs are under $BASE"

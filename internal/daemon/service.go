@@ -1,16 +1,15 @@
 package daemon
 
 import (
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 type Service struct {
-	inner *parker.ProxyDaemon
+	inner *ProxyDaemon
 }
 
 func New(profile string, runtimeConfig cfg.RuntimeConfig, mode string) (*Service, error) {
-	inner, err := parker.NewProxyDaemon(profile, runtimeConfig, mode)
+	inner, err := NewProxyDaemon(profile, runtimeConfig, mode)
 	if err != nil {
 		return nil, err
 	}

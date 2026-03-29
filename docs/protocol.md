@@ -354,10 +354,12 @@ The controller can proxy the public read routes for the browser.
 
 ## Current Limitations
 
+For the current dealerless hand protocol itself, including transcript records and private card delivery, see [dealerless.md](./dealerless.md).
+
 These points are important for reading the current implementation accurately:
 
 - peer join, action, fetch, and sync now travel inside signed transport envelopes over direct TCP `parker://` links; join/action/fetch/sync payloads still add their own wallet- or protocol-level auth objects where needed
-- peers accept replicated table state through `table.state.push` and host polling via `table.state.pull` after envelope verification, request-level auth, and monotonicity checks; they do not currently re-run a full event-by-event cryptographic replay before persistence
+- peers accept replicated table state through `table.state.push` and host polling via `table.state.pull` after envelope verification, request-level auth, transcript replay, public-state replay, and historical-ledger validation before persistence
 - snapshots are signed, but the runtime does not yet collect or enforce a multi-party signature quorum
 - the `latestFullySignedSnapshot` field name is historical; in current code it is populated with the latest locally built snapshot
 - the indexer validates required fields, but it does not verify advertisement or update signatures before storing them

@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	parker "github.com/danieldresner/arkade_fun/internal"
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	walletpkg "github.com/danieldresner/arkade_fun/internal/wallet"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	daemonpkg "github.com/parkerpoker/parkerd/internal/daemon"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
 const testOrigin = "http://127.0.0.1:3010"
@@ -356,7 +356,7 @@ func readSSEEvent(t *testing.T, reader *bufio.Reader) string {
 
 func stopDaemon(t *testing.T, runtimeConfig cfg.RuntimeConfig, profile string) {
 	t.Helper()
-	client := parker.NewClient(profile, runtimeConfig)
+	client := daemonpkg.NewClient(profile, runtimeConfig)
 	defer client.Close()
 
 	status, err := client.Inspect(false)

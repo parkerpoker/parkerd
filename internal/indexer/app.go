@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"strings"
 
-	cfg "github.com/danieldresner/arkade_fun/internal/config"
-	storepkg "github.com/danieldresner/arkade_fun/internal/storage"
+	cfg "github.com/parkerpoker/parkerd/internal/config"
+	storepkg "github.com/parkerpoker/parkerd/internal/storage"
 )
 
 type Stakes struct {

@@ -1,4 +1,4 @@
-package parker
+package meshruntime
 
 import (
 	"context"
@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	cfg "github.com/parkerpoker/parkerd/internal/config"
 )
 
 func TestClassifyPeerTransportTarget(t *testing.T) {
@@ -68,7 +70,7 @@ func TestClassifyPeerTransportTarget(t *testing.T) {
 func TestDialPeerTransportRejectsOnionWhenTorDisabled(t *testing.T) {
 	t.Parallel()
 
-	runtime := &meshRuntime{config: RuntimeConfig{UseTor: false}}
+	runtime := &meshRuntime{config: cfg.RuntimeConfig{UseTor: false}}
 	if _, err := runtime.dialPeerTransport("parker://merchantabcdefghijklmnop.onion:9735"); err == nil {
 		t.Fatal("expected onion dial to fail when Tor is disabled")
 	}

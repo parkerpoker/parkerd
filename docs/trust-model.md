@@ -2,14 +2,14 @@
 
 This document describes the trust model implemented today in this repository. It is intentionally current-state only.
 
-For wire surfaces, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md).
+For wire surfaces, see [protocol.md](./protocol.md). For component topology, see [architecture.md](./architecture.md). For the dealerless hand flow itself, see [dealerless.md](./dealerless.md).
 
 ## Short Version
 
 - wallet, peer, protocol, and transport private keys stay local to each daemon profile
 - the browser client and controller do not hold wallet, protocol, or transport private keys
-- the current Go runtime is still host-authoritative for gameplay progression, hidden-card privacy, and replicated table state
-- the runtime signs transport envelopes, request-auth payloads, events, advertisements, snapshots, and funds operations, but it does not yet enforce the stronger multi-party verification model described in older design docs
+- the current Go runtime is coordinator-led for sequencing and failover, but hidden-card confidentiality now comes from dealerless transcript flow with seat-local secrets
+- the runtime signs transport envelopes, request-auth payloads, events, advertisements, snapshots, and funds operations, and remote peers now replay accepted transcript/public/ledger state before persistence, but it does not yet enforce the stronger multi-party quorum model described in older design docs
 - the indexer is informational only and does not authorize money movement
 
 ## Security Boundary Summary
@@ -18,8 +18,8 @@ For wire surfaces, see [protocol.md](./protocol.md). For component topology, see
 - The localhost controller is a local control plane, not a money-authorizing peer.
 - The browser client can trigger local actions, but only the daemon owns peer transport, signing, persistence, and wallet operations.
 - The indexer and public browser surfaces are optional read surfaces only.
-- The host or failover successor is currently trusted as the active table authority.
-- Signed transport envelopes, events, and snapshots exist, but remote peers do not yet independently enforce full cryptographic replay and quorum validation on every replicated object.
+- The host or failover successor is currently trusted as the active coordinator for ordering, heartbeat handling, and timeout/failover flow.
+- Signed transport envelopes, events, snapshots, and hand transcripts are replay-checked before persistence, but the runtime does not yet enforce a multi-party snapshot quorum or broader consensus proof on every replicated object.
 
 ## Assets
 
@@ -99,8 +99,8 @@ A host daemon:
 
 - creates tables
 - accepts joins
-- sequences gameplay
-- deals hidden cards in `host-dealer-v1`
+- sequences gameplay and protocol deadlines
+- coordinates `dealerless-transcript-v1` hand setup and public progression
 - appends events
 - builds snapshots
 - replicates table state to other peers
@@ -179,27 +179,27 @@ The indexer and public browser surfaces can be stale, missing, or maliciously cu
 
 ## Important Current Limitations
 
-### Host authority is stronger than the older design docs implied
+### Coordinator authority is still stronger than the older design docs implied
 
 The current Go runtime is not yet a fully verified signed mesh.
 
-Today the host is trusted to:
+Today the coordinator is trusted to:
 
 - accept joins
 - accept actions
-- advance gameplay
+- order gameplay and timeout/failover transitions
 - replicate accurate table state
 - provide the current table copy to non-host peers
 
-### Signed peer transport does not remove host authority
+### Signed peer transport does not remove coordinator authority
 
 Daemon-to-daemon traffic no longer uses HTTP peer routes. Peers exchange signed transport envelopes over direct `parker://` TCP links, and request/response bodies are encrypted once the sender knows the recipient transport public key.
 
 Join requests still rely on wallet-signed identity bindings, action requests on wallet-signed turn bindings, and sync on a host protocol signature over the table hash. That authenticates messages, but it does not by itself make the runtime a fully trustless verified mesh.
 
-### Replicated state is not fully re-verified on receipt
+### Replicated state is replay-verified, but not quorum-finalized
 
-Peers accept replicated table state through host polling (`table.state.pull`) and host pushes (`table.state.push`) after envelope verification, request-level auth, and monotonicity checks. The current runtime does not yet re-run a full cryptographic replay and semantic verification pass before persisting that state.
+Peers accept replicated table state through host polling (`table.state.pull`) and host pushes (`table.state.push`) after envelope verification, request-level auth, transcript replay, public-state replay, and historical-ledger validation. The current runtime still does not collect or enforce a multi-party signature quorum before treating a snapshot as the latest local checkpoint.
 
 ### Snapshot quorum is not yet multi-party enforced
 
@@ -216,19 +216,19 @@ The indexer validates required fields, but it does not currently cryptographical
 
 ## Trust Assumptions
 
-### Trust the host for hidden-card privacy and dealing integrity
+### Do not trust the host with non-owned hole cards
 
-Current dealing is host-run. The host:
+Current dealing is `dealerless-transcript-v1`. The coordinator:
 
-- generates the deck seed
-- knows all hole cards during the hand
-- determines the public hand progression
+- orders the hand transcript and timeout transitions
+- does not derive or persist plaintext non-owned hole cards
+- only sees encrypted or redacted card material for other seats
 
-This is not dealerless mental poker.
+Each owning daemon can decrypt and locally store only its own hole cards after private delivery.
 
-### Trust the host or failover successor for replicated table truth
+### Trust the host or failover successor for ordering and liveness
 
-Because non-host peers currently rely on replicated table copies rather than a fully verified signed mesh, the active host or failover successor is effectively the authoritative table source.
+Because the coordinator still orders joins, actions, timeouts, and failover, liveness and sequencing still depend on the active host or failover successor. Replicated state is no longer accepted blindly, but it is still not backed by a multi-party consensus layer.
 
 ### Trust each local machine to protect its own secrets
 
@@ -303,7 +303,7 @@ If Arkade-backed services are unavailable:
 The safest way to interpret the current system is:
 
 - trust each daemon with its own wallet custody
-- treat the host or failover successor as the practical gameplay authority
-- treat events and snapshots as signed audit artifacts, not yet as fully verified multi-party consensus proofs
+- treat the host or failover successor as the practical gameplay coordinator
+- treat events, transcripts, and snapshots as signed and replay-verified audit artifacts, not yet as fully quorum-finalized consensus proofs
 - do not trust the indexer or browser client with money authority
-- do not over-claim privacy or fairness against a malicious host in `host-dealer-v1`
+- do not over-claim beyond the current dealerless transcript plus single-builder snapshot model
