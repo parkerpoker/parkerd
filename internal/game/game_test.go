@@ -54,11 +54,126 @@ func TestCommitmentAndDeckSeed(t *testing.T) {
 	}
 }
 
+func TestTranscriptHashingAndMentalReplay(t *testing.T) {
+	aliceKey, err := GenerateMentalKeyPair()
+	if err != nil {
+		t.Fatalf("generate alice key: %v", err)
+	}
+	bobKey, err := GenerateMentalKeyPair()
+	if err != nil {
+		t.Fatalf("generate bob key: %v", err)
+	}
+
+	transcript := HandTranscript{
+		HandID:     "770e8400-e29b-41d4-a716-446655440000",
+		HandNumber: 7,
+		TableID:    "4187c6da-b781-48cc-a5b6-40df6d44c96f",
+	}
+	aliceSeat := 0
+	bobSeat := 1
+	aliceSeed := strings.Repeat("11", 32)
+	bobSeed := strings.Repeat("22", 32)
+	aliceCommitment, err := BuildFairnessCommitment(transcript.TableID, transcript.HandNumber, aliceSeat, "alice", string(StreetCommitment), aliceSeed, aliceKey.PublicExponentHex)
+	if err != nil {
+		t.Fatalf("build alice commitment: %v", err)
+	}
+	bobCommitment, err := BuildFairnessCommitment(transcript.TableID, transcript.HandNumber, bobSeat, "bob", string(StreetCommitment), bobSeed, bobKey.PublicExponentHex)
+	if err != nil {
+		t.Fatalf("build bob commitment: %v", err)
+	}
+
+	transcript, _, err = AppendTranscriptRecord(transcript, HandTranscriptRecord{
+		CommitmentHash: aliceCommitment,
+		Kind:           "fairness-commit",
+		Phase:          string(StreetCommitment),
+		PlayerID:       "alice",
+		SeatIndex:      &aliceSeat,
+	})
+	if err != nil {
+		t.Fatalf("append alice commit: %v", err)
+	}
+	transcript, _, err = AppendTranscriptRecord(transcript, HandTranscriptRecord{
+		CommitmentHash: bobCommitment,
+		Kind:           "fairness-commit",
+		Phase:          string(StreetCommitment),
+		PlayerID:       "bob",
+		SeatIndex:      &bobSeat,
+	})
+	if err != nil {
+		t.Fatalf("append bob commit: %v", err)
+	}
+
+	replay, err := ReplayMentalDeck([]MentalDeckReveal{
+		{PlayerID: "alice", SeatIndex: aliceSeat, ShuffleSeedHex: aliceSeed, LockPublicExponentHex: aliceKey.PublicExponentHex},
+		{PlayerID: "bob", SeatIndex: bobSeat, ShuffleSeedHex: bobSeed, LockPublicExponentHex: bobKey.PublicExponentHex},
+	})
+	if err != nil {
+		t.Fatalf("replay mental deck: %v", err)
+	}
+	transcript, _, err = AppendTranscriptRecord(transcript, HandTranscriptRecord{
+		DeckStage:             replay.RevealStagesBySeat[aliceSeat],
+		DeckStageRoot:         replay.RevealStageRoots[0],
+		Kind:                  "fairness-reveal",
+		LockPublicExponentHex: aliceKey.PublicExponentHex,
+		Phase:                 string(StreetReveal),
+		PlayerID:              "alice",
+		SeatIndex:             &aliceSeat,
+		ShuffleSeedHex:        aliceSeed,
+	})
+	if err != nil {
+		t.Fatalf("append alice reveal: %v", err)
+	}
+	transcript, _, err = AppendTranscriptRecord(transcript, HandTranscriptRecord{
+		DeckStage:             replay.RevealStagesBySeat[bobSeat],
+		DeckStageRoot:         replay.RevealStageRoots[1],
+		Kind:                  "fairness-reveal",
+		LockPublicExponentHex: bobKey.PublicExponentHex,
+		Phase:                 string(StreetReveal),
+		PlayerID:              "bob",
+		SeatIndex:             &bobSeat,
+		ShuffleSeedHex:        bobSeed,
+	})
+	if err != nil {
+		t.Fatalf("append bob reveal: %v", err)
+	}
+
+	root, err := ReplayTranscriptRoot(transcript)
+	if err != nil {
+		t.Fatalf("replay transcript root: %v", err)
+	}
+	if root == "" || root != transcript.RootHash {
+		t.Fatalf("unexpected transcript root: replay=%q transcript=%q", root, transcript.RootHash)
+	}
+
+	plan, err := HoldemDealPositions(0)
+	if err != nil {
+		t.Fatalf("deal positions: %v", err)
+	}
+	alicePositions := plan.HoleCardPositionsBySeat[aliceSeat]
+	if len(alicePositions) != 2 {
+		t.Fatalf("expected two alice hole-card positions, got %v", alicePositions)
+	}
+	bobPartial, err := DecryptMentalValueHex(replay.FinalDeck[alicePositions[0]], bobKey.PrivateExponentHex)
+	if err != nil {
+		t.Fatalf("bob partial decrypt: %v", err)
+	}
+	alicePlain, err := DecryptMentalValueHex(bobPartial, aliceKey.PrivateExponentHex)
+	if err != nil {
+		t.Fatalf("alice full decrypt: %v", err)
+	}
+	card, err := DecodeMentalCardHex(alicePlain)
+	if err != nil {
+		t.Fatalf("decode alice card: %v", err)
+	}
+	if _, ok := mentalCardValueByCode[card]; !ok {
+		t.Fatalf("expected a valid hole card, got %q", card)
+	}
+}
+
 func TestHoldemHandTransitions(t *testing.T) {
 	state, err := CreateHoldemHand(HoldemHandConfig{
 		HandID:          "770e8400-e29b-41d4-a716-446655440000",
 		HandNumber:      1,
-		DeckSeedHex:     strings.Repeat("ab", 32),
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
@@ -70,16 +185,20 @@ func TestHoldemHandTransitions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create hand: %v", err)
 	}
+	if state.Phase != StreetCommitment {
+		t.Fatalf("expected commitment phase, got %s", state.Phase)
+	}
 
+	state, err = ActivateHoldemHand(state)
+	if err != nil {
+		t.Fatalf("activate hand: %v", err)
+	}
 	legal := GetLegalActions(state, intPtr(0))
 	if len(legal) != 3 || legal[0].Type != ActionFold || legal[1].Type != ActionCall || legal[2].Type != ActionRaise {
 		t.Fatalf("unexpected legal actions: %#v", legal)
 	}
 	if legal[2].MinTotalSats == nil || *legal[2].MinTotalSats != 200 {
 		t.Fatalf("unexpected raise minimum: %#v", legal[2])
-	}
-	if state.Players[0].HoleCards != [2]CardCode{"Jh", "Qh"} || state.Players[1].HoleCards != [2]CardCode{"9h", "2h"} {
-		t.Fatalf("unexpected hole cards: %#v", state.Players)
 	}
 
 	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionRaise, TotalSats: 250})
@@ -89,6 +208,14 @@ func TestHoldemHandTransitions(t *testing.T) {
 	state, err = ApplyHoldemAction(state, 1, Action{Type: ActionCall})
 	if err != nil {
 		t.Fatalf("call: %v", err)
+	}
+	if state.Phase != StreetFlopReveal {
+		t.Fatalf("expected flop reveal, got %s", state.Phase)
+	}
+
+	state, err = ApplyBoardCards(state, []CardCode{"7c", "4d", "8d"})
+	if err != nil {
+		t.Fatalf("apply flop: %v", err)
 	}
 	if state.Phase != StreetFlop || state.CurrentBetSats != 0 || state.MinRaiseToSats != 100 {
 		t.Fatalf("unexpected post-flop state: %#v", state)
@@ -105,7 +232,6 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	state, err := CreateHoldemHand(HoldemHandConfig{
 		HandID:          "770e8400-e29b-41d4-a716-446655440000",
 		HandNumber:      1,
-		DeckSeedHex:     strings.Repeat("cd", 32),
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
@@ -117,7 +243,7 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create hand: %v", err)
 	}
-	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionFold})
+	state, err = ForceFoldSeat(state, 0)
 	if err != nil {
 		t.Fatalf("fold: %v", err)
 	}
@@ -128,7 +254,6 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	state, err = CreateHoldemHand(HoldemHandConfig{
 		HandID:          "770e8400-e29b-41d4-a716-446655440000",
 		HandNumber:      1,
-		DeckSeedHex:     strings.Repeat("ab", 32),
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
@@ -140,12 +265,9 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create hand: %v", err)
 	}
-	state.Players[0].HoleCards = [2]CardCode{"Ah", "Kd"}
-	state.Players[1].HoleCards = [2]CardCode{"As", "Kc"}
-	state.Runout = HoldemRunout{
-		Flop:  [3]CardCode{"Qh", "Jh", "Th"},
-		Turn:  "2c",
-		River: "3d",
+	state, err = ActivateHoldemHand(state)
+	if err != nil {
+		t.Fatalf("activate hand: %v", err)
 	}
 
 	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionCall})
@@ -156,13 +278,9 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("check: %v", err)
 	}
-	state, err = ApplyHoldemAction(state, 1, Action{Type: ActionCheck})
+	state, err = ApplyBoardCards(state, []CardCode{"Qh", "Jh", "Th"})
 	if err != nil {
-		t.Fatalf("check: %v", err)
-	}
-	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionCheck})
-	if err != nil {
-		t.Fatalf("check: %v", err)
+		t.Fatalf("flop reveal: %v", err)
 	}
 	state, err = ApplyHoldemAction(state, 1, Action{Type: ActionCheck})
 	if err != nil {
@@ -172,6 +290,10 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("check: %v", err)
 	}
+	state, err = ApplyBoardCards(state, []CardCode{"2c"})
+	if err != nil {
+		t.Fatalf("turn reveal: %v", err)
+	}
 	state, err = ApplyHoldemAction(state, 1, Action{Type: ActionCheck})
 	if err != nil {
 		t.Fatalf("check: %v", err)
@@ -179,8 +301,30 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionCheck})
 	if err != nil {
 		t.Fatalf("check: %v", err)
+	}
+	state, err = ApplyBoardCards(state, []CardCode{"3d"})
+	if err != nil {
+		t.Fatalf("river reveal: %v", err)
+	}
+	state, err = ApplyHoldemAction(state, 1, Action{Type: ActionCheck})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionCheck})
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if state.Phase != StreetShowdownReveal {
+		t.Fatalf("expected showdown reveal, got %s", state.Phase)
 	}
 
+	state, err = SettleHoldemShowdown(state, map[string][2]CardCode{
+		"alpha": {"Ah", "Kd"},
+		"beta":  {"As", "Kc"},
+	})
+	if err != nil {
+		t.Fatalf("settle showdown: %v", err)
+	}
 	if state.Phase != StreetSettled || len(state.Winners) != 2 || state.Winners[0].AmountSats != 100 || state.Winners[1].AmountSats != 100 {
 		t.Fatalf("unexpected showdown outcome: %#v", state)
 	}

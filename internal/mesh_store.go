@@ -10,14 +10,15 @@ import (
 )
 
 const (
-	nativeProtocolVersion   = "poker/v1"
-	nativeDealerMode        = "host-dealer-v1"
-	nativeFundsProvider     = "arkade-table-funds/v1"
-	nativeHostHeartbeatMS   = 1000
-	nativeHostFailureMS     = 3500
-	nativeNextHandDelayMS   = 1000
-	nativePollIntervalMS    = 500
-	nativeTableSyncInterval = 1 * time.Second
+	nativeProtocolVersion       = "poker/v1"
+	nativeDealerMode            = "dealerless-transcript-v1"
+	nativeFundsProvider         = "arkade-table-funds/v1"
+	nativeHostHeartbeatMS       = 1000
+	nativeHostFailureMS         = 3500
+	nativeHandProtocolTimeoutMS = 1500
+	nativeNextHandDelayMS       = 1000
+	nativePollIntervalMS        = 500
+	nativeTableSyncInterval     = 1 * time.Second
 )
 
 type meshStore struct {

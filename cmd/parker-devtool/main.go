@@ -103,6 +103,9 @@ func runSelectTableAction(argv []string) error {
 		_, err := fmt.Fprintln(os.Stdout, "settled")
 		return err
 	}
+	if !phaseAllowsTableActions(state.Phase) {
+		return nil
+	}
 
 	aliceSeat, ok := findSeat(state.SeatedPlayers, *alicePlayerID)
 	if !ok {
@@ -142,6 +145,15 @@ func runSelectTableAction(argv []string) error {
 	}
 	_, err = fmt.Fprintf(os.Stdout, "%s %s %s\n", actor, action, amount)
 	return err
+}
+
+func phaseAllowsTableActions(phase string) bool {
+	switch phase {
+	case "preflop", "flop", "turn", "river":
+		return true
+	default:
+		return false
+	}
 }
 
 type tableEnvelope struct {

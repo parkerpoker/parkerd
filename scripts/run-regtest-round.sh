@@ -879,11 +879,11 @@ play_hand_automatically() {
   local amount=""
   local current_bet=""
   local pot_sats=""
-  local turns=30
+  local turns=60
   local turn
 
   if tor_enabled; then
-    turns=120
+    turns=180
   fi
 
   for ((turn = 0; turn < turns; turn += 1)); do

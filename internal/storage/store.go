@@ -431,6 +431,21 @@ func openSQLStore(driverName, dsn string) (*sqlStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	if driverName == "sqlite" {
+		// The runtime drives table replication and protocol progress from multiple goroutines.
+		// Serializing the SQLite handle and enabling a small busy timeout keeps those internal
+		// races from surfacing as spurious SQLITE_BUSY errors during local reads and writes.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+		if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
 	store := &sqlStore{
 		db:         db,
 		driverName: driverName,

@@ -2,6 +2,7 @@ package parker
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/danieldresner/arkade_fun/internal/game"
 	"github.com/danieldresner/arkade_fun/internal/settlementcore"
@@ -238,6 +239,7 @@ type NativeTableFundsState struct {
 
 type nativeSeatRecord struct {
 	NativeSeatedPlayer
+	PeerURL     string `json:"peerUrl,omitempty"`
 	ProfileName string `json:"profileName"`
 }
 
@@ -246,10 +248,15 @@ type nativeKnownParticipant struct {
 	Peer        NativePeerAddress `json:"peer"`
 }
 
+type nativeHandCardState struct {
+	FinalDeck       []string            `json:"finalDeck,omitempty"`
+	PhaseDeadlineAt string              `json:"phaseDeadlineAt,omitempty"`
+	Transcript      game.HandTranscript `json:"transcript"`
+}
+
 type nativeActiveHand struct {
-	CommitmentRoot      string              `json:"commitmentRoot"`
-	HoleCardsByPlayerID map[string][]string `json:"holeCardsByPlayerId"`
-	State               game.HoldemState    `json:"state"`
+	Cards nativeHandCardState `json:"cards"`
+	State game.HoldemState    `json:"state"`
 }
 
 type nativeTableState struct {
@@ -283,6 +290,11 @@ type nativePeerSelf struct {
 	WalletPlayerID     string            `json:"walletPlayerId"`
 }
 
+type nativeCachedPeerInfo struct {
+	FetchedAt time.Time
+	PeerSelf  nativePeerSelf
+}
+
 type nativeJoinRequest struct {
 	BuyInSats       int                            `json:"buyInSats"`
 	IdentityBinding settlementcore.IdentityBinding `json:"identityBinding"`
@@ -306,6 +318,29 @@ type nativeActionRequest struct {
 	SignatureHex  string      `json:"signatureHex"`
 	SignedAt      string      `json:"signedAt"`
 	TableID       string      `json:"tableId"`
+}
+
+type nativeHandMessageRequest struct {
+	CardPositions         []int    `json:"cardPositions,omitempty"`
+	Cards                 []string `json:"cards,omitempty"`
+	CommitmentHash        string   `json:"commitmentHash,omitempty"`
+	DeckStage             []string `json:"deckStage,omitempty"`
+	DeckStageRoot         string   `json:"deckStageRoot,omitempty"`
+	Epoch                 int      `json:"epoch"`
+	HandID                string   `json:"handId"`
+	HandNumber            int      `json:"handNumber"`
+	Kind                  string   `json:"kind"`
+	LockPublicExponentHex string   `json:"lockPublicExponentHex,omitempty"`
+	PartialCiphertexts    []string `json:"partialCiphertexts,omitempty"`
+	Phase                 string   `json:"phase"`
+	PlayerID              string   `json:"playerId"`
+	ProfileName           string   `json:"profileName"`
+	RecipientSeatIndex    *int     `json:"recipientSeatIndex,omitempty"`
+	SeatIndex             int      `json:"seatIndex"`
+	ShuffleSeedHex        string   `json:"shuffleSeedHex,omitempty"`
+	SignatureHex          string   `json:"signatureHex"`
+	SignedAt              string   `json:"signedAt"`
+	TableID               string   `json:"tableId"`
 }
 
 type nativeTableFetchRequest struct {

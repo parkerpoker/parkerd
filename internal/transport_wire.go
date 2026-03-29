@@ -34,6 +34,8 @@ const (
 	nativeTransportMessageTableJoinResp = "table.join.response"
 	nativeTransportMessageTableActReq   = "table.action.request"
 	nativeTransportMessageTableActResp  = "table.action.response"
+	nativeTransportMessageTableHandReq  = "table.hand.request"
+	nativeTransportMessageTableHandResp = "table.hand.response"
 	nativeTransportMessageAck           = "ack"
 	nativeTransportMessageNack          = "nack"
 
@@ -41,6 +43,7 @@ const (
 	nativeTransportReadTimeout     = 10 * time.Second
 	nativeTransportWriteTimeout    = 20 * time.Second
 	nativeTransportExchangeTimeout = 20 * time.Second
+	nativePeerInfoCacheTTL         = 30 * time.Second
 )
 
 type nativeTransportError struct {
@@ -89,7 +92,14 @@ func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	_ = writeJSONLine(connection, response)
 }
 
-func (runtime *meshRuntime) handlePeerTransportEnvelope(request TransportEnvelope) (TransportEnvelope, error) {
+func (runtime *meshRuntime) handlePeerTransportEnvelope(request TransportEnvelope) (response TransportEnvelope, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			response = TransportEnvelope{}
+			err = fmt.Errorf("transport handler panic: %v", recovered)
+		}
+	}()
+
 	body, sharedSecret, err := runtime.decodeIncomingEnvelope(request)
 	if err != nil {
 		return TransportEnvelope{}, err
@@ -129,6 +139,16 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request TransportEnvelop
 			return TransportEnvelope{}, err
 		}
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableActResp, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(table, action.PlayerID))
+	case nativeTransportMessageTableHandReq:
+		var handMessage nativeHandMessageRequest
+		if err := json.Unmarshal(body, &handMessage); err != nil {
+			return TransportEnvelope{}, err
+		}
+		table, err := runtime.handleHandMessageFromPeer(handMessage)
+		if err != nil {
+			return TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableHandResp, nativeTransportChannelTable, sharedSecret, runtime.networkTableView(table, handMessage.PlayerID))
 	case nativeTransportMessageTablePush:
 		var syncRequest nativeTableSyncRequest
 		if err := json.Unmarshal(body, &syncRequest); err != nil {
@@ -186,6 +206,16 @@ func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		return nativePeerSelf{}, err
 	}
+	if strings.TrimSpace(response.SignatureKeyID) == "" || response.SignatureKeyID != decoded.Peer.ProtocolPubkeyHex {
+		return nativePeerSelf{}, errors.New("peer manifest protocol key mismatch")
+	}
+	expectedProtocolID, err := settlementcore.DeriveScopedID(settlementcore.ProtocolIdentityScope, decoded.Peer.ProtocolPubkeyHex)
+	if err != nil {
+		return nativePeerSelf{}, err
+	}
+	if decoded.ProtocolID != expectedProtocolID {
+		return nativePeerSelf{}, errors.New("peer manifest protocol id mismatch")
+	}
 	runtime.cachePeerInfo(peerURL, decoded)
 	return decoded, nil
 }
@@ -194,11 +224,18 @@ func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 
-	peerInfo, ok := runtime.peerInfoCache[peerURL]
+	cached, ok := runtime.peerInfoCache[peerURL]
 	if !ok {
 		return nativePeerSelf{}, false
 	}
-	return peerInfo, true
+	if time.Since(cached.FetchedAt) > nativePeerInfoCacheTTL {
+		delete(runtime.peerInfoCache, peerURL)
+		if canonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); canonical != "" {
+			delete(runtime.peerInfoCache, canonical)
+		}
+		return nativePeerSelf{}, false
+	}
+	return cached.PeerSelf, true
 }
 
 func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
@@ -206,13 +243,17 @@ func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSel
 	defer runtime.mu.Unlock()
 
 	if runtime.peerInfoCache == nil {
-		runtime.peerInfoCache = map[string]nativePeerSelf{}
+		runtime.peerInfoCache = map[string]nativeCachedPeerInfo{}
+	}
+	cached := nativeCachedPeerInfo{
+		FetchedAt: time.Now(),
+		PeerSelf:  peerInfo,
 	}
 	if strings.TrimSpace(peerURL) != "" {
-		runtime.peerInfoCache[peerURL] = peerInfo
+		runtime.peerInfoCache[peerURL] = cached
 	}
 	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" {
-		runtime.peerInfoCache[canonical] = peerInfo
+		runtime.peerInfoCache[canonical] = cached
 	}
 }
 
@@ -257,6 +298,10 @@ func (runtime *meshRuntime) remoteJoin(peerURL string, input nativeJoinRequest) 
 
 func (runtime *meshRuntime) remoteAction(peerURL string, input nativeActionRequest) (nativeTableState, error) {
 	return runtime.sendPeerTableRequest(peerURL, nativeTransportMessageTableActReq, nativeTransportMessageTableActResp, input.TableID, input)
+}
+
+func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+	return runtime.sendPeerTableRequest(peerURL, nativeTransportMessageTableHandReq, nativeTransportMessageTableHandResp, input.TableID, input)
 }
 
 func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseType, tableID string, input any) (nativeTableState, error) {

@@ -31,32 +31,6 @@ func maxInt(left, right int) int {
 	return right
 }
 
-func buildHoleCards(deck []CardCode, dealerSeatIndex int) [2][2]CardCode {
-	var seats [2][2]CardCode
-	cardCounts := [2]int{}
-	dealSeat := dealerSeatIndex
-	deckIndex := 0
-
-	for round := 0; round < 2; round++ {
-		for seatOffset := 0; seatOffset < 2; seatOffset++ {
-			seats[dealSeat][cardCounts[dealSeat]] = deck[deckIndex]
-			cardCounts[dealSeat]++
-			deckIndex++
-			dealSeat = nextSeat(dealSeat)
-		}
-	}
-
-	return seats
-}
-
-func buildRunout(deck []CardCode) HoldemRunout {
-	return HoldemRunout{
-		Flop:  [3]CardCode{deck[5], deck[6], deck[7]},
-		Turn:  deck[9],
-		River: deck[11],
-	}
-}
-
 func cloneState(state HoldemState) HoldemState {
 	clone := state
 	clone.ActingSeatIndex = copyIntPointer(state.ActingSeatIndex)
@@ -159,7 +133,7 @@ func settleByFold(state *HoldemState) error {
 	return nil
 }
 
-func settleShowdown(state *HoldemState) error {
+func settleShowdown(state *HoldemState, holeCardsByPlayerID map[string][2]CardCode) error {
 	contenders := getActivePlayers(*state)
 	if len(contenders) == 0 {
 		return fmtErrorf("showdown requires at least one contender")
@@ -170,7 +144,11 @@ func settleShowdown(state *HoldemState) error {
 		score  HandScore
 	}, 0, len(contenders))
 	for _, player := range contenders {
-		cards := append([]CardCode(nil), player.HoleCards[:]...)
+		holeCards, ok := holeCardsByPlayerID[player.PlayerID]
+		if !ok {
+			return fmtErrorf("missing showdown reveal for %s", player.PlayerID)
+		}
+		cards := append([]CardCode(nil), holeCards[:]...)
 		cards = append(cards, state.Board...)
 		score, err := ScoreSevenCardHand(cards)
 		if err != nil {
@@ -205,33 +183,31 @@ func settleShowdown(state *HoldemState) error {
 	return nil
 }
 
-func advanceStreet(state *HoldemState) error {
+func streetRevealPhase(phase Street) (Street, error) {
+	switch phase {
+	case StreetPreflop:
+		return StreetFlopReveal, nil
+	case StreetFlop:
+		return StreetTurnReveal, nil
+	case StreetTurn:
+		return StreetRiverReveal, nil
+	case StreetRiver:
+		return StreetShowdownReveal, nil
+	default:
+		return "", fmtErrorf("phase %s does not advance to a reveal phase", phase)
+	}
+}
+
+func resetStreetState(state *HoldemState, phase Street) {
 	for index := range state.Players {
 		state.Players[index].RoundContributionSats = 0
 		state.Players[index].ActedThisRound = state.Players[index].Status != PlayerStatusActive
 	}
-
 	state.CurrentBetSats = 0
 	state.LastFullRaiseSats = state.BigBlindSats
 	state.MinRaiseToSats = state.BigBlindSats
 	state.RaiseLockedSeatIndex = nil
-
-	switch state.Phase {
-	case StreetPreflop:
-		state.Phase = StreetFlop
-		state.Board = append([]CardCode(nil), state.Runout.Flop[:]...)
-	case StreetFlop:
-		state.Phase = StreetTurn
-		state.Board = append(append([]CardCode(nil), state.Board...), state.Runout.Turn)
-	case StreetTurn:
-		state.Phase = StreetRiver
-		state.Board = append(append([]CardCode(nil), state.Board...), state.Runout.River)
-	case StreetRiver:
-		state.Phase = StreetShowdown
-		return settleShowdown(state)
-	default:
-		return nil
-	}
+	state.Phase = phase
 
 	nextActor := state.Players[firstToActForStreet(*state)]
 	if nextActor.Status == PlayerStatusActive {
@@ -240,7 +216,6 @@ func advanceStreet(state *HoldemState) error {
 	} else {
 		state.ActingSeatIndex = nil
 	}
-	return nil
 }
 
 func closeActionRoundIfNeeded(state *HoldemState) error {
@@ -250,17 +225,14 @@ func closeActionRoundIfNeeded(state *HoldemState) error {
 
 	ableToAct := getPlayersAbleToAct(*state)
 	if len(ableToAct) == 0 {
-		switch state.Phase {
-		case StreetPreflop:
-			state.Board = append([]CardCode(nil), state.Runout.Flop[:]...)
-			state.Board = append(state.Board, state.Runout.Turn, state.Runout.River)
-		case StreetFlop:
-			state.Board = append(append([]CardCode(nil), state.Board...), state.Runout.Turn, state.Runout.River)
-		case StreetTurn:
-			state.Board = append(append([]CardCode(nil), state.Board...), state.Runout.River)
+		nextPhase, err := streetRevealPhase(state.Phase)
+		if err != nil {
+			return err
 		}
-		state.Phase = StreetShowdown
-		return settleShowdown(state)
+		state.Phase = nextPhase
+		state.ActingSeatIndex = nil
+		state.RaiseLockedSeatIndex = nil
+		return nil
 	}
 
 	roundComplete := true
@@ -271,7 +243,14 @@ func closeActionRoundIfNeeded(state *HoldemState) error {
 		}
 	}
 	if roundComplete {
-		return advanceStreet(state)
+		nextPhase, err := streetRevealPhase(state.Phase)
+		if err != nil {
+			return err
+		}
+		state.Phase = nextPhase
+		state.ActingSeatIndex = nil
+		state.RaiseLockedSeatIndex = nil
+		return nil
 	}
 
 	for _, player := range ableToAct {
@@ -286,6 +265,40 @@ func closeActionRoundIfNeeded(state *HoldemState) error {
 	return nil
 }
 
+func HoldemDealPositions(dealerSeatIndex int) (HoldemDealPlan, error) {
+	if dealerSeatIndex != 0 && dealerSeatIndex != 1 {
+		return HoldemDealPlan{}, fmtErrorf("dealer seat index must be 0 or 1")
+	}
+
+	holeCardPositionsBySeat := map[int][]int{
+		0: {},
+		1: {},
+	}
+	dealSeat := dealerSeatIndex
+	for deckIndex := 0; deckIndex < 4; deckIndex++ {
+		holeCardPositionsBySeat[dealSeat] = append(holeCardPositionsBySeat[dealSeat], deckIndex)
+		dealSeat = nextSeat(dealSeat)
+	}
+
+	return HoldemDealPlan{
+		BoardPositionsByPhase: map[Street][]int{
+			StreetFlopReveal:  {5, 6, 7},
+			StreetTurnReveal:  {9},
+			StreetRiverReveal: {11},
+		},
+		HoleCardPositionsBySeat: holeCardPositionsBySeat,
+	}, nil
+}
+
+func PhaseAllowsActions(phase Street) bool {
+	switch phase {
+	case StreetPreflop, StreetFlop, StreetTurn, StreetRiver:
+		return true
+	default:
+		return false
+	}
+}
+
 func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 	if config.DealerSeatIndex != 0 && config.DealerSeatIndex != 1 {
 		return HoldemState{}, fmtErrorf("dealer seat index must be 0 or 1")
@@ -294,14 +307,6 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 		return HoldemState{}, fmtErrorf("blinds must be positive")
 	}
 
-	deck := CreateDeterministicDeck(config.DeckSeedHex)
-	codes := make([]CardCode, len(deck))
-	for index, card := range deck {
-		codes[index] = card.Code
-	}
-
-	holeCards := buildHoleCards(codes, config.DealerSeatIndex)
-	runout := buildRunout(codes)
 	smallBlindSeat := config.DealerSeatIndex
 	bigBlindSeat := nextSeat(config.DealerSeatIndex)
 
@@ -312,7 +317,6 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 			SeatIndex: seatIndex,
 			StackSats: seat.StackSats,
 			Status:    PlayerStatusActive,
-			HoleCards: holeCards[seatIndex],
 		}
 	}
 
@@ -335,13 +339,12 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 		bigBlindPlayer.Status = PlayerStatusAllIn
 	}
 
-	actingSeatIndex := smallBlindSeat
 	return HoldemState{
 		HandID:            config.HandID,
 		HandNumber:        config.HandNumber,
-		Phase:             StreetPreflop,
+		Phase:             StreetCommitment,
 		DealerSeatIndex:   config.DealerSeatIndex,
-		ActingSeatIndex:   &actingSeatIndex,
+		ActingSeatIndex:   nil,
 		SmallBlindSats:    config.SmallBlindSats,
 		BigBlindSats:      config.BigBlindSats,
 		CurrentBetSats:    committedBigBlind,
@@ -349,8 +352,6 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 		LastFullRaiseSats: config.BigBlindSats,
 		PotSats:           committedSmallBlind + committedBigBlind,
 		Board:             nil,
-		Runout:            runout,
-		DeckSeedHex:       config.DeckSeedHex,
 		Players:           players,
 		Winners:           nil,
 		ShowdownScores:    map[string]HandScore{},
@@ -358,7 +359,96 @@ func CreateHoldemHand(config HoldemHandConfig) (HoldemState, error) {
 	}, nil
 }
 
+func ActivateHoldemHand(state HoldemState) (HoldemState, error) {
+	switch state.Phase {
+	case StreetCommitment, StreetReveal, StreetFinalization, StreetPrivateDelivery:
+	default:
+		return HoldemState{}, fmtErrorf("hand cannot start betting from phase %s", state.Phase)
+	}
+
+	next := cloneState(state)
+	next.Phase = StreetPreflop
+	smallBlindSeat := next.DealerSeatIndex
+	if next.Players[smallBlindSeat].Status == PlayerStatusActive {
+		seat := smallBlindSeat
+		next.ActingSeatIndex = &seat
+	} else {
+		next.ActingSeatIndex = nil
+	}
+	return next, nil
+}
+
+func ApplyBoardCards(state HoldemState, cards []CardCode) (HoldemState, error) {
+	next := cloneState(state)
+	switch next.Phase {
+	case StreetFlopReveal:
+		if len(cards) != 3 {
+			return HoldemState{}, fmtErrorf("flop reveal requires 3 cards")
+		}
+		next.Board = append([]CardCode(nil), cards...)
+		resetStreetState(&next, StreetFlop)
+	case StreetTurnReveal:
+		if len(cards) != 1 {
+			return HoldemState{}, fmtErrorf("turn reveal requires 1 card")
+		}
+		next.Board = append(append([]CardCode(nil), next.Board...), cards[0])
+		resetStreetState(&next, StreetTurn)
+	case StreetRiverReveal:
+		if len(cards) != 1 {
+			return HoldemState{}, fmtErrorf("river reveal requires 1 card")
+		}
+		next.Board = append(append([]CardCode(nil), next.Board...), cards[0])
+		resetStreetState(&next, StreetRiver)
+	default:
+		return HoldemState{}, fmtErrorf("board cards cannot be applied while phase is %s", next.Phase)
+	}
+
+	if len(getPlayersAbleToAct(next)) == 0 {
+		if err := closeActionRoundIfNeeded(&next); err != nil {
+			return HoldemState{}, err
+		}
+	}
+	return next, nil
+}
+
+func ForceFoldSeat(state HoldemState, seatIndex int) (HoldemState, error) {
+	if state.Phase == StreetSettled || state.Phase == StreetAborted {
+		return HoldemState{}, fmtErrorf("hand is already closed")
+	}
+	if seatIndex < 0 || seatIndex > 1 {
+		return HoldemState{}, fmtErrorf("seat %d is out of range", seatIndex)
+	}
+
+	next := cloneState(state)
+	player := &next.Players[seatIndex]
+	if player.Status == PlayerStatusFolded {
+		return HoldemState{}, fmtErrorf("seat %d already folded", seatIndex)
+	}
+	player.Status = PlayerStatusFolded
+	player.ActedThisRound = true
+	next.ActingSeatIndex = nil
+	if err := settleByFold(&next); err != nil {
+		return HoldemState{}, err
+	}
+	return next, nil
+}
+
+func SettleHoldemShowdown(state HoldemState, holeCardsByPlayerID map[string][2]CardCode) (HoldemState, error) {
+	if state.Phase != StreetShowdownReveal {
+		return HoldemState{}, fmtErrorf("showdown requires phase %s, got %s", StreetShowdownReveal, state.Phase)
+	}
+	next := cloneState(state)
+	if err := settleShowdown(&next, holeCardsByPlayerID); err != nil {
+		return HoldemState{}, err
+	}
+	return next, nil
+}
+
 func GetLegalActions(state HoldemState, seatIndex *int) []LegalAction {
+	if !PhaseAllowsActions(state.Phase) {
+		return nil
+	}
+
 	targetSeat := state.ActingSeatIndex
 	if seatIndex != nil {
 		targetSeat = seatIndex
@@ -435,6 +525,9 @@ func expectLegal(state HoldemState, seatIndex int, action Action) error {
 func ApplyHoldemAction(state HoldemState, seatIndex int, action Action) (HoldemState, error) {
 	if state.Phase == StreetSettled {
 		return HoldemState{}, fmtErrorf("hand already settled")
+	}
+	if !PhaseAllowsActions(state.Phase) {
+		return HoldemState{}, fmtErrorf("hand is still starting")
 	}
 	if state.ActingSeatIndex == nil || *state.ActingSeatIndex != seatIndex {
 		return HoldemState{}, fmtErrorf("seat %d cannot act while seat %v is up", seatIndex, state.ActingSeatIndex)
@@ -515,26 +608,23 @@ func ToCheckpointShape(state HoldemState) CheckpointShape {
 	playerStacks := map[string]int{}
 	roundContributions := map[string]int{}
 	totalContributions := map[string]int{}
-	holeCardsByPlayerID := map[string][]CardCode{}
 	for _, player := range state.Players {
 		playerStacks[player.PlayerID] = player.StackSats
 		roundContributions[player.PlayerID] = player.RoundContributionSats
 		totalContributions[player.PlayerID] = player.TotalContributionSats
-		holeCardsByPlayerID[player.PlayerID] = append([]CardCode(nil), player.HoleCards[:]...)
 	}
 
 	return CheckpointShape{
-		Phase:               state.Phase,
-		ActingSeatIndex:     copyIntPointer(state.ActingSeatIndex),
-		DealerSeatIndex:     state.DealerSeatIndex,
-		Board:               append([]CardCode(nil), state.Board...),
-		PlayerStacks:        playerStacks,
-		RoundContributions:  roundContributions,
-		TotalContributions:  totalContributions,
-		PotSats:             state.PotSats,
-		CurrentBetSats:      state.CurrentBetSats,
-		MinRaiseToSats:      state.MinRaiseToSats,
-		HoleCardsByPlayerID: holeCardsByPlayerID,
+		Phase:              state.Phase,
+		ActingSeatIndex:    copyIntPointer(state.ActingSeatIndex),
+		DealerSeatIndex:    state.DealerSeatIndex,
+		Board:              append([]CardCode(nil), state.Board...),
+		PlayerStacks:       playerStacks,
+		RoundContributions: roundContributions,
+		TotalContributions: totalContributions,
+		PotSats:            state.PotSats,
+		CurrentBetSats:     state.CurrentBetSats,
+		MinRaiseToSats:     state.MinRaiseToSats,
 	}
 }
 
