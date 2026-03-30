@@ -8,6 +8,7 @@ GO_BIN="${PARKER_GO_BIN:-}"
 GO_FALLBACK_BIN="/opt/homebrew/bin/go"
 GO_CACHE_DIR="${PARKER_GO_CACHE_DIR:-$ROOT_DIR/.tmp/parker-gocache}"
 GO_MOD_CACHE_DIR="${PARKER_GO_MOD_CACHE_DIR:-$ROOT_DIR/.tmp/parker-gomodcache}"
+GO_TMP_DIR="${PARKER_GO_TMP_DIR:-$ROOT_DIR/.tmp/parker-gotmp}"
 GO_TOOLCHAIN="${PARKER_GOTOOLCHAIN:-auto}"
 
 require_go() {
@@ -25,31 +26,48 @@ require_go() {
   exit 1
 }
 
+binary_needs_rebuild() {
+  local output="$1"
+  if [[ ! -x "$output" ]] || [[ "$ROOT_DIR/go.mod" -nt "$output" ]] || [[ -f "$ROOT_DIR/go.sum" && "$ROOT_DIR/go.sum" -nt "$output" ]]; then
+    return 0
+  fi
+  if [[ -d "$ROOT_DIR/internal" ]] && find "$GO_SOURCE_DIR" "$ROOT_DIR/internal" -type f -newer "$output" -print -quit | grep -q .; then
+    return 0
+  fi
+  if find "$GO_SOURCE_DIR" -type f -newer "$output" -print -quit | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
 build_go_binary() {
   local output="$BIN_DIR/parker-daemon-go"
-  local rebuild=0
+  local lock_dir="$BIN_DIR/.parker-daemon-go.lock"
   mkdir -p "$BIN_DIR"
-  mkdir -p "$GO_CACHE_DIR" "$GO_MOD_CACHE_DIR"
+  mkdir -p "$GO_CACHE_DIR" "$GO_MOD_CACHE_DIR" "$GO_TMP_DIR"
 
   if [[ ! -d "$GO_SOURCE_DIR" ]]; then
     echo "parker-daemon: expected Go source at $GO_SOURCE_DIR but it does not exist." >&2
     exit 1
   fi
 
-  if [[ ! -x "$output" ]] || [[ "$ROOT_DIR/go.mod" -nt "$output" ]] || [[ -f "$ROOT_DIR/go.sum" && "$ROOT_DIR/go.sum" -nt "$output" ]]; then
-    rebuild=1
-  elif [[ -d "$ROOT_DIR/internal" ]] && find "$GO_SOURCE_DIR" "$ROOT_DIR/internal" -type f -newer "$output" -print -quit | grep -q .; then
-    rebuild=1
-  elif find "$GO_SOURCE_DIR" -type f -newer "$output" -print -quit | grep -q .; then
-    rebuild=1
+  if binary_needs_rebuild "$output"; then
+    require_go
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+      sleep 0.1
+    done
+    (
+      trap 'rmdir "$lock_dir" >/dev/null 2>&1 || true' EXIT
+      if binary_needs_rebuild "$output"; then
+        cd "$ROOT_DIR"
+        GOTOOLCHAIN="$GO_TOOLCHAIN" GOTMPDIR="$GO_TMP_DIR" GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" GOFLAGS="${GOFLAGS:+$GOFLAGS }-modcacherw" "$GO_BIN" build -o "$output" ./cmd/parker-daemon
+      fi
+    )
   fi
 
-  if [[ "$rebuild" == "1" ]]; then
-    require_go
-    (
-      cd "$ROOT_DIR"
-      GOTOOLCHAIN="$GO_TOOLCHAIN" GOCACHE="$GO_CACHE_DIR" GOMODCACHE="$GO_MOD_CACHE_DIR" "$GO_BIN" build -o "$output" ./cmd/parker-daemon
-    )
+  if [[ "${PARKER_BUILD_ONLY:-}" == "1" || "${PARKER_BUILD_ONLY:-}" == "true" ]]; then
+    printf '%s\n' "$output"
+    return 0
   fi
 
   exec "$output" "$@"

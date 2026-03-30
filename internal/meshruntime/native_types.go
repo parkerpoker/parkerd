@@ -363,12 +363,12 @@ type nativeCustodyApprovalResponse struct {
 }
 
 type nativeCustodyTxSignRequest struct {
-	ExpectedPrevStateHash string `json:"expectedPrevStateHash,omitempty"`
-	PSBT                  string `json:"psbt"`
-	PlayerID              string `json:"playerId"`
-	Purpose               string `json:"purpose,omitempty"`
-	TableID               string `json:"tableId"`
-	TransitionHash        string `json:"transitionHash,omitempty"`
+	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash,omitempty"`
+	PSBT                  string                         `json:"psbt"`
+	PlayerID              string                         `json:"playerId"`
+	Purpose               string                         `json:"purpose,omitempty"`
+	TableID               string                         `json:"tableId"`
+	TransitionHash        string                         `json:"transitionHash,omitempty"`
 	Transition            tablecustody.CustodyTransition `json:"transition"`
 }
 
@@ -377,11 +377,11 @@ type nativeCustodyTxSignResponse struct {
 }
 
 type nativeCustodySignerPrepareRequest struct {
-	DerivationPath        string `json:"derivationPath"`
-	ExpectedPrevStateHash string `json:"expectedPrevStateHash,omitempty"`
-	PlayerID              string `json:"playerId"`
-	TableID               string `json:"tableId"`
-	TransitionHash        string `json:"transitionHash,omitempty"`
+	DerivationPath        string                         `json:"derivationPath"`
+	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash,omitempty"`
+	PlayerID              string                         `json:"playerId"`
+	TableID               string                         `json:"tableId"`
+	TransitionHash        string                         `json:"transitionHash,omitempty"`
 	Transition            tablecustody.CustodyTransition `json:"transition"`
 }
 
@@ -390,32 +390,42 @@ type nativeCustodySignerPrepareResponse struct {
 }
 
 type nativeCustodySignerStartRequest struct {
-	BatchID                string             `json:"batchId"`
-	BatchExpiryType        string             `json:"batchExpiryType,omitempty"`
-	BatchExpiryValue       uint32             `json:"batchExpiryValue"`
-	BatchOutputAmountSats  int64              `json:"batchOutputAmountSats"`
-	DerivationPath         string             `json:"derivationPath"`
-	ExpectedPrevStateHash  string             `json:"expectedPrevStateHash,omitempty"`
-	PlayerID               string             `json:"playerId"`
-	SweepTapTreeRootHex    string             `json:"sweepTapTreeRootHex"`
-	TableID                string             `json:"tableId"`
-	TransitionHash         string             `json:"transitionHash,omitempty"`
-	UnsignedCommitmentTx   string             `json:"unsignedCommitmentTx,omitempty"`
-	VtxoTree               arktree.FlatTxTree `json:"vtxoTree"`
+	BatchID               string             `json:"batchId"`
+	BatchExpiryType       string             `json:"batchExpiryType,omitempty"`
+	BatchExpiryValue      uint32             `json:"batchExpiryValue"`
+	BatchOutputAmountSats int64              `json:"batchOutputAmountSats"`
+	DerivationPath        string             `json:"derivationPath"`
+	ExpectedPrevStateHash string             `json:"expectedPrevStateHash,omitempty"`
+	PlayerID              string             `json:"playerId"`
+	SweepTapTreeRootHex   string             `json:"sweepTapTreeRootHex"`
+	TableID               string             `json:"tableId"`
+	TransitionHash        string             `json:"transitionHash,omitempty"`
+	UnsignedCommitmentTx  string             `json:"unsignedCommitmentTx,omitempty"`
+	VtxoTree              arktree.FlatTxTree `json:"vtxoTree"`
 }
 
 type nativeCustodySignerNoncesRequest struct {
-	BatchID         string                      `json:"batchId"`
-	DerivationPath  string                      `json:"derivationPath"`
-	Nonces          map[string]*arktree.Musig2Nonce `json:"nonces"`
-	PlayerID        string                      `json:"playerId"`
-	TableID         string                      `json:"tableId"`
-	TxID            string                      `json:"txid"`
-	TransitionHash  string                      `json:"transitionHash,omitempty"`
+	BatchID        string                          `json:"batchId"`
+	DerivationPath string                          `json:"derivationPath"`
+	Nonces         map[string]*arktree.Musig2Nonce `json:"nonces"`
+	PlayerID       string                          `json:"playerId"`
+	TableID        string                          `json:"tableId"`
+	TxID           string                          `json:"txid"`
+	TransitionHash string                          `json:"transitionHash,omitempty"`
+}
+
+type nativeCustodySignerAggregatedNoncesRequest struct {
+	BatchID        string             `json:"batchId"`
+	DerivationPath string             `json:"derivationPath"`
+	Nonces         arktree.TreeNonces `json:"nonces"`
+	PlayerID       string             `json:"playerId"`
+	TableID        string             `json:"tableId"`
+	TransitionHash string             `json:"transitionHash,omitempty"`
 }
 
 type nativeCustodyAckResponse struct {
-	OK bool `json:"ok"`
+	OK     bool `json:"ok"`
+	Signed bool `json:"signed,omitempty"`
 }
 
 type nativeHandMessageRequest struct {

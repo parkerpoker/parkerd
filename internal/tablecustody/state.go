@@ -9,10 +9,8 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 	if binding.TableID == "" {
 		return CustodyState{}, fmt.Errorf("custody state is missing table id")
 	}
-	stackClaims := make([]StackClaim, 0, len(balances))
 	participants := make([]SliceParticipant, 0, len(balances))
-	totalStacks := 0
-	totalContributions := 0
+	totalValue := 0
 	for _, balance := range balances {
 		if balance.PlayerID == "" {
 			return CustodyState{}, fmt.Errorf("custody state is missing player id")
@@ -23,9 +21,24 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 		if balance.StackSats < 0 || balance.TotalContributionSats < 0 || balance.RoundContributionSats < 0 {
 			return CustodyState{}, fmt.Errorf("custody state balance for %s cannot be negative", balance.PlayerID)
 		}
+		participants = append(participants, SliceParticipant{
+			ContributionSats: balance.TotalContributionSats,
+			Folded:           balance.Folded,
+			PlayerID:         balance.PlayerID,
+			SeatIndex:        balance.SeatIndex,
+		})
+		totalValue += balance.StackSats + balance.TotalContributionSats
+	}
+	derivation, err := DerivePotStructure(participants)
+	if err != nil {
+		return CustodyState{}, err
+	}
+	stackClaims := make([]StackClaim, 0, len(balances))
+	for _, balance := range balances {
+		unmatchedContribution := derivation.UnmatchedContributionSats[balance.PlayerID]
 		stackClaims = append(stackClaims, StackClaim{
 			AllIn:                 balance.AllIn,
-			AmountSats:            balance.StackSats,
+			AmountSats:            balance.StackSats + unmatchedContribution,
 			Folded:                balance.Folded,
 			PlayerID:              balance.PlayerID,
 			RoundContributionSats: balance.RoundContributionSats,
@@ -34,18 +47,6 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 			TotalContributionSats: balance.TotalContributionSats,
 			VTXORefs:              append([]VTXORef(nil), balance.VTXORefs...),
 		})
-		participants = append(participants, SliceParticipant{
-			ContributionSats: balance.TotalContributionSats,
-			Folded:           balance.Folded,
-			PlayerID:         balance.PlayerID,
-			SeatIndex:        balance.SeatIndex,
-		})
-		totalStacks += balance.StackSats
-		totalContributions += balance.TotalContributionSats
-	}
-	potSlices, err := DerivePotSlices(participants)
-	if err != nil {
-		return CustodyState{}, err
 	}
 
 	state := CustodyState{
@@ -59,7 +60,7 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 		HandID:           binding.HandID,
 		HandNumber:       binding.HandNumber,
 		LegalActionsHash: binding.LegalActionsHash,
-		PotSlices:        potSlices,
+		PotSlices:        derivation.Slices,
 		PrevStateHash:    previousStateHash(previous),
 		PublicStateHash:  binding.PublicStateHash,
 		StackClaims:      stackClaims,
@@ -71,7 +72,7 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 		return CustodyState{}, err
 	}
 	state.StateHash = HashCustodyState(state)
-	if err := validateConservedValue(state, totalStacks+totalContributions); err != nil {
+	if err := validateConservedValue(state, totalValue); err != nil {
 		return CustodyState{}, err
 	}
 	return state, nil
@@ -110,7 +111,7 @@ func ValidateState(state CustodyState) error {
 		return fmt.Errorf("custody state must contain stack claims")
 	}
 	seenPlayers := map[string]struct{}{}
-	totalPot := 0
+	matchedContributionByPlayer := map[string]int{}
 	for _, stack := range state.StackClaims {
 		if stack.PlayerID == "" {
 			return fmt.Errorf("custody stack claim is missing player id")
@@ -121,6 +122,9 @@ func ValidateState(state CustodyState) error {
 		seenPlayers[stack.PlayerID] = struct{}{}
 		if stack.AmountSats < 0 || stack.TotalContributionSats < 0 || stack.RoundContributionSats < 0 {
 			return fmt.Errorf("custody stack claim for %s cannot be negative", stack.PlayerID)
+		}
+		if stack.RoundContributionSats > stack.TotalContributionSats {
+			return fmt.Errorf("custody stack claim round contribution exceeds total for %s", stack.PlayerID)
 		}
 	}
 	for _, slice := range state.PotSlices {
@@ -135,18 +139,27 @@ func ValidateState(state CustodyState) error {
 			if amount < 0 {
 				return fmt.Errorf("custody pot slice %s contribution for %s cannot be negative", slice.PotID, playerID)
 			}
+			if _, ok := seenPlayers[playerID]; !ok {
+				return fmt.Errorf("custody pot slice %s references unknown player %s", slice.PotID, playerID)
+			}
 			sum += amount
+			matchedContributionByPlayer[playerID] += amount
 		}
 		if sum != slice.TotalSats {
 			return fmt.Errorf("custody pot slice %s total mismatch", slice.PotID)
 		}
-		totalPot += slice.TotalSats
 	}
 	if expected := HashCustodyState(state); state.StateHash != "" && state.StateHash != expected {
 		return fmt.Errorf("custody state hash mismatch")
 	}
-	if totalPot != totalPotFromClaims(state.StackClaims) {
-		return fmt.Errorf("custody pot slices do not match contribution totals")
+	for _, stack := range state.StackClaims {
+		matchedContribution := matchedContributionByPlayer[stack.PlayerID]
+		if matchedContribution > stack.TotalContributionSats {
+			return fmt.Errorf("custody pot slices overclaim contributions for %s", stack.PlayerID)
+		}
+		if impliedUnmatched := stack.TotalContributionSats - matchedContribution; stack.AmountSats < impliedUnmatched {
+			return fmt.Errorf("custody stack claim for %s is below unmatched contribution floor", stack.PlayerID)
+		}
 	}
 	return nil
 }
@@ -236,16 +249,16 @@ func BuildExitProofRef(state CustodyState, playerID string, refs []VTXORef, txid
 	})
 }
 
-func totalPotFromClaims(claims []StackClaim) int {
+func totalPotFromSlices(slices []PotSlice) int {
 	total := 0
-	for _, claim := range claims {
-		total += claim.TotalContributionSats
+	for _, slice := range slices {
+		total += slice.TotalSats
 	}
 	return total
 }
 
 func validateConservedValue(state CustodyState, total int) error {
-	current := totalPotFromClaims(state.StackClaims)
+	current := totalPotFromSlices(state.PotSlices)
 	for _, claim := range state.StackClaims {
 		current += claim.AmountSats
 	}

@@ -154,8 +154,16 @@ func awardPotPayouts(state *HoldemState, payouts map[string]int, winnersByPlayer
 		return winners[left].SeatIndex < winners[right].SeatIndex
 	})
 	state.Winners = winners
+	for index := range state.Players {
+		state.Players[index].RoundContributionSats = 0
+		state.Players[index].TotalContributionSats = 0
+		state.Players[index].ActedThisRound = state.Players[index].Status != PlayerStatusActive
+	}
+	state.CurrentBetSats = 0
+	state.PotSats = 0
 	state.Phase = StreetSettled
 	state.ActingSeatIndex = nil
+	state.RaiseLockedSeatIndex = nil
 }
 
 func refundContribution(state *HoldemState, playerID string, amountSats int) {
@@ -189,13 +197,16 @@ func settleByFold(state *HoldemState) error {
 			SeatIndex:        player.SeatIndex,
 		})
 	}
-	potSlices, err := tablecustody.DerivePotSlices(participants)
+	derivation, err := tablecustody.DerivePotStructure(participants)
 	if err != nil {
 		return err
 	}
+	for playerID, amount := range derivation.UnmatchedContributionSats {
+		refundContribution(state, playerID, amount)
+	}
 	payoutsByPlayerID := map[string]int{}
 	winnersByPlayerID := map[string]HoldemWinner{}
-	for _, slice := range potSlices {
+	for _, slice := range derivation.Slices {
 		if len(slice.EligiblePlayerIDs) == 0 {
 			for playerID, amount := range slice.Contributions {
 				refundContribution(state, playerID, amount)
@@ -215,7 +226,6 @@ func settleByFold(state *HoldemState) error {
 			break
 		}
 	}
-	state.PotSats = recomputePot(state.Players)
 	awardPotPayouts(state, payoutsByPlayerID, winnersByPlayerID)
 	return nil
 }
@@ -251,14 +261,17 @@ func settleShowdown(state *HoldemState, holeCardsByPlayerID map[string][2]CardCo
 			SeatIndex:        player.SeatIndex,
 		})
 	}
-	potSlices, err := tablecustody.DerivePotSlices(participants)
+	derivation, err := tablecustody.DerivePotStructure(participants)
 	if err != nil {
 		return err
+	}
+	for playerID, amount := range derivation.UnmatchedContributionSats {
+		refundContribution(state, playerID, amount)
 	}
 
 	payoutsByPlayerID := map[string]int{}
 	winnersByPlayerID := map[string]HoldemWinner{}
-	for _, slice := range potSlices {
+	for _, slice := range derivation.Slices {
 		eligible := make([]HoldemWinner, 0, len(slice.EligiblePlayerIDs))
 		for _, contender := range contenders {
 			if !containsPlayerID(slice.EligiblePlayerIDs, contender.PlayerID) {

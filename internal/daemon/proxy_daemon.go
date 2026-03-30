@@ -226,6 +226,16 @@ func (d *ProxyDaemon) dispatch(request RequestEnvelope, connection net.Conn) Res
 	params := decodeMap(request.Params)
 	result, err := d.handleRuntimeRequest(request.Method, params)
 	if err != nil {
+		d.appendLogEnvelope(map[string]any{
+			"level":   "error",
+			"message": "daemon request failed",
+			"scope":   "parker-daemon-go",
+			"data": map[string]any{
+				"error":   err.Error(),
+				"method":  request.Method,
+				"profile": d.profileName,
+			},
+		})
 		return errorResponse(request.ID, err.Error())
 	}
 	d.appendLogEnvelope(map[string]any{

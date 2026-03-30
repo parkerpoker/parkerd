@@ -809,7 +809,7 @@ func allFairnessRevealsPresent(table nativeTableState) bool {
 	return len(transcriptRecordsByKind(table.ActiveHand.Cards.Transcript, nativeHandMessageFairnessReveal, string(game.StreetReveal))) == len(table.Seats)
 }
 
-func deriveLocalProtocolDeadline(existing *nativeTableState, incoming nativeTableState) string {
+func (runtime *meshRuntime) deriveLocalProtocolDeadline(existing *nativeTableState, incoming nativeTableState) string {
 	if incoming.ActiveHand == nil || !shouldTrackProtocolDeadline(incoming.ActiveHand.State.Phase) {
 		return ""
 	}
@@ -821,7 +821,7 @@ func deriveLocalProtocolDeadline(existing *nativeTableState, incoming nativeTabl
 		shouldTrackProtocolDeadline(existing.ActiveHand.State.Phase) {
 		return existing.ActiveHand.Cards.PhaseDeadlineAt
 	}
-	return addMillis(nowISO(), nativeHandProtocolTimeoutMS)
+	return addMillis(nowISO(), runtime.handProtocolTimeoutMS())
 }
 
 func (runtime *meshRuntime) normalizeAcceptedActiveHand(existing *nativeTableState, incoming *nativeTableState) error {
@@ -837,16 +837,16 @@ func (runtime *meshRuntime) normalizeAcceptedActiveHand(existing *nativeTableSta
 	} else {
 		incoming.ActiveHand.Cards.FinalDeck = nil
 	}
-	incoming.ActiveHand.Cards.PhaseDeadlineAt = deriveLocalProtocolDeadline(existing, *incoming)
+	incoming.ActiveHand.Cards.PhaseDeadlineAt = runtime.deriveLocalProtocolDeadline(existing, *incoming)
 	return nil
 }
 
-func setProtocolDeadline(table *nativeTableState) {
+func (runtime *meshRuntime) setProtocolDeadline(table *nativeTableState) {
 	if table == nil || table.ActiveHand == nil {
 		return
 	}
 	if shouldTrackProtocolDeadline(table.ActiveHand.State.Phase) {
-		table.ActiveHand.Cards.PhaseDeadlineAt = addMillis(nowISO(), nativeHandProtocolTimeoutMS)
+		table.ActiveHand.Cards.PhaseDeadlineAt = addMillis(nowISO(), runtime.handProtocolTimeoutMS())
 		return
 	}
 	table.ActiveHand.Cards.PhaseDeadlineAt = ""
@@ -1536,7 +1536,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 		case game.StreetCommitment:
 			if len(missingProtocolSeatIndexes(*table)) == 0 {
 				table.ActiveHand.State.Phase = game.StreetReveal
-				setProtocolDeadline(table)
+				runtime.setProtocolDeadline(table)
 				changed = true
 			}
 		case game.StreetReveal:
@@ -1559,7 +1559,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 					return err
 				}
 				table.ActiveHand.State.Phase = game.StreetPrivateDelivery
-				setProtocolDeadline(table)
+				runtime.setProtocolDeadline(table)
 				changed = true
 			}
 		case game.StreetPrivateDelivery:
@@ -1569,7 +1569,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 					return err
 				}
 				table.ActiveHand.State = nextState
-				setProtocolDeadline(table)
+				runtime.setProtocolDeadline(table)
 				changed = true
 			}
 		case game.StreetFlopReveal, game.StreetTurnReveal, game.StreetRiverReveal:
@@ -1580,7 +1580,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 						return err
 					}
 					table.ActiveHand.State = nextState
-					setProtocolDeadline(table)
+					runtime.setProtocolDeadline(table)
 					changed = true
 				}
 			}
@@ -1599,7 +1599,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 					return err
 				}
 				table.ActiveHand.State = nextState
-				setProtocolDeadline(table)
+				runtime.setProtocolDeadline(table)
 				return runtime.finalizeSettledHandLocked(table, nil)
 			}
 		case game.StreetSettled:

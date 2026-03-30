@@ -1017,6 +1017,22 @@ func TestJoinTableRejectsReusingReservedFundingRefsAcrossTables(t *testing.T) {
 	}
 }
 
+func TestDefaultDealerlessBlindsUseArkDustFloor(t *testing.T) {
+	smallBlind, bigBlind := defaultDealerlessBlinds(330, map[string]any{})
+	if smallBlind != 165 || bigBlind != 330 {
+		t.Fatalf("expected dust-aware defaults 165/330, got %d/%d", smallBlind, bigBlind)
+	}
+}
+
+func TestValidateDealerlessBlindPotRejectsSubDustOpeningPot(t *testing.T) {
+	if err := validateDealerlessBlindPot(50, 100, 330); err == nil {
+		t.Fatal("expected sub-dust opening blind pot to be rejected")
+	}
+	if err := validateDealerlessBlindPot(165, 330, 330); err != nil {
+		t.Fatalf("expected dust-compatible opening blind pot to pass, got %v", err)
+	}
+}
+
 func TestValidateAcceptedCustodyHistoryRejectsTamperedApprovalSignature(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -1217,6 +1233,34 @@ func TestSyntheticRealModeSupportsCallThenCheck(t *testing.T) {
 	}
 	if lastTransition.ArkTxID != "" {
 		t.Fatalf("expected zero-money check transition to avoid Ark settlement, got %q", lastTransition.ArkTxID)
+	}
+}
+
+func TestRealSettlementUsesExtendedHostFailureWindow(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+
+	host.config.UseMockSettlement = false
+	guest.config.UseMockSettlement = false
+	witness.config.UseMockSettlement = false
+
+	table := mustReadNativeTable(t, witness, tableID)
+	table.LastHostHeartbeatAt = addMillis(nowISO(), -(nativeHostFailureMS + 500))
+	if err := witness.store.writeTable(&table); err != nil {
+		t.Fatalf("write witness table: %v", err)
+	}
+
+	witness.Tick()
+
+	updated := mustReadNativeTable(t, witness, tableID)
+	if updated.CurrentHost.Peer.PeerID != host.selfPeerID() {
+		t.Fatalf("expected host to remain current host under real-mode heartbeat window, got %q", updated.CurrentHost.Peer.PeerID)
 	}
 }
 

@@ -3,7 +3,7 @@ SHELL := /bin/bash
 PARKER_BIN_DIR ?= .tmp/parker-bin
 HOST_PROFILE ?= alice
 
-.PHONY: rebuild-binaries local local-down deps deps-down host host-down witness witness-down alice alice-down bob bob-down fund-bob fund-alice kill-floating poker-regtest-round poker-regtest-round-tor poker-regtest-round-host-player poker-regtest-round-host-player-tor
+.PHONY: rebuild-binaries local local-down deps deps-down host host-down witness witness-down alice alice-down bob bob-down fund-bob fund-alice kill-floating poker-regtest-round poker-regtest-round-tor poker-regtest-round-host-player poker-regtest-round-host-player-tor test-integration
 
 rebuild-binaries:
 	rm -rf "$(PARKER_BIN_DIR)"
@@ -65,3 +65,6 @@ poker-regtest-round-host-player: rebuild-binaries
 
 poker-regtest-round-host-player-tor: rebuild-binaries
 	USE_TOR=true ROUND_SCENARIO=host-player-2d ./scripts/run-regtest-round.sh
+
+test-integration:
+	go test -tags=integration ./internal/meshruntime -run TestRegtestRoundUsesRealArkCustody -count=1 -timeout 20m

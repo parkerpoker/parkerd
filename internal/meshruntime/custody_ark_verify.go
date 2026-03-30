@@ -175,7 +175,7 @@ func (runtime *meshRuntime) verifyCustodyRefsOnArk(refs []tablecustody.VTXORef, 
 			return err
 		}
 		if strings.TrimSpace(ref.ArkTxID) != "" && vtxo.ArkTxid != ref.ArkTxID {
-			return fmt.Errorf("custody ref %s Ark tx mismatch", key)
+			return fmt.Errorf("custody ref %s Ark tx mismatch: ref=%s indexed=%s", key, ref.ArkTxID, vtxo.ArkTxid)
 		}
 	}
 	return nil
@@ -200,8 +200,8 @@ func (runtime *meshRuntime) validateCustodyTransitionArkProof(previous *tablecus
 		if transition.Kind == tablecustody.TransitionKindEmergencyExit {
 			continue
 		}
-		if strings.TrimSpace(ref.ArkTxID) == "" || ref.ArkTxID != transition.ArkTxID {
-			return fmt.Errorf("custody ref %s is not anchored to the transition Ark tx", key)
+		if strings.TrimSpace(ref.ArkIntentID) == "" || ref.ArkIntentID != transition.ArkIntentID {
+			return fmt.Errorf("custody ref %s is not anchored to the transition Ark intent", key)
 		}
 	}
 	return nil

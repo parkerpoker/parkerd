@@ -14,6 +14,7 @@ ALICE_PORT="${ALICE_PORT:-}"
 BOB_PORT="${BOB_PORT:-}"
 USE_TOR="${USE_TOR:-false}"
 SETUP_ONLY="${SETUP_ONLY:-false}"
+KEEP_FAILED_RUN="${KEEP_FAILED_RUN:-false}"
 ROUND_SCENARIO="${ROUND_SCENARIO:-standard-4d}"
 PCLI_TIMEOUT_SECONDS="${PCLI_TIMEOUT_SECONDS:-}"
 TOR_TARGET_HOST="${TOR_TARGET_HOST:-host.docker.internal}"
@@ -58,6 +59,10 @@ tor_enabled() {
 
 setup_only_enabled() {
   setting_enabled "$SETUP_ONLY"
+}
+
+keep_failed_run_enabled() {
+  setting_enabled "$KEEP_FAILED_RUN"
 }
 
 host_player_scenario_enabled() {
@@ -123,6 +128,7 @@ terminate_pid() {
 }
 
 cleanup() {
+  local exit_status=$?
   set +e
   collect_run_daemon_pids() {
     local metadata pid command_line
@@ -160,6 +166,11 @@ cleanup() {
     run_with_timeout 15 "$DOCKER_COMPOSE_BIN" -f "$TOR_COMPOSE_FILE" -p "$TOR_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
   fi
   stop_nigiri_stack || true
+  if keep_failed_run_enabled && [[ "$exit_status" -ne 0 ]]; then
+    echo "Preserving failed run state under $BASE" >&2
+    echo "Preserving failed Nigiri datadir under $NIGIRI_DATADIR" >&2
+    return
+  fi
   rm -rf "$TOR_STATE_BASE"
 }
 trap cleanup EXIT INT TERM HUP
@@ -573,6 +584,21 @@ cleanup_nigiri_data() {
   rm -rf "$NIGIRI_DATADIR"
 }
 
+prepare_nigiri_data_dirs() {
+  mkdir -p \
+    "$NIGIRI_DATADIR/volumes/bitcoin" \
+    "$NIGIRI_DATADIR/volumes/elements" \
+    "$NIGIRI_DATADIR/volumes/postgres" \
+    "$NIGIRI_DATADIR/volumes/tapd" \
+    "$NIGIRI_DATADIR/volumes/ark/wallet" \
+    "$NIGIRI_DATADIR/volumes/ark/data" \
+    "$NIGIRI_DATADIR/volumes/lnd" \
+    "$NIGIRI_DATADIR/volumes/nbxplorer" \
+    "$NIGIRI_DATADIR/volumes/lightningd"
+
+  chmod -R 0777 "$NIGIRI_DATADIR/volumes" 2>/dev/null || true
+}
+
 stop_nigiri_stack() {
   local pid=""
   local i
@@ -588,7 +614,9 @@ stop_nigiri_stack() {
   terminate_pid "$pid"
   wait "$pid" 2>/dev/null || true
   force_cleanup_nigiri_docker
-  cleanup_nigiri_data
+  if ! keep_failed_run_enabled; then
+    cleanup_nigiri_data
+  fi
 }
 
 free_port() {
@@ -676,11 +704,13 @@ start_nigiri_stack() {
   for attempt in 1 2 3; do
     stop_nigiri_stack
     mkdir -p "$NIGIRI_DATADIR"
+    prepare_nigiri_data_dirs
     : >"$BASE/nigiri-start.log"
 
     echo "Starting Nigiri (attempt ${attempt}/3)..."
     nigiri_cmd start --ark --ln --ci >"$BASE/nigiri-start.log" 2>&1 &
     NIGIRI_START_PID=$!
+    prepare_nigiri_data_dirs
 
     if wait_for_http_json "http://127.0.0.1:7070/v1/info" 120 1 >/dev/null &&
       seed_ark_liquidity &&
@@ -701,6 +731,12 @@ start_nigiri_stack() {
 
   echo "Nigiri failed to become ready after 3 attempts" >&2
   return 1
+}
+
+prebuild_parker_go_binaries() {
+  echo "Prebuilding Parker Go binaries..."
+  PARKER_BUILD_ONLY=1 "$ROOT_DIR/scripts/bin/parker-daemon" >/dev/null
+  PARKER_BUILD_ONLY=1 "$ROOT_DIR/scripts/bin/parker-cli" >/dev/null
 }
 
 select_table_action() {
@@ -1060,6 +1096,7 @@ if tor_enabled; then
   WATCH_PROFILE="host"
 fi
 
+prebuild_parker_go_binaries
 start_nigiri_stack
 
 if tor_enabled; then
@@ -1200,6 +1237,8 @@ INVITE_CODE="$(printf '%s' "$CREATE_JSON" | json_field data.inviteCode)"
 TABLE_ID="$(printf '%s' "$CREATE_JSON" | json_field data.table.tableId)"
 
 echo "TABLE_ID=$TABLE_ID"
+echo "Waiting for host to observe the new table..."
+watch_table_state_with_retry host >/dev/null
 
 echo "Joining players..."
 buy_in_profile "$PLAYER_ONE_PROFILE"

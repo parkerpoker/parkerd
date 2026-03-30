@@ -110,16 +110,26 @@ func potClaimKey(potID string) string {
 	return "pot:" + potID
 }
 
-func (runtime *meshRuntime) stackOutputSpec(table nativeTableState, playerID string, amountSats int) (custodyOutputSpec, error) {
-	seat, ok := seatRecordForPlayer(table, playerID)
-	if !ok {
-		return custodyOutputSpec{}, fmt.Errorf("missing seat for player %s", playerID)
+func (runtime *meshRuntime) walletPubkeyHexForPlayer(table nativeTableState, playerID string) (string, error) {
+	if seat, ok := seatRecordForPlayer(table, playerID); ok && strings.TrimSpace(seat.WalletPubkeyHex) != "" {
+		return seat.WalletPubkeyHex, nil
 	}
+	if playerID == runtime.walletID.PlayerID && strings.TrimSpace(runtime.walletID.PublicKeyHex) != "" {
+		return runtime.walletID.PublicKeyHex, nil
+	}
+	return "", fmt.Errorf("missing seat for player %s", playerID)
+}
+
+func (runtime *meshRuntime) stackOutputSpec(table nativeTableState, playerID string, amountSats int) (custodyOutputSpec, error) {
 	config, err := runtime.arkCustodyConfig()
 	if err != nil {
 		return custodyOutputSpec{}, err
 	}
-	ownerPubkey, err := compressedPubkeyFromHex(seat.WalletPubkeyHex)
+	walletPubkeyHex, err := runtime.walletPubkeyHexForPlayer(table, playerID)
+	if err != nil {
+		return custodyOutputSpec{}, err
+	}
+	ownerPubkey, err := compressedPubkeyFromHex(walletPubkeyHex)
 	if err != nil {
 		return custodyOutputSpec{}, err
 	}
@@ -177,11 +187,11 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 	}
 	playerPubkeys := make([]*btcec.PublicKey, 0, len(futureSignerIDs))
 	for _, playerID := range futureSignerIDs {
-		seat, ok := seatRecordForPlayer(table, playerID)
-		if !ok {
-			return custodyOutputSpec{}, fmt.Errorf("missing seat for player %s", playerID)
+		walletPubkeyHex, err := runtime.walletPubkeyHexForPlayer(table, playerID)
+		if err != nil {
+			return custodyOutputSpec{}, err
 		}
-		pubkey, err := compressedPubkeyFromHex(seat.WalletPubkeyHex)
+		pubkey, err := compressedPubkeyFromHex(walletPubkeyHex)
 		if err != nil {
 			return custodyOutputSpec{}, err
 		}
@@ -199,11 +209,11 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 			if playerID == transition.NextState.ActingPlayerID {
 				continue
 			}
-			seat, ok := seatRecordForPlayer(table, playerID)
-			if !ok {
-				return custodyOutputSpec{}, fmt.Errorf("missing seat for player %s", playerID)
+			walletPubkeyHex, err := runtime.walletPubkeyHexForPlayer(table, playerID)
+			if err != nil {
+				return custodyOutputSpec{}, err
 			}
-			pubkey, err := compressedPubkeyFromHex(seat.WalletPubkeyHex)
+			pubkey, err := compressedPubkeyFromHex(walletPubkeyHex)
 			if err != nil {
 				return custodyOutputSpec{}, err
 			}
@@ -276,6 +286,15 @@ func (runtime *meshRuntime) playerIDByXOnlyPubkey(table nativeTableState, xOnlyH
 			return seat.PlayerID, true, nil
 		}
 	}
+	if strings.TrimSpace(runtime.walletID.PublicKeyHex) != "" && strings.TrimSpace(runtime.walletID.PlayerID) != "" {
+		localXOnly, err := xOnlyPubkeyHexFromCompressed(runtime.walletID.PublicKeyHex)
+		if err != nil {
+			return "", false, err
+		}
+		if localXOnly == xOnlyHex {
+			return runtime.walletID.PlayerID, true, nil
+		}
+	}
 	return "", false, nil
 }
 
@@ -303,37 +322,39 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 	bestPlayers := []string(nil)
 	for index, closure := range vtxoScript.ForfeitClosures() {
 		keys := make([]string, 0)
+		unmappedNonOperatorKeys := 0
+		appendClosureKeys := func(pubkeys []*btcec.PublicKey) error {
+			for _, key := range pubkeys {
+				xOnly := hex.EncodeToString(schnorr.SerializePubKey(key))
+				if xOnly == operatorXOnly {
+					continue
+				}
+				playerID, ok, err := runtime.playerIDByXOnlyPubkey(table, xOnly)
+				if err != nil {
+					return err
+				}
+				if ok {
+					keys = append(keys, playerID)
+					continue
+				}
+				unmappedNonOperatorKeys++
+			}
+			return nil
+		}
 		switch typed := closure.(type) {
 		case *arkscript.MultisigClosure:
-			for _, key := range typed.PubKeys {
-				xOnly := hex.EncodeToString(schnorr.SerializePubKey(key))
-				if xOnly == operatorXOnly {
-					continue
-				}
-				playerID, ok, err := runtime.playerIDByXOnlyPubkey(table, xOnly)
-				if err != nil {
-					return custodySpendPath{}, err
-				}
-				if ok {
-					keys = append(keys, playerID)
-				}
+			if err := appendClosureKeys(typed.PubKeys); err != nil {
+				return custodySpendPath{}, err
 			}
 		case *arkscript.CLTVMultisigClosure:
-			for _, key := range typed.PubKeys {
-				xOnly := hex.EncodeToString(schnorr.SerializePubKey(key))
-				if xOnly == operatorXOnly {
-					continue
-				}
-				playerID, ok, err := runtime.playerIDByXOnlyPubkey(table, xOnly)
-				if err != nil {
-					return custodySpendPath{}, err
-				}
-				if ok {
-					keys = append(keys, playerID)
-				}
+			if err := appendClosureKeys(typed.PubKeys); err != nil {
+				return custodySpendPath{}, err
 			}
 		default:
 			continue
+		}
+		if len(keys) == 0 && unmappedNonOperatorKeys == 1 && strings.TrimSpace(ref.OwnerPlayerID) != "" {
+			keys = append(keys, ref.OwnerPlayerID)
 		}
 		keys = uniqueSortedPlayerIDs(keys)
 		if !reflect.DeepEqual(keys, desired) {
@@ -419,6 +440,10 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 		inputRefs := append([]tablecustody.VTXORef(nil), nextClaim.VTXORefs...)
 		if hadPrev {
 			inputRefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
+		} else if transition.Kind == tablecustody.TransitionKindBuyInLock {
+			if seat, ok := seatRecordForPlayer(table, nextClaim.PlayerID); ok && len(seat.FundingRefs) > 0 {
+				inputRefs = append([]tablecustody.VTXORef(nil), seat.FundingRefs...)
+			}
 		}
 		transition.NextState.StackClaims[index].VTXORefs = nil
 		if len(inputRefs) > 0 {

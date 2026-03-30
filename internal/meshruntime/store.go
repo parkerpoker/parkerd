@@ -203,7 +203,7 @@ func decodeInvite(invite string) (map[string]any, error) {
 }
 
 func nowISO() string {
-	return time.Now().UTC().Format(time.RFC3339)
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func addMillis(timestamp string, delta int) string {

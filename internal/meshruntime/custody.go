@@ -53,7 +53,7 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, hand *
 		return ""
 	}
 	if game.PhaseAllowsActions(hand.Phase) {
-		return addMillis(nowISO(), nativeActionTimeoutMS)
+		return addMillis(nowISO(), runtime.actionTimeoutMS())
 	}
 	if table.ActiveHand != nil {
 		return table.ActiveHand.Cards.PhaseDeadlineAt

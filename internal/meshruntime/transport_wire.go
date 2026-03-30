@@ -28,30 +28,32 @@ const (
 	nativeTransportChannelTable     = "table"
 	nativeTransportChannelSync      = "sync"
 
-	nativeTransportEncryptionNone          = "none"
-	nativeTransportEncryptionX25519GCM     = "x25519-aes256gcm"
-	nativeTransportMessagePeerManifest     = "peer.manifest"
-	nativeTransportMessagePeerProbe        = "peer.manifest.get"
-	nativeTransportMessageTablePull        = "table.state.pull"
-	nativeTransportMessageTablePush        = "table.state.push"
-	nativeTransportMessageTableJoinReq     = "table.join.request"
-	nativeTransportMessageTableJoinResp    = "table.join.response"
-	nativeTransportMessageTableActReq      = "table.action.request"
-	nativeTransportMessageTableActResp     = "table.action.response"
-	nativeTransportMessageTableCustodyReq  = "table.custody.request"
-	nativeTransportMessageTableCustodyResp = "table.custody.response"
-	nativeTransportMessageTableCustodySignReq = "table.custody.sign.request"
-	nativeTransportMessageTableCustodySignResp = "table.custody.sign.response"
-	nativeTransportMessageTableCustodySignerPrepareReq = "table.custody.signer.prepare.request"
-	nativeTransportMessageTableCustodySignerPrepareResp = "table.custody.signer.prepare.response"
-	nativeTransportMessageTableCustodySignerStartReq = "table.custody.signer.start.request"
-	nativeTransportMessageTableCustodySignerStartResp = "table.custody.signer.start.response"
-	nativeTransportMessageTableCustodySignerNoncesReq = "table.custody.signer.nonces.request"
-	nativeTransportMessageTableCustodySignerNoncesResp = "table.custody.signer.nonces.response"
-	nativeTransportMessageTableHandReq     = "table.hand.request"
-	nativeTransportMessageTableHandResp    = "table.hand.response"
-	nativeTransportMessageAck              = "ack"
-	nativeTransportMessageNack             = "nack"
+	nativeTransportEncryptionNone                         = "none"
+	nativeTransportEncryptionX25519GCM                    = "x25519-aes256gcm"
+	nativeTransportMessagePeerManifest                    = "peer.manifest"
+	nativeTransportMessagePeerProbe                       = "peer.manifest.get"
+	nativeTransportMessageTablePull                       = "table.state.pull"
+	nativeTransportMessageTablePush                       = "table.state.push"
+	nativeTransportMessageTableJoinReq                    = "table.join.request"
+	nativeTransportMessageTableJoinResp                   = "table.join.response"
+	nativeTransportMessageTableActReq                     = "table.action.request"
+	nativeTransportMessageTableActResp                    = "table.action.response"
+	nativeTransportMessageTableCustodyReq                 = "table.custody.request"
+	nativeTransportMessageTableCustodyResp                = "table.custody.response"
+	nativeTransportMessageTableCustodySignReq             = "table.custody.sign.request"
+	nativeTransportMessageTableCustodySignResp            = "table.custody.sign.response"
+	nativeTransportMessageTableCustodySignerPrepareReq    = "table.custody.signer.prepare.request"
+	nativeTransportMessageTableCustodySignerPrepareResp   = "table.custody.signer.prepare.response"
+	nativeTransportMessageTableCustodySignerStartReq      = "table.custody.signer.start.request"
+	nativeTransportMessageTableCustodySignerStartResp     = "table.custody.signer.start.response"
+	nativeTransportMessageTableCustodySignerNoncesReq     = "table.custody.signer.nonces.request"
+	nativeTransportMessageTableCustodySignerNoncesResp    = "table.custody.signer.nonces.response"
+	nativeTransportMessageTableCustodySignerAggNoncesReq  = "table.custody.signer.aggregated_nonces.request"
+	nativeTransportMessageTableCustodySignerAggNoncesResp = "table.custody.signer.aggregated_nonces.response"
+	nativeTransportMessageTableHandReq                    = "table.hand.request"
+	nativeTransportMessageTableHandResp                   = "table.hand.response"
+	nativeTransportMessageAck                             = "ack"
+	nativeTransportMessageNack                            = "nack"
 
 	nativeTransportRequestTTL      = 30 * time.Second
 	nativeTransportReadTimeout     = 10 * time.Second
@@ -112,6 +114,9 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 			response = transportpkg.TransportEnvelope{}
 			err = fmt.Errorf("transport handler panic: %v", recovered)
 		}
+		if err != nil {
+			debugMeshf("transport request failed type=%s table=%s sender=%s error=%v", request.MessageType, request.TableID, request.SenderPeerID, err)
+		}
 	}()
 
 	body, sharedSecret, err := runtime.decodeIncomingEnvelope(request)
@@ -127,6 +132,7 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 		if err := json.Unmarshal(body, &fetch); err != nil {
 			return transportpkg.TransportEnvelope{}, err
 		}
+		debugMeshf("table pull request table=%s sender=%s player=%s", fetch.TableID, request.SenderPeerID, fetch.PlayerID)
 		table, err := runtime.store.readTable(fetch.TableID)
 		if err != nil || table == nil {
 			return transportpkg.TransportEnvelope{}, fmt.Errorf("table %s not found", fetch.TableID)
@@ -138,6 +144,7 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 		if err := json.Unmarshal(body, &join); err != nil {
 			return transportpkg.TransportEnvelope{}, err
 		}
+		debugMeshf("table join request table=%s sender=%s player=%s peer_url=%s", join.TableID, request.SenderPeerID, join.WalletPlayerID, join.Peer.PeerURL)
 		table, err := runtime.handleJoinFromPeer(join)
 		if err != nil {
 			return transportpkg.TransportEnvelope{}, err
@@ -213,6 +220,16 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 			return transportpkg.TransportEnvelope{}, err
 		}
 		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodySignerNoncesResp, nativeTransportChannelTable, sharedSecret, response)
+	case nativeTransportMessageTableCustodySignerAggNoncesReq:
+		var noncesRequest nativeCustodySignerAggregatedNoncesRequest
+		if err := json.Unmarshal(body, &noncesRequest); err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		response, err := runtime.handleCustodySignerAggregatedNoncesFromPeer(noncesRequest)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+		return runtime.encodeResponseEnvelope(request, nativeTransportMessageTableCustodySignerAggNoncesResp, nativeTransportChannelTable, sharedSecret, response)
 	case nativeTransportMessageTablePush:
 		var syncRequest nativeTableSyncRequest
 		if err := json.Unmarshal(body, &syncRequest); err != nil {
@@ -479,34 +496,64 @@ func (runtime *meshRuntime) remoteStartCustodySigner(peerURL string, input nativ
 	return nil
 }
 
-func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, input nativeCustodySignerNoncesRequest) error {
+func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, input nativeCustodySignerNoncesRequest) (bool, error) {
 	peerInfo, err := runtime.fetchPeerInfo(peerURL)
 	if err != nil {
-		return err
+		return false, err
 	}
 	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
 	if err != nil {
-		return err
+		return false, err
 	}
 	response, err := runtime.exchangePeerTransport(peerURL, request)
 	if err != nil {
-		return err
+		return false, err
 	}
 	body, err := runtime.decodeResponseEnvelope(response, requestKey)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if response.MessageType != nativeTransportMessageTableCustodySignerNoncesResp {
-		return fmt.Errorf("unexpected transport response %q", response.MessageType)
+		return false, fmt.Errorf("unexpected transport response %q", response.MessageType)
 	}
 	var decoded nativeCustodyAckResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return err
+		return false, err
 	}
 	if !decoded.OK {
-		return errors.New("remote custody signer nonces were not acknowledged")
+		return false, errors.New("remote custody signer nonces were not acknowledged")
 	}
-	return nil
+	return decoded.Signed, nil
+}
+
+func (runtime *meshRuntime) remoteAdvanceCustodySignerAggregatedNonces(peerURL string, input nativeCustodySignerAggregatedNoncesRequest) (bool, error) {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return false, err
+	}
+	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerAggNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
+	if err != nil {
+		return false, err
+	}
+	response, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return false, err
+	}
+	body, err := runtime.decodeResponseEnvelope(response, requestKey)
+	if err != nil {
+		return false, err
+	}
+	if response.MessageType != nativeTransportMessageTableCustodySignerAggNoncesResp {
+		return false, fmt.Errorf("unexpected transport response %q", response.MessageType)
+	}
+	var decoded nativeCustodyAckResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return false, err
+	}
+	if !decoded.OK {
+		return false, errors.New("remote custody signer aggregated nonces were not acknowledged")
+	}
+	return decoded.Signed, nil
 }
 
 func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseType, tableID string, input any) (nativeTableState, error) {

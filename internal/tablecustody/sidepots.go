@@ -5,19 +5,38 @@ import (
 	"sort"
 )
 
+type PotDerivation struct {
+	MatchedContributionSats   map[string]int
+	Slices                    []PotSlice
+	UnmatchedContributionSats map[string]int
+}
+
 func DerivePotSlices(participants []SliceParticipant) ([]PotSlice, error) {
+	derivation, err := DerivePotStructure(participants)
+	if err != nil {
+		return nil, err
+	}
+	return derivation.Slices, nil
+}
+
+func DerivePotStructure(participants []SliceParticipant) (PotDerivation, error) {
+	derivation := PotDerivation{
+		MatchedContributionSats:   map[string]int{},
+		Slices:                    nil,
+		UnmatchedContributionSats: map[string]int{},
+	}
 	if len(participants) == 0 {
-		return nil, nil
+		return derivation, nil
 	}
 
 	distinctCaps := make([]int, 0, len(participants))
 	seenCaps := map[int]struct{}{}
 	for _, participant := range participants {
 		if participant.PlayerID == "" {
-			return nil, fmt.Errorf("pot participant is missing player id")
+			return PotDerivation{}, fmt.Errorf("pot participant is missing player id")
 		}
 		if participant.ContributionSats < 0 {
-			return nil, fmt.Errorf("pot participant %s has negative contribution", participant.PlayerID)
+			return PotDerivation{}, fmt.Errorf("pot participant %s has negative contribution", participant.PlayerID)
 		}
 		if participant.ContributionSats == 0 {
 			continue
@@ -30,9 +49,8 @@ func DerivePotSlices(participants []SliceParticipant) ([]PotSlice, error) {
 	}
 	sort.Ints(distinctCaps)
 
-	slices := make([]PotSlice, 0, len(distinctCaps))
 	previousCap := 0
-	for index, capSats := range distinctCaps {
+	for _, capSats := range distinctCaps {
 		contributors := make([]SliceParticipant, 0, len(participants))
 		eligiblePlayerIDs := make([]string, 0, len(participants))
 		contributedPlayerIDs := make([]string, 0, len(participants))
@@ -53,24 +71,37 @@ func DerivePotSlices(participants []SliceParticipant) ([]PotSlice, error) {
 		if len(contributors) == 0 {
 			continue
 		}
+		if len(contributors) < 2 {
+			break
+		}
 		totalSats := (capSats - previousCap) * len(contributors)
 		if totalSats <= 0 {
 			previousCap = capSats
 			continue
 		}
-		slices = append(slices, PotSlice{
+		for _, participant := range contributors {
+			derivation.MatchedContributionSats[participant.PlayerID] += capSats - previousCap
+		}
+		sequence := len(derivation.Slices)
+		derivation.Slices = append(derivation.Slices, PotSlice{
 			CapSats:              capSats,
 			ContributedPlayerIDs: sortedStrings(contributedPlayerIDs),
 			Contributions:        contributions,
 			EligiblePlayerIDs:    sortedStrings(eligiblePlayerIDs),
-			PotID:                fmt.Sprintf("pot-%02d", index),
-			Sequence:             index,
+			PotID:                fmt.Sprintf("pot-%02d", sequence),
+			Sequence:             sequence,
 			Status:               "open",
 			TotalSats:            totalSats,
 		})
 		previousCap = capSats
 	}
-	return slices, nil
+	for _, participant := range participants {
+		unmatched := participant.ContributionSats - derivation.MatchedContributionSats[participant.PlayerID]
+		if unmatched > 0 {
+			derivation.UnmatchedContributionSats[participant.PlayerID] = unmatched
+		}
+	}
+	return derivation, nil
 }
 
 func SplitAmount(totalSats int, winners []PayoutCandidate, dealerSeatIndex int) (map[string]int, []string) {

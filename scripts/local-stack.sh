@@ -472,6 +472,21 @@ cleanup_nigiri_data() {
   rm -rf "$PARKER_NIGIRI_DATADIR"
 }
 
+prepare_nigiri_data_dirs() {
+  mkdir -p \
+    "$PARKER_NIGIRI_DATADIR/volumes/bitcoin" \
+    "$PARKER_NIGIRI_DATADIR/volumes/elements" \
+    "$PARKER_NIGIRI_DATADIR/volumes/postgres" \
+    "$PARKER_NIGIRI_DATADIR/volumes/tapd" \
+    "$PARKER_NIGIRI_DATADIR/volumes/ark/wallet" \
+    "$PARKER_NIGIRI_DATADIR/volumes/ark/data" \
+    "$PARKER_NIGIRI_DATADIR/volumes/lnd" \
+    "$PARKER_NIGIRI_DATADIR/volumes/nbxplorer" \
+    "$PARKER_NIGIRI_DATADIR/volumes/lightningd"
+
+  chmod -R 0777 "$PARKER_NIGIRI_DATADIR/volumes" 2>/dev/null || true
+}
+
 cleanup_local_runtime_state() {
   load_runtime_env
   rm -rf \
@@ -505,11 +520,13 @@ start_nigiri_stack() {
   for attempt in 1 2 3; do
     stop_nigiri_stack
     mkdir -p "$PARKER_NIGIRI_DATADIR"
+    prepare_nigiri_data_dirs
     : >"$LOCAL_LOG_DIR/nigiri-start.log"
 
     echo "Starting Nigiri (attempt ${attempt}/3)..."
     nigiri_cmd start --ark --ln --ci >"$LOCAL_LOG_DIR/nigiri-start.log" 2>&1 &
     NIGIRI_START_PID=$!
+    prepare_nigiri_data_dirs
 
     if wait_for_http_json "http://127.0.0.1:7070/v1/info" 120 1 >/dev/null &&
       seed_ark_liquidity &&

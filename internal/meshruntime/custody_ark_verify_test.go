@@ -72,3 +72,126 @@ func TestVerifyCustodyRefsOnArkRejectsMismatchedTapscripts(t *testing.T) {
 		t.Fatalf("expected mismatched tapscripts to be rejected, got %v", err)
 	}
 }
+
+func TestValidateCustodyTransitionArkProofAllowsIndexedRefsWithoutPerRefArkTxID(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	host.config.UseMockSettlement = false
+	host.custodyArkVerify = func(refs []tablecustody.VTXORef, requireSpendable bool) error {
+		return nil
+	}
+
+	hostOwner, err := compressedPubkeyFromHex(host.walletID.PublicKeyHex)
+	if err != nil {
+		t.Fatalf("decode host owner pubkey: %v", err)
+	}
+	operator, err := compressedPubkeyFromHex(host.protocolIdentity.PublicKeyHex)
+	if err != nil {
+		t.Fatalf("decode operator pubkey: %v", err)
+	}
+	exitDelay := arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512}
+	script := arkscript.NewDefaultVtxoScript(hostOwner, operator, exitDelay)
+	tapscripts, err := script.Encode()
+	if err != nil {
+		t.Fatalf("encode tapscripts: %v", err)
+	}
+	tapKey, _, err := script.TapTree()
+	if err != nil {
+		t.Fatalf("build tap tree: %v", err)
+	}
+	pkScript, err := arkscript.P2TRScript(tapKey)
+	if err != nil {
+		t.Fatalf("derive p2tr script: %v", err)
+	}
+
+	transition := tablecustody.CustodyTransition{
+		Kind:        tablecustody.TransitionKindBuyInLock,
+		ArkIntentID: "ark-intent-1",
+		ArkTxID:     "batch-tx-1",
+		NextState: tablecustody.CustodyState{
+			StackClaims: []tablecustody.StackClaim{
+				{
+					PlayerID:   "player-1",
+					AmountSats: 4_000,
+					VTXORefs: []tablecustody.VTXORef{
+						{
+							AmountSats:  4_000,
+							ArkIntentID: "ark-intent-1",
+							ArkTxID:     "",
+							Script:      hex.EncodeToString(pkScript),
+							Tapscripts:  tapscripts,
+							TxID:        strings.Repeat("01", 32),
+							VOut:        0,
+						},
+					},
+				},
+			},
+		},
+		Proof: tablecustody.CustodyProof{
+			VTXORefs: []tablecustody.VTXORef{
+				{
+					AmountSats:  4_000,
+					ArkIntentID: "ark-intent-1",
+					ArkTxID:     "",
+					Script:      hex.EncodeToString(pkScript),
+					Tapscripts:  tapscripts,
+					TxID:        strings.Repeat("01", 32),
+					VOut:        0,
+				},
+			},
+		},
+	}
+
+	if err := validateAcceptedCustodyRefs(nil, transition, true); err != nil {
+		t.Fatalf("expected structural validation to accept blank per-ref Ark tx id, got %v", err)
+	}
+	if err := host.validateCustodyTransitionArkProof(nil, transition, true); err != nil {
+		t.Fatalf("expected Ark proof validation to accept blank per-ref Ark tx id, got %v", err)
+	}
+}
+
+func TestSelectCustodySpendPathFallsBackToRefOwnerBeforeSeatReplication(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	config, err := host.arkCustodyConfig()
+	if err != nil {
+		t.Fatalf("ark custody config: %v", err)
+	}
+	guestOwner, err := compressedPubkeyFromHex(guest.walletID.PublicKeyHex)
+	if err != nil {
+		t.Fatalf("decode guest owner pubkey: %v", err)
+	}
+	operator, err := compressedPubkeyFromHex(config.SignerPubkeyHex)
+	if err != nil {
+		t.Fatalf("decode operator pubkey: %v", err)
+	}
+	script := arkscript.NewDefaultVtxoScript(guestOwner, operator, config.UnilateralExitDelay)
+	tapscripts, err := script.Encode()
+	if err != nil {
+		t.Fatalf("encode tapscripts: %v", err)
+	}
+	tapKey, _, err := script.TapTree()
+	if err != nil {
+		t.Fatalf("build tap tree: %v", err)
+	}
+	pkScript, err := arkscript.P2TRScript(tapKey)
+	if err != nil {
+		t.Fatalf("derive p2tr script: %v", err)
+	}
+
+	ref := tablecustody.VTXORef{
+		AmountSats:    4_000,
+		OwnerPlayerID: guest.walletID.PlayerID,
+		Script:        hex.EncodeToString(pkScript),
+		Tapscripts:    tapscripts,
+		TxID:          strings.Repeat("02", 32),
+		VOut:          0,
+	}
+	path, err := host.selectCustodySpendPath(nativeTableState{}, ref, []string{guest.walletID.PlayerID}, false)
+	if err != nil {
+		t.Fatalf("expected spend path selection to fall back to ref owner, got %v", err)
+	}
+	if len(path.PlayerIDs) != 1 || path.PlayerIDs[0] != guest.walletID.PlayerID {
+		t.Fatalf("expected fallback player ownership, got %+v", path.PlayerIDs)
+	}
+}
