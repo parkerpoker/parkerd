@@ -83,11 +83,13 @@ func (runtime *meshRuntime) custodyBalancesFromHand(table nativeTableState, hand
 		for _, seat := range table.Seats {
 			amount := seat.BuyInSats
 			reserve := maxInt(0, sumVTXORefs(seat.FundingRefs)-amount)
+			refs := append([]tablecustody.VTXORef(nil), seat.FundingRefs...)
 			if table.LatestCustodyState != nil {
 				for _, claim := range table.LatestCustodyState.StackClaims {
 					if claim.PlayerID == seat.PlayerID {
 						amount = claim.AmountSats
 						reserve = claim.ReservedFeeSats
+						refs = append([]tablecustody.VTXORef(nil), claim.VTXORefs...)
 						break
 					}
 				}
@@ -98,7 +100,7 @@ func (runtime *meshRuntime) custodyBalancesFromHand(table nativeTableState, hand
 				SeatIndex:       seat.SeatIndex,
 				StackSats:       amount,
 				Status:          seat.Status,
-				VTXORefs:        firstNonEmptyRefs(refByPlayerID[seat.PlayerID], seat.FundingRefs),
+				VTXORefs:        refs,
 			})
 		}
 		return balances
@@ -372,6 +374,15 @@ func excludedCustodySignerIDs(transition tablecustody.CustodyTransition) map[str
 	return excluded
 }
 
+func terminalCustodySeatStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "completed", "exited", "pending-exit":
+		return true
+	default:
+		return false
+	}
+}
+
 func (runtime *meshRuntime) requiredCustodySigners(table nativeTableState, transition tablecustody.CustodyTransition) []string {
 	if transition.Kind == tablecustody.TransitionKindBuyInLock {
 		return nil
@@ -381,9 +392,17 @@ func (runtime *meshRuntime) requiredCustodySigners(table nativeTableState, trans
 		return []string{transition.ActingPlayerID}
 	}
 	excluded := excludedCustodySignerIDs(transition)
+	claimStatusByPlayer := map[string]string{}
+	for _, claim := range transition.NextState.StackClaims {
+		claimStatusByPlayer[claim.PlayerID] = claim.Status
+	}
 	playerIDs := make([]string, 0, len(table.Seats))
 	for _, seat := range table.Seats {
-		if seat.Status != "" && seat.Status != "active" {
+		if status, ok := claimStatusByPlayer[seat.PlayerID]; ok {
+			if terminalCustodySeatStatus(status) {
+				continue
+			}
+		} else if seat.Status != "" && seat.Status != "active" {
 			continue
 		}
 		if _, skip := excluded[seat.PlayerID]; skip {

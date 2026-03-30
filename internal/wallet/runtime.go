@@ -955,7 +955,7 @@ func createMockWallet(playerID string) WalletSummary {
 		WalletSpendableSats: 50_000,
 		TableLockedSats:     0,
 		PendingExitSats:     0,
-		ArkAddress:          "tark1" + suffix(playerID, 16),
+		ArkAddress:          "tark1qpt0syx7j0jspe69kldtljet0x9jz6ns4xw70m0w0xl30yfhn0mzm2qurrcmgc5p3xf8xvjg2crvl7d95wdgu5zal3k2vthw3l7mhq7utddkqv",
 		BoardingAddress:     "bcrt1q" + padRight(suffix(playerID, 20), 20, "0"),
 	}
 }

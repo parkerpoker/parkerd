@@ -11,17 +11,17 @@ func tableHasLiveHand(table nativeTableState) bool {
 	return table.ActiveHand != nil && table.ActiveHand.State.Phase != game.StreetSettled
 }
 
-func (runtime *meshRuntime) buildFundsCustodyTransition(table nativeTableState, kind tablecustody.TransitionKind, finalStatus string) (tablecustody.CustodyTransition, error) {
+func (runtime *meshRuntime) buildFundsCustodyTransitionForPlayer(table nativeTableState, playerID string, kind tablecustody.TransitionKind, finalStatus string) (tablecustody.CustodyTransition, error) {
 	if table.LatestCustodyState == nil {
 		return tablecustody.CustodyTransition{}, errors.New("latest custody state is unavailable")
 	}
 	binding := runtime.custodyStateBinding(table, nil)
-	binding.ActingPlayerID = runtime.walletID.PlayerID
+	binding.ActingPlayerID = playerID
 
 	balances := runtime.custodyBalancesFromHand(table, nil)
 	foundLocal := false
 	for index := range balances {
-		if balances[index].PlayerID != runtime.walletID.PlayerID {
+		if balances[index].PlayerID != playerID {
 			continue
 		}
 		balances[index].StackSats = 0
@@ -31,14 +31,24 @@ func (runtime *meshRuntime) buildFundsCustodyTransition(table nativeTableState, 
 		foundLocal = true
 	}
 	if !foundLocal {
-		return tablecustody.CustodyTransition{}, errors.New("latest custody state is missing the local stack claim")
+		return tablecustody.CustodyTransition{}, errors.New("latest custody state is missing the target stack claim")
 	}
 	return tablecustody.BuildTransition(kind, binding, balances, table.LatestCustodyState, nil, nil)
+}
+
+func (runtime *meshRuntime) buildFundsCustodyTransition(table nativeTableState, kind tablecustody.TransitionKind, finalStatus string) (tablecustody.CustodyTransition, error) {
+	return runtime.buildFundsCustodyTransitionForPlayer(table, runtime.walletID.PlayerID, kind, finalStatus)
 }
 
 func (runtime *meshRuntime) publicStateFromLatestCustody(table nativeTableState, status string) *NativePublicTableState {
 	if table.LatestCustodyState == nil {
 		return nil
+	}
+	handID := table.LatestCustodyState.HandID
+	handNumber := table.LatestCustodyState.HandNumber
+	if status != "active" {
+		handID = ""
+		handNumber = 0
 	}
 	chipBalances := map[string]int{}
 	livePlayerIDs := make([]string, 0, len(table.Seats))
@@ -74,8 +84,8 @@ func (runtime *meshRuntime) publicStateFromLatestCustody(table nativeTableState,
 		DealerSeatIndex:      nil,
 		Epoch:                table.CurrentEpoch,
 		FoldedPlayerIDs:      []string{},
-		HandID:               table.LatestCustodyState.HandID,
-		HandNumber:           table.LatestCustodyState.HandNumber,
+		HandID:               handID,
+		HandNumber:           handNumber,
 		LatestEventHash:      table.LastEventHash,
 		LivePlayerIDs:        livePlayerIDs,
 		MinRaiseToSats:       table.Config.BigBlindSats,

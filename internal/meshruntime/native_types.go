@@ -351,6 +351,36 @@ type nativeActionRequest struct {
 	TableID              string      `json:"tableId"`
 }
 
+type nativeFundsRequest struct {
+	ArkAddress           string `json:"arkAddress,omitempty"`
+	Epoch                int    `json:"epoch"`
+	Kind                 string `json:"kind"`
+	PlayerID             string `json:"playerId"`
+	PrevCustodyStateHash string `json:"prevCustodyStateHash,omitempty"`
+	ProfileName          string `json:"profileName"`
+	SignatureHex         string `json:"signatureHex"`
+	SignedAt             string `json:"signedAt"`
+	TableID              string `json:"tableId"`
+}
+
+type nativeFundsSettlement struct {
+	AmountSats      int                    `json:"amountSats"`
+	ArkIntentID     string                 `json:"arkIntentId,omitempty"`
+	ArkTxID         string                 `json:"arkTxid,omitempty"`
+	CustodySeq      int                    `json:"custodySeq"`
+	ExitProofRef    string                 `json:"exitProofRef,omitempty"`
+	PrevStateHash   string                 `json:"prevStateHash,omitempty"`
+	StateHash       string                 `json:"stateHash,omitempty"`
+	Status          string                 `json:"status"`
+	TransitionHash  string                 `json:"transitionHash,omitempty"`
+	VTXORefs        []tablecustody.VTXORef `json:"vtxoRefs,omitempty"`
+}
+
+type nativeFundsResponse struct {
+	Settlement nativeFundsSettlement `json:"settlement"`
+	Table      nativeTableState      `json:"table"`
+}
+
 type nativeCustodyApprovalRequest struct {
 	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash"`
 	PlayerID              string                         `json:"playerId"`
@@ -364,6 +394,7 @@ type nativeCustodyApprovalResponse struct {
 
 type nativeCustodyTxSignRequest struct {
 	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash,omitempty"`
+	ExpectedOutputs       []custodyBatchOutput          `json:"expectedOutputs,omitempty"`
 	PSBT                  string                         `json:"psbt"`
 	PlayerID              string                         `json:"playerId"`
 	Purpose               string                         `json:"purpose,omitempty"`
@@ -379,6 +410,7 @@ type nativeCustodyTxSignResponse struct {
 type nativeCustodySignerPrepareRequest struct {
 	DerivationPath        string                         `json:"derivationPath"`
 	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash,omitempty"`
+	ExpectedOffchainOutputs []custodyBatchOutput         `json:"expectedOffchainOutputs,omitempty"`
 	PlayerID              string                         `json:"playerId"`
 	TableID               string                         `json:"tableId"`
 	TransitionHash        string                         `json:"transitionHash,omitempty"`

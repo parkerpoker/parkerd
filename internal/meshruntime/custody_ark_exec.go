@@ -275,7 +275,7 @@ func custodyOutputAuthorizationKey(valueSats int64, pkScript []byte) string {
 	return fmt.Sprintf("%d|%s", valueSats, hex.EncodeToString(pkScript))
 }
 
-func validateCustodyProofPSBT(packet *psbt.Packet, plan *custodySettlementPlan) error {
+func validateCustodyProofPSBT(packet *psbt.Packet, plan *custodySettlementPlan, authorizedOutputs []custodyBatchOutput) error {
 	if packet == nil {
 		return errors.New("custody proof psbt is missing")
 	}
@@ -316,14 +316,19 @@ func validateCustodyProofPSBT(packet *psbt.Packet, plan *custodySettlementPlan) 
 	}
 
 	expectedOutputs := map[string]int{}
-	for _, output := range plan.Outputs {
-		txOut, err := decodeBatchOutputTxOut(custodyBatchOutputFromSpec(output))
+	if len(authorizedOutputs) == 0 {
+		for _, output := range plan.Outputs {
+			authorizedOutputs = append(authorizedOutputs, custodyBatchOutputFromSpec(output))
+		}
+	}
+	for _, output := range authorizedOutputs {
+		txOut, err := decodeBatchOutputTxOut(output)
 		if err != nil {
 			return err
 		}
 		expectedOutputs[custodyOutputAuthorizationKey(txOut.Value, txOut.PkScript)]++
 	}
-	if len(packet.UnsignedTx.TxOut) != len(plan.Outputs) {
+	if len(packet.UnsignedTx.TxOut) != len(authorizedOutputs) {
 		return errors.New("custody proof psbt output set does not match the authorized transition")
 	}
 	for _, txOut := range packet.UnsignedTx.TxOut {
@@ -353,6 +358,41 @@ func validateCustodyProofPSBT(packet *psbt.Packet, plan *custodySettlementPlan) 
 		}
 		if packet.UnsignedTx.TxIn[index+1].Sequence != expectedSequence {
 			return fmt.Errorf("custody proof psbt input %d sequence does not match the authorized spend path", index)
+		}
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) validateRequestedCustodyProofOutputs(playerID string, transition tablecustody.CustodyTransition, outputs []custodyBatchOutput) error {
+	if len(outputs) == 0 {
+		return nil
+	}
+	if transition.Kind != tablecustody.TransitionKindCashOut && transition.Kind != tablecustody.TransitionKindEmergencyExit {
+		return nil
+	}
+	walletInfo, err := runtime.walletRuntime.GetWallet(runtime.profileName)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(walletInfo.ArkAddress) == "" {
+		return errors.New("wallet has no Ark address for custody proof signing")
+	}
+	for _, output := range outputs {
+		if output.ClaimKey != "wallet-return" {
+			return fmt.Errorf("custody proof output %s is not authorized for player cash-out", output.ClaimKey)
+		}
+		if output.OwnerPlayerID != "" && output.OwnerPlayerID != playerID {
+			return fmt.Errorf("custody proof output %s is owned by the wrong player", output.ClaimKey)
+		}
+		expected, err := custodyBatchOutputFromReceiver(output.ClaimKey, playerID, sdktypes.Receiver{
+			To:     walletInfo.ArkAddress,
+			Amount: uint64(output.AmountSats),
+		}, output.Tapscripts)
+		if err != nil {
+			return err
+		}
+		if expected.Onchain != output.Onchain || expected.Script != output.Script {
+			return errors.New("custody proof wallet-return output does not match the requesting player's Ark wallet")
 		}
 	}
 	return nil
@@ -564,7 +604,7 @@ func (runtime *meshRuntime) validateCustodySigningTransition(table nativeTableSt
 	return plan, nil
 }
 
-func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, playerID, prevStateHash, transitionHash, purpose, current string, transition tablecustody.CustodyTransition) (string, error) {
+func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, playerID, prevStateHash, transitionHash, purpose, current string, transition tablecustody.CustodyTransition, outputs []custodyBatchOutput) (string, error) {
 	if playerID == runtime.walletID.PlayerID {
 		return runtime.walletRuntime.SignCustodyTransaction(runtime.profileName, current)
 	}
@@ -577,6 +617,7 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 	}
 	return runtime.remoteSignCustodyPSBT(seat.PeerURL, nativeCustodyTxSignRequest{
 		ExpectedPrevStateHash: prevStateHash,
+		ExpectedOutputs:       append([]custodyBatchOutput(nil), outputs...),
 		PSBT:                  current,
 		PlayerID:              playerID,
 		Purpose:               purpose,
@@ -586,10 +627,10 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 	})
 }
 
-func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition) (string, error) {
+func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition, outputs []custodyBatchOutput) (string, error) {
 	signed := unsigned
 	for _, playerID := range uniqueSortedPlayerIDs(signerIDs) {
-		nextSigned, err := runtime.signCustodyPSBTWithPlayer(table, playerID, prevStateHash, transitionHash, purpose, signed, transition)
+		nextSigned, err := runtime.signCustodyPSBTWithPlayer(table, playerID, prevStateHash, transitionHash, purpose, signed, transition, outputs)
 		if err != nil {
 			return "", err
 		}
@@ -619,7 +660,10 @@ func (runtime *meshRuntime) handleCustodyTxSignFromPeer(request nativeCustodyTxS
 		if !containsPlayerID(plan.ProofSignerIDs, request.PlayerID) {
 			return nativeCustodyTxSignResponse{}, errors.New("custody tx signing request is not authorized for this player")
 		}
-		if err := validateCustodyProofPSBT(packet, plan); err != nil {
+		if err := runtime.validateRequestedCustodyProofOutputs(request.PlayerID, request.Transition, request.ExpectedOutputs); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if err := validateCustodyProofPSBT(packet, plan, request.ExpectedOutputs); err != nil {
 			return nativeCustodyTxSignResponse{}, err
 		}
 	case "forfeit":
@@ -662,7 +706,10 @@ func (runtime *meshRuntime) handleCustodySignerPrepareFromPeer(request nativeCus
 	if !containsPlayerID(runtime.custodyTreeSignerIDs(*table, request.Transition), request.PlayerID) {
 		return nativeCustodySignerPrepareResponse{}, errors.New("custody signer prepare request is not authorized for this player")
 	}
-	offchainOutputs := offchainCustodyBatchOutputs(custodyTransitionBatchOutputs(table.LatestCustodyState, request.Transition))
+	offchainOutputs := offchainCustodyBatchOutputs(request.ExpectedOffchainOutputs)
+	if len(offchainOutputs) == 0 {
+		offchainOutputs = offchainCustodyBatchOutputs(custodyTransitionBatchOutputs(table.LatestCustodyState, request.Transition))
+	}
 	if len(offchainOutputs) == 0 {
 		return nativeCustodySignerPrepareResponse{}, errors.New("custody signer prepare request does not authorize any offchain outputs")
 	}
@@ -1169,7 +1216,7 @@ func (handler *custodyBatchEventsHandler) createSignedForfeit(ctx context.Contex
 	if err != nil {
 		return "", err
 	}
-	return handler.runtime.fullySignCustodyPSBT(handler.table, handler.prevStateHash, handler.requestKey, "forfeit", input.SpendPath.PlayerIDs, unsigned, handler.transition)
+	return handler.runtime.fullySignCustodyPSBT(handler.table, handler.prevStateHash, handler.requestKey, "forfeit", input.SpendPath.PlayerIDs, unsigned, handler.transition, nil)
 }
 
 func mustSerializeTxTree(value *arktree.TxTree) arktree.FlatTxTree {
@@ -1243,10 +1290,11 @@ func custodyOutputsRequireTreeSigning(outputs []custodyBatchOutput) bool {
 	return false
 }
 
-func (runtime *meshRuntime) prepareCustodyBatchSigners(table nativeTableState, prevStateHash, transitionHash string, transition tablecustody.CustodyTransition, signerIDs []string) (map[string]walletpkg.CustodySignerSession, map[string]string, string, error) {
+func (runtime *meshRuntime) prepareCustodyBatchSigners(table nativeTableState, prevStateHash, transitionHash string, transition tablecustody.CustodyTransition, signerIDs []string, outputs []custodyBatchOutput) (map[string]walletpkg.CustodySignerSession, map[string]string, string, error) {
 	derivationPath := custodySignerDerivationPath(transitionHash)
 	sessions := map[string]walletpkg.CustodySignerSession{}
 	pubkeys := map[string]string{}
+	offchainOutputs := offchainCustodyBatchOutputs(outputs)
 	for _, playerID := range uniqueSortedPlayerIDs(signerIDs) {
 		if strings.TrimSpace(playerID) == "" {
 			continue
@@ -1269,12 +1317,13 @@ func (runtime *meshRuntime) prepareCustodyBatchSigners(table nativeTableState, p
 			return nil, nil, "", fmt.Errorf("missing peer url for custody signer %s", playerID)
 		}
 		response, err := runtime.remotePrepareCustodySigner(peerURL, nativeCustodySignerPrepareRequest{
-			DerivationPath:        derivationPath,
-			ExpectedPrevStateHash: prevStateHash,
-			PlayerID:              playerID,
-			TableID:               table.Config.TableID,
-			Transition:            transition,
-			TransitionHash:        transitionHash,
+			DerivationPath:          derivationPath,
+			ExpectedPrevStateHash:   prevStateHash,
+			ExpectedOffchainOutputs: append([]custodyBatchOutput(nil), offchainOutputs...),
+			PlayerID:                playerID,
+			TableID:                 table.Config.TableID,
+			Transition:              transition,
+			TransitionHash:          transitionHash,
 		})
 		if err != nil {
 			return nil, nil, "", err
@@ -1419,7 +1468,7 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		return nil, errors.New("custody batch is missing proof signers")
 	}
 
-	signerSessions, signerPubkeys, derivationPath, err := runtime.prepareCustodyBatchSigners(table, prevStateHash, transitionHash, transition, treeSignerIDs)
+	signerSessions, signerPubkeys, derivationPath, err := runtime.prepareCustodyBatchSigners(table, prevStateHash, transitionHash, transition, treeSignerIDs, outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -1432,7 +1481,7 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	if err != nil {
 		return nil, err
 	}
-	signedProof, err := runtime.fullySignCustodyPSBT(table, prevStateHash, transitionHash, "proof", proofSignerIDs, unsignedProof, transition)
+	signedProof, err := runtime.fullySignCustodyPSBT(table, prevStateHash, transitionHash, "proof", proofSignerIDs, unsignedProof, transition, outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -1626,10 +1675,10 @@ func latestStackClaimForPlayer(state *tablecustody.CustodyState, playerID string
 	return tablecustody.StackClaim{}, false
 }
 
-func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind string) (*custodyBatchResult, int, string, error) {
-	claim, ok := latestStackClaimForPlayer(table.LatestCustodyState, runtime.walletID.PlayerID)
+func (runtime *meshRuntime) settleTableFundsForPlayer(table nativeTableState, transition tablecustody.CustodyTransition, playerID, arkAddress string) (*custodyBatchResult, int, string, error) {
+	claim, ok := latestStackClaimForPlayer(table.LatestCustodyState, playerID)
 	if !ok {
-		return nil, 0, "", errors.New("latest custody state is missing the local stack claim")
+		return nil, 0, "", errors.New("latest custody state is missing the target stack claim")
 	}
 	totalClaimSats := stackClaimBackedAmount(claim)
 	if totalClaimSats <= 0 {
@@ -1638,27 +1687,17 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if len(claim.VTXORefs) == 0 {
 		return nil, 0, "", errors.New("latest custody state stack claim is missing vtxo refs")
 	}
-	inputs := make([]custodyInputSpec, 0, len(claim.VTXORefs))
-	for _, ref := range claim.VTXORefs {
-		spendPath, err := runtime.selectCustodySpendPath(table, ref, []string{runtime.walletID.PlayerID}, false)
-		if err != nil {
-			return nil, 0, "", err
-		}
-		inputs = append(inputs, custodyInputSpec{
-			ClaimKey:      stackClaimKey(runtime.walletID.PlayerID),
-			OwnerPlayerID: runtime.walletID.PlayerID,
-			Ref:           ref,
-			SpendPath:     spendPath,
-		})
-	}
-	walletInfo, err := runtime.walletRuntime.GetWallet(runtime.profileName)
+	signingTransition, plan, err := runtime.normalizedCustodySigningTransition(table, transition)
 	if err != nil {
 		return nil, 0, "", err
 	}
-	if strings.TrimSpace(walletInfo.ArkAddress) == "" {
+	if len(plan.Inputs) == 0 {
+		return nil, 0, "", errors.New("latest custody state has no spendable stack to settle")
+	}
+	if strings.TrimSpace(arkAddress) == "" {
 		return nil, 0, "", errors.New("wallet has no Ark address for cash-out settlement")
 	}
-	feeSats, err := runtime.estimatedCustodyBatchFee(len(inputs), 1, 0, 0)
+	feeSats, err := runtime.estimatedCustodyBatchFee(len(plan.Inputs), 1, 0, 0)
 	if err != nil {
 		return nil, 0, "", err
 	}
@@ -1666,31 +1705,37 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if settledAmount <= 0 {
 		return nil, 0, "", fmt.Errorf("custody claim is too small to cover Ark cash-out fees: have %d need %d", totalClaimSats, feeSats)
 	}
-	output, err := custodyBatchOutputFromReceiver("wallet-return", runtime.walletID.PlayerID, sdktypes.Receiver{
-		To:     walletInfo.ArkAddress,
+	output, err := custodyBatchOutputFromReceiver("wallet-return", playerID, sdktypes.Receiver{
+		To:     arkAddress,
 		Amount: uint64(settledAmount),
 	}, nil)
 	if err != nil {
 		return nil, 0, "", err
 	}
-	transition := tablecustody.CustodyTransition{
-		ActingPlayerID: runtime.walletID.PlayerID,
-		CustodySeq:     table.LatestCustodyState.CustodySeq + 1,
-		Kind:           tablecustody.TransitionKindCashOut,
-		PrevStateHash:  table.LatestCustodyState.StateHash,
-		TableID:        table.Config.TableID,
-	}
-	if kind == string(tablecustody.TransitionKindEmergencyExit) || kind == "emergency-exit" {
-		transition.Kind = tablecustody.TransitionKindEmergencyExit
-	}
-	transitionHash := custodyTransitionRequestHash(transition)
-	result, err := runtime.executeCustodyBatch(table, table.LatestCustodyState.StateHash, transitionHash, transition, inputs, []string{runtime.walletID.PlayerID}, []string{runtime.walletID.PlayerID}, []custodyBatchOutput{output})
+	transitionHash := custodyTransitionRequestHash(signingTransition)
+	result, err := runtime.executeCustodyBatch(table, table.LatestCustodyState.StateHash, transitionHash, signingTransition, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, []custodyBatchOutput{output})
 	if err != nil {
 		return nil, 0, "", err
 	}
 	exitProofRef := ""
-	if kind == string(tablecustody.TransitionKindEmergencyExit) || kind == "emergency-exit" {
-		exitProofRef = tablecustody.BuildExitProofRef(*table.LatestCustodyState, runtime.walletID.PlayerID, claim.VTXORefs, nil)
+	if transition.Kind == tablecustody.TransitionKindEmergencyExit {
+		exitProofRef = tablecustody.BuildExitProofRef(*table.LatestCustodyState, playerID, claim.VTXORefs, nil)
 	}
 	return result, settledAmount, exitProofRef, nil
+}
+
+func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind string) (*custodyBatchResult, int, string, error) {
+	walletInfo, err := runtime.walletRuntime.GetWallet(runtime.profileName)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	transitionKind, finalStatus, err := fundsTransitionKindAndStatus(kind)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	transition, err := runtime.buildFundsCustodyTransitionForPlayer(table, runtime.walletID.PlayerID, transitionKind, finalStatus)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	return runtime.settleTableFundsForPlayer(table, transition, runtime.walletID.PlayerID, walletInfo.ArkAddress)
 }

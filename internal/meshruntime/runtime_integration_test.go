@@ -33,7 +33,15 @@ func lockRegtestRound(t *testing.T) func() {
 	}
 }
 
-func TestRegtestRoundUsesRealArkCustody(t *testing.T) {
+func TestRegtestRoundUsesRealArkCustodyStandardScenario(t *testing.T) {
+	runRegtestRoundScenario(t, "standard-4d")
+}
+
+func TestRegtestRoundUsesRealArkCustodyHostPlayerScenario(t *testing.T) {
+	runRegtestRoundScenario(t, "host-player-2d")
+}
+
+func runRegtestRoundScenario(t *testing.T, scenario string) {
 	if testing.Short() {
 		t.Skip("skipping regtest Ark integration round in short mode")
 	}
@@ -74,14 +82,14 @@ func TestRegtestRoundUsesRealArkCustody(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"BASE="+baseDir,
 		"PCLI_TIMEOUT_SECONDS=20",
-		"ROUND_SCENARIO=host-player-2d",
+		"ROUND_SCENARIO="+scenario,
 	)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		t.Fatalf("regtest round timed out after %s (artifacts at %s)\n%s", 15*time.Minute, runRoot, string(output))
+		t.Fatalf("regtest round %s timed out after %s (artifacts at %s)\n%s", scenario, 15*time.Minute, runRoot, string(output))
 	}
 	if err != nil {
-		t.Fatalf("regtest round failed: %v (artifacts at %s)\n%s", err, runRoot, string(output))
+		t.Fatalf("regtest round %s failed: %v (artifacts at %s)\n%s", scenario, err, runRoot, string(output))
 	}
 
 	text := string(output)
@@ -93,7 +101,7 @@ func TestRegtestRoundUsesRealArkCustody(t *testing.T) {
 		"Done. Logs are under",
 	} {
 		if !strings.Contains(text, marker) {
-			t.Fatalf("regtest round output missing %q (artifacts at %s)\n%s", marker, runRoot, text)
+			t.Fatalf("regtest round %s output missing %q (artifacts at %s)\n%s", scenario, marker, runRoot, text)
 		}
 	}
 	cleanupRunRoot = true
