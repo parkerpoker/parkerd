@@ -46,6 +46,8 @@ The daemon still exposes the existing local RPC methods used by the CLI and cont
 
 The local transport is still newline-delimited JSON request/response/event envelopes over the profile socket.
 
+`meshRenew` remains on the control surface for compatibility, but the current runtime implements it as a carry-forward acknowledgment over the latest custody state rather than as a separate money-moving protocol step.
+
 ## Peer Transport
 
 Peer endpoints are still advertised as:
@@ -70,14 +72,26 @@ The runtime currently handles:
 - `table.join.response`
 - `table.action.request`
 - `table.action.response`
+- `table.funds.request`
+- `table.funds.response`
 - `table.custody.request`
 - `table.custody.response`
+- `table.custody.sign.request`
+- `table.custody.sign.response`
+- `table.custody.signer.prepare.request`
+- `table.custody.signer.prepare.response`
+- `table.custody.signer.start.request`
+- `table.custody.signer.start.response`
+- `table.custody.signer.nonces.request`
+- `table.custody.signer.nonces.response`
+- `table.custody.signer.aggregated_nonces.request`
+- `table.custody.signer.aggregated_nonces.response`
 - `table.hand.request`
 - `table.hand.response`
 - `ack`
 - `nack`
 
-The new pieces in the custody generation are the `table.custody.*` routes and the tighter coupling between table sync, action acceptance, and custody finalization.
+The new pieces in the custody generation are the `table.funds.*`, `table.custody.*`, `table.custody.sign*`, and `table.custody.signer.*` routes plus the tighter coupling between table sync, action acceptance, and custody finalization.
 
 ## Authoritative Table State
 
@@ -124,6 +138,7 @@ The host will not accept `SeatLocked` unless:
 - funding refs are present
 - funding total covers the buy-in
 - funding refs are not duplicated
+- in real-settlement mode, funding refs verify live on Ark and remain acceptable spend inputs
 
 Seat lock is then committed as a `buy-in-lock` custody transition.
 
@@ -150,6 +165,8 @@ For an accepted action, the host:
 6. appends `PlayerAction`
 
 `PlayerAction` therefore reflects an already-finalized custody step.
+
+This also covers zero-exposure successors such as `check` or timeout auto-check. Those still advance `custodySeq`, but if the successor reuses the same refs and needs no Ark spend inputs, the runtime finalizes a non-settlement custody transition instead of forcing a batch.
 
 ## Custody Transition Contract
 
@@ -183,6 +200,8 @@ Transition kinds currently used by the runtime include:
 - `showdown-payout`
 - `cash-out`
 - `emergency-exit`
+
+In real-settlement mode, peer approval and replay validation do more than hash-chain checks. They verify Ark-linked refs live against Ark/indexer state, including amount/script identity and tapscript-to-output binding for any declared taproot custody refs. The current implementation relies on live verification, not a separate offline inclusion-proof bundle.
 
 ## Hand And Money Sequencing
 
@@ -235,4 +254,5 @@ The safest way to interpret the current protocol is:
 - custody state, not snapshots, is the money-finality object
 - the host proposes transitions and orchestrates replication
 - money-changing steps are accepted only after custody finalization
+- real-mode peer approvals and replay validate Ark-linked refs against live Ark/indexer state before signing or persistence
 - non-host peers replay transcript, public state, snapshot history, and custody history before persistence

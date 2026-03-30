@@ -83,6 +83,7 @@ Current runtime behavior:
 - cooperative money changes collect seated-player approvals
 - timeout successors can exclude a dead non-cooperating player when resolving that timeout path
 - reveal/private-delivery/showdown timeout refunds uncontested stack instead of gifting it to the surviving player
+- remote signers validate the prebuilt custody transition and authorized output set before signing PSBT or tree-signing requests
 
 This keeps liveness from depending on continued cooperation by a player who has already lost eligibility in the contested portion of the hand.
 
@@ -98,6 +99,8 @@ Accepted state is checked against:
 - historical event continuity
 - historical snapshot continuity
 - historical custody continuity
+
+In real-settlement mode those checks also include live Ark/indexer validation of accepted custody refs, including tapscript-to-output binding for any declared taproot custody refs. The current implementation validates against live services rather than carrying a fully self-contained offline inclusion-proof bundle.
 
 This means a malicious or stale proposer can still waste time or withhold progress, but it should not be able to silently rewrite accepted money history without being rejected by honest peers.
 
@@ -169,6 +172,7 @@ If Ark-backed services are unavailable:
 - new custody transitions may fail closed
 - onboarding/offboarding may stall
 - exit completion may stall
+- replay or approval of new Ark-settled successors may stall because live verification is part of acceptance
 
 Again, this is a liveness issue. The accepted custody checkpoint remains the reference claim.
 
@@ -193,4 +197,5 @@ The safest way to interpret the current system is:
 - trust each daemon to protect its own secrets
 - trust the host to propose and sequence, not to define money alone
 - trust custody replay more than snapshots or UI projections
+- treat live Ark/indexer verification as part of current acceptance and signing safety
 - treat controller and indexer outages as liveness failures, not custody failures

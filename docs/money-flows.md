@@ -13,9 +13,10 @@ The important current-state rules are:
 - `LatestCustodyState` is the authoritative money checkpoint
 - `LatestSnapshot` and `LatestFullySignedSnapshot` are derived replay/debug projections
 - seat lock, blind posting, betting actions, timeout successors, settled payouts, cash-out, and emergency exit are custody transitions
+- zero-exposure successors like `check` can still advance custody through a non-settlement transition that reuses the same refs
 - `meshRenew` is no longer a money-moving primitive; continuing play means carrying forward the latest stack claims
 - local table-funds state is now `arkade-table-funds/v2`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
-- `walletSummary()` presents wallet funds plus table-locked custody claims as separate buckets
+- `walletSummary()` presents Ark wallet funds plus locally recorded custody-backed table-funds buckets as separate totals
 
 In mock-settlement mode the runtime still synthesizes Ark ids for tests, but the runtime model and checkpoints are custody-first either way.
 
@@ -76,7 +77,7 @@ These are no longer money authority:
 - `LatestFullySignedSnapshot`
 - local table-funds entries
 
-They exist for replay, UI, and operator/debug workflows, but cash-out, exit, renew/carry-forward, availability, and historical validation all now key off custody state first.
+They exist for replay, UI, and operator/debug workflows. `arkade-table-funds/v2` is a derived local receipt ledger written after custody-backed operations succeed. Cash-out, exit, renew/carry-forward, availability, and historical validation all key off custody state first.
 
 ## Join And Buy-In Lock
 
@@ -98,10 +99,11 @@ The host:
 
 1. validates the identity binding
 2. validates funding refs and rejects empty, duplicate, or insufficient funding
-3. appends the seat
-4. finalizes a `buy-in-lock` custody transition
-5. appends `SeatLocked`
-6. once the table is full, derives ready state and schedules the hand
+3. verifies the funding refs live on Ark in real-settlement mode
+4. appends the seat
+5. finalizes a `buy-in-lock` custody transition
+6. appends `SeatLocked`
+7. once the table is full, derives ready state and schedules the hand
 
 In other words, buy-in lock is no longer just a local overlay convention. It is the first custody checkpoint for the table.
 
@@ -138,6 +140,18 @@ That applies to:
 
 `PlayerAction` is therefore downstream of custody finalization, not the other way around.
 
+### Zero-exposure successors
+
+Not every accepted custody step needs a fresh Ark batch.
+
+For actions like `check`, or for timeout auto-check when no stack or pot claims change, Parker still advances the custody chain so the transcript/gameplay state remains bound to a signed checkpoint. In that case the runtime:
+
+1. carries forward the latest accepted custody refs
+2. updates the custody binding fields such as transcript root, decision index, acting player, and legal-actions hash
+3. finalizes a non-settlement custody transition with approvals and replay validation, but without an Ark spend bundle
+
+That keeps zero-money actions on the same custody-backed sequencing model as money-changing actions.
+
 ### Timeout successors
 
 Action deadlines are carried in custody state, not only in host-local timers.
@@ -169,7 +183,9 @@ If the latest custody state already matches the settled public money state, Park
 
 `meshCashOut` and `meshExit` now read from `LatestCustodyState`, not from `LatestFullySignedSnapshot`.
 
-`arkade-table-funds/v2` operations carry:
+For both flows, Parker first finalizes a `cash-out` or `emergency-exit` custody transition. After that succeeds, it appends a derived local `arkade-table-funds/v2` receipt for wallet availability, UI, and operator/debug accounting.
+
+Those `arkade-table-funds/v2` operations carry:
 
 - `stateHash`
 - `prevStateHash`
@@ -178,6 +194,8 @@ If the latest custody state already matches the settled public money state, Park
 - `arkTxid`
 - `vtxoRefs`
 - `exitProofRef`
+
+Emergency exit also has a unilateral wallet path: the wallet runtime can redeem custody refs through their redemption branches and sweep the result into the player wallet when cooperative completion is unavailable.
 
 ### Continue playing
 
@@ -204,11 +222,11 @@ There is no separate local renewal receipt that changes monetary truth.
 Interpretation:
 
 - `WalletSpendableSats` is the Ark wallet's spendable balance
-- `TableLockedSats` is value currently locked into accepted table custody claims
-- `PendingExitSats` is value reserved for exit/cash-out completion
+- `TableLockedSats` is value currently recorded in local `arkade-table-funds/v2` entries with `pending-lock` or `locked` status
+- `PendingExitSats` is value recorded in local `arkade-table-funds/v2` entries awaiting exit/cash-out completion
 - `AvailableSats` is spendable wallet balance net of currently table-locked and pending-exit commitments
 
-This is presentation over real custody state plus wallet funds, not a security overlay.
+This is presentation over the Ark wallet balance plus the local custody-backed funds ledger, not a security overlay and not a direct scan of `LatestCustodyState`.
 
 ## Current Runtime Scope
 
@@ -226,4 +244,5 @@ The safest way to read the implementation today is:
 - table money truth lives in `LatestCustodyState`
 - snapshots and public state are derived from accepted custody-backed gameplay
 - every real exposure change is supposed to fail closed if custody cannot be finalized
+- real-mode approval and replay validate Ark-linked refs live, including tapscript-to-output binding for declared taproot custody refs
 - operator or indexer outages affect liveness and visibility, not ownership of the latest accepted custody claim
