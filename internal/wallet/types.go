@@ -121,20 +121,24 @@ type CustodySignerSession struct {
 }
 
 type CustodyExitResult struct {
-	BroadcastTxIDs []string                 `json:"broadcastTxIds,omitempty"`
-	Pending        bool                     `json:"pending"`
-	SourceRefs     []tablecustody.VTXORef   `json:"sourceRefs,omitempty"`
-	SweepTxID      string                   `json:"sweepTxId,omitempty"`
+	BroadcastTxIDs []string               `json:"broadcastTxIds,omitempty"`
+	Pending        bool                   `json:"pending"`
+	SourceRefs     []tablecustody.VTXORef `json:"sourceRefs,omitempty"`
+	SweepTxID      string                 `json:"sweepTxId,omitempty"`
 }
 
 type CustodyArkConfig struct {
-	ArkServerURL        string                  `json:"arkServerUrl"`
-	CheckpointTapscript string                  `json:"checkpointTapscript,omitempty"`
-	DustSats            uint64                  `json:"dustSats"`
-	ExplorerURL         string                  `json:"explorerUrl,omitempty"`
-	ForfeitAddress      string                  `json:"forfeitAddress,omitempty"`
-	ForfeitPubkeyHex    string                  `json:"forfeitPubkeyHex"`
-	Network             arklib.Network          `json:"network"`
-	SignerPubkeyHex     string                  `json:"signerPubkeyHex"`
-	UnilateralExitDelay arklib.RelativeLocktime `json:"unilateralExitDelay"`
+	ArkServerURL          string                  `json:"arkServerUrl"`
+	CheckpointTapscript   string                  `json:"checkpointTapscript,omitempty"`
+	DustSats              uint64                  `json:"dustSats"`
+	ExplorerURL           string                  `json:"explorerUrl,omitempty"`
+	ForfeitAddress        string                  `json:"forfeitAddress,omitempty"`
+	ForfeitPubkeyHex      string                  `json:"forfeitPubkeyHex"`
+	Network               arklib.Network          `json:"network"`
+	OffchainInputFeeSats  int                     `json:"offchainInputFeeSats,omitempty"`
+	OffchainOutputFeeSats int                     `json:"offchainOutputFeeSats,omitempty"`
+	OnchainInputFeeSats   int                     `json:"onchainInputFeeSats,omitempty"`
+	OnchainOutputFeeSats  int                     `json:"onchainOutputFeeSats,omitempty"`
+	SignerPubkeyHex       string                  `json:"signerPubkeyHex"`
+	UnilateralExitDelay   arklib.RelativeLocktime `json:"unilateralExitDelay"`
 }

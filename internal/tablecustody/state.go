@@ -18,7 +18,7 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 		if balance.SeatIndex < 0 {
 			return CustodyState{}, fmt.Errorf("custody state seat index for %s is invalid", balance.PlayerID)
 		}
-		if balance.StackSats < 0 || balance.TotalContributionSats < 0 || balance.RoundContributionSats < 0 {
+		if balance.StackSats < 0 || balance.ReservedFeeSats < 0 || balance.TotalContributionSats < 0 || balance.RoundContributionSats < 0 {
 			return CustodyState{}, fmt.Errorf("custody state balance for %s cannot be negative", balance.PlayerID)
 		}
 		participants = append(participants, SliceParticipant{
@@ -27,7 +27,7 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 			PlayerID:         balance.PlayerID,
 			SeatIndex:        balance.SeatIndex,
 		})
-		totalValue += balance.StackSats + balance.TotalContributionSats
+		totalValue += balance.StackSats + balance.ReservedFeeSats + balance.TotalContributionSats
 	}
 	derivation, err := DerivePotStructure(participants)
 	if err != nil {
@@ -41,6 +41,7 @@ func BuildState(binding StateBinding, balances []PlayerBalance, previous *Custod
 			AmountSats:            balance.StackSats + unmatchedContribution,
 			Folded:                balance.Folded,
 			PlayerID:              balance.PlayerID,
+			ReservedFeeSats:       balance.ReservedFeeSats,
 			RoundContributionSats: balance.RoundContributionSats,
 			SeatIndex:             balance.SeatIndex,
 			Status:                balance.Status,
@@ -120,7 +121,7 @@ func ValidateState(state CustodyState) error {
 			return fmt.Errorf("duplicate custody stack claim for %s", stack.PlayerID)
 		}
 		seenPlayers[stack.PlayerID] = struct{}{}
-		if stack.AmountSats < 0 || stack.TotalContributionSats < 0 || stack.RoundContributionSats < 0 {
+		if stack.AmountSats < 0 || stack.ReservedFeeSats < 0 || stack.TotalContributionSats < 0 || stack.RoundContributionSats < 0 {
 			return fmt.Errorf("custody stack claim for %s cannot be negative", stack.PlayerID)
 		}
 		if stack.RoundContributionSats > stack.TotalContributionSats {
@@ -260,7 +261,7 @@ func totalPotFromSlices(slices []PotSlice) int {
 func validateConservedValue(state CustodyState, total int) error {
 	current := totalPotFromSlices(state.PotSlices)
 	for _, claim := range state.StackClaims {
-		current += claim.AmountSats
+		current += claim.AmountSats + claim.ReservedFeeSats
 	}
 	if current != total {
 		return fmt.Errorf("custody value is not conserved")

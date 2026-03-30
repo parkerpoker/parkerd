@@ -74,6 +74,7 @@ func TestRegtestRoundUsesRealArkCustody(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"BASE="+baseDir,
 		"PCLI_TIMEOUT_SECONDS=20",
+		"ROUND_SCENARIO=host-player-2d",
 	)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {

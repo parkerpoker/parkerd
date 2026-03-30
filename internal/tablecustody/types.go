@@ -37,6 +37,7 @@ type StackClaim struct {
 	AmountSats            int       `json:"amountSats"`
 	Folded                bool      `json:"folded,omitempty"`
 	PlayerID              string    `json:"playerId"`
+	ReservedFeeSats       int       `json:"reservedFeeSats,omitempty"`
 	RoundContributionSats int       `json:"roundContributionSats,omitempty"`
 	SeatIndex             int       `json:"seatIndex"`
 	Status                string    `json:"status,omitempty"`
@@ -153,6 +154,7 @@ type PlayerBalance struct {
 	AllIn                 bool      `json:"allIn,omitempty"`
 	Folded                bool      `json:"folded,omitempty"`
 	PlayerID              string    `json:"playerId"`
+	ReservedFeeSats       int       `json:"reservedFeeSats,omitempty"`
 	RoundContributionSats int       `json:"roundContributionSats,omitempty"`
 	SeatIndex             int       `json:"seatIndex"`
 	StackSats             int       `json:"stackSats"`

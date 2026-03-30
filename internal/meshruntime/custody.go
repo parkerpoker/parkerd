@@ -55,6 +55,15 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, hand *
 	if game.PhaseAllowsActions(hand.Phase) {
 		return addMillis(nowISO(), runtime.actionTimeoutMS())
 	}
+	if shouldTrackProtocolDeadline(hand.Phase) {
+		if table.ActiveHand != nil &&
+			table.ActiveHand.State.HandID == hand.HandID &&
+			table.ActiveHand.State.Phase == hand.Phase &&
+			strings.TrimSpace(table.ActiveHand.Cards.PhaseDeadlineAt) != "" {
+			return table.ActiveHand.Cards.PhaseDeadlineAt
+		}
+		return addMillis(nowISO(), runtime.handProtocolTimeoutMS())
+	}
 	if table.ActiveHand != nil {
 		return table.ActiveHand.Cards.PhaseDeadlineAt
 	}
@@ -63,24 +72,33 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, hand *
 
 func (runtime *meshRuntime) custodyBalancesFromHand(table nativeTableState, hand *game.HoldemState) []tablecustody.PlayerBalance {
 	refByPlayerID := runtime.currentCustodyRefsByPlayer(table)
+	reserveByPlayerID := map[string]int{}
+	if table.LatestCustodyState != nil {
+		for _, claim := range table.LatestCustodyState.StackClaims {
+			reserveByPlayerID[claim.PlayerID] = claim.ReservedFeeSats
+		}
+	}
 	balances := make([]tablecustody.PlayerBalance, 0, len(table.Seats))
 	if hand == nil {
 		for _, seat := range table.Seats {
 			amount := seat.BuyInSats
+			reserve := maxInt(0, sumVTXORefs(seat.FundingRefs)-amount)
 			if table.LatestCustodyState != nil {
 				for _, claim := range table.LatestCustodyState.StackClaims {
 					if claim.PlayerID == seat.PlayerID {
 						amount = claim.AmountSats
+						reserve = claim.ReservedFeeSats
 						break
 					}
 				}
 			}
 			balances = append(balances, tablecustody.PlayerBalance{
-				PlayerID:  seat.PlayerID,
-				SeatIndex: seat.SeatIndex,
-				StackSats: amount,
-				Status:    seat.Status,
-				VTXORefs:  firstNonEmptyRefs(refByPlayerID[seat.PlayerID], seat.FundingRefs),
+				PlayerID:        seat.PlayerID,
+				ReservedFeeSats: reserve,
+				SeatIndex:       seat.SeatIndex,
+				StackSats:       amount,
+				Status:          seat.Status,
+				VTXORefs:        firstNonEmptyRefs(refByPlayerID[seat.PlayerID], seat.FundingRefs),
 			})
 		}
 		return balances
@@ -92,6 +110,7 @@ func (runtime *meshRuntime) custodyBalancesFromHand(table nativeTableState, hand
 			AllIn:                 playerState.Status == game.PlayerStatusAllIn,
 			Folded:                playerState.Status == game.PlayerStatusFolded,
 			PlayerID:              seat.PlayerID,
+			ReservedFeeSats:       reserveByPlayerID[seat.PlayerID],
 			RoundContributionSats: playerState.RoundContributionSats,
 			SeatIndex:             seat.SeatIndex,
 			StackSats:             playerState.StackSats,
@@ -177,6 +196,11 @@ func (runtime *meshRuntime) buildCustodyTransition(table nativeTableState, kind 
 	transition, err := tablecustody.BuildTransition(kind, binding, runtime.custodyBalancesFromHand(table, hand), table.LatestCustodyState, descriptor, timeout)
 	if err != nil {
 		return tablecustody.CustodyTransition{}, err
+	}
+	if !runtime.config.UseMockSettlement {
+		if err := runtime.applyRealCustodyFeeReserve(table, &transition); err != nil {
+			return tablecustody.CustodyTransition{}, err
+		}
 	}
 	carryForwardUnchangedCustodyRefs(table.LatestCustodyState, &transition)
 	transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
@@ -387,12 +411,13 @@ func (runtime *meshRuntime) finalizeCustodyTransition(table *nativeTableState, t
 	})
 	stackRefs := make([]tablecustody.VTXORef, 0, len(transition.NextState.StackClaims))
 	for index := range transition.NextState.StackClaims {
-		spec, err := runtime.stackOutputSpec(*table, transition.NextState.StackClaims[index].PlayerID, transition.NextState.StackClaims[index].AmountSats)
+		backedAmount := stackClaimBackedAmount(transition.NextState.StackClaims[index])
+		spec, err := runtime.stackOutputSpec(*table, transition.NextState.StackClaims[index].PlayerID, backedAmount)
 		if err != nil {
 			return err
 		}
 		ref := tablecustody.VTXORef{
-			AmountSats:    transition.NextState.StackClaims[index].AmountSats,
+			AmountSats:    backedAmount,
 			ArkIntentID:   intentID,
 			ArkTxID:       txID,
 			ExpiresAt:     addMillis(nowISO(), 86_400_000),

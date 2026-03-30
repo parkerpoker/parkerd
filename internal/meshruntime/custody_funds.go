@@ -25,6 +25,7 @@ func (runtime *meshRuntime) buildFundsCustodyTransition(table nativeTableState, 
 			continue
 		}
 		balances[index].StackSats = 0
+		balances[index].ReservedFeeSats = 0
 		balances[index].Status = finalStatus
 		balances[index].VTXORefs = nil
 		foundLocal = true

@@ -345,6 +345,10 @@ func sumVTXORefs(refs []tablecustody.VTXORef) int {
 	return total
 }
 
+func stackClaimBackedAmount(claim tablecustody.StackClaim) int {
+	return claim.AmountSats + claim.ReservedFeeSats
+}
+
 func fundingRefKey(ref tablecustody.VTXORef) string {
 	return fmt.Sprintf("%s:%d", ref.TxID, ref.VOut)
 }
@@ -367,6 +371,10 @@ func (runtime *meshRuntime) reservedFundingRefKeys() (map[string]struct{}, error
 }
 
 func (runtime *meshRuntime) selectJoinFundingBundle(buyInSats int) (walletpkg.CustodyFundingBundle, error) {
+	targetSats, err := runtime.requiredJoinFundingSats(buyInSats)
+	if err != nil {
+		return walletpkg.CustodyFundingBundle{}, err
+	}
 	refs, err := runtime.walletRuntime.ListVtxoRefs(runtime.profileName)
 	if err != nil {
 		return walletpkg.CustodyFundingBundle{}, err
@@ -383,12 +391,12 @@ func (runtime *meshRuntime) selectJoinFundingBundle(buyInSats int) (walletpkg.Cu
 		}
 		selected = append(selected, ref)
 		total += ref.AmountSats
-		if total >= buyInSats {
+		if total >= targetSats {
 			break
 		}
 	}
-	if total < buyInSats {
-		return walletpkg.CustodyFundingBundle{}, fmt.Errorf("insufficient unreserved spendable vtxos: have %d need %d", total, buyInSats)
+	if total < targetSats {
+		return walletpkg.CustodyFundingBundle{}, fmt.Errorf("insufficient unreserved spendable vtxos: have %d need %d", total, targetSats)
 	}
 	return walletpkg.CustodyFundingBundle{
 		PlayerID:  runtime.walletID.PlayerID,
@@ -957,8 +965,12 @@ func (runtime *meshRuntime) JoinTable(inviteCode string, buyInSats int) (NativeM
 	if err != nil {
 		return NativeMeshTableView{}, err
 	}
-	if wallet.AvailableSats < buyInSats {
-		return NativeMeshTableView{}, fmt.Errorf("insufficient available sats for buy-in: have %d need %d", wallet.AvailableSats, buyInSats)
+	requiredFundingSats, err := runtime.requiredJoinFundingSats(buyInSats)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	if wallet.AvailableSats < requiredFundingSats {
+		return NativeMeshTableView{}, fmt.Errorf("insufficient available sats for buy-in lock: have %d need %d", wallet.AvailableSats, requiredFundingSats)
 	}
 	funding, err := runtime.selectJoinFundingBundle(buyInSats)
 	if err != nil {
@@ -1163,9 +1175,13 @@ func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (ma
 	if kind == "emergency-exit" {
 		transitionKind = tablecustody.TransitionKindEmergencyExit
 	}
-	amount := latestStackAmount(table.LatestCustodyState, runtime.walletID.PlayerID)
+	claim, ok := latestStackClaimForPlayer(table.LatestCustodyState, runtime.walletID.PlayerID)
+	if !ok {
+		return nil, errors.New("latest custody state is missing the local stack claim")
+	}
+	amount := stackClaimBackedAmount(claim)
 	if amount <= 0 {
-		return nil, errors.New("latest custody state has no spendable stack to settle")
+		return nil, errors.New("latest custody state has no spendable custody claim to settle")
 	}
 	previousStateHash := table.LatestCustodyState.StateHash
 	sourceRefs := append([]tablecustody.VTXORef(nil), runtime.currentCustodyRefsByPlayer(*table)[runtime.walletID.PlayerID]...)
@@ -1203,13 +1219,14 @@ func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (ma
 			StateHash:       transition.NextStateHash,
 			VTXORefs:        append(stackProofRefs(transition.NextState), receiptRefs...),
 		}
-		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+		transition.Proof.TransitionHash = ""
 		approvals, err := runtime.collectCustodyApprovals(*table, transition, runtime.requiredCustodySigners(*table, transition))
 		if err != nil {
 			return nil, err
 		}
 		transition.Approvals = approvals
 		transition.Proof.Signatures = append([]tablecustody.CustodySignature(nil), approvals...)
+		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
 		if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
 			return nil, err
 		}
@@ -1241,13 +1258,14 @@ func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (ma
 			StateHash:       transition.NextStateHash,
 			VTXORefs:        append(stackProofRefs(transition.NextState), sourceRefs...),
 		}
-		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+		transition.Proof.TransitionHash = ""
 		approvals, err := runtime.collectCustodyApprovals(*table, transition, runtime.requiredCustodySigners(*table, transition))
 		if err != nil {
 			return nil, err
 		}
 		transition.Approvals = approvals
 		transition.Proof.Signatures = append([]tablecustody.CustodySignature(nil), approvals...)
+		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
 		if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
 			return nil, err
 		}
@@ -2637,7 +2655,7 @@ func validateAcceptedCustodyRefs(previous *tablecustody.CustodyState, transition
 	seenRefs := map[string]tablecustody.VTXORef{}
 	previousRefs := previousCustodyRefSet(previous)
 	for _, claim := range transition.NextState.StackClaims {
-		if sumVTXORefs(claim.VTXORefs) != claim.AmountSats {
+		if sumVTXORefs(claim.VTXORefs) != stackClaimBackedAmount(claim) {
 			return fmt.Errorf("custody stack refs do not match amount for %s", claim.PlayerID)
 		}
 		for _, ref := range claim.VTXORefs {

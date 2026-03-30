@@ -4,8 +4,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,11 +21,13 @@ import (
 )
 
 type custodySpendPath struct {
-	LeafProof  *arklib.TaprootMerkleProof
-	PKScript   []byte
-	PlayerIDs  []string
-	Script     []byte
-	Tapscripts []string
+	LeafProof        *arklib.TaprootMerkleProof
+	Locktime         arklib.AbsoluteLocktime
+	PKScript         []byte
+	PlayerIDs        []string
+	Script           []byte
+	Tapscripts       []string
+	UsesCLTVLocktime bool
 }
 
 type custodyInputSpec struct {
@@ -48,6 +52,11 @@ type custodySettlementPlan struct {
 	TreeSignerIDs  []string
 }
 
+const (
+	defaultRealCustodyReserveTransitions = 8
+	minimumRealCustodyReserveSats        = 10_000
+)
+
 func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, error) {
 	config, err := runtime.walletRuntime.ArkConfig(runtime.profileName)
 	if err != nil {
@@ -63,6 +72,48 @@ func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, erro
 		config.UnilateralExitDelay = arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512}
 	}
 	return config, nil
+}
+
+func (runtime *meshRuntime) estimatedCustodyBatchFee(offchainInputs, offchainOutputs, onchainInputs, onchainOutputs int) (int, error) {
+	config, err := runtime.arkCustodyConfig()
+	if err != nil {
+		return 0, err
+	}
+	fee := 0
+	fee += offchainInputs * maxInt(0, config.OffchainInputFeeSats)
+	fee += offchainOutputs * maxInt(0, config.OffchainOutputFeeSats)
+	fee += onchainInputs * maxInt(0, config.OnchainInputFeeSats)
+	fee += onchainOutputs * maxInt(0, config.OnchainOutputFeeSats)
+	return fee, nil
+}
+
+func (runtime *meshRuntime) initialSeatFeeReserveSats() (int, error) {
+	if runtime.config.UseMockSettlement {
+		return 0, nil
+	}
+	if override := strings.TrimSpace(os.Getenv("PARKER_CUSTODY_FEE_RESERVE_SATS")); override != "" {
+		value, err := strconv.Atoi(override)
+		if err != nil {
+			return 0, fmt.Errorf("parse PARKER_CUSTODY_FEE_RESERVE_SATS: %w", err)
+		}
+		return maxInt(0, value), nil
+	}
+	perTransition, err := runtime.estimatedCustodyBatchFee(2, 2, 0, 0)
+	if err != nil {
+		return 0, err
+	}
+	return maxInt(minimumRealCustodyReserveSats, perTransition*defaultRealCustodyReserveTransitions), nil
+}
+
+func (runtime *meshRuntime) requiredJoinFundingSats(buyInSats int) (int, error) {
+	if runtime.config.UseMockSettlement {
+		return buyInSats, nil
+	}
+	reserve, err := runtime.initialSeatFeeReserveSats()
+	if err != nil {
+		return 0, err
+	}
+	return buyInSats + reserve, nil
 }
 
 func compressedPubkeyFromHex(value string) (*btcec.PublicKey, error) {
@@ -97,6 +148,12 @@ func comparableStackClaim(claim tablecustody.StackClaim) tablecustody.StackClaim
 	return claim
 }
 
+func comparableStackClaimSansReserve(claim tablecustody.StackClaim) tablecustody.StackClaim {
+	claim = comparableStackClaim(claim)
+	claim.ReservedFeeSats = 0
+	return claim
+}
+
 func comparablePotSlice(slice tablecustody.PotSlice) tablecustody.PotSlice {
 	slice.VTXORefs = nil
 	return slice
@@ -108,6 +165,10 @@ func stackClaimKey(playerID string) string {
 
 func potClaimKey(potID string) string {
 	return "pot:" + potID
+}
+
+func stackClaimRefAmount(claim tablecustody.StackClaim) int {
+	return claim.AmountSats + claim.ReservedFeeSats
 }
 
 func (runtime *meshRuntime) walletPubkeyHexForPlayer(table nativeTableState, playerID string) (string, error) {
@@ -176,6 +237,44 @@ func uniqueSortedPlayerIDs(values []string) []string {
 	return ordered
 }
 
+func timeoutSignerSets(actingPlayerID string, futureSignerIDs []string) [][]string {
+	signers := uniqueSortedPlayerIDs(futureSignerIDs)
+	if len(signers) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(actingPlayerID) != "" {
+		timeoutSigners := make([]string, 0, len(signers))
+		for _, playerID := range signers {
+			if playerID == actingPlayerID {
+				continue
+			}
+			timeoutSigners = append(timeoutSigners, playerID)
+		}
+		if len(timeoutSigners) == 0 {
+			return nil
+		}
+		return [][]string{timeoutSigners}
+	}
+	if len(signers) < 2 {
+		return nil
+	}
+	sets := make([][]string, 0, len(signers))
+	for _, missingPlayerID := range signers {
+		timeoutSigners := make([]string, 0, len(signers)-1)
+		for _, playerID := range signers {
+			if playerID == missingPlayerID {
+				continue
+			}
+			timeoutSigners = append(timeoutSigners, playerID)
+		}
+		if len(timeoutSigners) == 0 {
+			continue
+		}
+		sets = append(sets, timeoutSigners)
+	}
+	return sets
+}
+
 func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tablecustody.CustodyTransition, slice tablecustody.PotSlice, futureSignerIDs []string) (custodyOutputSpec, error) {
 	config, err := runtime.arkCustodyConfig()
 	if err != nil {
@@ -203,26 +302,32 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 	collaborativeKeys = append(collaborativeKeys, operatorPubkey)
 	closures = append(closures, &arkscript.MultisigClosure{PubKeys: collaborativeKeys})
 
-	if transition.NextState.ActingPlayerID != "" && transition.NextState.ActionDeadlineAt != "" {
-		timeoutKeys := make([]*btcec.PublicKey, 0, len(playerPubkeys)+1)
-		for _, playerID := range futureSignerIDs {
-			if playerID == transition.NextState.ActingPlayerID {
+	if transition.NextState.ActionDeadlineAt != "" {
+		locktime, err := absoluteLocktimeFromISO(transition.NextState.ActionDeadlineAt)
+		if err != nil {
+			return custodyOutputSpec{}, err
+		}
+		seenTimeoutSets := map[string]struct{}{}
+		for _, timeoutSignerIDs := range timeoutSignerSets(transition.NextState.ActingPlayerID, futureSignerIDs) {
+			setKey := strings.Join(timeoutSignerIDs, ",")
+			if _, ok := seenTimeoutSets[setKey]; ok {
 				continue
 			}
-			walletPubkeyHex, err := runtime.walletPubkeyHexForPlayer(table, playerID)
-			if err != nil {
-				return custodyOutputSpec{}, err
+			seenTimeoutSets[setKey] = struct{}{}
+			timeoutKeys := make([]*btcec.PublicKey, 0, len(timeoutSignerIDs)+1)
+			for _, playerID := range timeoutSignerIDs {
+				walletPubkeyHex, err := runtime.walletPubkeyHexForPlayer(table, playerID)
+				if err != nil {
+					return custodyOutputSpec{}, err
+				}
+				pubkey, err := compressedPubkeyFromHex(walletPubkeyHex)
+				if err != nil {
+					return custodyOutputSpec{}, err
+				}
+				timeoutKeys = append(timeoutKeys, pubkey)
 			}
-			pubkey, err := compressedPubkeyFromHex(walletPubkeyHex)
-			if err != nil {
-				return custodyOutputSpec{}, err
-			}
-			timeoutKeys = append(timeoutKeys, pubkey)
-		}
-		if len(timeoutKeys) > 0 {
-			locktime, err := absoluteLocktimeFromISO(transition.NextState.ActionDeadlineAt)
-			if err != nil {
-				return custodyOutputSpec{}, err
+			if len(timeoutKeys) == 0 {
+				continue
 			}
 			timeoutKeys = append(timeoutKeys, operatorPubkey)
 			closures = append(closures, &arkscript.CLTVMultisigClosure{
@@ -318,6 +423,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 	desired := uniqueSortedPlayerIDs(desiredPlayerIDs)
 
 	bestIndex := -1
+	bestLocktime := arklib.AbsoluteLocktime(0)
 	bestScript := []byte(nil)
 	bestPlayers := []string(nil)
 	for index, closure := range vtxoScript.ForfeitClosures() {
@@ -361,8 +467,9 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 			continue
 		}
 		if preferTimeout {
-			if _, ok := closure.(*arkscript.CLTVMultisigClosure); ok {
+			if cltv, ok := closure.(*arkscript.CLTVMultisigClosure); ok {
 				bestIndex = index
+				bestLocktime = cltv.Locktime
 				bestPlayers = keys
 				bestScript, err = closure.Script()
 				if err != nil {
@@ -373,6 +480,10 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 			continue
 		}
 		bestIndex = index
+		bestLocktime = 0
+		if cltv, ok := closure.(*arkscript.CLTVMultisigClosure); ok {
+			bestLocktime = cltv.Locktime
+		}
 		bestPlayers = keys
 		bestScript, err = closure.Script()
 		if err != nil {
@@ -396,11 +507,13 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 		return custodySpendPath{}, err
 	}
 	return custodySpendPath{
-		LeafProof:  leafProof,
-		PKScript:   pkScript,
-		PlayerIDs:  bestPlayers,
-		Script:     bestScript,
-		Tapscripts: tapscripts,
+		LeafProof:        leafProof,
+		Locktime:         bestLocktime,
+		PKScript:         pkScript,
+		PlayerIDs:        bestPlayers,
+		Script:           bestScript,
+		Tapscripts:       tapscripts,
+		UsesCLTVLocktime: bestLocktime != 0,
 	}, nil
 }
 
@@ -429,6 +542,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 		potSpendSignerIDs = playerIDsFromSeats(table.Seats)
 	}
 	preferTimeout := transition.TimeoutResolution != nil
+	nextPotIDs := map[string]struct{}{}
 
 	for index := range transition.NextState.StackClaims {
 		nextClaim := transition.NextState.StackClaims[index]
@@ -464,7 +578,13 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			}
 		}
 		if nextClaim.AmountSats > 0 {
-			output, err := runtime.stackOutputSpec(table, nextClaim.PlayerID, nextClaim.AmountSats)
+			output, err := runtime.stackOutputSpec(table, nextClaim.PlayerID, stackClaimRefAmount(nextClaim))
+			if err != nil {
+				return nil, err
+			}
+			plan.Outputs = append(plan.Outputs, output)
+		} else if nextClaim.ReservedFeeSats > 0 {
+			output, err := runtime.stackOutputSpec(table, nextClaim.PlayerID, stackClaimRefAmount(nextClaim))
 			if err != nil {
 				return nil, err
 			}
@@ -474,6 +594,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 
 	for index := range transition.NextState.PotSlices {
 		nextSlice := transition.NextState.PotSlices[index]
+		nextPotIDs[nextSlice.PotID] = struct{}{}
 		prevSlice, hadPrev := prevPots[nextSlice.PotID]
 		if hadPrev && reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(nextSlice)) {
 			transition.NextState.PotSlices[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevSlice.VTXORefs...)
@@ -504,6 +625,25 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			plan.Outputs = append(plan.Outputs, output)
 		}
 	}
+	for potID, prevSlice := range prevPots {
+		if _, ok := nextPotIDs[potID]; ok {
+			continue
+		}
+		for _, ref := range prevSlice.VTXORefs {
+			spendPath, err := runtime.selectCustodySpendPath(table, ref, potSpendSignerIDs, preferTimeout)
+			if err != nil {
+				return nil, err
+			}
+			plan.Inputs = append(plan.Inputs, custodyInputSpec{
+				ClaimKey:  potClaimKey(potID),
+				Ref:       ref,
+				SpendPath: spendPath,
+			})
+			for _, playerID := range spendPath.PlayerIDs {
+				proofSignerSet[playerID] = struct{}{}
+			}
+		}
+	}
 
 	if len(plan.TreeSignerIDs) == 0 {
 		for _, playerID := range playerIDsFromSeats(table.Seats) {
@@ -521,4 +661,160 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 	}
 	sort.Strings(plan.ProofSignerIDs)
 	return plan, nil
+}
+
+func (runtime *meshRuntime) custodyFeePayerIDs(table nativeTableState, transition tablecustody.CustodyTransition) []string {
+	if transition.Kind == tablecustody.TransitionKindCashOut || transition.Kind == tablecustody.TransitionKindEmergencyExit {
+		if strings.TrimSpace(transition.ActingPlayerID) != "" {
+			return []string{transition.ActingPlayerID}
+		}
+	}
+
+	previousStacks := map[string]tablecustody.StackClaim{}
+	previousPots := map[string]tablecustody.PotSlice{}
+	if table.LatestCustodyState != nil {
+		for _, claim := range table.LatestCustodyState.StackClaims {
+			previousStacks[claim.PlayerID] = claim
+		}
+		for _, slice := range table.LatestCustodyState.PotSlices {
+			previousPots[slice.PotID] = slice
+		}
+	}
+	changed := make([]string, 0)
+	for _, claim := range transition.NextState.StackClaims {
+		prevClaim, hadPrev := previousStacks[claim.PlayerID]
+		if !hadPrev || !reflect.DeepEqual(comparableStackClaimSansReserve(prevClaim), comparableStackClaimSansReserve(claim)) {
+			changed = append(changed, claim.PlayerID)
+		}
+	}
+	changed = uniqueSortedPlayerIDs(changed)
+	if len(changed) > 0 {
+		return changed
+	}
+	potsChanged := false
+	for _, slice := range transition.NextState.PotSlices {
+		prevSlice, hadPrev := previousPots[slice.PotID]
+		if !hadPrev || !reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(slice)) {
+			potsChanged = true
+			break
+		}
+	}
+	if !potsChanged {
+		return nil
+	}
+	if strings.TrimSpace(transition.ActingPlayerID) != "" {
+		return []string{transition.ActingPlayerID}
+	}
+	return nil
+}
+
+func previewFeeChargedTransition(previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition, payerIDs []string) tablecustody.CustodyTransition {
+	preview := cloneJSON(transition)
+	if previous == nil || len(payerIDs) == 0 {
+		return preview
+	}
+	previousByPlayer := map[string]tablecustody.StackClaim{}
+	for _, claim := range previous.StackClaims {
+		previousByPlayer[claim.PlayerID] = claim
+	}
+	payers := map[string]struct{}{}
+	for _, playerID := range payerIDs {
+		payers[playerID] = struct{}{}
+	}
+	for index := range preview.NextState.StackClaims {
+		claim := preview.NextState.StackClaims[index]
+		if _, ok := payers[claim.PlayerID]; !ok {
+			continue
+		}
+		prevClaim, hadPrev := previousByPlayer[claim.PlayerID]
+		if hadPrev && reflect.DeepEqual(comparableStackClaim(prevClaim), comparableStackClaim(claim)) {
+			preview.NextState.StackClaims[index].ReservedFeeSats++
+		}
+	}
+	return preview
+}
+
+func (runtime *meshRuntime) applyRealCustodyFeeReserve(table nativeTableState, transition *tablecustody.CustodyTransition) error {
+	if transition == nil || runtime.config.UseMockSettlement {
+		return nil
+	}
+	payerIDs := runtime.custodyFeePayerIDs(table, *transition)
+	if len(payerIDs) == 0 {
+		return nil
+	}
+	preview := previewFeeChargedTransition(table.LatestCustodyState, *transition, payerIDs)
+	plan, err := runtime.buildCustodySettlementPlan(table, preview)
+	if err != nil {
+		return err
+	}
+	feeSats, err := runtime.estimatedCustodyBatchFee(len(plan.Inputs), len(plan.Outputs), 0, 0)
+	if err != nil {
+		return err
+	}
+	if feeSats <= 0 {
+		return nil
+	}
+	return allocateCustodyFeeReserve(transition, payerIDs, feeSats)
+}
+
+func allocateCustodyFeeReserve(transition *tablecustody.CustodyTransition, payerIDs []string, feeSats int) error {
+	if transition == nil || feeSats <= 0 {
+		return nil
+	}
+	payerSet := map[string]struct{}{}
+	for _, playerID := range payerIDs {
+		payerSet[playerID] = struct{}{}
+	}
+	type payerReserve struct {
+		Index        int
+		PlayerID     string
+		ReservedSats int
+		SeatIndex    int
+	}
+	reserves := make([]payerReserve, 0, len(payerSet))
+	totalReserve := 0
+	for index, claim := range transition.NextState.StackClaims {
+		if _, ok := payerSet[claim.PlayerID]; !ok {
+			continue
+		}
+		reserves = append(reserves, payerReserve{
+			Index:        index,
+			PlayerID:     claim.PlayerID,
+			ReservedSats: claim.ReservedFeeSats,
+			SeatIndex:    claim.SeatIndex,
+		})
+		totalReserve += claim.ReservedFeeSats
+	}
+	if totalReserve < feeSats {
+		return fmt.Errorf("insufficient custody fee reserve: need %d have %d", feeSats, totalReserve)
+	}
+	sort.SliceStable(reserves, func(left, right int) bool {
+		if reserves[left].ReservedSats != reserves[right].ReservedSats {
+			return reserves[left].ReservedSats > reserves[right].ReservedSats
+		}
+		if reserves[left].SeatIndex != reserves[right].SeatIndex {
+			return reserves[left].SeatIndex < reserves[right].SeatIndex
+		}
+		return reserves[left].PlayerID < reserves[right].PlayerID
+	})
+	remaining := feeSats
+	for _, reserve := range reserves {
+		if remaining == 0 {
+			break
+		}
+		deduction := minInt(reserve.ReservedSats, remaining)
+		transition.NextState.StackClaims[reserve.Index].ReservedFeeSats -= deduction
+		remaining -= deduction
+	}
+	if remaining > 0 {
+		return fmt.Errorf("custody fee reserve allocation left %d sats unpaid", remaining)
+	}
+	return nil
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }

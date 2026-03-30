@@ -1511,6 +1511,10 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 	}
 	for iteration := 0; iteration < 8; iteration++ {
 		changed := false
+		if shouldTrackProtocolDeadline(table.ActiveHand.State.Phase) && table.ActiveHand.Cards.PhaseDeadlineAt == "" {
+			runtime.setProtocolDeadline(table)
+			changed = true
+		}
 		if handled, err := runtime.handleActionTimeoutLocked(table); err != nil {
 			return err
 		} else if handled {

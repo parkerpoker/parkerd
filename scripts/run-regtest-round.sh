@@ -976,14 +976,19 @@ play_hand_automatically() {
   local amount=""
   local current_bet=""
   local pot_sats=""
-  local turns=60
+  local max_wait_seconds=45
+  local start_epoch=0
   local turn
 
   if tor_enabled; then
-    turns=180
+    max_wait_seconds=120
   fi
 
-  for ((turn = 0; turn < turns; turn += 1)); do
+  start_epoch="$(date +%s)"
+  for ((turn = 0; ; turn += 1)); do
+    if (( "$(date +%s)" - start_epoch >= max_wait_seconds )); then
+      break
+    fi
     state_json="$(watch_table_state_with_retry "$WATCH_PROFILE")"
     hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId)"
     hand_number="$(printf '%s' "$state_json" | json_field data.publicState.handNumber)"

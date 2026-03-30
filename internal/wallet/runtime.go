@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -151,15 +152,19 @@ func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) 
 		return CustodyArkConfig{}, errors.New("ark client config is incomplete")
 	}
 	return CustodyArkConfig{
-		ArkServerURL:        runtime.config.ArkServerURL,
-		CheckpointTapscript: config.CheckpointTapscript,
-		DustSats:            config.Dust,
-		ExplorerURL:         config.ExplorerURL,
-		ForfeitAddress:      config.ForfeitAddress,
-		ForfeitPubkeyHex:    hex.EncodeToString(config.ForfeitPubKey.SerializeCompressed()),
-		Network:             config.Network,
-		SignerPubkeyHex:     hex.EncodeToString(config.SignerPubKey.SerializeCompressed()),
-		UnilateralExitDelay: config.UnilateralExitDelay,
+		ArkServerURL:          runtime.config.ArkServerURL,
+		CheckpointTapscript:   config.CheckpointTapscript,
+		DustSats:              config.Dust,
+		ExplorerURL:           config.ExplorerURL,
+		ForfeitAddress:        config.ForfeitAddress,
+		ForfeitPubkeyHex:      hex.EncodeToString(config.ForfeitPubKey.SerializeCompressed()),
+		Network:               config.Network,
+		OffchainInputFeeSats:  parseSatsString(config.Fees.IntentFees.OffchainInput),
+		OffchainOutputFeeSats: parseSatsString(config.Fees.IntentFees.OffchainOutput),
+		OnchainInputFeeSats:   int(config.Fees.IntentFees.OnchainInput),
+		OnchainOutputFeeSats:  int(config.Fees.IntentFees.OnchainOutput),
+		SignerPubkeyHex:       hex.EncodeToString(config.SignerPubKey.SerializeCompressed()),
+		UnilateralExitDelay:   config.UnilateralExitDelay,
 	}, nil
 }
 
@@ -1031,4 +1036,12 @@ func deriveSignerPrivateKeyHex(seedHex, derivationPath string) (string, string, 
 
 func addDurationISO(delta time.Duration) string {
 	return time.Now().UTC().Add(delta).Format(time.RFC3339)
+}
+
+func parseSatsString(value string) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0
+	}
+	return parsed
 }

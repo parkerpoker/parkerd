@@ -3,6 +3,7 @@ package meshruntime
 import (
 	"encoding/json"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -360,6 +361,134 @@ func TestMissingRevealTimeoutAwardsPotAndAppendsAbort(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for missing reveal timeout to settle the hand")
+}
+
+func TestSyntheticRealModeMissingShowdownRevealTimeoutSettles(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	enableSyntheticRealMode(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call to showdown line: %v", err)
+	}
+	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send river-line check %d: %v", index, err)
+		}
+	}
+
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetShowdownReveal)
+	if err := guest.Close(); err != nil {
+		t.Fatalf("close guest runtime: %v", err)
+	}
+	settled := waitForSettledHand(t, []*meshRuntime{host}, host, tableID)
+	if len(settled.ActiveHand.State.Winners) != 1 || settled.ActiveHand.State.Winners[0].PlayerID != host.walletID.PlayerID {
+		t.Fatalf("expected host to win timeout-forfeited showdown, got %+v", settled.ActiveHand.State.Winners)
+	}
+	lastTransition := settled.CustodyTransitions[len(settled.CustodyTransitions)-1]
+	if lastTransition.Kind != tablecustody.TransitionKindShowdownPayout {
+		t.Fatalf("expected showdown payout transition after timeout, got %s", lastTransition.Kind)
+	}
+	if lastTransition.TimeoutResolution == nil {
+		t.Fatal("expected showdown payout timeout resolution")
+	}
+	if !slices.Contains(lastTransition.TimeoutResolution.LostEligibilityPlayerIDs, guest.walletID.PlayerID) {
+		t.Fatalf("expected guest to lose pot eligibility on timeout, got %+v", lastTransition.TimeoutResolution)
+	}
+	if len(lastTransition.Approvals) != 1 || lastTransition.Approvals[0].PlayerID != host.walletID.PlayerID {
+		t.Fatalf("expected timeout payout approvals to exclude guest, got %+v", lastTransition.Approvals)
+	}
+}
+
+func TestShowdownPayoutPlanConsumesRemovedPotRefs(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	enableSyntheticRealMode(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop showdown call: %v", err)
+	}
+	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send showdown-line check %d: %v", index, err)
+		}
+	}
+
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetShowdownReveal)
+	if len(table.LatestCustodyState.PotSlices) == 0 {
+		t.Fatal("expected live custody pot before showdown timeout")
+	}
+	previousPotInputSats := 0
+	for _, slice := range table.LatestCustodyState.PotSlices {
+		previousPotInputSats += sumVTXORefs(slice.VTXORefs)
+	}
+	if previousPotInputSats == 0 {
+		t.Fatal("expected prior pot refs to carry spendable value")
+	}
+
+	resolution := &tablecustody.TimeoutResolution{
+		ActionType:               string(game.ActionFold),
+		ActingPlayerID:           guest.walletID.PlayerID,
+		DeadPlayerIDs:            []string{guest.walletID.PlayerID},
+		LostEligibilityPlayerIDs: []string{guest.walletID.PlayerID},
+		Policy:                   defaultCustodyTimeoutPolicy,
+		Reason:                   "protocol timeout during showdown-reveal",
+	}
+	nextState, err := game.ForceFoldSeat(table.ActiveHand.State, 1)
+	if err != nil {
+		t.Fatalf("force fold missing showdown player: %v", err)
+	}
+	transition, err := host.buildCustodyTransition(table, tablecustody.TransitionKindShowdownPayout, &nextState, nil, resolution)
+	if err != nil {
+		t.Fatalf("build showdown payout transition: %v", err)
+	}
+	plan, err := host.buildCustodySettlementPlan(table, transition)
+	if err != nil {
+		t.Fatalf("build showdown payout settlement plan: %v", err)
+	}
+
+	potInputSats := 0
+	inputSum := 0
+	for _, input := range plan.Inputs {
+		inputSum += input.Ref.AmountSats
+		if strings.HasPrefix(input.ClaimKey, "pot:") {
+			potInputSats += input.Ref.AmountSats
+		}
+	}
+	outputSum := 0
+	for _, output := range plan.Outputs {
+		outputSum += output.AmountSats
+	}
+	if potInputSats != previousPotInputSats {
+		t.Fatalf("expected settlement plan to consume %d sats of removed pot refs, got %d", previousPotInputSats, potInputSats)
+	}
+	if inputSum < outputSum {
+		t.Fatalf("expected showdown payout inputs to cover outputs, got inputs=%d outputs=%d", inputSum, outputSum)
+	}
 }
 
 func TestHandleJoinRejectsPeerEndpointMismatch(t *testing.T) {
@@ -1091,6 +1220,45 @@ func TestCashOutAppendsCustodyTransition(t *testing.T) {
 	}
 }
 
+func TestCashOutTransitionHashIncludesApprovals(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, host, tableID)
+	transition, err := host.buildFundsCustodyTransition(table, tablecustody.TransitionKindCashOut, "completed")
+	if err != nil {
+		t.Fatalf("build cash-out transition: %v", err)
+	}
+	transition.ArkIntentID = "intent-test"
+	transition.ArkTxID = "tx-test"
+	transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
+	transition.NextStateHash = transition.NextState.StateHash
+	transition.Proof = tablecustody.CustodyProof{
+		ArkIntentID:     transition.ArkIntentID,
+		ArkTxID:         transition.ArkTxID,
+		FinalizedAt:     nowISO(),
+		ReplayValidated: true,
+		StateHash:       transition.NextStateHash,
+	}
+	approvals, err := host.collectCustodyApprovals(table, transition, host.requiredCustodySigners(table, transition))
+	if err != nil {
+		t.Fatalf("collect cash-out approvals: %v", err)
+	}
+	transition.Approvals = approvals
+	transition.Proof.Signatures = append([]tablecustody.CustodySignature(nil), approvals...)
+	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
+	if transition.Proof.TransitionHash == "" {
+		t.Fatal("expected cash-out proof transition hash")
+	}
+	if want := tablecustody.HashCustodyTransition(transition); transition.Proof.TransitionHash != want {
+		t.Fatalf("expected cash-out transition hash %s, got %s", want, transition.Proof.TransitionHash)
+	}
+	if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
+		t.Fatalf("validate cash-out transition: %v", err)
+	}
+}
+
 func TestEmergencyExitAppendsCustodyTransition(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -1167,7 +1335,7 @@ func TestCustodyTxSigningRejectsPSBTOutsideAuthorizedTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("normalize custody signing transition: %v", err)
 	}
-	intentInputs, leafProofs, arkFields, err := custodyIntentInputs(plan.Inputs)
+	intentInputs, leafProofs, arkFields, locktime, err := custodyIntentInputs(plan.Inputs)
 	if err != nil {
 		t.Fatalf("build intent inputs: %v", err)
 	}
@@ -1187,7 +1355,7 @@ func TestCustodyTxSigningRejectsPSBTOutsideAuthorizedTransition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register message: %v", err)
 	}
-	maliciousPSBT, err := custodyBuildProofPSBT(message, intentInputs, txOutputs, leafProofs, arkFields)
+	maliciousPSBT, err := custodyBuildProofPSBT(message, intentInputs, txOutputs, leafProofs, arkFields, locktime)
 	if err != nil {
 		t.Fatalf("build malicious psbt: %v", err)
 	}
@@ -1233,6 +1401,37 @@ func TestSyntheticRealModeSupportsCallThenCheck(t *testing.T) {
 	}
 	if lastTransition.ArkTxID != "" {
 		t.Fatalf("expected zero-money check transition to avoid Ark settlement, got %q", lastTransition.ArkTxID)
+	}
+}
+
+func TestActionDrivenShowdownArmsProtocolDeadline(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call to showdown line: %v", err)
+	}
+	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send river-line check %d: %v", index, err)
+		}
+	}
+
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetShowdownReveal)
+	if table.ActiveHand.Cards.PhaseDeadlineAt == "" {
+		t.Fatal("expected showdown-reveal phase to have a protocol deadline")
 	}
 }
 

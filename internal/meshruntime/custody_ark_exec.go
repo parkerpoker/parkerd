@@ -109,21 +109,29 @@ func custodyBatchExpiry(expiry uint32) arklib.RelativeLocktime {
 	return arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: expiry}
 }
 
-func custodyIntentInputs(inputs []custodyInputSpec) ([]arkintent.Input, []*arklib.TaprootMerkleProof, [][]*psbt.Unknown, error) {
+func custodyIntentInputs(inputs []custodyInputSpec) ([]arkintent.Input, []*arklib.TaprootMerkleProof, [][]*psbt.Unknown, arklib.AbsoluteLocktime, error) {
 	intentInputs := make([]arkintent.Input, 0, len(inputs))
 	leafProofs := make([]*arklib.TaprootMerkleProof, 0, len(inputs))
 	arkFields := make([][]*psbt.Unknown, 0, len(inputs))
+	locktime := arklib.AbsoluteLocktime(0)
 	for _, input := range inputs {
 		hash, err := chainhash.NewHashFromStr(input.Ref.TxID)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, 0, err
+		}
+		sequence := uint32(wire.MaxTxInSequenceNum)
+		if input.SpendPath.UsesCLTVLocktime {
+			sequence = wire.MaxTxInSequenceNum - 1
+			if input.SpendPath.Locktime > locktime {
+				locktime = input.SpendPath.Locktime
+			}
 		}
 		intentInputs = append(intentInputs, arkintent.Input{
 			OutPoint: &wire.OutPoint{
 				Hash:  *hash,
 				Index: input.Ref.VOut,
 			},
-			Sequence: wire.MaxTxInSequenceNum,
+			Sequence: sequence,
 			WitnessUtxo: &wire.TxOut{
 				Value:    int64(input.Ref.AmountSats),
 				PkScript: input.SpendPath.PKScript,
@@ -132,11 +140,11 @@ func custodyIntentInputs(inputs []custodyInputSpec) ([]arkintent.Input, []*arkli
 		leafProofs = append(leafProofs, input.SpendPath.LeafProof)
 		taptreeField, err := arktxutils.VtxoTaprootTreeField.Encode(input.SpendPath.Tapscripts)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, 0, err
 		}
 		arkFields = append(arkFields, []*psbt.Unknown{taptreeField})
 	}
-	return intentInputs, leafProofs, arkFields, nil
+	return intentInputs, leafProofs, arkFields, locktime, nil
 }
 
 func custodyRegisterMessage(onchainIndexes []int, cosignerPubkeys []string) (string, error) {
@@ -156,10 +164,13 @@ func custodyRegisterMessage(onchainIndexes []int, cosignerPubkeys []string) (str
 	return message, nil
 }
 
-func custodyBuildProofPSBT(message string, inputs []arkintent.Input, outputs []*wire.TxOut, leafProofs []*arklib.TaprootMerkleProof, arkFields [][]*psbt.Unknown) (string, error) {
+func custodyBuildProofPSBT(message string, inputs []arkintent.Input, outputs []*wire.TxOut, leafProofs []*arklib.TaprootMerkleProof, arkFields [][]*psbt.Unknown, locktime arklib.AbsoluteLocktime) (string, error) {
 	proof, err := arkintent.New(message, inputs, outputs)
 	if err != nil {
 		return "", err
+	}
+	if locktime != 0 {
+		proof.UnsignedTx.LockTime = uint32(locktime)
 	}
 	for i, input := range proof.Inputs {
 		var leafProof *arklib.TaprootMerkleProof
@@ -177,6 +188,19 @@ func custodyBuildProofPSBT(message string, inputs []arkintent.Input, outputs []*
 		proof.Inputs[i] = input
 	}
 	return proof.B64Encode()
+}
+
+func authorizedCustodyProofLocktime(plan *custodySettlementPlan) arklib.AbsoluteLocktime {
+	if plan == nil {
+		return 0
+	}
+	locktime := arklib.AbsoluteLocktime(0)
+	for _, input := range plan.Inputs {
+		if input.SpendPath.UsesCLTVLocktime && input.SpendPath.Locktime > locktime {
+			locktime = input.SpendPath.Locktime
+		}
+	}
+	return locktime
 }
 
 func custodyTransitionRequestHash(transition tablecustody.CustodyTransition) string {
@@ -314,6 +338,23 @@ func validateCustodyProofPSBT(packet *psbt.Packet, plan *custodySettlementPlan) 
 			return fmt.Errorf("custody proof psbt is missing authorized output %s", key)
 		}
 	}
+	expectedLocktime := authorizedCustodyProofLocktime(plan)
+	if expectedLocktime == 0 {
+		if packet.UnsignedTx.LockTime != 0 {
+			return errors.New("custody proof psbt has an unexpected locktime")
+		}
+	} else if packet.UnsignedTx.LockTime != uint32(expectedLocktime) {
+		return errors.New("custody proof psbt locktime does not match the authorized transition")
+	}
+	for index, input := range plan.Inputs {
+		expectedSequence := uint32(wire.MaxTxInSequenceNum)
+		if input.SpendPath.UsesCLTVLocktime {
+			expectedSequence = wire.MaxTxInSequenceNum - 1
+		}
+		if packet.UnsignedTx.TxIn[index+1].Sequence != expectedSequence {
+			return fmt.Errorf("custody proof psbt input %d sequence does not match the authorized spend path", index)
+		}
+	}
 	return nil
 }
 
@@ -364,6 +405,24 @@ func validateCustodyForfeitPSBT(packet *psbt.Packet, plan *custodySettlementPlan
 	sumOutputs := packet.UnsignedTx.TxOut[0].Value + packet.UnsignedTx.TxOut[1].Value
 	if sumInputs != sumOutputs {
 		return errors.New("custody forfeit psbt does not conserve the authorized value")
+	}
+	expectedLocktime := uint32(0)
+	expectedSequence := uint32(wire.MaxTxInSequenceNum)
+	for _, input := range plan.Inputs {
+		if !containsPlayerID(input.SpendPath.PlayerIDs, playerID) {
+			continue
+		}
+		if input.SpendPath.UsesCLTVLocktime {
+			expectedLocktime = uint32(input.SpendPath.Locktime)
+			expectedSequence = wire.MaxTxInSequenceNum - 1
+		}
+		break
+	}
+	if packet.UnsignedTx.LockTime != expectedLocktime {
+		return errors.New("custody forfeit psbt locktime does not match the authorized spend path")
+	}
+	if packet.UnsignedTx.TxIn[0].Sequence != expectedSequence {
+		return errors.New("custody forfeit psbt sequence does not match the authorized spend path")
 	}
 	return nil
 }
@@ -1085,12 +1144,18 @@ func (handler *custodyBatchEventsHandler) createSignedForfeit(ctx context.Contex
 	if err != nil {
 		return "", err
 	}
+	vtxoSequence := uint32(wire.MaxTxInSequenceNum)
+	vtxoLocktime := uint32(0)
+	if input.SpendPath.UsesCLTVLocktime {
+		vtxoSequence = wire.MaxTxInSequenceNum - 1
+		vtxoLocktime = uint32(input.SpendPath.Locktime)
+	}
 	forfeitTx, err := arktree.BuildForfeitTx(
 		[]*wire.OutPoint{{Hash: *vtxoHash, Index: input.Ref.VOut}, connectorOutpoint},
-		[]uint32{wire.MaxTxInSequenceNum, wire.MaxTxInSequenceNum},
+		[]uint32{vtxoSequence, wire.MaxTxInSequenceNum},
 		[]*wire.TxOut{{Value: int64(input.Ref.AmountSats), PkScript: input.SpendPath.PKScript}, connector},
 		forfeitPkScript,
-		0,
+		vtxoLocktime,
 	)
 	if err != nil {
 		return "", err
@@ -1332,7 +1397,7 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	if len(inputs) == 0 {
 		return nil, errors.New("custody batch is missing inputs")
 	}
-	intentInputs, leafProofs, arkFields, err := custodyIntentInputs(inputs)
+	intentInputs, leafProofs, arkFields, locktime, err := custodyIntentInputs(inputs)
 	if err != nil {
 		return nil, err
 	}
@@ -1363,7 +1428,7 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	if err != nil {
 		return nil, err
 	}
-	unsignedProof, err := custodyBuildProofPSBT(message, intentInputs, txOutputs, leafProofs, arkFields)
+	unsignedProof, err := custodyBuildProofPSBT(message, intentInputs, txOutputs, leafProofs, arkFields, locktime)
 	if err != nil {
 		return nil, err
 	}
@@ -1566,7 +1631,8 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if !ok {
 		return nil, 0, "", errors.New("latest custody state is missing the local stack claim")
 	}
-	if claim.AmountSats <= 0 {
+	totalClaimSats := stackClaimBackedAmount(claim)
+	if totalClaimSats <= 0 {
 		return nil, 0, "", errors.New("latest custody state has no spendable stack to settle")
 	}
 	if len(claim.VTXORefs) == 0 {
@@ -1592,9 +1658,17 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if strings.TrimSpace(walletInfo.ArkAddress) == "" {
 		return nil, 0, "", errors.New("wallet has no Ark address for cash-out settlement")
 	}
+	feeSats, err := runtime.estimatedCustodyBatchFee(len(inputs), 1, 0, 0)
+	if err != nil {
+		return nil, 0, "", err
+	}
+	settledAmount := totalClaimSats - feeSats
+	if settledAmount <= 0 {
+		return nil, 0, "", fmt.Errorf("custody claim is too small to cover Ark cash-out fees: have %d need %d", totalClaimSats, feeSats)
+	}
 	output, err := custodyBatchOutputFromReceiver("wallet-return", runtime.walletID.PlayerID, sdktypes.Receiver{
 		To:     walletInfo.ArkAddress,
-		Amount: uint64(claim.AmountSats),
+		Amount: uint64(settledAmount),
 	}, nil)
 	if err != nil {
 		return nil, 0, "", err
@@ -1618,5 +1692,5 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if kind == string(tablecustody.TransitionKindEmergencyExit) || kind == "emergency-exit" {
 		exitProofRef = tablecustody.BuildExitProofRef(*table.LatestCustodyState, runtime.walletID.PlayerID, claim.VTXORefs, nil)
 	}
-	return result, claim.AmountSats, exitProofRef, nil
+	return result, settledAmount, exitProofRef, nil
 }
