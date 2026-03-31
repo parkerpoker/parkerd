@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
 	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
@@ -136,7 +135,7 @@ func absoluteLocktimeFromISO(value string) (arklib.AbsoluteLocktime, error) {
 	if strings.TrimSpace(value) == "" {
 		return 0, errors.New("missing action deadline")
 	}
-	timestamp, err := time.Parse(time.RFC3339, value)
+	timestamp, err := parseISOTimestamp(value)
 	if err != nil {
 		return 0, err
 	}

@@ -610,7 +610,11 @@ func (runtime *meshRuntime) validateAcceptedHandTranscript(table nativeTableStat
 	}
 
 	allRevealsPresent := len(transcriptRecordsByKind(transcript, nativeHandMessageFairnessReveal, string(game.StreetReveal))) == len(table.Seats)
+	_, abortedHand := acceptedAbortSeatIndex(table)
 	if table.ActiveHand.State.Phase != game.StreetCommitment && table.ActiveHand.State.Phase != game.StreetReveal && !allRevealsPresent {
+		if abortedHand && table.ActiveHand.State.Phase == game.StreetSettled {
+			return nil
+		}
 		return fmt.Errorf("missing fairness reveals for active hand")
 	}
 	if allRevealsPresent {
@@ -634,6 +638,9 @@ func (runtime *meshRuntime) validateAcceptedHandTranscript(table nativeTableStat
 		} else if !sameStrings(table.ActiveHand.Cards.FinalDeck, replay.FinalDeck) {
 			return fmt.Errorf("active hand final deck does not match replayed transcript deck")
 		}
+	}
+	if abortedHand && table.ActiveHand.State.Phase == game.StreetSettled {
+		return nil
 	}
 	if requiresCompletedPrivateDelivery(table.ActiveHand.State.Phase) {
 		if missing := missingProtocolSeatIndexesForPhase(table, game.StreetPrivateDelivery); len(missing) > 0 {
@@ -821,11 +828,15 @@ func (runtime *meshRuntime) deriveLocalProtocolDeadline(existing *nativeTableSta
 		shouldTrackProtocolDeadline(existing.ActiveHand.State.Phase) {
 		return existing.ActiveHand.Cards.PhaseDeadlineAt
 	}
-	return addMillis(nowISO(), runtime.handProtocolTimeoutMS())
+	return addMillis(nowISO(), runtime.handProtocolTimeoutMSForTable(incoming))
 }
 
 func (runtime *meshRuntime) normalizeAcceptedActiveHand(existing *nativeTableState, incoming *nativeTableState) error {
-	if incoming == nil || incoming.ActiveHand == nil {
+	if incoming == nil {
+		return nil
+	}
+	if incoming.ActiveHand == nil {
+		incoming.ActiveHandStartAt = ""
 		return nil
 	}
 	if allFairnessRevealsPresent(*incoming) {
@@ -846,7 +857,7 @@ func (runtime *meshRuntime) setProtocolDeadline(table *nativeTableState) {
 		return
 	}
 	if shouldTrackProtocolDeadline(table.ActiveHand.State.Phase) {
-		table.ActiveHand.Cards.PhaseDeadlineAt = addMillis(nowISO(), runtime.handProtocolTimeoutMS())
+		table.ActiveHand.Cards.PhaseDeadlineAt = addMillis(nowISO(), runtime.handProtocolTimeoutMSForTable(*table))
 		return
 	}
 	table.ActiveHand.Cards.PhaseDeadlineAt = ""
@@ -1020,6 +1031,34 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 	if err != nil {
 		return game.HoldemState{}, err
 	}
+	blindTransition, previousBlindState, previousEventHash, haveBlindTransition, err := runtime.handStartTransitionForHand(table, hand.HandID)
+	if err != nil {
+		return game.HoldemState{}, err
+	}
+	if haveBlindTransition {
+		blindTable := cloneJSON(table)
+		blindTable.CurrentEpoch = blindTransition.NextState.Epoch
+		blindTable.CustodyTransitions = nil
+		blindTable.ActiveHand = &nativeActiveHand{
+			Cards: nativeHandCardState{
+				FinalDeck:       nil,
+				PhaseDeadlineAt: "",
+				Transcript: game.HandTranscript{
+					HandID:     hand.HandID,
+					HandNumber: hand.HandNumber,
+					Records:    []game.HandTranscriptRecord{},
+					RootHash:   "",
+					TableID:    table.Config.TableID,
+				},
+			},
+			State: cloneJSON(hand),
+		}
+		blindTable.LastEventHash = previousEventHash
+		blindTable.LatestCustodyState = previousBlindState
+		if err := runtime.validateCustodyTransitionSemantics(blindTable, blindTransition, nil); err != nil {
+			return game.HoldemState{}, err
+		}
+	}
 
 	switch table.ActiveHand.State.Phase {
 	case game.StreetCommitment, game.StreetReveal, game.StreetFinalization, game.StreetPrivateDelivery:
@@ -1031,11 +1070,15 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 	if err != nil {
 		return game.HoldemState{}, err
 	}
+	actionEvents, err := runtime.acceptedReplayActionEvents(table, hand.HandID)
+	if err != nil {
+		return game.HoldemState{}, err
+	}
 
 	actionIndex := 0
 	for {
 		if game.PhaseAllowsActions(hand.Phase) {
-			if actionIndex >= len(table.ActiveHand.State.ActionLog) {
+			if actionIndex >= len(actionEvents) {
 				if next, applied, err := replayAcceptedAbortIfPresent(table, hand); err != nil {
 					return game.HoldemState{}, err
 				} else if applied {
@@ -1044,12 +1087,7 @@ func (runtime *meshRuntime) replayAcceptedHandState(table nativeTableState) (gam
 				}
 				return hand, nil
 			}
-			record := table.ActiveHand.State.ActionLog[actionIndex]
-			seat, ok := seatRecordForPlayer(table, record.ActorPlayerID)
-			if !ok {
-				return game.HoldemState{}, fmt.Errorf("missing seat for action actor %s", record.ActorPlayerID)
-			}
-			next, err := game.ApplyHoldemAction(hand, seat.SeatIndex, record.Action)
+			next, _, err := runtime.applyAcceptedReplayActionEvent(table, hand, actionEvents[actionIndex])
 			if err != nil {
 				return game.HoldemState{}, err
 			}
@@ -1361,26 +1399,17 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if err != nil {
 		return false, err
 	}
-	if err := runtime.finalizeCustodyTransition(table, &custodyTransition); err != nil {
+	if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
 		return false, err
 	}
 	runtime.applyCustodyTransition(table, custodyTransition)
 	if err := runtime.appendEvent(table, map[string]any{
-		"type": "PlayerAction",
-		"intent": map[string]any{
-			"action": rawJSONMap(map[string]any{
-				"type":      action.Type,
-				"totalSats": action.TotalSats,
-			}),
-			"autoApplied":    true,
-			"custodySeq":     custodyTransition.CustodySeq,
-			"handId":         nextState.HandID,
-			"playerId":       actingPlayerID,
-			"resolution":     rawJSONMap(resolution),
-			"seatIndex":      actingSeatIndex,
-			"tableId":        table.Config.TableID,
-			"transitionHash": custodyTransition.Proof.TransitionHash,
-		},
+		"custodySeq":        custodyTransition.CustodySeq,
+		"playerId":          actingPlayerID,
+		"seatIndex":         actingSeatIndex,
+		"timeoutResolution": rawJSONMap(resolution),
+		"transitionHash":    custodyTransition.Proof.TransitionHash,
+		"type":              "PlayerAction",
 	}); err != nil {
 		return false, err
 	}
@@ -1423,15 +1452,17 @@ func (runtime *meshRuntime) abortActiveHandLocked(table *nativeTableState, reaso
 	}
 	if table.LatestFullySignedSnapshot == nil {
 		table.ActiveHand = nil
+		table.ActiveHandStartAt = ""
 		table.Config.Status = "ready"
-		table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
+		table.NextHandAt = addMillis(nowISO(), runtime.nextHandDelayMSForTable(*table))
 		return nil
 	}
 	restored := runtime.publicStateFromSnapshot(*table, *table.LatestFullySignedSnapshot)
 	table.PublicState = &restored
 	table.ActiveHand = nil
+	table.ActiveHandStartAt = ""
 	table.Config.Status = "ready"
-	table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
+	table.NextHandAt = addMillis(nowISO(), runtime.nextHandDelayMSForTable(*table))
 	snapshot, err := runtime.buildSnapshot(*table, restored)
 	if err != nil {
 		return err
@@ -1466,7 +1497,10 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 		if err != nil {
 			return err
 		}
-		if err := runtime.finalizeCustodyTransition(table, &custodyTransition); err != nil {
+		if err := runtime.syncTableToCustodySigners(*table, runtime.requiredCustodySigners(*table, custodyTransition)); err != nil {
+			return err
+		}
+		if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
 			return err
 		}
 		runtime.applyCustodyTransition(table, custodyTransition)
@@ -1501,7 +1535,8 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 	}); err != nil {
 		return err
 	}
-	table.NextHandAt = addMillis(nowISO(), nativeNextHandDelayMS)
+	table.ActiveHandStartAt = ""
+	table.NextHandAt = addMillis(nowISO(), runtime.nextHandDelayMSForTable(*table))
 	return nil
 }
 

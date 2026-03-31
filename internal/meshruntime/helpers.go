@@ -18,6 +18,18 @@ func MustMarshalJSON(value any) json.RawMessage {
 	return data
 }
 
+func decodeJSONValue[T any](input any) (T, error) {
+	var decoded T
+	data, err := json.Marshal(input)
+	if err != nil {
+		return decoded, err
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return decoded, err
+	}
+	return decoded, nil
+}
+
 func readTrimmedLine(reader *bufio.Reader) (string, error) {
 	line, err := reader.ReadString('\n')
 	if err != nil {

@@ -13,6 +13,7 @@ The important current-state rules are:
 - `LatestCustodyState` is the authoritative money checkpoint
 - `LatestSnapshot` and `LatestFullySignedSnapshot` are derived replay/debug projections
 - seat lock, blind posting, betting actions, timeout successors, settled payouts, cash-out, and emergency exit are custody transitions
+- accepted action and funds history replays from canonical signed request objects, not host-authored summaries or `ActionLog`
 - zero-exposure successors like `check` can still advance custody through a non-settlement transition that reuses the same refs
 - `meshRenew` is no longer a money-moving primitive; continuing play means carrying forward the latest stack claims
 - local table-funds state is now `arkade-table-funds/v2`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
@@ -121,12 +122,14 @@ If custody finalization fails, the hand fails closed.
 
 For every stake-changing action, Parker:
 
-1. validates that the request references the latest custody base hash
+1. validates that the signed request references the latest custody base hash
 2. applies Hold'em rules in `internal/game`
-3. builds the next `CustodyTransition`
-4. collects required approvals
-5. finalizes the custody step
-6. appends `PlayerAction`
+3. derives the expected semantic successor locally from the latest accepted state plus that signed request
+4. builds the next `CustodyTransition`
+5. verifies Ark/output authorization separately when the successor needs settlement material
+6. collects required approvals
+7. finalizes the custody step
+8. appends `PlayerAction`
 
 That applies to:
 
@@ -138,23 +141,35 @@ That applies to:
 - timeout auto-check
 - timeout auto-fold
 
-`PlayerAction` is therefore downstream of custody finalization, not the other way around.
+`PlayerAction` is therefore downstream of custody finalization, not the other way around, and its canonical payload is the full signed `nativeActionRequest`.
+
+Those same semantic checks run before:
+
+- custody approval
+- PSBT signing
+- signer-session prepare
 
 ### Zero-exposure successors
 
 Not every accepted custody step needs a fresh Ark batch.
 
-For actions like `check`, or for timeout auto-check when no stack or pot claims change, Parker still advances the custody chain so the transcript/gameplay state remains bound to a signed checkpoint. In that case the runtime:
+For actions like `check`, or for timeout auto-check when no stack or pot claims change, Parker still advances the custody chain without forcing a new Ark batch. In that case the runtime:
 
 1. carries forward the latest accepted custody refs
 2. updates the custody binding fields such as transcript root, decision index, acting player, and legal-actions hash
 3. finalizes a non-settlement custody transition with approvals and replay validation, but without an Ark spend bundle
 
-That keeps zero-money actions on the same custody-backed sequencing model as money-changing actions.
+Current validation scope: `action`, `timeout`, and `blind-post` successors exact-match the locally derived custody bindings, including `ActionDeadlineAt`, `ChallengeAnchor`, and `TranscriptRoot`. That deadline derivation uses the accepted table timing config, not the local daemon's current settlement mode. The same strict binding-field equality is also enforced for `cash-out`, `emergency-exit`, and the other host-derived non-action successors such as `buy-in-lock`, `showdown-payout`, and `carry-forward`.
 
 ### Timeout successors
 
 Action deadlines are carried in custody state, not only in host-local timers.
+
+Timeout validation is also local-derivation-first:
+
+- the runtime rejects timeout successors before the accepted custody deadline
+- it derives auto-check vs auto-fold from the accepted timeout policy and the current legal actions
+- it rejects any timeout successor whose supplied resolution disagrees with that local derivation
 
 Current timeout behavior:
 
@@ -183,7 +198,10 @@ If the latest custody state already matches the settled public money state, Park
 
 `meshCashOut` and `meshExit` now read from `LatestCustodyState`, not from `LatestFullySignedSnapshot`.
 
-For both flows, Parker first finalizes a `cash-out` or `emergency-exit` custody transition. After that succeeds, it appends a derived local `arkade-table-funds/v2` receipt for wallet availability, UI, and operator/debug accounting.
+For both flows, Parker first validates the canonical signed `nativeFundsRequest` against the latest accepted custody state, derives the expected successor locally, and only then finalizes a `cash-out` or `emergency-exit` custody transition. After that succeeds, it appends:
+
+- a canonical `CashOut` or `EmergencyExit` event containing the full signed `nativeFundsRequest`
+- a derived local `arkade-table-funds/v2` receipt for wallet availability, UI, and operator/debug accounting
 
 Those `arkade-table-funds/v2` operations carry:
 
@@ -244,5 +262,6 @@ The safest way to read the implementation today is:
 - table money truth lives in `LatestCustodyState`
 - snapshots and public state are derived from accepted custody-backed gameplay
 - every real exposure change is supposed to fail closed if custody cannot be finalized
+- poker-semantic successor validation and Ark/output-shape validation are distinct required checks
 - real-mode approval and replay validate Ark-linked refs live, including tapscript-to-output binding for declared taproot custody refs
 - operator or indexer outages affect liveness and visibility, not ownership of the latest accepted custody claim

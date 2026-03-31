@@ -1042,6 +1042,13 @@ play_hand_automatically() {
   return 1
 }
 
+write_table_artifact() {
+  local profile="$1"
+  local path="$2"
+  mkdir -p "$(dirname "$path")"
+  watch_table_state_with_retry "$profile" >"$path"
+}
+
 INDEXER_PORT="${INDEXER_PORT:-$(free_port)}"
 HOST_PORT="${HOST_PORT:-$(free_port)}"
 WITNESS_PORT="${WITNESS_PORT:-$(free_port)}"
@@ -1251,6 +1258,7 @@ buy_in_profile "$PLAYER_TWO_PROFILE"
 echo "Waiting for players to observe the active table..."
 wait_for_table_status "$PLAYER_ONE_PROFILE" active 2 >/dev/null
 wait_for_table_status "$PLAYER_TWO_PROFILE" active 2 >/dev/null
+write_table_artifact host "$BASE/artifacts/table-active.json"
 
 write_runtime_env
 
@@ -1262,6 +1270,7 @@ fi
 
 echo "Playing one hand automatically..."
 play_hand_automatically >/dev/null
+write_table_artifact host "$BASE/artifacts/table-after-hand.json"
 
 echo "Final table state:"
 watch_table_state_with_retry "$WATCH_PROFILE"
@@ -1269,6 +1278,7 @@ watch_table_state_with_retry "$WATCH_PROFILE"
 echo "Cashing out..."
 cashout_profile "$PLAYER_ONE_PROFILE"
 cashout_profile "$PLAYER_TWO_PROFILE"
+write_table_artifact host "$BASE/artifacts/table-after-cashout.json"
 
 echo "Final wallet summaries:"
 pcli wallet --profile "$PLAYER_ONE_PROFILE" --json

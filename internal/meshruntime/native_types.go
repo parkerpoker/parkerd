@@ -63,15 +63,18 @@ type NativeMeshRuntimeState struct {
 }
 
 type NativeMeshTableConfig struct {
+	ActionTimeoutMS           int    `json:"actionTimeoutMs,omitempty"`
 	BigBlindSats              int    `json:"bigBlindSats"`
 	BuyInMaxSats              int    `json:"buyInMaxSats"`
 	BuyInMinSats              int    `json:"buyInMinSats"`
 	CreatedAt                 string `json:"createdAt"`
 	DealerMode                string `json:"dealerMode"`
+	HandProtocolTimeoutMS     int    `json:"handProtocolTimeoutMs,omitempty"`
 	HostPeerID                string `json:"hostPeerId"`
 	HostPlaysAllowed          bool   `json:"hostPlaysAllowed"`
 	Name                      string `json:"name"`
 	NetworkID                 string `json:"networkId"`
+	NextHandDelayMS           int    `json:"nextHandDelayMs,omitempty"`
 	OccupiedSeats             int    `json:"occupiedSeats"`
 	PublicSpectatorDelayHands int    `json:"publicSpectatorDelayHands"`
 	SeatCount                 int    `json:"seatCount"`
@@ -301,6 +304,7 @@ type nativeTableState struct {
 	LatestCustodyState        *tablecustody.CustodyState       `json:"latestCustodyState,omitempty"`
 	LatestFullySignedSnapshot *NativeCooperativeTableSnapshot  `json:"latestFullySignedSnapshot,omitempty"`
 	LatestSnapshot            *NativeCooperativeTableSnapshot  `json:"latestSnapshot,omitempty"`
+	ActiveHandStartAt         string                           `json:"activeHandStartAt,omitempty"`
 	NextHandAt                string                           `json:"nextHandAt,omitempty"`
 	PublicState               *NativePublicTableState          `json:"publicState,omitempty"`
 	Seats                     []nativeSeatRecord               `json:"seats"`
@@ -340,6 +344,7 @@ type nativeJoinRequest struct {
 
 type nativeActionRequest struct {
 	Action               game.Action `json:"action"`
+	ChallengeAnchor      string      `json:"challengeAnchor,omitempty"`
 	DecisionIndex        int         `json:"decisionIndex"`
 	Epoch                int         `json:"epoch"`
 	HandID               string      `json:"handId"`
@@ -349,6 +354,7 @@ type nativeActionRequest struct {
 	SignatureHex         string      `json:"signatureHex"`
 	SignedAt             string      `json:"signedAt"`
 	TableID              string      `json:"tableId"`
+	TranscriptRoot       string      `json:"transcriptRoot,omitempty"`
 }
 
 type nativeFundsRequest struct {
@@ -364,16 +370,16 @@ type nativeFundsRequest struct {
 }
 
 type nativeFundsSettlement struct {
-	AmountSats      int                    `json:"amountSats"`
-	ArkIntentID     string                 `json:"arkIntentId,omitempty"`
-	ArkTxID         string                 `json:"arkTxid,omitempty"`
-	CustodySeq      int                    `json:"custodySeq"`
-	ExitProofRef    string                 `json:"exitProofRef,omitempty"`
-	PrevStateHash   string                 `json:"prevStateHash,omitempty"`
-	StateHash       string                 `json:"stateHash,omitempty"`
-	Status          string                 `json:"status"`
-	TransitionHash  string                 `json:"transitionHash,omitempty"`
-	VTXORefs        []tablecustody.VTXORef `json:"vtxoRefs,omitempty"`
+	AmountSats     int                    `json:"amountSats"`
+	ArkIntentID    string                 `json:"arkIntentId,omitempty"`
+	ArkTxID        string                 `json:"arkTxid,omitempty"`
+	CustodySeq     int                    `json:"custodySeq"`
+	ExitProofRef   string                 `json:"exitProofRef,omitempty"`
+	PrevStateHash  string                 `json:"prevStateHash,omitempty"`
+	StateHash      string                 `json:"stateHash,omitempty"`
+	Status         string                 `json:"status"`
+	TransitionHash string                 `json:"transitionHash,omitempty"`
+	VTXORefs       []tablecustody.VTXORef `json:"vtxoRefs,omitempty"`
 }
 
 type nativeFundsResponse struct {
@@ -381,8 +387,14 @@ type nativeFundsResponse struct {
 	Table      nativeTableState      `json:"table"`
 }
 
+type nativeTransitionAuthorizer struct {
+	ActionRequest *nativeActionRequest `json:"actionRequest,omitempty"`
+	FundsRequest  *nativeFundsRequest  `json:"fundsRequest,omitempty"`
+}
+
 type nativeCustodyApprovalRequest struct {
 	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash"`
+	Authorizer            *nativeTransitionAuthorizer    `json:"authorizer,omitempty"`
 	PlayerID              string                         `json:"playerId"`
 	TableID               string                         `json:"tableId"`
 	Transition            tablecustody.CustodyTransition `json:"transition"`
@@ -394,7 +406,8 @@ type nativeCustodyApprovalResponse struct {
 
 type nativeCustodyTxSignRequest struct {
 	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash,omitempty"`
-	ExpectedOutputs       []custodyBatchOutput          `json:"expectedOutputs,omitempty"`
+	ExpectedOutputs       []custodyBatchOutput           `json:"expectedOutputs,omitempty"`
+	Authorizer            *nativeTransitionAuthorizer    `json:"authorizer,omitempty"`
 	PSBT                  string                         `json:"psbt"`
 	PlayerID              string                         `json:"playerId"`
 	Purpose               string                         `json:"purpose,omitempty"`
@@ -408,13 +421,14 @@ type nativeCustodyTxSignResponse struct {
 }
 
 type nativeCustodySignerPrepareRequest struct {
-	DerivationPath        string                         `json:"derivationPath"`
-	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash,omitempty"`
-	ExpectedOffchainOutputs []custodyBatchOutput         `json:"expectedOffchainOutputs,omitempty"`
-	PlayerID              string                         `json:"playerId"`
-	TableID               string                         `json:"tableId"`
-	TransitionHash        string                         `json:"transitionHash,omitempty"`
-	Transition            tablecustody.CustodyTransition `json:"transition"`
+	DerivationPath          string                         `json:"derivationPath"`
+	ExpectedPrevStateHash   string                         `json:"expectedPrevStateHash,omitempty"`
+	ExpectedOffchainOutputs []custodyBatchOutput           `json:"expectedOffchainOutputs,omitempty"`
+	Authorizer              *nativeTransitionAuthorizer    `json:"authorizer,omitempty"`
+	PlayerID                string                         `json:"playerId"`
+	TableID                 string                         `json:"tableId"`
+	TransitionHash          string                         `json:"transitionHash,omitempty"`
+	Transition              tablecustody.CustodyTransition `json:"transition"`
 }
 
 type nativeCustodySignerPrepareResponse struct {

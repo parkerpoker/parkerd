@@ -61,14 +61,16 @@ The host still has real responsibility for:
 
 But the host is no longer supposed to be the unilateral money sequencer.
 
-The host cannot legitimately advance money state without producing a custody successor that is bound to:
+For user-initiated transitions, honest replicas do not trust a host-authored summary of intent. They derive the expected successor locally from:
 
-- the previous custody state hash
-- the active transcript root
-- the current decision index
-- the acting player
-- timeout policy and deadline
-- the derived public money state hash
+- the latest accepted custody state
+- the signed `nativeActionRequest` or `nativeFundsRequest`
+
+Current runtime guarantee:
+
+- `action` successors now exact-match the locally derived next custody state, including `ActionDeadlineAt`, `ChallengeAnchor`, `TranscriptRoot`, and the derived public money state hash, using the latest accepted custody state plus the signed `nativeActionRequest`
+- `timeout`, `blind-post`, `cash-out`, `emergency-exit`, and the other host-derived non-action successors such as `buy-in-lock`, `showdown-payout`, and `carry-forward` also exact-match those locally derived custody bindings
+- deadline derivation uses the accepted table timing profile (`actionTimeoutMs`, `handProtocolTimeoutMs`, `nextHandDelayMs`) instead of the local daemon's current mock/real mode, so accepted replay stays stable across local settlement-mode changes
 
 In practice, that means the host is a proposer of the next valid state, not the sole owner of monetary truth.
 
@@ -83,7 +85,8 @@ Current runtime behavior:
 - cooperative money changes collect seated-player approvals
 - timeout successors can exclude a dead non-cooperating player when resolving that timeout path
 - reveal/private-delivery/showdown timeout refunds uncontested stack instead of gifting it to the surviving player
-- remote signers validate the prebuilt custody transition and authorized output set before signing PSBT or tree-signing requests
+- remote signers validate the prebuilt custody transition semantically before approval, PSBT signing, or signer-session prepare
+- Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
 
 This keeps liveness from depending on continued cooperation by a player who has already lost eligibility in the contested portion of the hand.
 
@@ -96,11 +99,13 @@ Accepted state is checked against:
 - signed transport/auth envelopes
 - hand transcript replay
 - public-state replay
-- historical event continuity
+- historical event continuity, including embedded initiator signatures and custody anchors
 - historical snapshot continuity
 - historical custody continuity
 
 In real-settlement mode those checks also include live Ark/indexer validation of accepted custody refs, including tapscript-to-output binding for any declared taproot custody refs. The current implementation validates against live services rather than carrying a fully self-contained offline inclusion-proof bundle.
+
+`ReplayValidated` remains telemetry/debug metadata only. It is not treated as proof on its own.
 
 This means a malicious or stale proposer can still waste time or withhold progress, but it should not be able to silently rewrite accepted money history without being rejected by honest peers.
 

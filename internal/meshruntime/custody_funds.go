@@ -15,7 +15,7 @@ func (runtime *meshRuntime) buildFundsCustodyTransitionForPlayer(table nativeTab
 	if table.LatestCustodyState == nil {
 		return tablecustody.CustodyTransition{}, errors.New("latest custody state is unavailable")
 	}
-	binding := runtime.custodyStateBinding(table, nil)
+	binding := runtime.custodyStateBinding(table, kind, nil, nil)
 	binding.ActingPlayerID = playerID
 
 	balances := runtime.custodyBalancesFromHand(table, nil)

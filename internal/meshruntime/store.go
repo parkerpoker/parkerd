@@ -3,6 +3,7 @@ package meshruntime
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
@@ -206,8 +207,19 @@ func nowISO() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
+func parseISOTimestamp(timestamp string) (time.Time, error) {
+	trimmed := strings.TrimSpace(timestamp)
+	if trimmed == "" {
+		return time.Time{}, errors.New("empty timestamp")
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, trimmed)
+}
+
 func addMillis(timestamp string, delta int) string {
-	base, err := time.Parse(time.RFC3339, timestamp)
+	base, err := parseISOTimestamp(timestamp)
 	if err != nil {
 		base = time.Now().UTC()
 	}
@@ -218,7 +230,7 @@ func elapsedMillis(timestamp string) int64 {
 	if timestamp == "" {
 		return 1 << 62
 	}
-	value, err := time.Parse(time.RFC3339, timestamp)
+	value, err := parseISOTimestamp(timestamp)
 	if err != nil {
 		return 1 << 62
 	}

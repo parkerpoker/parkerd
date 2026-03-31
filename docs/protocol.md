@@ -13,7 +13,8 @@ The important protocol changes in this generation are:
 - money authority is the latest accepted `CustodyState`
 - local funds bookkeeping is `arkade-table-funds/v2`
 - join requests include funded buy-in refs
-- action requests are bound to `prevCustodyStateHash`
+- action and funds requests are bound to `prevCustodyStateHash`
+- accepted `PlayerAction`, `CashOut`, and `EmergencyExit` events carry the full signed initiator request as the canonical payload
 - host sequencing is proposer-only; action and result events are appended only after custody finalization succeeds
 - the game engine is N-player-capable for money logic, but runtime table creation is still capped at 2 seats
 
@@ -93,6 +94,8 @@ The runtime currently handles:
 
 The new pieces in the custody generation are the `table.funds.*`, `table.custody.*`, `table.custody.sign*`, and `table.custody.signer.*` routes plus the tighter coupling between table sync, action acceptance, and custody finalization.
 
+For user-initiated transitions, `table.custody.request`, `table.custody.sign.request`, and `table.custody.signer.prepare.request` now carry a transition authorizer object with the full signed `nativeActionRequest` or `nativeFundsRequest`. Later signer start/nonces/aggregated-nonces steps continue from the already-validated transition hash and stored signer session.
+
 ## Authoritative Table State
 
 `nativeTableState` now carries both the derived UI/debug views and the custody history:
@@ -147,26 +150,36 @@ Seat lock is then committed as a `buy-in-lock` custody transition.
 `table.action.request` now includes:
 
 - action payload
+- current `challengeAnchor`
 - `handId`
 - `epoch`
 - `decisionIndex`
 - `prevCustodyStateHash`
+- current `transcriptRoot`
 - wallet signature over the action plus that custody base hash
 
 The host rejects the action if the request is not anchored to the latest custody checkpoint.
+It also rejects the action if the signed transcript bindings do not match the locally accepted table state.
+
+It also rejects any proposed custody successor unless the daemon can derive the same semantic successor locally from:
+
+- the latest accepted local table state
+- the signed `nativeActionRequest`
 
 For an accepted action, the host:
 
 1. validates the current turn against transcript/game state
 2. applies Hold'em rules
-3. builds the next custody transition
+3. rebuilds the exact next custody successor, including deadline and transcript bindings
 4. collects required approvals
 5. finalizes custody
 6. appends `PlayerAction`
 
-`PlayerAction` therefore reflects an already-finalized custody step.
+`PlayerAction` therefore reflects an already-finalized custody step, and its canonical initiator payload is the full signed `nativeActionRequest`, not a host-authored summary.
 
 This also covers zero-exposure successors such as `check` or timeout auto-check. Those still advance `custodySeq`, but if the successor reuses the same refs and needs no Ark spend inputs, the runtime finalizes a non-settlement custody transition instead of forcing a batch.
+
+Custody timing is also protocol-configured now. Table config carries `actionTimeoutMs`, `handProtocolTimeoutMs`, and `nextHandDelayMs`, and semantic replay uses those accepted table values instead of the local daemon's current mock-vs-real settlement mode.
 
 ## Custody Transition Contract
 
@@ -186,6 +199,9 @@ The custody layer lives in `internal/tablecustody`.
 - `actingPlayerId`
 - `legalActionsHash`
 - `timeoutPolicy`
+- `actionTimeoutMs`
+- `handProtocolTimeoutMs`
+- `nextHandDelayMs`
 - `actionDeadlineAt`
 - `challengeAnchor`
 - stack claims
@@ -200,6 +216,20 @@ Transition kinds currently used by the runtime include:
 - `showdown-payout`
 - `cash-out`
 - `emergency-exit`
+
+User-initiated transition validation is now explicitly layered:
+
+1. semantic successor validation
+2. Ark/output authorization and proof validation
+
+Semantic successor validation derives the expected next custody step locally from the last accepted state plus the relevant signed initiator request:
+
+- `action` uses the embedded `nativeActionRequest` and local `game.ApplyHoldemAction(...)`
+- `timeout` derives the timeout resolution locally from the prior custody deadline and timeout policy
+- `cash-out` and `emergency-exit` use the embedded `nativeFundsRequest`
+- `blind-post`, `showdown-payout`, and `carry-forward` are rebuilt locally with no host-authored semantic input
+
+Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers still verify Ark-linked refs, authorized output sets, and Ark proof material even after the semantic successor matches.
 
 In real-settlement mode, peer approval and replay validation do more than hash-chain checks. They verify Ark-linked refs live against Ark/indexer state, including amount/script identity and tapscript-to-output binding for any declared taproot custody refs. The current implementation relies on live verification, not a separate offline inclusion-proof bundle.
 
@@ -220,6 +250,7 @@ That means:
 - transcript-only steps can exist without a money transition
 - stake-changing steps fail closed if custody cannot finalize
 - `HandResult` is appended after the money checkpoint for that result is established
+- accepted action and funds replay uses player-signed request objects, not host-authored `ActionLog` summaries
 
 ## Failover And Continuation
 
@@ -254,5 +285,6 @@ The safest way to interpret the current protocol is:
 - custody state, not snapshots, is the money-finality object
 - the host proposes transitions and orchestrates replication
 - money-changing steps are accepted only after custody finalization
+- semantic successor validation and Ark/output validation are distinct required checks
 - real-mode peer approvals and replay validate Ark-linked refs against live Ark/indexer state before signing or persistence
 - non-host peers replay transcript, public state, snapshot history, and custody history before persistence
