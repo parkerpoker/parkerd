@@ -1779,6 +1779,9 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 		if err != nil {
 			return err
 		}
+		if err := runtime.syncTableToCustodySigners(*table, runtime.custodyTreeSignerIDs(*table, seatLockTransition)); err != nil {
+			return err
+		}
 		if err := runtime.finalizeCustodyTransition(table, &seatLockTransition, nil); err != nil {
 			return err
 		}

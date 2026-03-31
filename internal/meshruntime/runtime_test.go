@@ -1740,6 +1740,50 @@ func TestJoinTableAcceptsPendingSeatLockSemanticValidationInSyntheticRealMode(t 
 	}
 }
 
+func TestJoinTableSyncsExistingSeatsBeforeRemoteSignerPrepare(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	alice := newMeshTestRuntime(t, "alice")
+	bob := newMeshTestRuntime(t, "bob")
+	enableSyntheticRealMode(host, alice, bob)
+
+	createResult, err := host.CreateTable(map[string]any{"name": "Three Party Join Table"})
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	inviteCode := stringValue(createResult["inviteCode"])
+	if inviteCode == "" {
+		t.Fatal("expected invite code from table creation")
+	}
+	invite, err := decodeInvite(inviteCode)
+	if err != nil {
+		t.Fatalf("decode invite: %v", err)
+	}
+	tableID := stringValue(invite["tableId"])
+	if tableID == "" {
+		t.Fatal("expected table id from table creation")
+	}
+
+	if _, err := alice.JoinTable(inviteCode, 4_000); err != nil {
+		t.Fatalf("alice join table: %v", err)
+	}
+	if _, err := bob.JoinTable(inviteCode, 4_000); err != nil {
+		t.Fatalf("bob join table: %v", err)
+	}
+	table := mustReadNativeTable(t, bob, tableID)
+	if got := len(table.Seats); got != 2 {
+		t.Fatalf("expected two active seats after second join, got %d", got)
+	}
+	for _, player := range []*meshRuntime{alice, bob} {
+		seat, ok := seatRecordForPlayer(table, player.walletID.PlayerID)
+		if !ok {
+			t.Fatalf("expected seat for player %s after join sync", player.walletID.PlayerID)
+		}
+		if seat.Status != "active" {
+			t.Fatalf("expected player %s seat to be active, got %q", player.walletID.PlayerID, seat.Status)
+		}
+	}
+}
+
 func TestDefaultDealerlessBlindsUseArkDustFloor(t *testing.T) {
 	smallBlind, bigBlind := defaultDealerlessBlinds(330, map[string]any{})
 	if smallBlind != 165 || bigBlind != 330 {
