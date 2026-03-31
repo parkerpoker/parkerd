@@ -47,6 +47,7 @@ type meshRuntime struct {
 	protocolIdentity    settlementcore.ScopedIdentity
 	self                nativePeerSelf
 	server              *http.Server
+	fundsSenderHook     func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
 	tableSyncSender     func(peerURL string, input nativeTableSyncRequest) error
 	started             bool
 	store               *meshStore
@@ -244,6 +245,7 @@ func (runtime *meshRuntime) Tick() {
 		selfPeerID := runtime.selfPeerID()
 		if table.CurrentHost.Peer.PeerID == selfPeerID {
 			if elapsedMillis(table.LastHostHeartbeatAt) >= int64(runtime.hostHeartbeatIntervalMS()) {
+				var replicateView *nativeTableState
 				_ = runtime.store.withTableLock(tableID, func() error {
 					latest, err := runtime.store.readTable(tableID)
 					if err != nil || latest == nil {
@@ -263,8 +265,16 @@ func (runtime *meshRuntime) Tick() {
 						debugMeshf("host tick advance hand protocol failed table=%s err=%v", tableID, err)
 						return err
 					}
-					return runtime.persistAndReplicate(latest, true)
+					if err := runtime.persistLocalTable(latest, true); err != nil {
+						return err
+					}
+					snapshot := cloneJSON(*latest)
+					replicateView = &snapshot
+					return nil
 				})
+				if replicateView != nil {
+					runtime.replicateTable(*replicateView)
+				}
 			}
 			continue
 		}
@@ -1184,43 +1194,65 @@ func (runtime *meshRuntime) Exit(tableID string) (map[string]any, error) {
 }
 
 func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (map[string]any, error) {
-	table, err := runtime.refreshLocalTable(tableID)
-	if err != nil {
-		return nil, err
-	}
-	if table == nil || table.LatestCustodyState == nil {
-		return nil, errors.New("latest custody state is unavailable")
-	}
-	if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && table.CurrentHost.Peer.PeerURL != "" {
-		// Funds requests are signed against the latest custody hash, so force one
-		// authoritative host refresh instead of relying on periodic polling.
-		remote, err := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
+	var (
+		response nativeFundsResponse
+		table    *nativeTableState
+		err      error
+	)
+	for attempt := 0; attempt < 2; attempt++ {
+		table, err = runtime.refreshLocalTable(tableID)
 		if err != nil {
 			return nil, err
 		}
-		if remote != nil {
-			if err := runtime.acceptRemoteTable(*remote); err != nil {
-				return nil, err
-			}
-			runtime.lastSyncAt[tableID] = time.Now()
-			table, err = runtime.store.readTable(tableID)
+		if table == nil || table.LatestCustodyState == nil {
+			return nil, errors.New("latest custody state is unavailable")
+		}
+		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && table.CurrentHost.Peer.PeerURL != "" {
+			// Funds requests are signed against the latest custody hash, so force one
+			// authoritative host refresh instead of relying on periodic polling.
+			remote, err := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
 			if err != nil {
 				return nil, err
 			}
-			if table == nil || table.LatestCustodyState == nil {
-				return nil, errors.New("latest custody state is unavailable")
+			if remote != nil {
+				if err := runtime.acceptRemoteTable(*remote); err != nil {
+					return nil, err
+				}
+				runtime.lastSyncAt[tableID] = time.Now()
+				table, err = runtime.store.readTable(tableID)
+				if err != nil {
+					return nil, err
+				}
+				if table == nil || table.LatestCustodyState == nil {
+					return nil, errors.New("latest custody state is unavailable")
+				}
 			}
 		}
-	}
-	request, err := runtime.buildSignedFundsRequest(*table, kind)
-	if err != nil {
+		request, err := runtime.buildSignedFundsRequest(*table, kind)
+		if err != nil {
+			return nil, err
+		}
+		if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
+			response, err = runtime.handleFundsFromPeer(request)
+		} else {
+			response, err = runtime.remoteFunds(table.CurrentHost.Peer.PeerURL, request)
+		}
+		if err == nil {
+			break
+		}
+		if attempt == 0 &&
+			table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+			table.CurrentHost.Peer.PeerURL != "" &&
+			isRetryableFundsRequestStateError(err) {
+			remote, fetchErr := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
+			if fetchErr == nil && remote != nil {
+				if acceptErr := runtime.acceptRemoteTable(*remote); acceptErr == nil {
+					runtime.lastSyncAt[tableID] = time.Now()
+					continue
+				}
+			}
+		}
 		return nil, err
-	}
-	var response nativeFundsResponse
-	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
-		response, err = runtime.handleFundsFromPeer(request)
-	} else {
-		response, err = runtime.remoteFunds(table.CurrentHost.Peer.PeerURL, request)
 	}
 	if err != nil {
 		return nil, err
@@ -1250,6 +1282,15 @@ func (runtime *meshRuntime) completeFunds(tableID, kind, finalStatus string) (ma
 		"settledArkTx":   response.Settlement.ArkTxID,
 		"status":         status,
 	}, nil
+}
+
+func isRetryableFundsRequestStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "funds request custody mismatch") ||
+		strings.Contains(message, "funds request epoch mismatch")
 }
 
 func (runtime *meshRuntime) buildSignedFundsRequest(table nativeTableState, kind string) (nativeFundsRequest, error) {
@@ -1525,6 +1566,9 @@ func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState
 		remote, err := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
 		if err == nil && remote != nil {
 			if err := runtime.acceptRemoteTable(*remote); err != nil {
+				if isStaleRemoteTableError(err) {
+					return table, nil
+				}
 				return nil, err
 			}
 			runtime.lastSyncAt[tableID] = time.Now()
@@ -1542,6 +1586,16 @@ func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState
 	if table != nil && elapsedMillis(table.LastHostHeartbeatAt) > int64(runtime.hostFailureTimeoutMS()) && runtime.shouldHandleFailover(*table) {
 		if err := runtime.failoverTable(tableID, "missed host heartbeats"); err == nil {
 			table, _ = runtime.store.readTable(tableID)
+		}
+	}
+	if table != nil &&
+		table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+		table.ActiveHand != nil &&
+		!game.PhaseAllowsActions(table.ActiveHand.State.Phase) {
+		runtime.driveLocalHandProtocol(tableID)
+		table, err = runtime.store.readTable(tableID)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return table, nil
@@ -2033,7 +2087,8 @@ func (runtime *meshRuntime) forceProtocolFailover(tableID, reason string) error 
 	return runtime.rotateHostTable(tableID, reason, false, false)
 }
 
-func (runtime *meshRuntime) persistAndReplicate(table *nativeTableState, publish bool) error {
+func (runtime *meshRuntime) persistLocalTable(table *nativeTableState, publish bool) error {
+	normalizePublicTranscriptRoot(table)
 	table.LastSyncedAt = nowISO()
 	if err := runtime.store.writeTable(table); err != nil {
 		return err
@@ -2050,6 +2105,13 @@ func (runtime *meshRuntime) persistAndReplicate(table *nativeTableState, publish
 	if publish && table.Advertisement != nil && table.Config.Visibility == "public" {
 		_ = runtime.store.upsertPublicAd(*table.Advertisement)
 		_ = runtime.publishPublicState(*table)
+	}
+	return nil
+}
+
+func (runtime *meshRuntime) persistAndReplicate(table *nativeTableState, publish bool) error {
+	if err := runtime.persistLocalTable(table, publish); err != nil {
+		return err
 	}
 	runtime.replicateTable(*table)
 	return nil
@@ -3043,8 +3105,10 @@ func (runtime *meshRuntime) validateAcceptedPublicReplay(table nativeTableState)
 
 	base := previousSnapshotForCurrentState(table)
 	expectedPublic := runtime.publicStateFromHand(base, replayedState)
-	if !reflect.DeepEqual(comparablePublicState(table.PublicState), comparablePublicState(&expectedPublic)) {
-		return errors.New("public state does not match transcript replay")
+	comparableActual := comparablePublicState(table.PublicState)
+	comparableExpected := comparablePublicState(&expectedPublic)
+	if !reflect.DeepEqual(comparableActual, comparableExpected) {
+		return fmt.Errorf("public state does not match transcript replay: expected=%+v got=%+v", comparableExpected, comparableActual)
 	}
 	if replayedState.Phase != game.StreetSettled {
 		return nil
@@ -3524,6 +3588,17 @@ func (runtime *meshRuntime) shouldPollHost(tableID string) bool {
 	return time.Since(last) >= nativeTableSyncInterval
 }
 
+func isStaleRemoteTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "would roll back table epoch") ||
+		strings.Contains(message, "would roll back table events") ||
+		strings.Contains(message, "would roll back table snapshots") ||
+		strings.Contains(message, "would roll back custody transitions")
+}
+
 func (runtime *meshRuntime) shouldHandleFailover(table nativeTableState) bool {
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		return false
@@ -3539,13 +3614,8 @@ func (runtime *meshRuntime) shouldHandleFailover(table nativeTableState) bool {
 	if runtime.seatIndexForPlayer(table) < 0 {
 		return false
 	}
-	lowestPeerID := ""
-	for _, seat := range table.Seats {
-		if lowestPeerID == "" || seat.PeerID < lowestPeerID {
-			lowestPeerID = seat.PeerID
-		}
-	}
-	return lowestPeerID == runtime.selfPeerID()
+	candidate, ok := lowestEligibleFailoverSeat(table)
+	return ok && candidate.PeerID == runtime.selfPeerID()
 }
 
 func (runtime *meshRuntime) knownPeerURL(peerID string) string {
@@ -3963,16 +4033,8 @@ func (runtime *meshRuntime) authorizedRemoteHostPeer(table *nativeTableState, ca
 	if len(table.Witnesses) > 0 {
 		return NativePeerAddress{}, false
 	}
-	lowestPeerID := ""
-	var lowestSeat *nativeSeatRecord
-	for _, seat := range table.Seats {
-		if lowestPeerID == "" || seat.PeerID < lowestPeerID {
-			lowestPeerID = seat.PeerID
-			seatClone := seat
-			lowestSeat = &seatClone
-		}
-	}
-	if candidatePeerID != lowestPeerID || lowestSeat == nil {
+	lowestSeat, ok := lowestEligibleFailoverSeat(*table)
+	if !ok || candidatePeerID != lowestSeat.PeerID {
 		return NativePeerAddress{}, false
 	}
 	return NativePeerAddress{
@@ -3981,6 +4043,25 @@ func (runtime *meshRuntime) authorizedRemoteHostPeer(table *nativeTableState, ca
 		PeerURL:           lowestSeat.PeerURL,
 		ProtocolPubkeyHex: lowestSeat.ProtocolPubkeyHex,
 	}, true
+}
+
+func lowestEligibleFailoverSeat(table nativeTableState) (nativeSeatRecord, bool) {
+	lowestPeerID := ""
+	var lowestSeat *nativeSeatRecord
+	for _, seat := range table.Seats {
+		if seat.PeerID == "" || seat.PeerID == table.CurrentHost.Peer.PeerID {
+			continue
+		}
+		if lowestPeerID == "" || seat.PeerID < lowestPeerID {
+			lowestPeerID = seat.PeerID
+			seatClone := seat
+			lowestSeat = &seatClone
+		}
+	}
+	if lowestSeat == nil {
+		return nativeSeatRecord{}, false
+	}
+	return *lowestSeat, true
 }
 
 func timestampWithinWindow(timestamp string, maxAge time.Duration) bool {

@@ -394,6 +394,9 @@ func (runtime *meshRuntime) remoteAction(peerURL string, input nativeActionReque
 }
 
 func (runtime *meshRuntime) remoteFunds(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error) {
+	if runtime.fundsSenderHook != nil {
+		return runtime.fundsSenderHook(peerURL, input)
+	}
 	peerInfo, err := runtime.fetchPeerInfo(peerURL)
 	if err != nil {
 		return nativeFundsResponse{}, err

@@ -17,6 +17,7 @@ SETUP_ONLY="${SETUP_ONLY:-false}"
 KEEP_FAILED_RUN="${KEEP_FAILED_RUN:-false}"
 ROUND_SCENARIO="${ROUND_SCENARIO:-standard-4d}"
 PCLI_TIMEOUT_SECONDS="${PCLI_TIMEOUT_SECONDS:-}"
+HAND_SETTLE_TIMEOUT_SECONDS="${HAND_SETTLE_TIMEOUT_SECONDS:-}"
 TOR_TARGET_HOST="${TOR_TARGET_HOST:-host.docker.internal}"
 HOST_TOR_SOCKS_PORT="${HOST_TOR_SOCKS_PORT:-}"
 HOST_TOR_CONTROL_PORT="${HOST_TOR_CONTROL_PORT:-}"
@@ -77,6 +78,34 @@ validate_round_scenario() {
       exit 1
       ;;
   esac
+}
+
+resolve_nigiri_datadir() {
+  local preferred="$1"
+  local fallback_app_support="$HOME/Library/Application Support/Nigiri/parker-auto/$(printf '%s' "$BASE" | tr '/:' '__')"
+  local fallback_home_nigiri="$HOME/.nigiri/parker-auto/$(printf '%s' "$BASE" | tr '/:' '__')"
+  local candidate=""
+
+  docker_bind_mount_is_writable() {
+    local path="$1"
+    mkdir -p "$path" 2>/dev/null || return 1
+    docker run --rm --user 1000:1000 -v "$path:/probe" alpine:3.20 \
+      sh -lc 'touch /probe/.docker-write-test && rm /probe/.docker-write-test' >/dev/null 2>&1
+  }
+
+  for candidate in "$preferred" "$fallback_app_support" "$fallback_home_nigiri"; do
+    [[ -n "$candidate" ]] || continue
+    if docker_bind_mount_is_writable "$candidate"; then
+      if [[ "$candidate" != "$preferred" ]]; then
+        printf 'Falling back to Docker-writable Nigiri datadir at %s\n' "$candidate" >&2
+      fi
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "unable to find a Docker-writable Nigiri datadir (tried $preferred, $fallback_app_support, $fallback_home_nigiri)" >&2
+  return 1
 }
 
 ensure_toolchains() {
@@ -177,6 +206,7 @@ trap cleanup EXIT INT TERM HUP
 
 ensure_toolchains
 validate_round_scenario
+NIGIRI_DATADIR="$(resolve_nigiri_datadir "$NIGIRI_DATADIR")"
 
 command_timeout_seconds() {
   if [[ -n "$PCLI_TIMEOUT_SECONDS" ]]; then
@@ -233,6 +263,36 @@ pdevtool() {
 
 json_field() {
   pdevtool json-field "$1"
+}
+
+table_has_settled_custody_checkpoint() {
+  local state_json="$1"
+  local phase=""
+  local hand_id=""
+  local latest_custody_hash=""
+
+  phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+  hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId 2>/dev/null || true)"
+  latest_custody_hash="$(printf '%s' "$state_json" | json_field data.latestCustodyState.stateHash 2>/dev/null || true)"
+  if [[ -z "$phase" || "$phase" != "settled" ]]; then
+    return 1
+  fi
+  if [[ -z "$hand_id" || "$hand_id" == "null" ]]; then
+    return 1
+  fi
+  if [[ -z "$latest_custody_hash" || "$latest_custody_hash" == "null" ]]; then
+    return 1
+  fi
+  if [[ "$state_json" != *"\"type\":\"HandResult\""* ]]; then
+    return 1
+  fi
+  if [[ "$state_json" != *"\"handId\":\"$hand_id\""* ]]; then
+    return 1
+  fi
+  if [[ "$state_json" != *"\"latestCustodyStateHash\":\"$latest_custody_hash\""* ]]; then
+    return 1
+  fi
+  return 0
 }
 
 docker_compose() {
@@ -964,6 +1024,7 @@ print_local_stack_summary() {
 
 play_hand_automatically() {
   local state_json=""
+  local candidate_state_json=""
   local hand_id=""
   local hand_number=""
   local initial_hand_number=""
@@ -976,13 +1037,26 @@ play_hand_automatically() {
   local amount=""
   local current_bet=""
   local pot_sats=""
-  local max_wait_seconds=45
+  local max_wait_seconds=90
   local start_epoch=0
   local turn
+  local -a watch_profiles=()
+  local profile=""
+  local action_profile=""
 
   if tor_enabled; then
-    max_wait_seconds=120
+    max_wait_seconds=180
   fi
+  if [[ -n "$HAND_SETTLE_TIMEOUT_SECONDS" ]]; then
+    max_wait_seconds="$HAND_SETTLE_TIMEOUT_SECONDS"
+  fi
+
+  watch_profiles=("$WATCH_PROFILE")
+  for profile in "$PLAYER_ONE_PROFILE" "$PLAYER_TWO_PROFILE"; do
+    if [[ -n "$profile" && ! " ${watch_profiles[*]} " =~ " ${profile} " ]]; then
+      watch_profiles+=("$profile")
+    fi
+  done
 
   start_epoch="$(date +%s)"
   for ((turn = 0; ; turn += 1)); do
@@ -1002,25 +1076,40 @@ play_hand_automatically() {
     if [[ -z "$initial_hand_number" && -n "$hand_number" && "$hand_number" != "null" ]]; then
       initial_hand_number="$hand_number"
     fi
+    if table_has_settled_custody_checkpoint "$state_json"; then
+      printf '%s\n' "$state_json"
+      return 0
+    fi
     if [[ "$phase" == "settled" ]]; then
-      printf '%s\n' "$state_json"
-      return 0
-    fi
-    if [[ -n "$initial_hand_number" && "$initial_hand_number" != "null" && "$latest_snapshot_phase" == "settled" && "$latest_snapshot_hand_number" == "$initial_hand_number" ]]; then
-      printf '%s\n' "$state_json"
-      return 0
-    fi
-
-    action_line="$(printf '%s' "$state_json" | select_table_action)"
-    if [[ -z "$action_line" ]]; then
       sleep 0.25
       continue
     fi
-    if [[ "$action_line" == "settled" ]]; then
-      printf '%s\n' "$state_json"
-      return 0
+    if [[ -n "$initial_hand_number" && "$initial_hand_number" != "null" && "$latest_snapshot_phase" == "settled" && "$latest_snapshot_hand_number" == "$initial_hand_number" ]]; then
+      sleep 0.25
+      continue
     fi
 
+    action_line=""
+    action_profile="$WATCH_PROFILE"
+    for profile in "${watch_profiles[@]}"; do
+      if [[ "$profile" != "$WATCH_PROFILE" ]]; then
+        candidate_state_json="$(watch_table_state_with_retry "$profile")"
+        if table_has_settled_custody_checkpoint "$candidate_state_json"; then
+          printf '%s\n' "$candidate_state_json"
+          return 0
+        fi
+        state_json="$candidate_state_json"
+      fi
+      action_line="$(printf '%s' "$state_json" | select_table_action)"
+      if [[ -n "$action_line" && "$action_line" != "settled" ]]; then
+        action_profile="$profile"
+        break
+      fi
+    done
+    if [[ -z "$action_line" || "$action_line" == "settled" ]]; then
+      sleep 0.25
+      continue
+    fi
     actor=""
     action=""
     amount=""
@@ -1068,7 +1157,6 @@ fi
 rm -rf "$BASE" "$TOR_STATE_BASE"
 mkdir -p "$BASE"/{daemons,profiles,runs,tor}
 mkdir -p "$TOR_STATE_BASE"
-mkdir -p "$NIGIRI_DATADIR"
 
 common_flags=(
   --network regtest
@@ -1273,11 +1361,30 @@ play_hand_automatically >/dev/null
 write_table_artifact host "$BASE/artifacts/table-after-hand.json"
 
 echo "Final table state:"
-watch_table_state_with_retry "$WATCH_PROFILE"
+FINAL_TABLE_JSON="$(watch_table_state_with_retry "$WATCH_PROFILE")"
+printf '%s\n' "$FINAL_TABLE_JSON"
+
+CASHOUT_FIRST_PROFILE="$PLAYER_ONE_PROFILE"
+CASHOUT_SECOND_PROFILE="$PLAYER_TWO_PROFILE"
+CURRENT_HOST_PEER_ID="$(printf '%s' "$FINAL_TABLE_JSON" | json_field data.currentHost.peer.peerId)"
+if [[ -z "$CURRENT_HOST_PEER_ID" || "$CURRENT_HOST_PEER_ID" == "null" ]]; then
+  CURRENT_HOST_PEER_ID="$(printf '%s' "$FINAL_TABLE_JSON" | json_field data.config.hostPeerId)"
+fi
+if [[ -n "$CURRENT_HOST_PEER_ID" ]]; then
+  if [[ "$CURRENT_HOST_PEER_ID" == "${PLAYER_TWO_PEER_ID:-}" ]]; then
+    CASHOUT_FIRST_PROFILE="$PLAYER_TWO_PROFILE"
+    CASHOUT_SECOND_PROFILE="$PLAYER_ONE_PROFILE"
+  elif [[ "$CURRENT_HOST_PEER_ID" == "${PLAYER_ONE_PEER_ID:-}" ]]; then
+    CASHOUT_FIRST_PROFILE="$PLAYER_ONE_PROFILE"
+    CASHOUT_SECOND_PROFILE="$PLAYER_TWO_PROFILE"
+  fi
+fi
 
 echo "Cashing out..."
-cashout_profile "$PLAYER_ONE_PROFILE"
-cashout_profile "$PLAYER_TWO_PROFILE"
+cashout_profile "$CASHOUT_FIRST_PROFILE"
+if [[ "$CASHOUT_SECOND_PROFILE" != "$CASHOUT_FIRST_PROFILE" ]]; then
+  cashout_profile "$CASHOUT_SECOND_PROFILE"
+fi
 write_table_artifact host "$BASE/artifacts/table-after-cashout.json"
 
 echo "Final wallet summaries:"

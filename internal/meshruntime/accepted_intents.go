@@ -221,25 +221,24 @@ func (runtime *meshRuntime) acceptedTableBeforeFundsTransition(table nativeTable
 	baseTable.LatestCustodyState = previousState
 	restoreAcceptedSeatStatusesFromCustodyState(&baseTable, previousState)
 
-	if strings.TrimSpace(previousState.TranscriptRoot) != "" || strings.TrimSpace(previousState.HandID) != "" {
-		baseTable.ActiveHand = &nativeActiveHand{
-			Cards: nativeHandCardState{
-				FinalDeck:       nil,
-				PhaseDeadlineAt: previousState.ActionDeadlineAt,
-				Transcript: game.HandTranscript{
-					HandID:     previousState.HandID,
-					HandNumber: previousState.HandNumber,
-					Records:    []game.HandTranscriptRecord{},
-					RootHash:   previousState.TranscriptRoot,
-					TableID:    table.Config.TableID,
-				},
-			},
-		}
-	}
-
 	if publicState, ok, err := handResultPublicStateForStateHash(table, previousState.StateHash); err != nil {
 		return nativeTableState{}, err
 	} else if ok {
+		if strings.TrimSpace(previousState.TranscriptRoot) != "" || strings.TrimSpace(previousState.HandID) != "" {
+			baseTable.ActiveHand = &nativeActiveHand{
+				Cards: nativeHandCardState{
+					FinalDeck:       nil,
+					PhaseDeadlineAt: previousState.ActionDeadlineAt,
+					Transcript: game.HandTranscript{
+						HandID:     previousState.HandID,
+						HandNumber: previousState.HandNumber,
+						Records:    []game.HandTranscriptRecord{},
+						RootHash:   previousState.TranscriptRoot,
+						TableID:    table.Config.TableID,
+					},
+				},
+			}
+		}
 		baseTable.PublicState = publicState
 		baseTable.Config.Status = firstNonEmptyString(stringValue(publicState.Status), baseTable.Config.Status)
 		return baseTable, nil

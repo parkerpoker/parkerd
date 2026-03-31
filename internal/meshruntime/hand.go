@@ -397,6 +397,25 @@ func publicTranscriptRoot(table nativeTableState) string {
 	return strings.TrimSpace(table.PublicState.DealerCommitment.RootHash)
 }
 
+func normalizePublicTranscriptRoot(table *nativeTableState) {
+	if table == nil || table.PublicState == nil || table.ActiveHand == nil {
+		return
+	}
+	rootHash := strings.TrimSpace(handTranscriptRoot(*table))
+	if rootHash == "" {
+		table.PublicState.DealerCommitment = nil
+		return
+	}
+	commitment := NativeDealerCommitment{
+		Mode:     nativeDealerMode,
+		RootHash: rootHash,
+	}
+	if table.PublicState.DealerCommitment != nil {
+		commitment.CommittedAt = table.PublicState.DealerCommitment.CommittedAt
+	}
+	table.PublicState.DealerCommitment = &commitment
+}
+
 func protocolDeadlineExpired(table nativeTableState) bool {
 	if table.ActiveHand == nil || !shouldTrackProtocolDeadline(table.ActiveHand.State.Phase) {
 		return false
@@ -849,6 +868,7 @@ func (runtime *meshRuntime) normalizeAcceptedActiveHand(existing *nativeTableSta
 		incoming.ActiveHand.Cards.FinalDeck = nil
 	}
 	incoming.ActiveHand.Cards.PhaseDeadlineAt = runtime.deriveLocalProtocolDeadline(existing, *incoming)
+	normalizePublicTranscriptRoot(incoming)
 	return nil
 }
 
@@ -1947,7 +1967,10 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 }
 
 func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageRequest) (nativeTableState, error) {
-	var updated nativeTableState
+	var (
+		updated       nativeTableState
+		replicateView *nativeTableState
+	)
 	err := runtime.store.withTableLock(request.TableID, func() error {
 		table, err := runtime.store.readTable(request.TableID)
 		if err != nil || table == nil {
@@ -1976,12 +1999,17 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 		if err := runtime.advanceHandProtocolLocked(table); err != nil {
 			return err
 		}
-		if err := runtime.persistAndReplicate(table, true); err != nil {
+		if err := runtime.persistLocalTable(table, true); err != nil {
 			return err
 		}
-		updated = *table
+		snapshot := cloneJSON(*table)
+		updated = snapshot
+		replicateView = &snapshot
 		return nil
 	})
+	if err == nil && replicateView != nil {
+		go runtime.replicateTable(*replicateView)
+	}
 	return updated, err
 }
 
@@ -1991,6 +2019,7 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 		return
 	}
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
+		var replicateView *nativeTableState
 		_ = runtime.store.withTableLock(tableID, func() error {
 			latest, err := runtime.store.readTable(tableID)
 			if err != nil || latest == nil || latest.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
@@ -1999,17 +2028,29 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 			if err := runtime.advanceHandProtocolLocked(latest); err != nil {
 				return err
 			}
-			return runtime.persistAndReplicate(latest, true)
+			if err := runtime.persistLocalTable(latest, true); err != nil {
+				return err
+			}
+			snapshot := cloneJSON(*latest)
+			replicateView = &snapshot
+			return nil
 		})
+		if replicateView != nil {
+			runtime.replicateTable(*replicateView)
+		}
 		return
 	}
+	debugMeshf("drive local hand protocol table=%s phase=%s self=%s host=%s", tableID, table.ActiveHand.State.Phase, runtime.walletID.PlayerID, table.CurrentHost.Peer.PeerID)
 	record, err := runtime.buildLocalContributionRecord(*table)
 	if err != nil || record == nil {
 		if err != nil {
 			debugMeshf("build local contribution record failed table=%s err=%v", tableID, err)
+		} else {
+			debugMeshf("build local contribution record skipped table=%s phase=%s self=%s", tableID, table.ActiveHand.State.Phase, runtime.walletID.PlayerID)
 		}
 		return
 	}
+	debugMeshf("build local contribution record ready table=%s phase=%s kind=%s self=%s", tableID, table.ActiveHand.State.Phase, record.Kind, runtime.walletID.PlayerID)
 	request, err := runtime.buildSignedHandMessageRequest(*table, *record)
 	if err != nil {
 		debugMeshf("build signed hand message failed table=%s err=%v", tableID, err)
@@ -2020,6 +2061,7 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 		debugMeshf("remote hand message failed table=%s kind=%s err=%v", tableID, record.Kind, err)
 		return
 	}
+	debugMeshf("remote hand message accepted table=%s kind=%s phase=%s self=%s", tableID, record.Kind, table.ActiveHand.State.Phase, runtime.walletID.PlayerID)
 	if err := runtime.acceptRemoteTable(updated); err != nil {
 		debugMeshf("accept remote table after hand message failed table=%s err=%v", tableID, err)
 	}

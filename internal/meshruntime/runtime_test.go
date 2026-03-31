@@ -104,6 +104,159 @@ func TestGuestSendActionWaitsForSlowReplicationTargetsInParallel(t *testing.T) {
 	}
 }
 
+func TestHostTickReleasesTableLockBeforeSlowReplication(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.LastHostHeartbeatAt = addMillis(nowISO(), -(host.hostHeartbeatIntervalMS() + 100))
+		return host.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("age host heartbeat: %v", err)
+	}
+
+	replicationStarted := make(chan struct{})
+	var replicationCalls int
+	var replicationMu sync.Mutex
+	host.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+		replicationMu.Lock()
+		replicationCalls++
+		callNumber := replicationCalls
+		replicationMu.Unlock()
+		if callNumber == 1 {
+			close(replicationStarted)
+		}
+		time.Sleep(700 * time.Millisecond)
+		return nil
+	}
+
+	tickDone := make(chan struct{})
+	go func() {
+		host.Tick()
+		close(tickDone)
+	}()
+
+	select {
+	case <-replicationStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for host tick replication to start")
+	}
+
+	start := time.Now()
+	if _, err := guest.CashOut(tableID); err != nil {
+		t.Fatalf("guest cash out during slow host replication: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 1200*time.Millisecond {
+		t.Fatalf("expected guest request to avoid host tick replication delay, took %s", elapsed)
+	}
+
+	select {
+	case <-tickDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for host tick to finish")
+	}
+}
+
+func TestHandleHandMessageReturnsBeforeSlowReplication(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.LastHostHeartbeatAt = nowISO()
+		table.NextHandAt = addMillis(nowISO(), -1000)
+		if err := host.startNextHandLocked(table); err != nil {
+			return err
+		}
+		return host.persistLocalTable(table, true)
+	}); err != nil {
+		t.Fatalf("start next hand without replication: %v", err)
+	}
+
+	host.Tick()
+	commitTable := mustReadNativeTable(t, host, tableID)
+	commitRecord, err := guest.buildLocalContributionRecord(commitTable)
+	if err != nil {
+		t.Fatalf("build guest commitment: %v", err)
+	}
+	if commitRecord == nil || commitRecord.Kind != nativeHandMessageFairnessCommit {
+		t.Fatalf("expected guest fairness commit, got %#v", commitRecord)
+	}
+	commitRequest, err := guest.buildSignedHandMessageRequest(commitTable, *commitRecord)
+	if err != nil {
+		t.Fatalf("build guest commitment request: %v", err)
+	}
+	if _, err := host.handleHandMessageFromPeer(commitRequest); err != nil {
+		t.Fatalf("host handle guest commitment: %v", err)
+	}
+
+	host.Tick()
+	revealTable := mustReadNativeTable(t, host, tableID)
+	revealRecord, err := guest.buildLocalContributionRecord(revealTable)
+	if err != nil {
+		t.Fatalf("build guest reveal: %v", err)
+	}
+	if revealRecord == nil || revealRecord.Kind != nativeHandMessageFairnessReveal {
+		t.Fatalf("expected guest fairness reveal, got %#v", revealRecord)
+	}
+	revealRequest, err := guest.buildSignedHandMessageRequest(revealTable, *revealRecord)
+	if err != nil {
+		t.Fatalf("build guest reveal request: %v", err)
+	}
+	if _, err := host.handleHandMessageFromPeer(revealRequest); err != nil {
+		t.Fatalf("host handle guest reveal: %v", err)
+	}
+
+	table := mustReadNativeTable(t, host, tableID)
+	if table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetPrivateDelivery {
+		t.Fatalf("expected private-delivery phase, got %+v", table.ActiveHand)
+	}
+	hostSeatIndex := 0
+	guestSeatIndex := 1
+	if _, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessagePrivateDelivery, &hostSeatIndex, string(game.StreetPrivateDelivery), &guestSeatIndex); !ok {
+		t.Fatalf("expected host private-delivery share before guest reply, transcript=%+v", table.ActiveHand.Cards.Transcript)
+	}
+
+	host.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+		time.Sleep(1500 * time.Millisecond)
+		return nil
+	}
+
+	record, err := guest.buildLocalContributionRecord(table)
+	if err != nil {
+		t.Fatalf("build guest private-delivery share: %v", err)
+	}
+	if record == nil || record.Kind != nativeHandMessagePrivateDelivery {
+		t.Fatalf("expected guest private-delivery record, got %#v", record)
+	}
+	request, err := guest.buildSignedHandMessageRequest(table, *record)
+	if err != nil {
+		t.Fatalf("build guest hand message request: %v", err)
+	}
+
+	start := time.Now()
+	updated, err := host.handleHandMessageFromPeer(request)
+	if err != nil {
+		t.Fatalf("host handle guest private-delivery share: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= 1200*time.Millisecond {
+		t.Fatalf("expected hand message response before replication fanout, took %s", elapsed)
+	}
+	if updated.ActiveHand == nil {
+		t.Fatalf("expected active hand after private-delivery completion")
+	}
+}
+
 func TestLocalTableViewHidesLegalActionsWhenItIsNotYourTurn(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -282,6 +435,105 @@ func TestHandleHandMessageRejectsPlaintextCardsInCommit(t *testing.T) {
 
 	if _, err := host.handleHandMessageFromPeer(request); err == nil || !strings.Contains(err.Error(), "plaintext cards") {
 		t.Fatalf("expected plaintext-card hand message to be rejected, got %v", err)
+	}
+}
+
+func TestPersistAndReplicateNormalizesPublicTranscriptRoot(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		if table.PublicState == nil || table.PublicState.DealerCommitment == nil {
+			t.Fatalf("expected active hand dealer commitment, got %+v", table.PublicState)
+		}
+		table.PublicState.DealerCommitment.RootHash = "bogus-root"
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("persist normalized transcript root: %v", err)
+	}
+
+	hostTable := mustReadNativeTable(t, host, tableID)
+	if got, want := publicTranscriptRoot(hostTable), handTranscriptRoot(hostTable); got != want {
+		t.Fatalf("expected host public transcript root %q after normalization, got %q", want, got)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		guestTable := mustReadNativeTable(t, guest, tableID)
+		if publicTranscriptRoot(guestTable) == handTranscriptRoot(guestTable) && publicTranscriptRoot(guestTable) != "bogus-root" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	guestTable := mustReadNativeTable(t, guest, tableID)
+	t.Fatalf("expected guest transcript root normalization to replicate, got public=%q transcript=%q", publicTranscriptRoot(guestTable), handTranscriptRoot(guestTable))
+}
+
+func TestRefreshLocalTableIgnoresStaleHostPoll(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	guestTable := mustReadNativeTable(t, guest, tableID)
+	if err := guest.store.withTableLock(tableID, func() error {
+		table, err := guest.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.CurrentHost = nativeKnownParticipant{ProfileName: guest.profileName, Peer: guest.self.Peer}
+		table.CurrentEpoch++
+		if table.PublicState != nil {
+			table.PublicState.Epoch = table.CurrentEpoch
+		}
+		if err := guest.store.writeTable(table); err != nil {
+			return err
+		}
+		if err := guest.store.rewriteEvents(tableID, table.Events); err != nil {
+			return err
+		}
+		return guest.store.rewriteSnapshots(tableID, table.Snapshots)
+	}); err != nil {
+		t.Fatalf("promote guest to current host: %v", err)
+	}
+
+	expectedEvents := 0
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.CurrentHost = nativeKnownParticipant{ProfileName: guest.profileName, Peer: guest.self.Peer}
+		table.CurrentEpoch = guestTable.CurrentEpoch + 1
+		extra := cloneJSON(table.Events[len(table.Events)-1])
+		extra.Seq++
+		extra.Timestamp = nowISO()
+		table.Events = append(table.Events, extra)
+		expectedEvents = len(table.Events)
+		if err := host.store.writeTable(table); err != nil {
+			return err
+		}
+		return host.store.rewriteEvents(tableID, table.Events)
+	}); err != nil {
+		t.Fatalf("seed stale host-local history: %v", err)
+	}
+
+	refreshed, err := host.refreshLocalTable(tableID)
+	if err != nil {
+		t.Fatalf("refresh local table with stale host poll: %v", err)
+	}
+	if refreshed == nil {
+		t.Fatal("expected local table after stale host poll")
+	}
+	if got := len(refreshed.Events); got != expectedEvents {
+		t.Fatalf("expected local table events to remain at %d after stale host poll, got %d", expectedEvents, got)
 	}
 }
 
@@ -1313,6 +1565,59 @@ func TestProtocolDeadlineForcesFailoverDespiteFreshHeartbeat(t *testing.T) {
 	t.Fatal("timed out waiting for protocol deadline failover")
 }
 
+func TestTwoPlayerFailoverUsesLowestNonHostSeat(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	host.self.Peer.PeerID = "peer-aaa"
+	guest.self.Peer.PeerID = "peer-zzz"
+
+	table := nativeTableState{
+		CurrentHost: nativeKnownParticipant{
+			ProfileName: host.profileName,
+			Peer:        host.self.Peer,
+		},
+		Seats: []nativeSeatRecord{
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Host",
+					PeerID:    host.self.Peer.PeerID,
+					PlayerID:  host.walletID.PlayerID,
+					SeatIndex: 0,
+					Status:    "active",
+				},
+				PeerURL:     host.self.Peer.PeerURL,
+				ProfileName: host.profileName,
+			},
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Guest",
+					PeerID:    guest.self.Peer.PeerID,
+					PlayerID:  guest.walletID.PlayerID,
+					SeatIndex: 1,
+					Status:    "active",
+				},
+				PeerURL:     guest.self.Peer.PeerURL,
+				ProfileName: guest.profileName,
+			},
+		},
+	}
+
+	if !guest.shouldHandleFailover(table) {
+		t.Fatal("expected lowest non-host seat to handle failover")
+	}
+	if host.shouldHandleFailover(table) {
+		t.Fatal("expected current host not to handle failover")
+	}
+	authorized, ok := guest.authorizedRemoteHostPeer(&table, guest.selfPeerID())
+	if !ok {
+		t.Fatal("expected lowest non-host seat to be authorized as rotated host")
+	}
+	if authorized.PeerID != guest.selfPeerID() {
+		t.Fatalf("expected authorized rotated host %q, got %q", guest.selfPeerID(), authorized.PeerID)
+	}
+}
+
 func TestTableFetchAuthRejectsStaleSignature(t *testing.T) {
 	t.Parallel()
 
@@ -1413,6 +1718,25 @@ func TestJoinTableRejectsReusingReservedFundingRefsAcrossTables(t *testing.T) {
 	}
 	if _, err := guest.JoinTable(stringValue(secondCreate["inviteCode"]), 4_000); err == nil || !strings.Contains(err.Error(), "insufficient available sats") {
 		t.Fatalf("expected second join to fail on reserved funds, got %v", err)
+	}
+}
+
+func TestJoinTableAcceptsPendingSeatLockSemanticValidationInSyntheticRealMode(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	enableSyntheticRealMode(host, guest)
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, guest, tableID)
+	if got := len(table.CustodyTransitions); got != 2 {
+		t.Fatalf("expected two seat-lock transitions after synthetic-real joins, got %d", got)
+	}
+	seat, ok := seatRecordForPlayer(table, guest.walletID.PlayerID)
+	if !ok {
+		t.Fatal("expected guest seat after synthetic-real join")
+	}
+	if seat.Status != "active" {
+		t.Fatalf("expected guest seat to be active after synthetic-real join, got %q", seat.Status)
 	}
 }
 
@@ -1721,6 +2045,135 @@ func TestGuestCashOutRefreshesRemoteCustodyAfterPeerCashOut(t *testing.T) {
 	hostTable := mustReadNativeTable(t, host, tableID)
 	if latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID) != 0 {
 		t.Fatalf("expected guest stack to be zero after stale-state cash-out recovery, got %d", latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID))
+	}
+}
+
+func TestHostCashOutAfterPeerSettledHandCashOutAcceptsRemoteHistory(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call to showdown line: %v", err)
+	}
+	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send showdown-line check %d: %v", index, err)
+		}
+	}
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	promoteGuestHost := func(runtime *meshRuntime) error {
+		return runtime.store.withTableLock(tableID, func() error {
+			table, err := runtime.store.readTable(tableID)
+			if err != nil || table == nil {
+				return err
+			}
+			table.CurrentHost = nativeKnownParticipant{ProfileName: guest.profileName, Peer: guest.self.Peer}
+			table.CurrentEpoch++
+			if table.PublicState != nil {
+				table.PublicState.Epoch = table.CurrentEpoch
+			}
+			if err := runtime.store.writeTable(table); err != nil {
+				return err
+			}
+			if err := runtime.store.rewriteEvents(tableID, table.Events); err != nil {
+				return err
+			}
+			return runtime.store.rewriteSnapshots(tableID, table.Snapshots)
+		})
+	}
+	if err := promoteGuestHost(host); err != nil {
+		t.Fatalf("promote guest to host on host runtime: %v", err)
+	}
+	if err := promoteGuestHost(guest); err != nil {
+		t.Fatalf("promote guest to host on guest runtime: %v", err)
+	}
+
+	if _, err := guest.CashOut(tableID); err != nil {
+		t.Fatalf("guest cash out after settled hand: %v", err)
+	}
+	if _, err := host.CashOut(tableID); err != nil {
+		t.Fatalf("host cash out after peer settled-hand cash-out: %v", err)
+	}
+
+	hostTable := mustReadNativeTable(t, host, tableID)
+	if latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID) != 0 {
+		t.Fatalf("expected guest stack to be zero after first cash-out, got %d", latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID))
+	}
+	if latestStackAmount(hostTable.LatestCustodyState, host.walletID.PlayerID) != 0 {
+		t.Fatalf("expected host stack to be zero after second cash-out, got %d", latestStackAmount(hostTable.LatestCustodyState, host.walletID.PlayerID))
+	}
+}
+
+func TestCashOutRetriesRemoteCustodyMismatchAfterAuthoritativeRefresh(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+
+	promoteGuestHost := func(runtime *meshRuntime) error {
+		return runtime.store.withTableLock(tableID, func() error {
+			table, err := runtime.store.readTable(tableID)
+			if err != nil || table == nil {
+				return err
+			}
+			table.CurrentHost = nativeKnownParticipant{ProfileName: guest.profileName, Peer: guest.self.Peer}
+			table.CurrentEpoch++
+			if table.PublicState != nil {
+				table.PublicState.Epoch = table.CurrentEpoch
+			}
+			if err := runtime.store.writeTable(table); err != nil {
+				return err
+			}
+			if err := runtime.store.rewriteEvents(tableID, table.Events); err != nil {
+				return err
+			}
+			return runtime.store.rewriteSnapshots(tableID, table.Snapshots)
+		})
+	}
+	if err := promoteGuestHost(host); err != nil {
+		t.Fatalf("promote guest to host on host runtime: %v", err)
+	}
+	if err := promoteGuestHost(guest); err != nil {
+		t.Fatalf("promote guest to host on guest runtime: %v", err)
+	}
+
+	firstCall := true
+	host.fundsSenderHook = func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error) {
+		if firstCall {
+			firstCall = false
+			if _, err := guest.CashOut(tableID); err != nil {
+				t.Fatalf("guest cash out during forced remote custody race: %v", err)
+			}
+			return nativeFundsResponse{}, errors.New("funds request custody mismatch")
+		}
+		return guest.handleFundsFromPeer(input)
+	}
+
+	if _, err := host.CashOut(tableID); err != nil {
+		t.Fatalf("host cash out after retryable custody mismatch: %v", err)
+	}
+
+	hostTable := mustReadNativeTable(t, host, tableID)
+	if latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID) != 0 {
+		t.Fatalf("expected guest stack to be zero after guest cash-out refresh, got %d", latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID))
+	}
+	if latestStackAmount(hostTable.LatestCustodyState, host.walletID.PlayerID) != 0 {
+		t.Fatalf("expected host stack to be zero after retrying host cash-out, got %d", latestStackAmount(hostTable.LatestCustodyState, host.walletID.PlayerID))
 	}
 }
 

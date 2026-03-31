@@ -306,6 +306,25 @@ func (runtime *meshRuntime) buildSeatLockTransition(table nativeTableState) (tab
 	return tablecustody.BuildTransition(tablecustody.TransitionKindBuyInLock, runtime.custodyStateBinding(table, tablecustody.TransitionKindBuyInLock, nil, nil), runtime.custodyBalancesFromHand(table, nil), table.LatestCustodyState, nil, nil)
 }
 
+func semanticSeatLockTable(table nativeTableState, transition tablecustody.CustodyTransition) nativeTableState {
+	normalized := cloneJSON(table)
+	activePlayerIDs := make(map[string]struct{}, len(transition.NextState.StackClaims))
+	for _, claim := range transition.NextState.StackClaims {
+		activePlayerIDs[claim.PlayerID] = struct{}{}
+	}
+	for index := range normalized.Seats {
+		if normalized.Seats[index].Status != "pending-join" {
+			continue
+		}
+		if _, ok := activePlayerIDs[normalized.Seats[index].PlayerID]; !ok {
+			continue
+		}
+		normalized.Seats[index].Status = "active"
+		normalized.Seats[index].NativeSeatedPlayer.Status = "active"
+	}
+	return normalized
+}
+
 func cloneTransitionAuthorizer(authorizer *nativeTransitionAuthorizer) *nativeTransitionAuthorizer {
 	if authorizer == nil {
 		return nil
@@ -516,7 +535,7 @@ func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTable
 	case tablecustody.TransitionKindCarryForward:
 		expected, err = runtime.buildCustodyTransition(table, tablecustody.TransitionKindCarryForward, nil, nil, nil)
 	case tablecustody.TransitionKindBuyInLock:
-		expected, err = runtime.buildSeatLockTransition(table)
+		expected, err = runtime.buildSeatLockTransition(semanticSeatLockTable(table, transition))
 	default:
 		return nil
 	}
@@ -639,7 +658,7 @@ func (runtime *meshRuntime) collectCustodyApprovals(table nativeTableState, tran
 			Transition:            transition,
 		})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("remote custody approval for %s: %w", playerID, err)
 		}
 		if err := verifyCustodyApproval(seat, transition, approval); err != nil {
 			return nil, err

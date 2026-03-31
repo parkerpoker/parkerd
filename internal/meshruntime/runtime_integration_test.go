@@ -212,6 +212,32 @@ func assertRegtestRoundCustodyArtifacts(t *testing.T, result regtestRoundResult)
 	afterHand := loadIntegrationTableView(t, result.TableAfterHandPath)
 	afterCashout := loadIntegrationTableView(t, result.TableAfterCashout)
 
+	handResultCount := 0
+	for index, event := range afterHand.Events {
+		if stringValue(event.Body["type"]) != "HandResult" {
+			continue
+		}
+		handResultCount++
+		if strings.TrimSpace(stringValue(event.Body["latestCustodyStateHash"])) == "" {
+			t.Fatalf("hand result event %d is missing latest custody state hash", index)
+		}
+		custodySeq, err := eventCustodySeq(event)
+		if err != nil {
+			t.Fatalf("decode hand result custody seq for event %d: %v", index, err)
+		}
+		transitionHash := eventTransitionHash(event)
+		transition, _, ok := linkedTransitionBySeqHash(afterHand.CustodyTransitions, transitionHash, custodySeq)
+		if !ok {
+			t.Fatalf("hand result event %d does not link to custody history", index)
+		}
+		if transition.NextStateHash != strings.TrimSpace(stringValue(event.Body["latestCustodyStateHash"])) {
+			t.Fatalf("hand result event %d latest custody hash %q does not match linked transition next hash %q", index, stringValue(event.Body["latestCustodyStateHash"]), transition.NextStateHash)
+		}
+	}
+	if handResultCount == 0 {
+		t.Fatal("expected at least one HandResult event in regtest round")
+	}
+
 	playerActionCount := 0
 	signedActionCount := 0
 	for index, event := range afterHand.Events {

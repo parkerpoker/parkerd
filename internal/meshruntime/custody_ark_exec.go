@@ -618,7 +618,7 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 	if seat.PeerURL == "" {
 		return "", fmt.Errorf("missing peer url for signer %s", playerID)
 	}
-	return runtime.remoteSignCustodyPSBT(seat.PeerURL, nativeCustodyTxSignRequest{
+	signedPSBT, err := runtime.remoteSignCustodyPSBT(seat.PeerURL, nativeCustodyTxSignRequest{
 		ExpectedPrevStateHash: prevStateHash,
 		ExpectedOutputs:       append([]custodyBatchOutput(nil), outputs...),
 		Authorizer:            cloneTransitionAuthorizer(authorizer),
@@ -629,6 +629,10 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 		Transition:            transition,
 		TransitionHash:        transitionHash,
 	})
+	if err != nil {
+		return "", fmt.Errorf("remote custody %s signing for %s: %w", purpose, playerID, err)
+	}
+	return signedPSBT, nil
 }
 
 func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (string, error) {
@@ -636,7 +640,7 @@ func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevSta
 	for _, playerID := range uniqueSortedPlayerIDs(signerIDs) {
 		nextSigned, err := runtime.signCustodyPSBTWithPlayer(table, playerID, prevStateHash, transitionHash, purpose, signed, transition, authorizer, outputs)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("custody %s signing via %s: %w", purpose, playerID, err)
 		}
 		signed = nextSigned
 	}
@@ -919,6 +923,7 @@ type custodyBatchEventsHandler struct {
 	prevStateHash      string
 	requestKey         string
 	transition         tablecustody.CustodyTransition
+	authorizer         *nativeTransitionAuthorizer
 	plan               *custodySettlementPlan
 	transport          arkclient.TransportClient
 	arkConfig          walletpkg.CustodyArkConfig
@@ -1220,7 +1225,7 @@ func (handler *custodyBatchEventsHandler) createSignedForfeit(ctx context.Contex
 	if err != nil {
 		return "", err
 	}
-	return handler.runtime.fullySignCustodyPSBT(handler.table, handler.prevStateHash, handler.requestKey, "forfeit", input.SpendPath.PlayerIDs, unsigned, handler.transition, nil, nil)
+	return handler.runtime.fullySignCustodyPSBT(handler.table, handler.prevStateHash, handler.requestKey, "forfeit", input.SpendPath.PlayerIDs, unsigned, handler.transition, handler.authorizer, nil)
 }
 
 func mustSerializeTxTree(value *arktree.TxTree) arktree.FlatTxTree {
@@ -1331,7 +1336,7 @@ func (runtime *meshRuntime) prepareCustodyBatchSigners(table nativeTableState, p
 			TransitionHash:          transitionHash,
 		})
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, "", fmt.Errorf("remote custody signer prepare for %s: %w", playerID, err)
 		}
 		pubkeys[playerID] = response.SignerPubkeyHex
 		debugMeshf("custody batch remote prepare table=%s transition=%s player=%s pubkey=%s", table.Config.TableID, transitionHash, playerID, response.SignerPubkeyHex)
@@ -1520,6 +1525,7 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		prevStateHash:  prevStateHash,
 		requestKey:     transitionHash,
 		transition:     transition,
+		authorizer:     cloneTransitionAuthorizer(authorizer),
 		plan:           &custodySettlementPlan{Inputs: append([]custodyInputSpec(nil), inputs...)},
 		transport:      transport,
 		arkConfig:      arkConfig,
@@ -1734,6 +1740,10 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if err != nil {
 		return nil, 0, "", err
 	}
+	request, err := runtime.buildSignedFundsRequest(table, kind)
+	if err != nil {
+		return nil, 0, "", err
+	}
 	transitionKind, finalStatus, err := fundsTransitionKindAndStatus(kind)
 	if err != nil {
 		return nil, 0, "", err
@@ -1742,5 +1752,5 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if err != nil {
 		return nil, 0, "", err
 	}
-	return runtime.settleTableFundsForPlayer(table, transition, nil, runtime.walletID.PlayerID, walletInfo.ArkAddress)
+	return runtime.settleTableFundsForPlayer(table, transition, authorizerForFundsRequest(request), runtime.walletID.PlayerID, walletInfo.ArkAddress)
 }
