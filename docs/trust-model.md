@@ -12,6 +12,7 @@ The current model is:
 - the browser/controller and indexer remain non-custodial
 - monetary truth is the latest accepted `CustodyState`, not replicated UI state
 - the host is a proposer and sequencer, not a unilateral money authority
+- in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty should not be able to claw that accepted result back through a later cash-out or exit
 - operator outage affects liveness and visibility, not ownership of the latest accepted custody claim
 
 ## Money Authority
@@ -89,6 +90,19 @@ Current runtime behavior:
 - Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
 
 This keeps liveness from depending on continued cooperation by a player who has already lost eligibility in the contested portion of the hand.
+
+## Heads-Up Counterparty Guarantee
+
+In the current `seatCount <= 2` runtime, the practical money guarantee against the other player is:
+
+- once a betting or payout step has finalized as an accepted custody transition, later `cash-out` and `emergency-exit` requests are evaluated against that resulting custody state, not against an older pre-loss balance
+- `cash-out` and `emergency-exit` derive from the acting player's latest accepted stack claim, not from snapshots or stale local overlays
+- `emergency-exit` is rejected while a hand is still live, so a player cannot pull contested chips out of an in-progress hand and then claim them unilaterally
+
+This is not a blanket "trustless under every failure" claim:
+
+- host, operator, controller, or indexer outages can still stall progress
+- compromising a local wallet or protocol key still compromises that player's own funds
 
 ## Derived State And Replay Guarantees
 

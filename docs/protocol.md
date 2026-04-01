@@ -16,6 +16,7 @@ The important protocol changes in this generation are:
 - action and funds requests are bound to `prevCustodyStateHash`
 - accepted `PlayerAction`, `CashOut`, and `EmergencyExit` events carry the full signed initiator request as the canonical payload
 - host sequencing is proposer-only; action and result events are appended only after custody finalization succeeds
+- in the current heads-up runtime, accepted betting and payout steps become the new cash-out and exit baseline; later funds requests are evaluated against the latest custody state, not a pre-loss balance
 - the game engine is N-player-capable for money logic, but runtime table creation is still capped at 2 seats
 
 ## Runtime Surfaces
@@ -265,6 +266,8 @@ That means:
 - stake-changing steps fail closed if custody cannot finalize
 - `HandResult` is appended after the money checkpoint for that result is established
 - accepted action and funds replay uses player-signed request objects, not host-authored `ActionLog` summaries
+- later `CashOut` and `EmergencyExit` requests are evaluated against that accepted custody result, not against the pre-action or pre-payout balance
+- `EmergencyExit` is only available from a settled hand, so it is not a protocol path for pulling contested chips out of a live hand
 
 ## Failover And Continuation
 

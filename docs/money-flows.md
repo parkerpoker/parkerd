@@ -15,6 +15,7 @@ The important current-state rules are:
 - seat lock, blind posting, betting actions, timeout successors, settled payouts, cash-out, and emergency exit are custody transitions
 - accepted action and funds history replays from canonical signed request objects, not host-authored summaries or `ActionLog`
 - accepted Ark-settled custody history replays from the stored settlement witness bundle in `CustodyProof`, not from live Ark/indexer lookups
+- in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the losing player cannot later cash out or emergency-exit a larger pre-loss claim
 - zero-exposure successors like `check` can still advance custody through a non-settlement transition that reuses the same refs
 - `meshRenew` is no longer a money-moving primitive; continuing play means carrying forward the latest stack claims
 - local table-funds state is now `arkade-table-funds/v1`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
@@ -215,6 +216,12 @@ For both flows, Parker first validates the canonical signed `nativeFundsRequest`
 - a canonical `CashOut` or `EmergencyExit` event containing the full signed `nativeFundsRequest`
 - a derived local `arkade-table-funds/v1` receipt for wallet availability, UI, and operator/debug accounting
 
+Operationally, that means:
+
+- both flows spend from the acting player's latest accepted stack claim in `LatestCustodyState`, not from a stale pre-hand or pre-bet balance
+- `meshExit` is rejected while a hand is live, so contested pot money cannot be pulled out mid-hand through the unilateral exit path
+- emergency-exit requests must carry the exact current source refs used by the local exit execution proof
+
 Those `arkade-table-funds/v1` operations carry:
 
 - `stateHash`
@@ -275,5 +282,6 @@ The safest way to read the implementation today is:
 - snapshots and public state are derived from accepted custody-backed gameplay
 - every real exposure change is supposed to fail closed if custody cannot be finalized
 - poker-semantic successor validation and Ark/output-shape validation are distinct required checks
-- real-mode approval and replay validate Ark-linked refs live, including tapscript-to-output binding for declared taproot custody refs
+- real-mode approval still uses live Ark/indexer checks when current liveness or spendability matters, but accepted-history replay validates stored settlement witness bundles offline
+- in the current heads-up runtime, once a betting or payout step is accepted into custody history, the other player cannot later cash out or emergency-exit a larger pre-loss claim
 - operator or indexer outages affect liveness and visibility, not ownership of the latest accepted custody claim
