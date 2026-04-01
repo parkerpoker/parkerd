@@ -136,10 +136,3 @@ make poker-regtest-round
 ```
 
 That target still starts Nigiri, the indexer, four segregated Go daemons (`host`, `witness`, `alice`, `bob`), funds the player wallets on regtest, creates a table, auto-plays a hand, and cashes both players out.
-
-## Notes
-
-- All tracked runtime code in this repository is Go.
-- `parkerd` no longer contains Node, TypeScript, or the controller browser app.
-- The localhost controller is a local control plane, not part of consensus.
-- Public table discovery is optional and read-only.
