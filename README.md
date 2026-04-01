@@ -1,6 +1,6 @@
 # Parker
 
-`parkerd` is the Go-only daemon workspace for local poker runtime, localhost control, and optional public indexing.
+`parkerd` is the daemon workspace that implements the [Parker protocol](./docs/protocol.md) for local poker runtime, localhost control, and optional public indexing.
 
 The browser app has been split out into the sibling repo `../controller-web`. `parkerd` no longer contains or serves a bundled web app.
 
@@ -9,7 +9,6 @@ The browser app has been split out into the sibling repo `../controller-web`. `p
 - [docs/architecture.md](./docs/architecture.md): current component topology, runtime boundaries, deployment shapes, and recovery flows
 - [docs/protocol.md](./docs/protocol.md): current local RPC surface, peer-to-peer endpoints, signed objects, and public read flow
 - [docs/trust-model.md](./docs/trust-model.md): current guarantees, trust assumptions, security boundaries, and known gaps
-- [docs/go-parker-daemon-parity.md](./docs/go-parker-daemon-parity.md): Go runtime status, preserved contracts, and remaining hardening work
 
 ## Repository Layout
 
@@ -136,10 +135,3 @@ make poker-regtest-round
 ```
 
 That target still starts Nigiri, the indexer, four segregated Go daemons (`host`, `witness`, `alice`, `bob`), funds the player wallets on regtest, creates a table, auto-plays a hand, and cashes both players out.
-
-## Notes
-
-- All tracked runtime code in this repository is Go.
-- `parkerd` no longer contains Node, TypeScript, or the controller browser app.
-- The localhost controller is a local control plane, not part of consensus.
-- Public table discovery is optional and read-only.
