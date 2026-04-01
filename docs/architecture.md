@@ -335,7 +335,7 @@ The repository currently exercises these local shapes:
 3. The host validates the action signature and custody base hash, applies Hold'em rules, finalizes the required custody transition, then appends `PlayerAction` and persists the updated table.
 4. Each receiving daemon verifies the accepted hand transcript, public replay, custody history, approval signatures, and Ark-linked proof material before persisting the replicated table.
 5. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
-6. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v2` receipt for wallet availability and operator/debug surfaces.
+6. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
 
 ### Public read flow
 

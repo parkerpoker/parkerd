@@ -32,6 +32,24 @@ func HashCustodyTransition(transition CustodyTransition) string {
 	return HashValue(unsigned)
 }
 
+func HashCustodyRequest(transition CustodyTransition) string {
+	unsigned := canonicalTransition(transition)
+	unsigned.Approvals = nil
+	unsigned.ArkIntentID = ""
+	unsigned.ArkTxID = ""
+	unsigned.Proof.ArkIntentID = ""
+	unsigned.Proof.ArkTxID = ""
+	unsigned.Proof.ExitProofRef = ""
+	unsigned.Proof.FinalizedAt = ""
+	unsigned.Proof.RequestHash = ""
+	unsigned.Proof.ReplayValidated = false
+	unsigned.Proof.StateHash = ""
+	unsigned.Proof.Signatures = nil
+	unsigned.Proof.TransitionHash = ""
+	unsigned.Proof.VTXORefs = nil
+	return HashValue(unsigned)
+}
+
 func canonicalState(state CustodyState) CustodyState {
 	state.StackClaims = append([]StackClaim(nil), state.StackClaims...)
 	sort.SliceStable(state.StackClaims, func(left, right int) bool {

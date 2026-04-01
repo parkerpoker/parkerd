@@ -236,10 +236,14 @@ func uniqueSortedPlayerIDs(values []string) []string {
 	return ordered
 }
 
-func timeoutSignerSets(actingPlayerID string, futureSignerIDs []string) [][]string {
+func timeoutSignerSets(transition tablecustody.CustodyTransition, futureSignerIDs []string) [][]string {
 	signers := uniqueSortedPlayerIDs(futureSignerIDs)
 	if len(signers) == 0 {
 		return nil
+	}
+	actingPlayerID := transition.NextState.ActingPlayerID
+	if transition.Kind == tablecustody.TransitionKindShowdownPayout {
+		actingPlayerID = ""
 	}
 	if strings.TrimSpace(actingPlayerID) != "" {
 		timeoutSigners := make([]string, 0, len(signers))
@@ -307,7 +311,7 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 			return custodyOutputSpec{}, err
 		}
 		seenTimeoutSets := map[string]struct{}{}
-		for _, timeoutSignerIDs := range timeoutSignerSets(transition.NextState.ActingPlayerID, futureSignerIDs) {
+		for _, timeoutSignerIDs := range timeoutSignerSets(transition, futureSignerIDs) {
 			setKey := strings.Join(timeoutSignerIDs, ",")
 			if _, ok := seenTimeoutSets[setKey]; ok {
 				continue

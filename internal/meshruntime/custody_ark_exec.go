@@ -204,7 +204,55 @@ func authorizedCustodyProofLocktime(plan *custodySettlementPlan) arklib.Absolute
 }
 
 func custodyTransitionRequestHash(transition tablecustody.CustodyTransition) string {
-	return tablecustody.HashCustodyTransition(transition)
+	return tablecustody.HashCustodyRequest(transition)
+}
+
+func resetCustodyRequestTransition(table nativeTableState, transition tablecustody.CustodyTransition) tablecustody.CustodyTransition {
+	request := cloneJSON(transition)
+	prevStacks := map[string]tablecustody.StackClaim{}
+	prevPots := map[string]tablecustody.PotSlice{}
+	if table.LatestCustodyState != nil {
+		for _, claim := range table.LatestCustodyState.StackClaims {
+			prevStacks[claim.PlayerID] = claim
+		}
+		for _, slice := range table.LatestCustodyState.PotSlices {
+			prevPots[slice.PotID] = slice
+		}
+	}
+	for index := range request.NextState.StackClaims {
+		claim := request.NextState.StackClaims[index]
+		if prevClaim, ok := prevStacks[claim.PlayerID]; ok && reflect.DeepEqual(comparableStackClaim(prevClaim), comparableStackClaim(claim)) {
+			request.NextState.StackClaims[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
+			continue
+		}
+		if _, ok := prevStacks[claim.PlayerID]; !ok && request.Kind != tablecustody.TransitionKindBuyInLock {
+			request.NextState.StackClaims[index].VTXORefs = nil
+		}
+	}
+	for index := range request.NextState.PotSlices {
+		slice := request.NextState.PotSlices[index]
+		if prevSlice, ok := prevPots[slice.PotID]; ok && reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(slice)) {
+			request.NextState.PotSlices[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevSlice.VTXORefs...)
+			continue
+		}
+		if _, ok := prevPots[slice.PotID]; !ok {
+			request.NextState.PotSlices[index].VTXORefs = nil
+		}
+	}
+	request.Approvals = nil
+	request.ArkIntentID = ""
+	request.ArkTxID = ""
+	request.Proof.ArkIntentID = ""
+	request.Proof.ArkTxID = ""
+	request.Proof.ExitProofRef = ""
+	request.Proof.FinalizedAt = ""
+	request.Proof.RequestHash = ""
+	request.Proof.ReplayValidated = false
+	request.Proof.StateHash = ""
+	request.Proof.Signatures = nil
+	request.Proof.VTXORefs = nil
+	request.Proof.TransitionHash = ""
+	return request
 }
 
 func signingPlaceholderRefs(plan *custodySettlementPlan, transition tablecustody.CustodyTransition) map[string][]tablecustody.VTXORef {
@@ -520,6 +568,16 @@ func (runtime *meshRuntime) normalizedCustodySigningTransition(table nativeTable
 	return normalized, plan, nil
 }
 
+func (runtime *meshRuntime) normalizedCustodyApprovalTransition(table nativeTableState, transition tablecustody.CustodyTransition) (tablecustody.CustodyTransition, *custodySettlementPlan, error) {
+	request := resetCustodyRequestTransition(table, transition)
+	normalized, plan, err := runtime.normalizedCustodySigningTransition(table, request)
+	if err != nil {
+		return tablecustody.CustodyTransition{}, nil, err
+	}
+	normalized.Proof.RequestHash = custodyTransitionRequestHash(normalized)
+	return normalized, plan, nil
+}
+
 func custodyTransitionBatchOutputs(previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) []custodyBatchOutput {
 	outputs := make([]custodyBatchOutput, 0)
 	prevStacks := map[string]tablecustody.StackClaim{}
@@ -584,7 +642,11 @@ func (runtime *meshRuntime) validatePrebuiltCustodySigningTransition(table nativ
 	if err := runtime.validateCustodyTransitionSemantics(table, transition, authorizer); err != nil {
 		return err
 	}
-	if custodyTransitionRequestHash(transition) != transitionHash {
+	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(table, transition)
+	if err != nil {
+		return err
+	}
+	if approvalTransition.Proof.RequestHash != transitionHash {
 		return errors.New("custody signing request transition hash mismatch")
 	}
 	if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
@@ -625,6 +687,7 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 		PSBT:                  current,
 		PlayerID:              playerID,
 		Purpose:               purpose,
+		ProtocolVersion:       nativeProtocolVersion,
 		TableID:               table.Config.TableID,
 		Transition:            transition,
 		TransitionHash:        transitionHash,
@@ -650,6 +713,9 @@ func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevSta
 func (runtime *meshRuntime) handleCustodyTxSignFromPeer(request nativeCustodyTxSignRequest) (nativeCustodyTxSignResponse, error) {
 	table, err := runtime.requireLocalTable(request.TableID)
 	if err != nil {
+		return nativeCustodyTxSignResponse{}, err
+	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
 		return nativeCustodyTxSignResponse{}, err
 	}
 	if request.PlayerID != runtime.walletID.PlayerID {
@@ -705,6 +771,9 @@ func (runtime *meshRuntime) handleCustodySignerPrepareFromPeer(request nativeCus
 	if err != nil {
 		return nativeCustodySignerPrepareResponse{}, err
 	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
+		return nativeCustodySignerPrepareResponse{}, err
+	}
 	if request.PlayerID != runtime.walletID.PlayerID {
 		return nativeCustodySignerPrepareResponse{}, errors.New("custody signer prepare request is not addressed to this player")
 	}
@@ -740,6 +809,9 @@ func (runtime *meshRuntime) handleCustodySignerStartFromPeer(request nativeCusto
 	key := custodySignerSessionKey(request.TableID, request.TransitionHash, request.PlayerID, request.DerivationPath)
 	table, err := runtime.requireLocalTable(request.TableID)
 	if err != nil {
+		return nativeCustodyAckResponse{}, err
+	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
 		return nativeCustodyAckResponse{}, err
 	}
 	if request.PlayerID != runtime.walletID.PlayerID {
@@ -836,6 +908,9 @@ func (runtime *meshRuntime) handleCustodySignerNoncesFromPeer(request nativeCust
 	if err != nil {
 		return nativeCustodyAckResponse{}, err
 	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
+		return nativeCustodyAckResponse{}, err
+	}
 	authorization, ok := runtime.loadCustodySignerAuthorization(key)
 	if !ok {
 		return nativeCustodyAckResponse{}, errors.New("custody signer authorization is not available")
@@ -879,6 +954,9 @@ func (runtime *meshRuntime) handleCustodySignerAggregatedNoncesFromPeer(request 
 	key := custodySignerSessionKey(request.TableID, request.TransitionHash, request.PlayerID, request.DerivationPath)
 	table, err := runtime.requireLocalTable(request.TableID)
 	if err != nil {
+		return nativeCustodyAckResponse{}, err
+	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
 		return nativeCustodyAckResponse{}, err
 	}
 	if request.PlayerID != runtime.walletID.PlayerID {
@@ -1035,6 +1113,7 @@ func (handler *custodyBatchEventsHandler) OnTreeSigningStarted(ctx context.Conte
 			DerivationPath:        handler.derivationPath,
 			ExpectedPrevStateHash: handler.prevStateHash,
 			PlayerID:              playerID,
+			ProtocolVersion:       nativeProtocolVersion,
 			SweepTapTreeRootHex:   hex.EncodeToString(sweepRoot.CloneBytes()),
 			TableID:               handler.table.Config.TableID,
 			TransitionHash:        handler.requestKey,
@@ -1077,13 +1156,14 @@ func (handler *custodyBatchEventsHandler) OnTreeNonces(ctx context.Context, even
 			return false, fmt.Errorf("missing peer url for custody signer %s", playerID)
 		}
 		signed, err := handler.runtime.remoteAdvanceCustodySignerNonces(seat.PeerURL, nativeCustodySignerNoncesRequest{
-			BatchID:        event.Id,
-			DerivationPath: handler.derivationPath,
-			Nonces:         event.Nonces,
-			PlayerID:       playerID,
-			TableID:        handler.table.Config.TableID,
-			TxID:           event.Txid,
-			TransitionHash: handler.requestKey,
+			BatchID:         event.Id,
+			DerivationPath:  handler.derivationPath,
+			Nonces:          event.Nonces,
+			PlayerID:        playerID,
+			ProtocolVersion: nativeProtocolVersion,
+			TableID:         handler.table.Config.TableID,
+			TxID:            event.Txid,
+			TransitionHash:  handler.requestKey,
 		})
 		if err != nil {
 			return false, err
@@ -1119,12 +1199,13 @@ func (handler *custodyBatchEventsHandler) OnTreeNoncesAggregated(ctx context.Con
 			return false, fmt.Errorf("missing peer url for custody signer %s", playerID)
 		}
 		signed, err := handler.runtime.remoteAdvanceCustodySignerAggregatedNonces(seat.PeerURL, nativeCustodySignerAggregatedNoncesRequest{
-			BatchID:        event.Id,
-			DerivationPath: handler.derivationPath,
-			Nonces:         event.Nonces,
-			PlayerID:       playerID,
-			TableID:        handler.table.Config.TableID,
-			TransitionHash: handler.requestKey,
+			BatchID:         event.Id,
+			DerivationPath:  handler.derivationPath,
+			Nonces:          event.Nonces,
+			PlayerID:        playerID,
+			ProtocolVersion: nativeProtocolVersion,
+			TableID:         handler.table.Config.TableID,
+			TransitionHash:  handler.requestKey,
 		})
 		if err != nil {
 			return false, err
@@ -1331,6 +1412,7 @@ func (runtime *meshRuntime) prepareCustodyBatchSigners(table nativeTableState, p
 			ExpectedOffchainOutputs: append([]custodyBatchOutput(nil), offchainOutputs...),
 			Authorizer:              cloneTransitionAuthorizer(authorizer),
 			PlayerID:                playerID,
+			ProtocolVersion:         nativeProtocolVersion,
 			TableID:                 table.Config.TableID,
 			Transition:              transition,
 			TransitionHash:          transitionHash,
@@ -1603,7 +1685,11 @@ func (runtime *meshRuntime) finalizeNonSettlementCustodyTransition(table *native
 	if table == nil || transition == nil {
 		return nil
 	}
-	approvals, err := runtime.collectCustodyApprovals(*table, *transition, authorizer, runtime.requiredCustodySigners(*table, *transition))
+	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(*table, *transition)
+	if err != nil {
+		return err
+	}
+	approvals, err := runtime.collectCustodyApprovals(*table, approvalTransition, authorizer, runtime.requiredCustodySigners(*table, approvalTransition))
 	if err != nil {
 		return err
 	}
@@ -1612,6 +1698,7 @@ func (runtime *meshRuntime) finalizeNonSettlementCustodyTransition(table *native
 	transition.NextStateHash = transition.NextState.StateHash
 	transition.Proof = tablecustody.CustodyProof{
 		FinalizedAt:     nowISO(),
+		RequestHash:     approvalTransition.Proof.RequestHash,
 		ReplayValidated: true,
 		Signatures:      append([]tablecustody.CustodySignature(nil), approvals...),
 		StateHash:       transition.NextStateHash,
@@ -1625,7 +1712,7 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 	if table == nil || transition == nil {
 		return nil
 	}
-	signingTransition, plan, err := runtime.normalizedCustodySigningTransition(*table, *transition)
+	signingTransition, plan, err := runtime.normalizedCustodyApprovalTransition(*table, *transition)
 	if err != nil {
 		return err
 	}
@@ -1636,8 +1723,12 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 	if len(plan.Inputs) == 0 {
 		return runtime.finalizeNonSettlementCustodyTransition(table, transition, authorizer)
 	}
-	transitionHash := custodyTransitionRequestHash(signingTransition)
-	result, err := runtime.executeCustodyBatch(*table, transition.PrevStateHash, transitionHash, signingTransition, authorizer, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, batchOutputs)
+	approvals, err := runtime.collectCustodyApprovals(*table, signingTransition, authorizer, runtime.requiredCustodySigners(*table, signingTransition))
+	if err != nil {
+		return err
+	}
+	requestHash := signingTransition.Proof.RequestHash
+	result, err := runtime.executeCustodyBatch(*table, transition.PrevStateHash, requestHash, signingTransition, authorizer, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, batchOutputs)
 	if err != nil {
 		return err
 	}
@@ -1650,26 +1741,13 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 		ArkIntentID:     result.IntentID,
 		ArkTxID:         result.ArkTxID,
 		FinalizedAt:     result.FinalizedAt,
-		ReplayValidated: true,
-		StateHash:       transition.NextStateHash,
-		VTXORefs:        stackProofRefs(transition.NextState),
-	}
-	transition.Proof.TransitionHash = ""
-
-	approvals, err := runtime.collectCustodyApprovals(*table, *transition, authorizer, runtime.requiredCustodySigners(*table, *transition))
-	if err != nil {
-		return err
-	}
-	transition.Approvals = approvals
-	transition.Proof = tablecustody.CustodyProof{
-		ArkIntentID:     result.IntentID,
-		ArkTxID:         result.ArkTxID,
-		FinalizedAt:     result.FinalizedAt,
+		RequestHash:     requestHash,
 		ReplayValidated: true,
 		Signatures:      append([]tablecustody.CustodySignature(nil), approvals...),
 		StateHash:       transition.NextStateHash,
 		VTXORefs:        stackProofRefs(transition.NextState),
 	}
+	transition.Approvals = approvals
 	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(*transition)
 	return tablecustody.ValidateTransition(table.LatestCustodyState, *transition)
 }

@@ -16,7 +16,7 @@ The important current-state rules are:
 - accepted action and funds history replays from canonical signed request objects, not host-authored summaries or `ActionLog`
 - zero-exposure successors like `check` can still advance custody through a non-settlement transition that reuses the same refs
 - `meshRenew` is no longer a money-moving primitive; continuing play means carrying forward the latest stack claims
-- local table-funds state is now `arkade-table-funds/v2`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
+- local table-funds state is now `arkade-table-funds/v1`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
 - `walletSummary()` presents Ark wallet funds plus locally recorded custody-backed table-funds buckets as separate totals
 
 In mock-settlement mode the runtime still synthesizes Ark ids for tests, but the runtime model and checkpoints are custody-first either way.
@@ -78,7 +78,7 @@ These are no longer money authority:
 - `LatestFullySignedSnapshot`
 - local table-funds entries
 
-They exist for replay, UI, and operator/debug workflows. `arkade-table-funds/v2` is a derived local receipt ledger written after custody-backed operations succeed. Cash-out, exit, renew/carry-forward, availability, and historical validation all key off custody state first.
+They exist for replay, UI, and operator/debug workflows. `arkade-table-funds/v1` is a derived local receipt ledger written after custody-backed operations succeed. Cash-out, exit, renew/carry-forward, availability, and historical validation all key off custody state first.
 
 ## Join And Buy-In Lock
 
@@ -201,9 +201,9 @@ If the latest custody state already matches the settled public money state, Park
 For both flows, Parker first validates the canonical signed `nativeFundsRequest` against the latest accepted custody state, derives the expected successor locally, and only then finalizes a `cash-out` or `emergency-exit` custody transition. After that succeeds, it appends:
 
 - a canonical `CashOut` or `EmergencyExit` event containing the full signed `nativeFundsRequest`
-- a derived local `arkade-table-funds/v2` receipt for wallet availability, UI, and operator/debug accounting
+- a derived local `arkade-table-funds/v1` receipt for wallet availability, UI, and operator/debug accounting
 
-Those `arkade-table-funds/v2` operations carry:
+Those `arkade-table-funds/v1` operations carry:
 
 - `stateHash`
 - `prevStateHash`
@@ -240,8 +240,8 @@ There is no separate local renewal receipt that changes monetary truth.
 Interpretation:
 
 - `WalletSpendableSats` is the Ark wallet's spendable balance
-- `TableLockedSats` is value currently recorded in local `arkade-table-funds/v2` entries with `pending-lock` or `locked` status
-- `PendingExitSats` is value recorded in local `arkade-table-funds/v2` entries awaiting exit/cash-out completion
+- `TableLockedSats` is value currently recorded in local `arkade-table-funds/v1` entries with `pending-lock` or `locked` status
+- `PendingExitSats` is value recorded in local `arkade-table-funds/v1` entries awaiting exit/cash-out completion
 - `AvailableSats` is spendable wallet balance net of currently table-locked and pending-exit commitments
 
 This is presentation over the Ark wallet balance plus the local custody-backed funds ledger, not a security overlay and not a direct scan of `LatestCustodyState`.

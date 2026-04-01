@@ -80,7 +80,14 @@ func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
 			}
 			continue
 		}
-		go runtime.handlePeerTransportConnection(connection)
+		if !runtime.beginBackgroundTask() {
+			_ = connection.Close()
+			continue
+		}
+		go func() {
+			defer runtime.endBackgroundTask()
+			runtime.handlePeerTransportConnection(connection)
+		}()
 	}
 }
 
@@ -257,15 +264,24 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 }
 
 func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	if !runtime.isRunning() {
+		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
+	}
 	connection, err := runtime.dialPeerTransport(peerURL)
 	if err != nil {
 		return transportpkg.TransportEnvelope{}, err
 	}
 	defer connection.Close()
+	if !runtime.isRunning() {
+		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
+	}
 
 	_ = connection.SetDeadline(time.Now().Add(nativeTransportExchangeTimeout))
 	if err := writeJSONLine(connection, request); err != nil {
 		return transportpkg.TransportEnvelope{}, err
+	}
+	if !runtime.isRunning() {
+		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
 	}
 
 	line, err := readTrimmedLine(bufio.NewReader(connection))

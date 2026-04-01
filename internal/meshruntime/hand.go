@@ -366,6 +366,32 @@ func seatPlayerID(table nativeTableState, seatIndex int) string {
 	return ""
 }
 
+type protocolDriveSnapshot struct {
+	custodyHash string
+	epoch       int
+	handID      string
+	hostPeerID  string
+	phase       game.Street
+}
+
+func snapshotProtocolDrive(table nativeTableState) protocolDriveSnapshot {
+	snapshot := protocolDriveSnapshot{
+		custodyHash: latestCustodyStateHash(table),
+		epoch:       table.CurrentEpoch,
+		hostPeerID:  table.CurrentHost.Peer.PeerID,
+	}
+	if table.ActiveHand != nil {
+		snapshot.handID = table.ActiveHand.State.HandID
+		snapshot.phase = table.ActiveHand.State.Phase
+	}
+	return snapshot
+}
+
+func sameProtocolDriveSnapshot(table nativeTableState, snapshot protocolDriveSnapshot) bool {
+	current := snapshotProtocolDrive(table)
+	return current == snapshot
+}
+
 func sameInts(left, right []int) bool {
 	if len(left) != len(right) {
 		return false
@@ -1384,7 +1410,8 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if !game.PhaseAllowsActions(table.ActiveHand.State.Phase) || table.ActiveHand.State.ActingSeatIndex == nil {
 		return false, nil
 	}
-	if table.LatestCustodyState.ActionDeadlineAt == "" || elapsedMillis(table.LatestCustodyState.ActionDeadlineAt) < 0 {
+	deadline := runtime.currentCustodyActionDeadline(*table)
+	if deadline == "" || elapsedMillis(deadline) < 0 {
 		return false, nil
 	}
 	actingSeatIndex := *table.ActiveHand.State.ActingSeatIndex
@@ -1414,7 +1441,6 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if err != nil {
 		return false, err
 	}
-	table.ActiveHand.State = nextState
 	custodyTransition, err := runtime.buildCustodyTransition(*table, tablecustody.TransitionKindTimeout, &nextState, &action, &resolution)
 	if err != nil {
 		return false, err
@@ -1422,6 +1448,7 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
 		return false, err
 	}
+	table.ActiveHand.State = nextState
 	runtime.applyCustodyTransition(table, custodyTransition)
 	if err := runtime.appendEvent(table, map[string]any{
 		"custodySeq":        custodyTransition.CustodySeq,
@@ -1506,6 +1533,15 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 	if timeoutResolution == nil {
 		timeoutResolution = latestTimeoutResolutionForHand(*table)
 	}
+	derivedTimeoutResolution := runtime.showdownPayoutTimeoutResolution(*table, timeoutResolution)
+	showdownResolution := timeoutResolution
+	showdownOverrides := (*custodyBindingOverrides)(nil)
+	if derivedTimeoutResolution != nil {
+		showdownResolution = derivedTimeoutResolution
+		showdownOverrides = &custodyBindingOverrides{
+			ActionDeadlineAt: table.LatestCustodyState.ActionDeadlineAt,
+		}
+	}
 	custodySeq := 0
 	latestCustodyStateHash := ""
 	transitionHash := ""
@@ -1513,15 +1549,17 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 		table.LatestCustodyState.HandID != table.ActiveHand.State.HandID ||
 		table.LatestCustodyState.HandNumber != table.ActiveHand.State.HandNumber ||
 		table.LatestCustodyState.PublicStateHash != runtime.publicMoneyStateHash(*table, &table.ActiveHand.State) {
-		custodyTransition, err := runtime.buildCustodyTransition(*table, tablecustody.TransitionKindShowdownPayout, &table.ActiveHand.State, nil, timeoutResolution)
+		custodyTransition, err := runtime.buildCustodyTransitionWithOverrides(*table, tablecustody.TransitionKindShowdownPayout, &table.ActiveHand.State, nil, showdownResolution, showdownOverrides)
 		if err != nil {
 			return err
 		}
 		if err := runtime.syncTableToCustodySigners(*table, runtime.requiredCustodySigners(*table, custodyTransition)); err != nil {
-			return err
+			debugMeshf("settled hand payout sync deferred table=%s err=%v", table.Config.TableID, err)
+			return nil
 		}
 		if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
-			return err
+			debugMeshf("settled hand payout finalize deferred table=%s err=%v", table.Config.TableID, err)
+			return nil
 		}
 		runtime.applyCustodyTransition(table, custodyTransition)
 		custodySeq = custodyTransition.CustodySeq
@@ -1560,6 +1598,59 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 	return nil
 }
 
+func settledPayoutAmountByPlayer(hand game.HoldemState) map[string]int {
+	payouts := make(map[string]int, len(hand.Players))
+	for _, player := range hand.Players {
+		payouts[player.PlayerID] = 0
+	}
+	for _, winner := range hand.Winners {
+		payouts[winner.PlayerID] += winner.AmountSats
+	}
+	return payouts
+}
+
+func (runtime *meshRuntime) showdownPayoutTimeoutResolution(table nativeTableState, baseline *tablecustody.TimeoutResolution) *tablecustody.TimeoutResolution {
+	if table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetSettled || table.LatestCustodyState == nil {
+		return nil
+	}
+	if strings.TrimSpace(table.LatestCustodyState.ActionDeadlineAt) == "" || elapsedMillis(table.LatestCustodyState.ActionDeadlineAt) < 0 {
+		return nil
+	}
+	baselineTransition, err := runtime.buildCustodyTransition(table, tablecustody.TransitionKindShowdownPayout, &table.ActiveHand.State, nil, baseline)
+	if err != nil {
+		return nil
+	}
+	payouts := settledPayoutAmountByPlayer(table.ActiveHand.State)
+	missingPlayers := make([]string, 0)
+	for _, playerID := range runtime.requiredCustodySigners(table, baselineTransition) {
+		if payouts[playerID] != 0 {
+			continue
+		}
+		missingPlayers = append(missingPlayers, playerID)
+	}
+	if len(missingPlayers) == 0 {
+		return nil
+	}
+	resolution := cloneTimeoutResolution(baseline)
+	if resolution == nil {
+		resolution = &tablecustody.TimeoutResolution{
+			ActionType:     string(game.ActionFold),
+			ActingPlayerID: missingPlayers[0],
+			Policy:         timeoutPolicyFromState(table.LatestCustodyState),
+			Reason:         "settlement deadline expired",
+		}
+	}
+	if strings.TrimSpace(resolution.ActingPlayerID) == "" {
+		resolution.ActingPlayerID = missingPlayers[0]
+	}
+	resolution.ActionType = string(game.ActionFold)
+	resolution.Policy = timeoutPolicyFromState(table.LatestCustodyState)
+	resolution.Reason = "settlement deadline expired"
+	resolution.DeadPlayerIDs = uniqueSortedPlayerIDs(append(append([]string(nil), resolution.DeadPlayerIDs...), missingPlayers...))
+	resolution.LostEligibilityPlayerIDs = uniqueSortedPlayerIDs(append(append([]string(nil), resolution.LostEligibilityPlayerIDs...), missingPlayers...))
+	return resolution
+}
+
 func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) error {
 	if table == nil || table.ActiveHand == nil {
 		return nil
@@ -1575,13 +1666,6 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 		} else if handled {
 			changed = true
 		}
-		if err := runtime.handleProtocolTimeoutLocked(table); err != nil {
-			return err
-		}
-		if table.ActiveHand == nil {
-			return nil
-		}
-
 		if record, err := runtime.buildLocalContributionRecord(*table); err != nil {
 			return err
 		} else if record != nil && table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
@@ -1589,6 +1673,12 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 				return err
 			}
 			changed = true
+		}
+		if err := runtime.handleProtocolTimeoutLocked(table); err != nil {
+			return err
+		}
+		if table.ActiveHand == nil {
+			return nil
 		}
 
 		switch table.ActiveHand.State.Phase {
@@ -2008,19 +2098,38 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 		return nil
 	})
 	if err == nil && replicateView != nil {
-		go runtime.replicateTable(*replicateView)
+		if runtime.beginBackgroundTask() {
+			go func(table nativeTableState) {
+				defer runtime.endBackgroundTask()
+				runtime.replicateTable(table)
+			}(*replicateView)
+		}
 	}
 	return updated, err
 }
 
 func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
+	if !runtime.beginProtocolDrive(tableID) {
+		return
+	}
+	defer runtime.endProtocolDrive(tableID)
+	if !runtime.isRunning() {
+		return
+	}
 	table, err := runtime.requireLocalTable(tableID)
 	if err != nil || table == nil || table.ActiveHand == nil {
+		return
+	}
+	snapshot := snapshotProtocolDrive(*table)
+	if !runtime.isRunning() {
 		return
 	}
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		var replicateView *nativeTableState
 		_ = runtime.store.withTableLock(tableID, func() error {
+			if !runtime.isRunning() {
+				return nil
+			}
 			latest, err := runtime.store.readTable(tableID)
 			if err != nil || latest == nil || latest.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
 				return err
@@ -2056,12 +2165,26 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 		debugMeshf("build signed hand message failed table=%s err=%v", tableID, err)
 		return
 	}
+	latest, latestErr := runtime.requireLocalTable(tableID)
+	if latestErr != nil || latest == nil || !sameProtocolDriveSnapshot(*latest, snapshot) {
+		return
+	}
+	if !runtime.isRunning() {
+		return
+	}
 	updated, err := runtime.remoteHandMessage(table.CurrentHost.Peer.PeerURL, request)
 	if err != nil {
 		debugMeshf("remote hand message failed table=%s kind=%s err=%v", tableID, record.Kind, err)
 		return
 	}
 	debugMeshf("remote hand message accepted table=%s kind=%s phase=%s self=%s", tableID, record.Kind, table.ActiveHand.State.Phase, runtime.walletID.PlayerID)
+	latest, latestErr = runtime.requireLocalTable(tableID)
+	if latestErr != nil || latest == nil || !sameProtocolDriveSnapshot(*latest, snapshot) {
+		return
+	}
+	if !runtime.isRunning() {
+		return
+	}
 	if err := runtime.acceptRemoteTable(updated); err != nil {
 		debugMeshf("accept remote table after hand message failed table=%s err=%v", tableID, err)
 	}

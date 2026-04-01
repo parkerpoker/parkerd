@@ -76,6 +76,7 @@ type NativeMeshTableConfig struct {
 	NetworkID                 string `json:"networkId"`
 	NextHandDelayMS           int    `json:"nextHandDelayMs,omitempty"`
 	OccupiedSeats             int    `json:"occupiedSeats"`
+	ProtocolVersion           string `json:"protocolVersion"`
 	PublicSpectatorDelayHands int    `json:"publicSpectatorDelayHands"`
 	SeatCount                 int    `json:"seatCount"`
 	SmallBlindSats            int    `json:"smallBlindSats"`
@@ -151,6 +152,7 @@ type NativeCooperativeTableSnapshot struct {
 	Phase                any                            `json:"phase"`
 	PotSats              int                            `json:"potSats"`
 	PreviousSnapshotHash any                            `json:"previousSnapshotHash"`
+	ProtocolVersion      string                         `json:"protocolVersion"`
 	SeatedPlayers        []NativeSeatedPlayer           `json:"seatedPlayers"`
 	SidePots             []int                          `json:"sidePots"`
 	Signatures           []NativeTableSnapshotSignature `json:"signatures"`
@@ -233,6 +235,7 @@ type NativeTableFundsOperation struct {
 	ArkIntentID     string                 `json:"arkIntentId,omitempty"`
 	ArkTxID         string                 `json:"arkTxid,omitempty"`
 	ExitProofRef    string                 `json:"exitProofRef,omitempty"`
+	FundsRequest    *nativeFundsRequest    `json:"fundsRequest,omitempty"`
 	Kind            string                 `json:"kind"`
 	NetworkID       string                 `json:"networkId"`
 	OperationID     string                 `json:"operationId"`
@@ -358,15 +361,17 @@ type nativeActionRequest struct {
 }
 
 type nativeFundsRequest struct {
-	ArkAddress           string `json:"arkAddress,omitempty"`
-	Epoch                int    `json:"epoch"`
-	Kind                 string `json:"kind"`
-	PlayerID             string `json:"playerId"`
-	PrevCustodyStateHash string `json:"prevCustodyStateHash,omitempty"`
-	ProfileName          string `json:"profileName"`
-	SignatureHex         string `json:"signatureHex"`
-	SignedAt             string `json:"signedAt"`
-	TableID              string `json:"tableId"`
+	ArkAddress           string                    `json:"arkAddress,omitempty"`
+	Epoch                int                       `json:"epoch"`
+	ExitExecution        *nativeFundsExitExecution `json:"exitExecution,omitempty"`
+	Kind                 string                    `json:"kind"`
+	PlayerID             string                    `json:"playerId"`
+	PrevCustodyStateHash string                    `json:"prevCustodyStateHash,omitempty"`
+	ProfileName          string                    `json:"profileName"`
+	ProtocolVersion      string                    `json:"protocolVersion,omitempty"`
+	SignatureHex         string                    `json:"signatureHex"`
+	SignedAt             string                    `json:"signedAt"`
+	TableID              string                    `json:"tableId"`
 }
 
 type nativeFundsSettlement struct {
@@ -387,6 +392,13 @@ type nativeFundsResponse struct {
 	Table      nativeTableState      `json:"table"`
 }
 
+type nativeFundsExitExecution struct {
+	BroadcastTxIDs []string               `json:"broadcastTxIds,omitempty"`
+	Pending        bool                   `json:"pending"`
+	SourceRefs     []tablecustody.VTXORef `json:"sourceRefs,omitempty"`
+	SweepTxID      string                 `json:"sweepTxId,omitempty"`
+}
+
 type nativeTransitionAuthorizer struct {
 	ActionRequest *nativeActionRequest `json:"actionRequest,omitempty"`
 	FundsRequest  *nativeFundsRequest  `json:"fundsRequest,omitempty"`
@@ -396,6 +408,7 @@ type nativeCustodyApprovalRequest struct {
 	ExpectedPrevStateHash string                         `json:"expectedPrevStateHash"`
 	Authorizer            *nativeTransitionAuthorizer    `json:"authorizer,omitempty"`
 	PlayerID              string                         `json:"playerId"`
+	ProtocolVersion       string                         `json:"protocolVersion,omitempty"`
 	TableID               string                         `json:"tableId"`
 	Transition            tablecustody.CustodyTransition `json:"transition"`
 }
@@ -411,6 +424,7 @@ type nativeCustodyTxSignRequest struct {
 	PSBT                  string                         `json:"psbt"`
 	PlayerID              string                         `json:"playerId"`
 	Purpose               string                         `json:"purpose,omitempty"`
+	ProtocolVersion       string                         `json:"protocolVersion,omitempty"`
 	TableID               string                         `json:"tableId"`
 	TransitionHash        string                         `json:"transitionHash,omitempty"`
 	Transition            tablecustody.CustodyTransition `json:"transition"`
@@ -426,6 +440,7 @@ type nativeCustodySignerPrepareRequest struct {
 	ExpectedOffchainOutputs []custodyBatchOutput           `json:"expectedOffchainOutputs,omitempty"`
 	Authorizer              *nativeTransitionAuthorizer    `json:"authorizer,omitempty"`
 	PlayerID                string                         `json:"playerId"`
+	ProtocolVersion         string                         `json:"protocolVersion,omitempty"`
 	TableID                 string                         `json:"tableId"`
 	TransitionHash          string                         `json:"transitionHash,omitempty"`
 	Transition              tablecustody.CustodyTransition `json:"transition"`
@@ -443,6 +458,7 @@ type nativeCustodySignerStartRequest struct {
 	DerivationPath        string             `json:"derivationPath"`
 	ExpectedPrevStateHash string             `json:"expectedPrevStateHash,omitempty"`
 	PlayerID              string             `json:"playerId"`
+	ProtocolVersion       string             `json:"protocolVersion,omitempty"`
 	SweepTapTreeRootHex   string             `json:"sweepTapTreeRootHex"`
 	TableID               string             `json:"tableId"`
 	TransitionHash        string             `json:"transitionHash,omitempty"`
@@ -451,22 +467,24 @@ type nativeCustodySignerStartRequest struct {
 }
 
 type nativeCustodySignerNoncesRequest struct {
-	BatchID        string                          `json:"batchId"`
-	DerivationPath string                          `json:"derivationPath"`
-	Nonces         map[string]*arktree.Musig2Nonce `json:"nonces"`
-	PlayerID       string                          `json:"playerId"`
-	TableID        string                          `json:"tableId"`
-	TxID           string                          `json:"txid"`
-	TransitionHash string                          `json:"transitionHash,omitempty"`
+	BatchID         string                          `json:"batchId"`
+	DerivationPath  string                          `json:"derivationPath"`
+	Nonces          map[string]*arktree.Musig2Nonce `json:"nonces"`
+	PlayerID        string                          `json:"playerId"`
+	ProtocolVersion string                          `json:"protocolVersion,omitempty"`
+	TableID         string                          `json:"tableId"`
+	TxID            string                          `json:"txid"`
+	TransitionHash  string                          `json:"transitionHash,omitempty"`
 }
 
 type nativeCustodySignerAggregatedNoncesRequest struct {
-	BatchID        string             `json:"batchId"`
-	DerivationPath string             `json:"derivationPath"`
-	Nonces         arktree.TreeNonces `json:"nonces"`
-	PlayerID       string             `json:"playerId"`
-	TableID        string             `json:"tableId"`
-	TransitionHash string             `json:"transitionHash,omitempty"`
+	BatchID         string             `json:"batchId"`
+	DerivationPath  string             `json:"derivationPath"`
+	Nonces          arktree.TreeNonces `json:"nonces"`
+	PlayerID        string             `json:"playerId"`
+	ProtocolVersion string             `json:"protocolVersion,omitempty"`
+	TableID         string             `json:"tableId"`
+	TransitionHash  string             `json:"transitionHash,omitempty"`
 }
 
 type nativeCustodyAckResponse struct {

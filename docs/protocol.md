@@ -6,12 +6,12 @@ For component topology, see [architecture.md](./architecture.md). For dealerless
 
 ## Short Version
 
-The current runtime is `poker/v2`.
+The current runtime is `poker/v1`.
 
 The important protocol changes in this generation are:
 
 - money authority is the latest accepted `CustodyState`
-- local funds bookkeeping is `arkade-table-funds/v2`
+- local funds bookkeeping is `arkade-table-funds/v1`
 - join requests include funded buy-in refs
 - action and funds requests are bound to `prevCustodyStateHash`
 - accepted `PlayerAction`, `CashOut`, and `EmergencyExit` events carry the full signed initiator request as the canonical payload

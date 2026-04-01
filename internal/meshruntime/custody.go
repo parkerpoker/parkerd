@@ -76,7 +76,8 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, kind t
 	case tablecustody.TransitionKindBlindPost:
 		baseDeadline = runtime.canonicalNextHandAt(table)
 	default:
-		if table.LatestCustodyState != nil {
+		baseDeadline = runtime.currentCustodyActionDeadline(table)
+		if baseDeadline == "" && table.LatestCustodyState != nil {
 			baseDeadline = strings.TrimSpace(table.LatestCustodyState.ActionDeadlineAt)
 		}
 	}
@@ -99,10 +100,28 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, kind t
 		}
 		return addMillis(nowISO(), runtime.handProtocolTimeoutMSForTable(table))
 	}
+	if kind == tablecustody.TransitionKindAction || kind == tablecustody.TransitionKindTimeout {
+		return baseDeadline
+	}
 	if table.ActiveHand != nil {
 		return table.ActiveHand.Cards.PhaseDeadlineAt
 	}
 	return ""
+}
+
+func (runtime *meshRuntime) currentCustodyActionDeadline(table nativeTableState) string {
+	if table.LatestCustodyState == nil {
+		return ""
+	}
+	baseDeadline := strings.TrimSpace(table.LatestCustodyState.ActionDeadlineAt)
+	if baseDeadline == "" || table.ActiveHand == nil || !game.PhaseAllowsActions(table.ActiveHand.State.Phase) || table.ActiveHand.State.ActingSeatIndex == nil {
+		return baseDeadline
+	}
+	currentPublicStateHash := runtime.publicMoneyStateHash(table, &table.ActiveHand.State)
+	if table.LatestCustodyState.PublicStateHash == currentPublicStateHash {
+		return baseDeadline
+	}
+	return addMillis(baseDeadline, runtime.actionTimeoutMSForTable(table))
 }
 
 func (runtime *meshRuntime) custodyBalancesFromHand(table nativeTableState, hand *game.HoldemState) []tablecustody.PlayerBalance {
@@ -191,8 +210,9 @@ func (runtime *meshRuntime) custodyActingPlayerID(table nativeTableState, hand *
 }
 
 type custodyBindingOverrides struct {
-	ChallengeAnchor string
-	TranscriptRoot  string
+	ActionDeadlineAt string
+	ChallengeAnchor  string
+	TranscriptRoot   string
 }
 
 func (runtime *meshRuntime) currentCustodyTranscriptBindings(table nativeTableState) (string, string) {
@@ -218,12 +238,20 @@ func (runtime *meshRuntime) custodyStateBinding(table nativeTableState, kind tab
 		handNumber = table.PublicState.HandNumber
 	}
 	challengeAnchor, transcriptRoot := runtime.currentCustodyTranscriptBindings(table)
+	actionDeadlineAt := runtime.custodyActionDeadline(table, kind, hand)
 	if overrides != nil {
-		challengeAnchor = overrides.ChallengeAnchor
-		transcriptRoot = overrides.TranscriptRoot
+		if strings.TrimSpace(overrides.ActionDeadlineAt) != "" {
+			actionDeadlineAt = strings.TrimSpace(overrides.ActionDeadlineAt)
+		}
+		if strings.TrimSpace(overrides.ChallengeAnchor) != "" {
+			challengeAnchor = overrides.ChallengeAnchor
+		}
+		if strings.TrimSpace(overrides.TranscriptRoot) != "" {
+			transcriptRoot = overrides.TranscriptRoot
+		}
 	}
 	return tablecustody.StateBinding{
-		ActionDeadlineAt: runtime.custodyActionDeadline(table, kind, hand),
+		ActionDeadlineAt: actionDeadlineAt,
 		ActingPlayerID:   runtime.custodyActingPlayerID(table, hand),
 		ChallengeAnchor:  challengeAnchor,
 		CreatedAt:        nowISO(),
@@ -431,7 +459,7 @@ func (runtime *meshRuntime) deriveTimeoutCustodyTransition(table nativeTableStat
 	if table.LatestCustodyState == nil {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition requires a prior custody state")
 	}
-	if elapsedMillis(table.LatestCustodyState.ActionDeadlineAt) < 0 {
+	if elapsedMillis(runtime.currentCustodyActionDeadline(table)) < 0 {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition is before the custody deadline")
 	}
 	actingSeatIndex := *table.ActiveHand.State.ActingSeatIndex
@@ -531,7 +559,15 @@ func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTable
 			return errors.New("showdown-payout transition requires a settled hand")
 		}
 		hand := cloneJSON(table.ActiveHand.State)
-		expected, err = runtime.buildCustodyTransition(table, tablecustody.TransitionKindShowdownPayout, &hand, nil, latestTimeoutResolutionForHand(table))
+		timeoutResolution := latestTimeoutResolutionForHand(table)
+		overrides := (*custodyBindingOverrides)(nil)
+		if derived := runtime.showdownPayoutTimeoutResolution(table, timeoutResolution); derived != nil {
+			timeoutResolution = derived
+			overrides = &custodyBindingOverrides{
+				ActionDeadlineAt: table.LatestCustodyState.ActionDeadlineAt,
+			}
+		}
+		expected, err = runtime.buildCustodyTransitionWithOverrides(table, tablecustody.TransitionKindShowdownPayout, &hand, nil, timeoutResolution, overrides)
 	case tablecustody.TransitionKindCarryForward:
 		expected, err = runtime.buildCustodyTransition(table, tablecustody.TransitionKindCarryForward, nil, nil, nil)
 	case tablecustody.TransitionKindBuyInLock:
@@ -561,10 +597,10 @@ func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTable
 	return nil
 }
 
-func custodyApprovalPayload(tableID, playerID, prevStateHash, nextStateHash string, custodySeq int, signedAt string) map[string]any {
+func custodyApprovalPayload(tableID, playerID, prevStateHash, approvalHash string, custodySeq int, signedAt string) map[string]any {
 	return map[string]any{
+		"approvalHash":  approvalHash,
 		"custodySeq":    custodySeq,
-		"nextStateHash": nextStateHash,
 		"playerId":      playerID,
 		"prevStateHash": prevStateHash,
 		"signedAt":      signedAt,
@@ -573,14 +609,19 @@ func custodyApprovalPayload(tableID, playerID, prevStateHash, nextStateHash stri
 	}
 }
 
+func custodyApprovalTargetHash(transition tablecustody.CustodyTransition) string {
+	return firstNonEmptyString(strings.TrimSpace(transition.Proof.RequestHash), custodyTransitionRequestHash(transition))
+}
+
 func (runtime *meshRuntime) localCustodyApproval(transition tablecustody.CustodyTransition) (tablecustody.CustodySignature, error) {
 	signedAt := nowISO()
-	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, custodyApprovalPayload(transition.TableID, runtime.walletID.PlayerID, transition.PrevStateHash, transition.NextStateHash, transition.CustodySeq, signedAt))
+	approvalHash := custodyApprovalTargetHash(transition)
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, custodyApprovalPayload(transition.TableID, runtime.walletID.PlayerID, transition.PrevStateHash, approvalHash, transition.CustodySeq, signedAt))
 	if err != nil {
 		return tablecustody.CustodySignature{}, err
 	}
 	return tablecustody.CustodySignature{
-		ApprovalHash:    transition.NextStateHash,
+		ApprovalHash:    approvalHash,
 		PlayerID:        runtime.walletID.PlayerID,
 		SignatureHex:    signatureHex,
 		SignedAt:        signedAt,
@@ -589,7 +630,8 @@ func (runtime *meshRuntime) localCustodyApproval(transition tablecustody.Custody
 }
 
 func verifyCustodyApproval(seat nativeSeatRecord, transition tablecustody.CustodyTransition, approval tablecustody.CustodySignature) error {
-	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, custodyApprovalPayload(transition.TableID, approval.PlayerID, transition.PrevStateHash, transition.NextStateHash, transition.CustodySeq, approval.SignedAt), approval.SignatureHex)
+	approvalHash := custodyApprovalTargetHash(transition)
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, custodyApprovalPayload(transition.TableID, approval.PlayerID, transition.PrevStateHash, approvalHash, transition.CustodySeq, approval.SignedAt), approval.SignatureHex)
 	if err != nil {
 		return err
 	}
@@ -604,24 +646,17 @@ func (runtime *meshRuntime) handleCustodyApprovalFromPeer(request nativeCustodyA
 	if err != nil {
 		return nativeCustodyApprovalResponse{}, err
 	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
+		return nativeCustodyApprovalResponse{}, err
+	}
 	if request.PlayerID != runtime.walletID.PlayerID {
 		return nativeCustodyApprovalResponse{}, errors.New("custody approval request is not addressed to this player")
 	}
-	if table.LatestCustodyState == nil || table.LatestCustodyState.StateHash != request.ExpectedPrevStateHash {
-		return nativeCustodyApprovalResponse{}, errors.New("custody approval request references stale state")
-	}
-	if err := runtime.validateCustodyTransitionSemantics(*table, request.Transition, request.Authorizer); err != nil {
+	if err := runtime.validatePrebuiltCustodySigningTransition(*table, request.ExpectedPrevStateHash, custodyApprovalTargetHash(request.Transition), request.Transition, request.Authorizer); err != nil {
 		return nativeCustodyApprovalResponse{}, err
 	}
-	if err := tablecustody.ValidateTransition(table.LatestCustodyState, request.Transition); err != nil {
-		return nativeCustodyApprovalResponse{}, err
-	}
-	requireArkSettlement := !runtime.config.UseMockSettlement && custodyTransitionRequiresArkSettlement(table.LatestCustodyState, request.Transition)
-	if err := validateAcceptedCustodyRefs(table.LatestCustodyState, request.Transition, requireArkSettlement); err != nil {
-		return nativeCustodyApprovalResponse{}, err
-	}
-	if requireArkSettlement {
-		if err := runtime.validateCustodyTransitionArkProof(table.LatestCustodyState, request.Transition, true); err != nil {
+	if runtime.custodyApprovalHook != nil {
+		if err := runtime.custodyApprovalHook(request); err != nil {
 			return nativeCustodyApprovalResponse{}, err
 		}
 	}
@@ -654,6 +689,7 @@ func (runtime *meshRuntime) collectCustodyApprovals(table nativeTableState, tran
 			ExpectedPrevStateHash: transition.PrevStateHash,
 			Authorizer:            cloneTransitionAuthorizer(authorizer),
 			PlayerID:              playerID,
+			ProtocolVersion:       nativeProtocolVersion,
 			TableID:               table.Config.TableID,
 			Transition:            transition,
 		})
@@ -741,6 +777,14 @@ func (runtime *meshRuntime) finalizeCustodyTransition(table *nativeTableState, t
 	if !runtime.config.UseMockSettlement {
 		return runtime.finalizeRealCustodyTransition(table, transition, authorizer)
 	}
+	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(*table, *transition)
+	if err != nil {
+		return err
+	}
+	approvals, err := runtime.collectCustodyApprovals(*table, approvalTransition, authorizer, runtime.requiredCustodySigners(*table, approvalTransition))
+	if err != nil {
+		return err
+	}
 	intentID := "mock-intent-" + randomUUID()
 	txID := tablecustody.HashValue(map[string]any{
 		"tableId":    table.Config.TableID,
@@ -796,25 +840,14 @@ func (runtime *meshRuntime) finalizeCustodyTransition(table *nativeTableState, t
 	transition.Proof = tablecustody.CustodyProof{
 		ArkIntentID:     intentID,
 		ArkTxID:         txID,
+		RequestHash:     approvalTransition.Proof.RequestHash,
 		ReplayValidated: true,
-		StateHash:       transition.NextStateHash,
+		FinalizedAt:     nowISO(),
+		Signatures:      append([]tablecustody.CustodySignature(nil), approvals...),
+		StateHash:       transition.NextState.StateHash,
 		VTXORefs:        append([]tablecustody.VTXORef(nil), stackRefs...),
 	}
-	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(*transition)
-	approvals, err := runtime.collectCustodyApprovals(*table, *transition, authorizer, runtime.requiredCustodySigners(*table, *transition))
-	if err != nil {
-		return err
-	}
 	transition.Approvals = approvals
-	transition.Proof = tablecustody.CustodyProof{
-		ArkIntentID:     intentID,
-		ArkTxID:         txID,
-		FinalizedAt:     nowISO(),
-		ReplayValidated: true,
-		Signatures:      approvals,
-		StateHash:       transition.NextState.StateHash,
-		VTXORefs:        stackRefs,
-	}
 	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(*transition)
 	return tablecustody.ValidateTransition(table.LatestCustodyState, *transition)
 }

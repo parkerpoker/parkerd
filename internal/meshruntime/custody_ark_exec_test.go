@@ -147,7 +147,10 @@ func TestCustodyBatchEventsHandlerSignsAggregatedNonces(t *testing.T) {
 	handler := &custodyBatchEventsHandler{
 		runtime: runtime,
 		table: nativeTableState{
-			Config: NativeMeshTableConfig{TableID: "table-1"},
+			Config: NativeMeshTableConfig{
+				TableID:         "table-1",
+				ProtocolVersion: nativeProtocolVersion,
+			},
 		},
 		derivationPath: "parker/custody/test",
 		requestKey:     "transition-1",
@@ -194,7 +197,10 @@ func TestHandleCustodySignerAggregatedNoncesFromPeerSubmitsSignatures(t *testing
 	runtime := newBootstrapOnlyMeshRuntime(t, "guest")
 	tableID := "table-aggregated-nonces"
 	table := nativeTableState{
-		Config: NativeMeshTableConfig{TableID: tableID},
+		Config: NativeMeshTableConfig{
+			TableID:         tableID,
+			ProtocolVersion: nativeProtocolVersion,
+		},
 		LatestCustodyState: &tablecustody.CustodyState{
 			StateHash: "state-1",
 		},
@@ -228,9 +234,10 @@ func TestHandleCustodySignerAggregatedNoncesFromPeerSubmitsSignatures(t *testing
 		Nonces: arktree.TreeNonces{
 			"tx-2": &arktree.Musig2Nonce{},
 		},
-		PlayerID:       runtime.walletID.PlayerID,
-		TableID:        tableID,
-		TransitionHash: transitionHash,
+		PlayerID:        runtime.walletID.PlayerID,
+		ProtocolVersion: nativeProtocolVersion,
+		TableID:         tableID,
+		TransitionHash:  transitionHash,
 	})
 	if err != nil {
 		t.Fatalf("handle aggregated nonces from peer: %v", err)
@@ -262,7 +269,10 @@ func TestHandleCustodySignerNoncesFromPeerReportsIncompleteAggregation(t *testin
 	runtime := newBootstrapOnlyMeshRuntime(t, "guest")
 	tableID := "table-nonces"
 	table := nativeTableState{
-		Config: NativeMeshTableConfig{TableID: tableID},
+		Config: NativeMeshTableConfig{
+			TableID:         tableID,
+			ProtocolVersion: nativeProtocolVersion,
+		},
 		LatestCustodyState: &tablecustody.CustodyState{
 			StateHash: "state-1",
 		},
@@ -299,10 +309,11 @@ func TestHandleCustodySignerNoncesFromPeerReportsIncompleteAggregation(t *testin
 		Nonces: map[string]*arktree.Musig2Nonce{
 			"nonce-1": &arktree.Musig2Nonce{},
 		},
-		PlayerID:       runtime.walletID.PlayerID,
-		TableID:        tableID,
-		TxID:           "tx-3",
-		TransitionHash: transitionHash,
+		PlayerID:        runtime.walletID.PlayerID,
+		ProtocolVersion: nativeProtocolVersion,
+		TableID:         tableID,
+		TxID:            "tx-3",
+		TransitionHash:  transitionHash,
 	})
 	if err != nil {
 		t.Fatalf("handle nonces from peer: %v", err)

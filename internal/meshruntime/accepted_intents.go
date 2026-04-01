@@ -29,7 +29,7 @@ func verifyNativeFundsRequestSignature(seat nativeSeatRecord, request nativeFund
 	if request.SignedAt == "" || request.SignatureHex == "" {
 		return errors.New("funds request is missing player signature")
 	}
-	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeFundsAuthPayload(request.TableID, request.PlayerID, request.PrevCustodyStateHash, request.Kind, request.ArkAddress, request.Epoch, request.SignedAt), request.SignatureHex)
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeFundsAuthPayload(request), request.SignatureHex)
 	if err != nil {
 		return err
 	}
@@ -333,6 +333,9 @@ func (runtime *meshRuntime) validateAcceptedInitiatorHistory(table nativeTableSt
 			if !hasRequest {
 				return fmt.Errorf("event %d is missing its signed funds request", index)
 			}
+			if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
+				return fmt.Errorf("event %d funds request protocol version is invalid: %w", index, err)
+			}
 			seat, ok := seatRecordForPlayer(table, request.PlayerID)
 			if !ok {
 				return fmt.Errorf("event %d funds request player %s is not seated", index, request.PlayerID)
@@ -359,6 +362,22 @@ func (runtime *meshRuntime) validateAcceptedInitiatorHistory(table nativeTableSt
 			baseTable, err := runtime.acceptedTableBeforeFundsTransition(table, event, transition, transitionIndex)
 			if err != nil {
 				return fmt.Errorf("event %d funds replay setup failed: %w", index, err)
+			}
+			if expectedKind == tablecustody.TransitionKindEmergencyExit {
+				if err := runtime.validateEmergencyExitExecution(baseTable, *request); err != nil {
+					return fmt.Errorf("event %d emergency exit execution is invalid: %w", index, err)
+				}
+				expectedArkTxID := fundsExitExecutionArkTxID(request.ExitExecution)
+				if transition.ArkTxID != expectedArkTxID {
+					return fmt.Errorf("event %d emergency exit txid mismatch", index)
+				}
+				expectedProofRef := emergencyExitProofRef(*baseTable.LatestCustodyState, request.PlayerID, request.ExitExecution)
+				if transition.Proof.ExitProofRef != expectedProofRef {
+					return fmt.Errorf("event %d emergency exit proof ref mismatch", index)
+				}
+				if strings.TrimSpace(stringValue(event.Body["exitProofRef"])) != expectedProofRef {
+					return fmt.Errorf("event %d emergency exit event proof ref mismatch", index)
+				}
 			}
 			if err := runtime.validateCustodyTransitionSemantics(baseTable, transition, authorizerForFundsRequest(*request)); err != nil {
 				return fmt.Errorf("event %d funds transition does not match the locally derived successor: %w", index, err)

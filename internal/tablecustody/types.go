@@ -81,6 +81,7 @@ type CustodyProof struct {
 	ArkTxID         string             `json:"arkTxid,omitempty"`
 	ExitProofRef    string             `json:"exitProofRef,omitempty"`
 	FinalizedAt     string             `json:"finalizedAt,omitempty"`
+	RequestHash     string             `json:"requestHash,omitempty"`
 	ReplayValidated bool               `json:"replayValidated"`
 	Signatures      []CustodySignature `json:"signatures,omitempty"`
 	StateHash       string             `json:"stateHash"`
