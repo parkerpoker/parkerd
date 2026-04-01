@@ -1913,7 +1913,7 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 		if err != nil {
 			return nativeFundsSettlement{}, err
 		}
-		result, settledAmount, _, err := runtime.settleTableFundsForPlayer(*table, transition, authorizer, request.PlayerID, request.ArkAddress)
+		result, settledAmount, _, err := runtime.settleTableFundsForPlayer(*table, transition, authorizer, request.PlayerID)
 		if err != nil {
 			return nativeFundsSettlement{}, err
 		}
@@ -1925,14 +1925,15 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 		transition.ArkTxID = result.ArkTxID
 		transition.Approvals = append([]tablecustody.CustodySignature(nil), approvals...)
 		transition.Proof = tablecustody.CustodyProof{
-			ArkIntentID:     result.IntentID,
-			ArkTxID:         result.ArkTxID,
-			FinalizedAt:     result.FinalizedAt,
-			RequestHash:     approvalTransition.Proof.RequestHash,
-			ReplayValidated: true,
-			Signatures:      append([]tablecustody.CustodySignature(nil), approvals...),
-			StateHash:       transition.NextStateHash,
-			VTXORefs:        append(stackProofRefs(transition.NextState), receiptRefs...),
+			ArkIntentID:       result.IntentID,
+			ArkTxID:           result.ArkTxID,
+			FinalizedAt:       result.FinalizedAt,
+			RequestHash:       approvalTransition.Proof.RequestHash,
+			ReplayValidated:   true,
+			SettlementWitness: custodySettlementWitnessFromResult(result),
+			Signatures:        append([]tablecustody.CustodySignature(nil), approvals...),
+			StateHash:         transition.NextStateHash,
+			VTXORefs:          append(stackProofRefs(transition.NextState), receiptRefs...),
 		}
 		transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(transition)
 		if err := tablecustody.ValidateTransition(table.LatestCustodyState, transition); err != nil {
@@ -3360,7 +3361,9 @@ func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTable
 }
 
 func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableState, previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) error {
-	requireArkSettlement := !runtime.config.UseMockSettlement && custodyTransitionRequiresArkSettlement(previous, transition)
+	requireArkSettlement := !runtime.config.UseMockSettlement &&
+		custodyTransitionRequiresArkSettlement(previous, transition) &&
+		!custodyTransitionUsesMockSettlement(transition)
 	if transition.Proof.StateHash != transition.NextStateHash {
 		return errors.New("custody proof state hash mismatch")
 	}
@@ -3400,10 +3403,10 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if err := validateAcceptedCustodyRefs(previous, transition, requireArkSettlement); err != nil {
 		return err
 	}
-	if !requireArkSettlement {
+	if !requireArkSettlement || transition.Kind == tablecustody.TransitionKindEmergencyExit {
 		return nil
 	}
-	return runtime.validateCustodyTransitionArkProof(previous, transition, false)
+	return runtime.validateAcceptedCustodySettlementWitness(table, previous, transition)
 }
 
 func (runtime *meshRuntime) validateCustodyApprovals(table nativeTableState, transition tablecustody.CustodyTransition, required []string) error {
@@ -3601,6 +3604,11 @@ func custodyTransitionRequiresArkSettlement(previous *tablecustody.CustodyState,
 		return true
 	}
 	return !reflect.DeepEqual(canonicalCustodyMoneyPots(previous), canonicalCustodyMoneyPots(&transition.NextState))
+}
+
+func custodyTransitionUsesMockSettlement(transition tablecustody.CustodyTransition) bool {
+	intentID := firstNonEmptyString(transition.Proof.ArkIntentID, transition.ArkIntentID)
+	return strings.HasPrefix(intentID, "mock-intent-")
 }
 
 func previousSnapshotForCurrentState(table nativeTableState) nativeTableState {

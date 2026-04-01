@@ -210,6 +210,24 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 	if transition.Proof.ArkTxID != "" && transition.ArkTxID != "" && transition.Proof.ArkTxID != transition.ArkTxID {
 		return fmt.Errorf("custody proof txid mismatch")
 	}
+	if transition.Proof.SettlementWitness != nil {
+		witness := transition.Proof.SettlementWitness
+		if transition.ArkIntentID != "" && witness.ArkIntentID != transition.ArkIntentID {
+			return fmt.Errorf("custody settlement witness intent mismatch")
+		}
+		if transition.Proof.ArkIntentID != "" && witness.ArkIntentID != transition.Proof.ArkIntentID {
+			return fmt.Errorf("custody proof witness intent mismatch")
+		}
+		if transition.ArkTxID != "" && witness.ArkTxID != transition.ArkTxID {
+			return fmt.Errorf("custody settlement witness txid mismatch")
+		}
+		if transition.Proof.ArkTxID != "" && witness.ArkTxID != transition.Proof.ArkTxID {
+			return fmt.Errorf("custody proof witness txid mismatch")
+		}
+		if transition.Proof.FinalizedAt != "" && witness.FinalizedAt != transition.Proof.FinalizedAt {
+			return fmt.Errorf("custody proof witness finalized timestamp mismatch")
+		}
+	}
 	expectedHash := HashCustodyTransition(transition)
 	if transition.Proof.TransitionHash != "" && transition.Proof.TransitionHash != expectedHash {
 		return fmt.Errorf("custody transition hash mismatch")

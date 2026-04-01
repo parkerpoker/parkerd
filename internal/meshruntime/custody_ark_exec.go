@@ -41,10 +41,16 @@ type custodyBatchOutput struct {
 }
 
 type custodyBatchResult struct {
-	ArkTxID     string
-	FinalizedAt string
-	IntentID    string
-	OutputRefs  map[string][]tablecustody.VTXORef
+	ArkTxID          string
+	BatchExpiryType  string
+	BatchExpiryValue uint32
+	CommitmentTx     string
+	ConnectorTree    arktree.FlatTxTree
+	FinalizedAt      string
+	IntentID         string
+	OutputRefs       map[string][]tablecustody.VTXORef
+	ProofPSBT        string
+	VtxoTree         arktree.FlatTxTree
 }
 
 type custodySignerAuthorization struct {
@@ -107,6 +113,26 @@ func custodyBatchExpiry(expiry uint32) arklib.RelativeLocktime {
 		return arklib.RelativeLocktime{Type: arklib.LocktimeTypeSecond, Value: expiry}
 	}
 	return arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: expiry}
+}
+
+func custodyBatchExpiryType(expiry arklib.RelativeLocktime) string {
+	if expiry.Type == arklib.LocktimeTypeSecond {
+		return "seconds"
+	}
+	return "blocks"
+}
+
+func parseCustodyBatchExpiry(expiryType string, expiryValue uint32) (arklib.RelativeLocktime, error) {
+	expiry := arklib.RelativeLocktime{Value: expiryValue}
+	switch strings.TrimSpace(expiryType) {
+	case "", "blocks":
+		expiry.Type = arklib.LocktimeTypeBlock
+	case "seconds":
+		expiry.Type = arklib.LocktimeTypeSecond
+	default:
+		return arklib.RelativeLocktime{}, fmt.Errorf("unsupported custody batch expiry type %q", expiryType)
+	}
+	return expiry, nil
 }
 
 func custodyIntentInputs(inputs []custodyInputSpec) ([]arkintent.Input, []*arklib.TaprootMerkleProof, [][]*psbt.Unknown, arklib.AbsoluteLocktime, error) {
@@ -248,6 +274,7 @@ func resetCustodyRequestTransition(table nativeTableState, transition tablecusto
 	request.Proof.FinalizedAt = ""
 	request.Proof.RequestHash = ""
 	request.Proof.ReplayValidated = false
+	request.Proof.SettlementWitness = nil
 	request.Proof.StateHash = ""
 	request.Proof.Signatures = nil
 	request.Proof.VTXORefs = nil
@@ -364,6 +391,9 @@ func validateCustodyProofPSBT(packet *psbt.Packet, plan *custodySettlementPlan, 
 	}
 
 	expectedOutputs := map[string]int{}
+	if len(authorizedOutputs) == 0 {
+		authorizedOutputs = append(authorizedOutputs, plan.AuthorizedOutputs...)
+	}
 	if len(authorizedOutputs) == 0 {
 		for _, output := range plan.Outputs {
 			authorizedOutputs = append(authorizedOutputs, custodyBatchOutputFromSpec(output))
@@ -1011,6 +1041,7 @@ type custodyBatchEventsHandler struct {
 	signerPubkeys      map[string]string
 	batchSessionID     string
 	batchExpiry        arklib.RelativeLocktime
+	commitmentTx       string
 	finalVtxoTree      *arktree.TxTree
 	finalConnectorTree *arktree.TxTree
 }
@@ -1219,6 +1250,7 @@ func (handler *custodyBatchEventsHandler) OnTreeNoncesAggregated(ctx context.Con
 }
 
 func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Context, event arkclient.BatchFinalizationEvent, vtxoTree, connectorTree *arktree.TxTree) error {
+	handler.commitmentTx = event.Tx
 	if vtxoTree != nil {
 		commitment, err := psbt.NewFromRawBytes(strings.NewReader(event.Tx), true)
 		if err != nil {
@@ -1318,6 +1350,41 @@ func mustSerializeTxTree(value *arktree.TxTree) arktree.FlatTxTree {
 		panic(err)
 	}
 	return serialized
+}
+
+func cloneFlatTxTree(tree arktree.FlatTxTree) arktree.FlatTxTree {
+	if len(tree) == 0 {
+		return nil
+	}
+	cloned := append(arktree.FlatTxTree(nil), tree...)
+	for index := range cloned {
+		if cloned[index].Children == nil {
+			continue
+		}
+		children := make(map[uint32]string, len(cloned[index].Children))
+		for outputIndex, txID := range cloned[index].Children {
+			children[outputIndex] = txID
+		}
+		cloned[index].Children = children
+	}
+	return cloned
+}
+
+func custodySettlementWitnessFromResult(result *custodyBatchResult) *tablecustody.CustodySettlementWitness {
+	if result == nil {
+		return nil
+	}
+	return &tablecustody.CustodySettlementWitness{
+		ArkIntentID:      result.IntentID,
+		ArkTxID:          result.ArkTxID,
+		FinalizedAt:      result.FinalizedAt,
+		ProofPSBT:        result.ProofPSBT,
+		CommitmentTx:     result.CommitmentTx,
+		BatchExpiryType:  result.BatchExpiryType,
+		BatchExpiryValue: result.BatchExpiryValue,
+		VtxoTree:         cloneFlatTxTree(result.VtxoTree),
+		ConnectorTree:    cloneFlatTxTree(result.ConnectorTree),
+	}
 }
 
 func custodySignerDerivationPath(transitionHash string) string {
@@ -1495,7 +1562,7 @@ func matchCustodyBatchOutputRefs(intentID, arkTxID, finalizedAt string, expiry a
 			available = append(available, tablecustody.VTXORef{
 				AmountSats:  int(txOut.Value),
 				ArkIntentID: intentID,
-				ArkTxID:     "",
+				ArkTxID:     arkTxID,
 				ExpiresAt:   custodyRefExpiryISO(finalizedAt, expiry),
 				Script:      scriptHex,
 				TxID:        leaf.UnsignedTx.TxID(),
@@ -1625,16 +1692,32 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	if err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(handler.commitmentTx) == "" {
+		return nil, errors.New("ark batch did not return a finalized commitment transaction")
+	}
+	commitment, err := psbt.NewFromRawBytes(strings.NewReader(handler.commitmentTx), true)
+	if err != nil {
+		return nil, err
+	}
+	if commitment.UnsignedTx.TxID() != arkTxID {
+		return nil, errors.New("ark batch finalized txid does not match the returned commitment transaction")
+	}
 	finalizedAt := nowISO()
 	outputRefs, err := matchCustodyBatchOutputRefs(intentID, arkTxID, finalizedAt, handler.batchExpiry, outputs, handler.finalVtxoTree)
 	if err != nil {
 		return nil, err
 	}
 	return &custodyBatchResult{
-		ArkTxID:     arkTxID,
-		FinalizedAt: finalizedAt,
-		IntentID:    intentID,
-		OutputRefs:  outputRefs,
+		ArkTxID:          arkTxID,
+		BatchExpiryType:  custodyBatchExpiryType(handler.batchExpiry),
+		BatchExpiryValue: handler.batchExpiry.Value,
+		CommitmentTx:     handler.commitmentTx,
+		ConnectorTree:    mustSerializeTxTree(handler.finalConnectorTree),
+		FinalizedAt:      finalizedAt,
+		IntentID:         intentID,
+		OutputRefs:       outputRefs,
+		ProofPSBT:        signedProof,
+		VtxoTree:         mustSerializeTxTree(handler.finalVtxoTree),
 	}, nil
 }
 
@@ -1716,10 +1799,6 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 	if err != nil {
 		return err
 	}
-	batchOutputs := make([]custodyBatchOutput, 0, len(plan.Outputs))
-	for _, output := range plan.Outputs {
-		batchOutputs = append(batchOutputs, custodyBatchOutputFromSpec(output))
-	}
 	if len(plan.Inputs) == 0 {
 		return runtime.finalizeNonSettlementCustodyTransition(table, transition, authorizer)
 	}
@@ -1728,7 +1807,7 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 		return err
 	}
 	requestHash := signingTransition.Proof.RequestHash
-	result, err := runtime.executeCustodyBatch(*table, transition.PrevStateHash, requestHash, signingTransition, authorizer, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, batchOutputs)
+	result, err := runtime.executeCustodyBatch(*table, transition.PrevStateHash, requestHash, signingTransition, authorizer, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, plan.AuthorizedOutputs)
 	if err != nil {
 		return err
 	}
@@ -1738,14 +1817,15 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 	transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
 	transition.NextStateHash = transition.NextState.StateHash
 	transition.Proof = tablecustody.CustodyProof{
-		ArkIntentID:     result.IntentID,
-		ArkTxID:         result.ArkTxID,
-		FinalizedAt:     result.FinalizedAt,
-		RequestHash:     requestHash,
-		ReplayValidated: true,
-		Signatures:      append([]tablecustody.CustodySignature(nil), approvals...),
-		StateHash:       transition.NextStateHash,
-		VTXORefs:        stackProofRefs(transition.NextState),
+		ArkIntentID:       result.IntentID,
+		ArkTxID:           result.ArkTxID,
+		FinalizedAt:       result.FinalizedAt,
+		RequestHash:       requestHash,
+		ReplayValidated:   true,
+		SettlementWitness: custodySettlementWitnessFromResult(result),
+		Signatures:        append([]tablecustody.CustodySignature(nil), approvals...),
+		StateHash:         transition.NextStateHash,
+		VTXORefs:          stackProofRefs(transition.NextState),
 	}
 	transition.Approvals = approvals
 	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(*transition)
@@ -1764,7 +1844,7 @@ func latestStackClaimForPlayer(state *tablecustody.CustodyState, playerID string
 	return tablecustody.StackClaim{}, false
 }
 
-func (runtime *meshRuntime) settleTableFundsForPlayer(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, playerID, arkAddress string) (*custodyBatchResult, int, string, error) {
+func (runtime *meshRuntime) settleTableFundsForPlayer(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, playerID string) (*custodyBatchResult, int, string, error) {
 	claim, ok := latestStackClaimForPlayer(table.LatestCustodyState, playerID)
 	if !ok {
 		return nil, 0, "", errors.New("latest custody state is missing the target stack claim")
@@ -1783,26 +1863,21 @@ func (runtime *meshRuntime) settleTableFundsForPlayer(table nativeTableState, tr
 	if len(plan.Inputs) == 0 {
 		return nil, 0, "", errors.New("latest custody state has no spendable stack to settle")
 	}
-	if strings.TrimSpace(arkAddress) == "" {
-		return nil, 0, "", errors.New("wallet has no Ark address for cash-out settlement")
+	settledAmount := 0
+	for _, output := range plan.AuthorizedOutputs {
+		if output.ClaimKey == "wallet-return" {
+			settledAmount = output.AmountSats
+			break
+		}
 	}
-	feeSats, err := runtime.estimatedCustodyBatchFee(len(plan.Inputs), 1, 0, 0)
-	if err != nil {
-		return nil, 0, "", err
+	if settledAmount == 0 {
+		return nil, 0, "", errors.New("cash-out settlement did not derive the expected wallet-return output")
 	}
-	settledAmount := totalClaimSats - feeSats
 	if settledAmount <= 0 {
-		return nil, 0, "", fmt.Errorf("custody claim is too small to cover Ark cash-out fees: have %d need %d", totalClaimSats, feeSats)
-	}
-	output, err := custodyBatchOutputFromReceiver("wallet-return", playerID, sdktypes.Receiver{
-		To:     arkAddress,
-		Amount: uint64(settledAmount),
-	}, nil)
-	if err != nil {
-		return nil, 0, "", err
+		return nil, 0, "", fmt.Errorf("custody claim is too small to cover Ark cash-out fees: have %d", totalClaimSats)
 	}
 	transitionHash := custodyTransitionRequestHash(signingTransition)
-	result, err := runtime.executeCustodyBatch(table, table.LatestCustodyState.StateHash, transitionHash, signingTransition, authorizer, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, []custodyBatchOutput{output})
+	result, err := runtime.executeCustodyBatch(table, table.LatestCustodyState.StateHash, transitionHash, signingTransition, authorizer, plan.Inputs, plan.ProofSignerIDs, plan.TreeSignerIDs, plan.AuthorizedOutputs)
 	if err != nil {
 		return nil, 0, "", err
 	}
@@ -1814,10 +1889,6 @@ func (runtime *meshRuntime) settleTableFundsForPlayer(table nativeTableState, tr
 }
 
 func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind string) (*custodyBatchResult, int, string, error) {
-	walletInfo, err := runtime.walletRuntime.GetWallet(runtime.profileName)
-	if err != nil {
-		return nil, 0, "", err
-	}
 	request, err := runtime.buildSignedFundsRequest(table, kind)
 	if err != nil {
 		return nil, 0, "", err
@@ -1830,5 +1901,5 @@ func (runtime *meshRuntime) settleCurrentTableFunds(table nativeTableState, kind
 	if err != nil {
 		return nil, 0, "", err
 	}
-	return runtime.settleTableFundsForPlayer(table, transition, authorizerForFundsRequest(request), runtime.walletID.PlayerID, walletInfo.ArkAddress)
+	return runtime.settleTableFundsForPlayer(table, transition, authorizerForFundsRequest(request), runtime.walletID.PlayerID)
 }

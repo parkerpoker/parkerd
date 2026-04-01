@@ -1,5 +1,7 @@
 package tablecustody
 
+import arktree "github.com/arkade-os/arkd/pkg/ark-lib/tree"
+
 type TimeoutPolicy string
 
 const (
@@ -76,17 +78,30 @@ type CustodySignature struct {
 	WalletPubkeyHex string `json:"walletPubkeyHex,omitempty"`
 }
 
+type CustodySettlementWitness struct {
+	ArkIntentID      string             `json:"arkIntentId,omitempty"`
+	ArkTxID          string             `json:"arkTxid,omitempty"`
+	FinalizedAt      string             `json:"finalizedAt,omitempty"`
+	ProofPSBT        string             `json:"proofPsbt,omitempty"`
+	CommitmentTx     string             `json:"commitmentTx,omitempty"`
+	BatchExpiryType  string             `json:"batchExpiryType,omitempty"`
+	BatchExpiryValue uint32             `json:"batchExpiryValue,omitempty"`
+	VtxoTree         arktree.FlatTxTree `json:"vtxoTree,omitempty"`
+	ConnectorTree    arktree.FlatTxTree `json:"connectorTree,omitempty"`
+}
+
 type CustodyProof struct {
-	ArkIntentID     string             `json:"arkIntentId,omitempty"`
-	ArkTxID         string             `json:"arkTxid,omitempty"`
-	ExitProofRef    string             `json:"exitProofRef,omitempty"`
-	FinalizedAt     string             `json:"finalizedAt,omitempty"`
-	RequestHash     string             `json:"requestHash,omitempty"`
-	ReplayValidated bool               `json:"replayValidated"`
-	Signatures      []CustodySignature `json:"signatures,omitempty"`
-	StateHash       string             `json:"stateHash"`
-	TransitionHash  string             `json:"transitionHash"`
-	VTXORefs        []VTXORef          `json:"vtxoRefs,omitempty"`
+	ArkIntentID       string                    `json:"arkIntentId,omitempty"`
+	ArkTxID           string                    `json:"arkTxid,omitempty"`
+	ExitProofRef      string                    `json:"exitProofRef,omitempty"`
+	FinalizedAt       string                    `json:"finalizedAt,omitempty"`
+	RequestHash       string                    `json:"requestHash,omitempty"`
+	ReplayValidated   bool                      `json:"replayValidated"`
+	SettlementWitness *CustodySettlementWitness `json:"settlementWitness,omitempty"`
+	Signatures        []CustodySignature        `json:"signatures,omitempty"`
+	StateHash         string                    `json:"stateHash"`
+	TransitionHash    string                    `json:"transitionHash"`
+	VTXORefs          []VTXORef                 `json:"vtxoRefs,omitempty"`
 }
 
 type CustodyState struct {

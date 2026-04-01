@@ -12,6 +12,7 @@ import (
 
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
 	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
+	sdktypes "github.com/arkade-os/go-sdk/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/txscript"
@@ -45,10 +46,11 @@ type custodyOutputSpec struct {
 }
 
 type custodySettlementPlan struct {
-	Inputs         []custodyInputSpec
-	Outputs        []custodyOutputSpec
-	ProofSignerIDs []string
-	TreeSignerIDs  []string
+	AuthorizedOutputs []custodyBatchOutput
+	Inputs            []custodyInputSpec
+	Outputs           []custodyOutputSpec
+	ProofSignerIDs    []string
+	TreeSignerIDs     []string
 }
 
 const (
@@ -663,7 +665,57 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 		plan.ProofSignerIDs = append(plan.ProofSignerIDs, playerID)
 	}
 	sort.Strings(plan.ProofSignerIDs)
+	authorizedOutputs, err := runtime.authorizedCustodyBatchOutputs(table, transition, plan)
+	if err != nil {
+		return nil, err
+	}
+	plan.AuthorizedOutputs = authorizedOutputs
 	return plan, nil
+}
+
+func (runtime *meshRuntime) authorizedCustodyBatchOutputs(table nativeTableState, transition tablecustody.CustodyTransition, plan *custodySettlementPlan) ([]custodyBatchOutput, error) {
+	if plan == nil {
+		return nil, errors.New("missing custody settlement plan")
+	}
+	outputs := make([]custodyBatchOutput, 0, len(plan.Outputs)+1)
+	for _, output := range plan.Outputs {
+		outputs = append(outputs, custodyBatchOutputFromSpec(output))
+	}
+	if transition.Kind == tablecustody.TransitionKindCashOut {
+		claim, ok := latestStackClaimForPlayer(table.LatestCustodyState, transition.ActingPlayerID)
+		if !ok {
+			return nil, errors.New("latest custody state is missing the target stack claim")
+		}
+		totalClaimSats := stackClaimBackedAmount(claim)
+		if totalClaimSats <= 0 {
+			return nil, errors.New("latest custody state has no spendable stack to settle")
+		}
+		seat, ok := seatRecordForPlayer(table, transition.ActingPlayerID)
+		if !ok {
+			return nil, fmt.Errorf("missing seat for cash-out player %s", transition.ActingPlayerID)
+		}
+		if strings.TrimSpace(seat.ArkAddress) == "" {
+			return nil, fmt.Errorf("seat %s is missing an Ark address", transition.ActingPlayerID)
+		}
+		feeSats, err := runtime.estimatedCustodyBatchFee(len(plan.Inputs), len(outputs)+1, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		settledAmount := totalClaimSats - feeSats
+		if settledAmount <= 0 {
+			return nil, fmt.Errorf("custody claim is too small to cover Ark cash-out fees: have %d need %d", totalClaimSats, feeSats)
+		}
+		output, err := custodyBatchOutputFromReceiver("wallet-return", transition.ActingPlayerID, sdktypes.Receiver{
+			To:     seat.ArkAddress,
+			Amount: uint64(settledAmount),
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		outputs = append(outputs, output)
+		return outputs, nil
+	}
+	return outputs, nil
 }
 
 func (runtime *meshRuntime) custodyFeePayerIDs(table nativeTableState, transition tablecustody.CustodyTransition) []string {

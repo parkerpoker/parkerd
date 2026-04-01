@@ -6,12 +6,20 @@ import (
 	"errors"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
+	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
+	arktree "github.com/arkade-os/arkd/pkg/ark-lib/tree"
 	sdktypes "github.com/arkade-os/go-sdk/types"
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	cfg "github.com/parkerpoker/parkerd/internal/config"
 	"github.com/parkerpoker/parkerd/internal/game"
@@ -3070,11 +3078,7 @@ func TestSyntheticRealModeSettledHandCashOutProofRefsCoverRemainingClaims(t *tes
 	if err := host.validatePrebuiltCustodySigningTransition(table, transition.PrevStateHash, custodyTransitionRequestHash(normalized), normalized, authorizerForFundsRequest(fundsRequest)); err != nil {
 		t.Fatalf("validate normalized settled-hand guest cash-out transition: %v", err)
 	}
-	wallet, err := guest.walletSummary()
-	if err != nil {
-		t.Fatalf("guest wallet summary: %v", err)
-	}
-	result, _, _, err := host.settleTableFundsForPlayer(table, transition, authorizerForFundsRequest(fundsRequest), guest.walletID.PlayerID, wallet.ArkAddress)
+	result, _, _, err := host.settleTableFundsForPlayer(table, transition, authorizerForFundsRequest(fundsRequest), guest.walletID.PlayerID)
 	if err != nil {
 		t.Fatalf("settle settled-hand guest cash-out transition: %v", err)
 	}
@@ -3217,6 +3221,13 @@ func TestCustodyPeerValidationIgnoresProofFieldPollution(t *testing.T) {
 	}}, pollutedApproval.Proof.VTXORefs...)
 	pollutedApproval.Proof.FinalizedAt = nowISO()
 	pollutedApproval.Proof.ArkTxID = "polluted-approval-arktx"
+	pollutedApproval.Proof.SettlementWitness = &tablecustody.CustodySettlementWitness{
+		ArkIntentID:  "polluted-approval-intent",
+		ArkTxID:      "polluted-approval-arktx",
+		FinalizedAt:  nowISO(),
+		ProofPSBT:    "polluted-proof",
+		CommitmentTx: "polluted-commitment",
+	}
 
 	if _, err := guest.handleCustodyApprovalFromPeer(nativeCustodyApprovalRequest{
 		ExpectedPrevStateHash: pollutedApproval.PrevStateHash,
@@ -3238,6 +3249,13 @@ func TestCustodyPeerValidationIgnoresProofFieldPollution(t *testing.T) {
 	}}, pollutedSigning.Proof.VTXORefs...)
 	pollutedSigning.Proof.FinalizedAt = nowISO()
 	pollutedSigning.Proof.ArkIntentID = "polluted-signing-intent"
+	pollutedSigning.Proof.SettlementWitness = &tablecustody.CustodySettlementWitness{
+		ArkIntentID:  "polluted-signing-intent",
+		ArkTxID:      "polluted-signing-txid",
+		FinalizedAt:  nowISO(),
+		ProofPSBT:    "polluted-proof",
+		CommitmentTx: "polluted-commitment",
+	}
 
 	proofPSBT, err := buildCustodyProofPSBTForTest(plan)
 	if err != nil {
@@ -4013,33 +4031,7 @@ func enableSyntheticRealMode(runtimes ...*meshRuntime) {
 			return nil
 		}
 		runtime.custodyBatchExecute = func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error) {
-			intentID := "synthetic-intent-" + transitionHash[:12]
-			txID := transitionHash
-			outputRefs := map[string][]tablecustody.VTXORef{}
-			vout := uint32(0)
-			for _, output := range outputs {
-				if output.Onchain {
-					continue
-				}
-				outputRefs[output.ClaimKey] = append(outputRefs[output.ClaimKey], tablecustody.VTXORef{
-					AmountSats:    output.AmountSats,
-					ArkIntentID:   intentID,
-					ArkTxID:       txID,
-					ExpiresAt:     addMillis(nowISO(), 86_400_000),
-					OwnerPlayerID: output.OwnerPlayerID,
-					Script:        output.Script,
-					Tapscripts:    append([]string(nil), output.Tapscripts...),
-					TxID:          txID,
-					VOut:          vout,
-				})
-				vout++
-			}
-			return &custodyBatchResult{
-				ArkTxID:     txID,
-				FinalizedAt: nowISO(),
-				IntentID:    intentID,
-				OutputRefs:  outputRefs,
-			}, nil
+			return buildSyntheticCustodyBatchResultForTest(runtime, table, transitionHash, inputs, proofSignerIDs, treeSignerIDs, outputs)
 		}
 	}
 }
@@ -4593,19 +4585,139 @@ func buildCustodyProofPSBTForTest(plan *custodySettlementPlan) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	txOutputs := make([]*wire.TxOut, 0, len(plan.Outputs))
-	for _, output := range plan.Outputs {
-		txOut, err := decodeBatchOutputTxOut(custodyBatchOutputFromSpec(output))
+	txOutputs := make([]*wire.TxOut, 0, len(plan.AuthorizedOutputs))
+	for _, output := range plan.AuthorizedOutputs {
+		txOut, err := decodeBatchOutputTxOut(output)
 		if err != nil {
 			return "", err
 		}
 		txOutputs = append(txOutputs, txOut)
 	}
-	message, err := custodyRegisterMessage(custodyOnchainOutputIndexes(offchainCustodyBatchOutputs(nil)), nil)
+	message, err := custodyRegisterMessage(custodyOnchainOutputIndexes(plan.AuthorizedOutputs), nil)
 	if err != nil {
 		return "", err
 	}
 	return custodyBuildProofPSBT(message, intentInputs, txOutputs, leafProofs, arkFields, locktime)
+}
+
+func syntheticCustodyTreeSignerPubkeys(runtime *meshRuntime, table nativeTableState, treeSignerIDs, proofSignerIDs []string) ([]string, error) {
+	playerIDs := append([]string(nil), treeSignerIDs...)
+	if len(playerIDs) == 0 {
+		playerIDs = append(playerIDs, proofSignerIDs...)
+	}
+	pubkeys := make([]string, 0, len(playerIDs))
+	for _, playerID := range uniqueSortedPlayerIDs(playerIDs) {
+		pubkeyHex, err := runtime.walletPubkeyHexForPlayer(table, playerID)
+		if err != nil {
+			return nil, err
+		}
+		pubkeys = append(pubkeys, pubkeyHex)
+	}
+	if len(pubkeys) == 0 {
+		pubkeys = append(pubkeys, runtime.walletID.PublicKeyHex)
+	}
+	sort.Strings(pubkeys)
+	return pubkeys, nil
+}
+
+func buildSyntheticCustodyBatchResultForTest(runtime *meshRuntime, table nativeTableState, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error) {
+	intentID := "synthetic-intent-" + transitionHash[:12]
+	finalizedAt := nowISO()
+	cosignerPubkeys, err := syntheticCustodyTreeSignerPubkeys(runtime, table, treeSignerIDs, proofSignerIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	intentInputs, leafProofs, arkFields, locktime, err := custodyIntentInputs(inputs)
+	if err != nil {
+		return nil, err
+	}
+	txOutputs := make([]*wire.TxOut, 0, len(outputs))
+	receivers := make([]arktree.Leaf, 0, len(outputs))
+	for _, output := range outputs {
+		if output.Onchain {
+			return nil, errors.New("synthetic real mode does not support onchain custody outputs")
+		}
+		txOut, err := decodeBatchOutputTxOut(output)
+		if err != nil {
+			return nil, err
+		}
+		txOutputs = append(txOutputs, txOut)
+		receivers = append(receivers, arktree.Leaf{
+			Script:              output.Script,
+			Amount:              uint64(output.AmountSats),
+			CosignersPublicKeys: append([]string(nil), cosignerPubkeys...),
+		})
+	}
+	message, err := custodyRegisterMessage(custodyOnchainOutputIndexes(outputs), cosignerPubkeys)
+	if err != nil {
+		return nil, err
+	}
+	proofPSBT, err := custodyBuildProofPSBT(message, intentInputs, txOutputs, leafProofs, arkFields, locktime)
+	if err != nil {
+		return nil, err
+	}
+
+	config, err := runtime.arkCustodyConfig()
+	if err != nil {
+		return nil, err
+	}
+	forfeitPubkey, err := compressedPubkeyFromHex(config.ForfeitPubkeyHex)
+	if err != nil {
+		return nil, err
+	}
+	batchExpiry := arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 144}
+	sweepScript, err := (&arkscript.CSVMultisigClosure{
+		MultisigClosure: arkscript.MultisigClosure{PubKeys: []*btcec.PublicKey{forfeitPubkey}},
+		Locktime:        batchExpiry,
+	}).Script()
+	if err != nil {
+		return nil, err
+	}
+	sweepRoot := txscript.AssembleTaprootScriptTree(txscript.NewBaseTapLeaf(sweepScript)).RootNode.TapHash()
+	batchScript, batchAmount, err := arktree.BuildBatchOutput(receivers, sweepRoot.CloneBytes())
+	if err != nil {
+		return nil, err
+	}
+
+	prevHash, err := chainhash.NewHashFromStr(transitionHash)
+	if err != nil {
+		prevHash = &chainhash.Hash{}
+	}
+	commitmentTx := wire.NewMsgTx(2)
+	commitmentTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
+		Sequence:         wire.MaxTxInSequenceNum,
+	})
+	commitmentTx.AddTxOut(&wire.TxOut{Value: batchAmount, PkScript: batchScript})
+	commitmentPacket, err := psbt.NewFromUnsignedTx(commitmentTx)
+	if err != nil {
+		return nil, err
+	}
+	commitmentPSBT, err := commitmentPacket.B64Encode()
+	if err != nil {
+		return nil, err
+	}
+
+	vtxoTree, err := arktree.BuildVtxoTree(&wire.OutPoint{Hash: commitmentTx.TxHash(), Index: 0}, receivers, sweepRoot.CloneBytes(), batchExpiry)
+	if err != nil {
+		return nil, err
+	}
+	outputRefs, err := matchCustodyBatchOutputRefs(intentID, commitmentTx.TxHash().String(), finalizedAt, batchExpiry, outputs, vtxoTree)
+	if err != nil {
+		return nil, err
+	}
+	return &custodyBatchResult{
+		ArkTxID:          commitmentTx.TxHash().String(),
+		BatchExpiryType:  custodyBatchExpiryType(batchExpiry),
+		BatchExpiryValue: batchExpiry.Value,
+		CommitmentTx:     commitmentPSBT,
+		FinalizedAt:      finalizedAt,
+		IntentID:         intentID,
+		OutputRefs:       outputRefs,
+		ProofPSBT:        proofPSBT,
+		VtxoTree:         mustSerializeTxTree(vtxoTree),
+	}, nil
 }
 
 func resignHistoricalSnapshotForTest(t *testing.T, runtime *meshRuntime, snapshot *NativeCooperativeTableSnapshot) {

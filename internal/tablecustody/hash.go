@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+
+	arktree "github.com/arkade-os/arkd/pkg/ark-lib/tree"
 )
 
 func HashValue(value any) string {
@@ -43,6 +45,7 @@ func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned.Proof.FinalizedAt = ""
 	unsigned.Proof.RequestHash = ""
 	unsigned.Proof.ReplayValidated = false
+	unsigned.Proof.SettlementWitness = nil
 	unsigned.Proof.StateHash = ""
 	unsigned.Proof.Signatures = nil
 	unsigned.Proof.TransitionHash = ""
@@ -96,11 +99,42 @@ func canonicalTransition(transition CustodyTransition) CustodyTransition {
 	sort.SliceStable(transition.Proof.Signatures, func(left, right int) bool {
 		return transition.Proof.Signatures[left].PlayerID < transition.Proof.Signatures[right].PlayerID
 	})
+	if transition.Proof.SettlementWitness != nil {
+		canonicalWitness := canonicalSettlementWitness(*transition.Proof.SettlementWitness)
+		transition.Proof.SettlementWitness = &canonicalWitness
+	}
 	transition.Proof.VTXORefs = append([]VTXORef(nil), transition.Proof.VTXORefs...)
 	sort.SliceStable(transition.Proof.VTXORefs, func(left, right int) bool {
 		return compareVTXORefs(transition.Proof.VTXORefs[left], transition.Proof.VTXORefs[right]) < 0
 	})
 	return transition
+}
+
+func canonicalSettlementWitness(witness CustodySettlementWitness) CustodySettlementWitness {
+	witness.VtxoTree = canonicalFlatTxTree(witness.VtxoTree)
+	witness.ConnectorTree = canonicalFlatTxTree(witness.ConnectorTree)
+	return witness
+}
+
+func canonicalFlatTxTree(tree arktree.FlatTxTree) arktree.FlatTxTree {
+	if len(tree) == 0 {
+		return nil
+	}
+	cloned := append(arktree.FlatTxTree(nil), tree...)
+	for index := range cloned {
+		if cloned[index].Children == nil {
+			continue
+		}
+		children := make(map[uint32]string, len(cloned[index].Children))
+		for outputIndex, childTxID := range cloned[index].Children {
+			children[outputIndex] = childTxID
+		}
+		cloned[index].Children = children
+	}
+	sort.SliceStable(cloned, func(left, right int) bool {
+		return cloned[left].Txid < cloned[right].Txid
+	})
+	return cloned
 }
 
 func sortedStrings(values []string) []string {

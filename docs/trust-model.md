@@ -103,7 +103,7 @@ Accepted state is checked against:
 - historical snapshot continuity
 - historical custody continuity
 
-In real-settlement mode those checks also include live Ark/indexer validation of accepted custody refs, including tapscript-to-output binding for any declared taproot custody refs. The current implementation validates against live services rather than carrying a fully self-contained offline inclusion-proof bundle.
+In real-settlement mode those checks replay accepted Ark-settled custody transitions from the stored settlement witness bundle inside `CustodyProof`. That witness bundle carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree needed to re-derive the accepted refs offline. If the witness is intact, accepted history no longer depends on live Ark/indexer availability.
 
 `ReplayValidated` remains telemetry/debug metadata only. It is not treated as proof on its own.
 
@@ -177,9 +177,9 @@ If Ark-backed services are unavailable:
 - new custody transitions may fail closed
 - onboarding/offboarding may stall
 - exit completion may stall
-- replay or approval of new Ark-settled successors may stall because live verification is part of acceptance
+- live spendability checks such as join funding admission can still stall
 
-Again, this is a liveness issue. The accepted custody checkpoint remains the reference claim.
+Accepted historical replay of already-settled Ark custody steps can still succeed from the stored witness bundle even while Ark services are unavailable. Again, the remaining failures are liveness issues, not ownership changes.
 
 ## Important Current Limits
 
@@ -202,5 +202,5 @@ The safest way to interpret the current system is:
 - trust each daemon to protect its own secrets
 - trust the host to propose and sequence, not to define money alone
 - trust custody replay more than snapshots or UI projections
-- treat live Ark/indexer verification as part of current acceptance and signing safety
+- treat stored settlement witnesses as the proof for accepted Ark-settled history, and live Ark/indexer checks as a current liveness/spendability safety layer
 - treat controller and indexer outages as liveness failures, not custody failures

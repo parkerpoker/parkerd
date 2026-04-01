@@ -231,7 +231,21 @@ Semantic successor validation derives the expected next custody step locally fro
 
 Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers still verify Ark-linked refs, authorized output sets, and Ark proof material even after the semantic successor matches.
 
-In real-settlement mode, peer approval and replay validation do more than hash-chain checks. They verify Ark-linked refs live against Ark/indexer state, including amount/script identity and tapscript-to-output binding for any declared taproot custody refs. The current implementation relies on live verification, not a separate offline inclusion-proof bundle.
+In real-settlement mode, accepted replay for real Ark-settled, non-emergency transitions now uses the stored `CustodyProof.SettlementWitness` bundle as the canonical proof surface. That witness bundle includes:
+
+- `arkIntentId`
+- `arkTxid`
+- `finalizedAt`
+- `proofPsbt`
+- `commitmentTx`
+- `batchExpiryType`
+- `batchExpiryValue`
+- `vtxoTree`
+- optional `connectorTree`
+
+Accepted replay re-derives the authorized spend paths and batch outputs from the previous custody state plus the accepted transition, validates the witness bundle offline, and exact-matches the witness-derived refs against `NextState` and `Proof.VTXORefs`.
+
+Live Ark/indexer checks remain in the current protocol only where liveness or spendability matters, such as join funding admission and other interactive safety checks.
 
 ## Hand And Money Sequencing
 
@@ -286,5 +300,5 @@ The safest way to interpret the current protocol is:
 - the host proposes transitions and orchestrates replication
 - money-changing steps are accepted only after custody finalization
 - semantic successor validation and Ark/output validation are distinct required checks
-- real-mode peer approvals and replay validate Ark-linked refs against live Ark/indexer state before signing or persistence
+- real-mode peer approvals still use live Ark/indexer checks when current liveness or spendability matters, while accepted-history replay validates stored settlement witness bundles before persistence
 - non-host peers replay transcript, public state, snapshot history, and custody history before persistence

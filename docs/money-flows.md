@@ -14,6 +14,7 @@ The important current-state rules are:
 - `LatestSnapshot` and `LatestFullySignedSnapshot` are derived replay/debug projections
 - seat lock, blind posting, betting actions, timeout successors, settled payouts, cash-out, and emergency exit are custody transitions
 - accepted action and funds history replays from canonical signed request objects, not host-authored summaries or `ActionLog`
+- accepted Ark-settled custody history replays from the stored settlement witness bundle in `CustodyProof`, not from live Ark/indexer lookups
 - zero-exposure successors like `check` can still advance custody through a non-settlement transition that reuses the same refs
 - `meshRenew` is no longer a money-moving primitive; continuing play means carrying forward the latest stack claims
 - local table-funds state is now `arkade-table-funds/v1`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
@@ -46,6 +47,7 @@ This is the spendable wallet pool outside a table.
 - `PotSlice`
 - `CustodyTransition`
 - `CustodyProof`
+- `CustodySettlementWitness`
 - `TimeoutResolution`
 
 `CustodyState` binds money to gameplay by hashing:
@@ -148,6 +150,16 @@ Those same semantic checks run before:
 - custody approval
 - PSBT signing
 - signer-session prepare
+
+For accepted historical replay, real Ark-settled successors now validate from the stored `CustodyProof.SettlementWitness` bundle:
+
+- `proofPsbt`
+- finalized `commitmentTx`
+- stored batch expiry
+- finalized `vtxoTree`
+- optional `connectorTree`
+
+That witness bundle is authoritative replay proof. The duplicated top-level summary fields (`arkIntentId`, `arkTxid`, `finalizedAt`, `vtxoRefs`) remain as convenience summaries and must stay consistent with the witness-derived result.
 
 ### Zero-exposure successors
 
