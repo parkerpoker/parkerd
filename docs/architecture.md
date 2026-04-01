@@ -2,7 +2,7 @@
 
 This document describes the architecture implemented today in this repository. It is intentionally current-state only.
 
-For protocol details, see [protocol.md](./protocol.md). For the current dealerless hand flow, see [dealerless.md](./dealerless.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
+For protocol details, see [protocol.md](./protocol.md). For the current dealerless hand flow, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Overview
 
@@ -21,7 +21,7 @@ The peer runtime is coordinator-led and dealerless today:
 - the current host coordinates joins, actions, failover, event append order, and replication
 - hidden cards flow through `dealerless-transcript-v1`, not a host-dealt deck seed
 - only the owning seat stores its own hole cards in plaintext locally after private delivery
-- non-host peers replay the accepted hand transcript, public state, and historical ledger before persistence
+- non-host peers replay the accepted hand transcript, public state, custody history, and historical ledger before persistence
 - peer listeners expose a direct TCP transport on advertised `parker://` endpoints
 - public discovery remains optional through the indexer
 - the browser stays outside daemon custody and peer-to-peer transport
@@ -30,20 +30,22 @@ Daemons now advertise direct peer endpoints shaped like `parker://host:port` and
 
 ## Practical Repo Mapping
 
-- `cmd/parker-daemon` plus `[internal/mesh_runtime.go](../internal/mesh_runtime.go)` and `[internal/transport_wire.go](../internal/transport_wire.go)` are the gameplay and peer-transport runtime
-- `cmd/parker-cli` plus `[internal/client.go](../internal/client.go)` are the local CLI control surface
-- `cmd/parker-controller` plus `[internal/controller/app.go](../internal/controller/app.go)` are the localhost browser bridge
-- `cmd/parker-indexer` plus `[internal/indexer/app.go](../internal/indexer/app.go)` are the optional public ingest/read model
-- `[internal/storage/store.go](../internal/storage/store.go)` provides the runtime and indexer storage backends
-- `[internal/settlementcore/core.go](../internal/settlementcore/core.go)` implements canonical JSON hashing and signatures
-- `[internal/game](../internal/game)` contains the current heads-up Hold'em engine
+- `cmd/parker-daemon` plus [internal/meshruntime/runtime.go](../internal/meshruntime/runtime.go), [internal/meshruntime/api.go](../internal/meshruntime/api.go), and [internal/meshruntime/transport_wire.go](../internal/meshruntime/transport_wire.go) are the gameplay, local-RPC, and peer-transport runtime
+- `cmd/parker-cli` plus [internal/client.go](../internal/client.go) are the local CLI control surface
+- `cmd/parker-controller` plus [internal/controller/app.go](../internal/controller/app.go) are the localhost browser bridge
+- `cmd/parker-indexer` plus [internal/indexer/app.go](../internal/indexer/app.go) are the optional public ingest/read model
+- [internal/storage/store.go](../internal/storage/store.go) provides the runtime and indexer storage backends
+- [internal/settlementcore/core.go](../internal/settlementcore/core.go) implements canonical JSON hashing and signatures
+- [internal/tablecustody](../internal/tablecustody) owns custody state hashing, transition validation, side-pot claims, and exit-proof material
+- [internal/wallet/runtime.go](../internal/wallet/runtime.go) plus [internal/wallet/custody_exit.go](../internal/wallet/custody_exit.go) own Ark wallet access, signer sessions, and unilateral exit execution
+- [internal/game](../internal/game) contains the current Hold'em rules engine and N-player money evaluation
 - browser clients are maintained outside this repository
 
 ## Component Roles
 
 ### Daemon process
 
-`cmd/parker-daemon` starts `[internal/daemon.Service](../internal/daemon/service.go)`, which currently wraps `[internal.ProxyDaemon](../internal/proxy_daemon.go)`, the daemon runtime adapter in `[internal/daemon_runtime_adapter.go](../internal/daemon_runtime_adapter.go)`, and the gameplay engine in `[internal/mesh_runtime.go](../internal/mesh_runtime.go)`.
+`cmd/parker-daemon` starts [internal/daemon/service.go](../internal/daemon/service.go), which currently wraps [internal/daemon/proxy_daemon.go](../internal/daemon/proxy_daemon.go), the daemon runtime adapter in [internal/daemon/runtime_adapter.go](../internal/daemon/runtime_adapter.go), and the gameplay/custody runtime in [internal/meshruntime/runtime.go](../internal/meshruntime/runtime.go).
 
 This process owns:
 
@@ -59,7 +61,7 @@ This is the only component that can:
 - accept joins and actions
 - append signed events
 - build snapshots
-- execute renew, cash-out, and emergency-exit operations
+- execute carry-forward acknowledgments (`meshRenew`), cash-out, and emergency-exit operations
 
 ### CLI process
 
@@ -121,7 +123,7 @@ The CLI still accepts `--mode indexer` for compatibility, but the actual public 
 
 ### Optional indexer
 
-`cmd/parker-indexer` is a standalone Go `net/http` service with a public read model stored through `[internal/storage/store.go](../internal/storage/store.go)`.
+`cmd/parker-indexer` is a standalone Go `net/http` service with a public read model stored through [internal/storage/store.go](../internal/storage/store.go).
 
 It accepts:
 
@@ -149,7 +151,7 @@ In controller mode the browser can:
 - request wallet actions
 - create or join tables
 - submit gameplay actions
-- request renew, cash-out, or emergency exit
+- request carry-forward (`meshRenew`), cash-out, or emergency exit
 
 Even in controller mode, the browser is still outside daemon custody:
 
@@ -162,8 +164,8 @@ Even in controller mode, the browser is still outside daemon custody:
 The current runtime uses Arkade-backed wallet and table-funds operations for:
 
 - faucet/onboarding flows
-- buy-in and funds tracking
-- renewals
+- buy-in funding verification and lock
+- custody transition settlement and replay verification
 - cash-out
 - emergency exit
 
@@ -191,7 +193,7 @@ No remote peer talks to another peer's CLI or controller.
 
 ### Peer replication boundary
 
-The current Go runtime exchanges newline-delimited `[TransportEnvelope](../internal/transport_types.go)` JSON over direct TCP connections rather than `/native/*` HTTP routes.
+The current Go runtime exchanges newline-delimited [TransportEnvelope](../internal/transport_types.go) JSON over direct TCP connections rather than `/native/*` HTTP routes.
 
 Request message types are:
 
@@ -199,6 +201,14 @@ Request message types are:
 - `table.state.pull`
 - `table.join.request`
 - `table.action.request`
+- `table.funds.request`
+- `table.custody.request`
+- `table.custody.sign.request`
+- `table.custody.signer.prepare.request`
+- `table.custody.signer.start.request`
+- `table.custody.signer.nonces.request`
+- `table.custody.signer.aggregated_nonces.request`
+- `table.hand.request`
 - `table.state.push`
 
 Responses are:
@@ -207,6 +217,14 @@ Responses are:
 - `table.state.push`
 - `table.join.response`
 - `table.action.response`
+- `table.funds.response`
+- `table.custody.response`
+- `table.custody.sign.response`
+- `table.custody.signer.prepare.response`
+- `table.custody.signer.start.response`
+- `table.custody.signer.nonces.response`
+- `table.custody.signer.aggregated_nonces.response`
+- `table.hand.response`
 - `ack`
 - `nack`
 
@@ -306,18 +324,18 @@ The repository currently exercises these local shapes:
 1. A local CLI or controller asks the host daemon to create a table.
 2. The host daemon appends `TableAnnounce`, stores the invite code, and optionally builds an advertisement.
 3. If the table is public and an indexer is configured, the daemon publishes the advertisement and public snapshot.
-4. A player daemon decodes the invite, builds a wallet-signed identity binding, and sends `table.join.request` to the host's `parker://` endpoint.
-5. The host daemon validates the binding and live peer identity, accepts the seat, appends `SeatLocked`, and marks the table ready when seat count is reached.
+4. A player daemon decodes the invite, selects unreserved funding refs, reserves them locally, builds a wallet-signed identity binding, and sends `table.join.request` to the host's `parker://` endpoint.
+5. The host daemon validates the binding, live peer identity, and funded buy-in refs, verifies those refs on Ark in real-settlement mode, finalizes the `buy-in-lock` custody transition, appends `SeatLocked`, and marks the table ready when seat count is reached.
 6. Once the table is ready, the host builds a snapshot and starts the first hand.
 
 ### Gameplay loop
 
-1. The host daemon starts the hand, coordinates the dealerless transcript phases, and records the resulting transcript root in public state.
+1. The host daemon starts the hand from the latest accepted custody state, posts blinds through custody, coordinates the dealerless transcript phases, and records the resulting transcript root in public state.
 2. Player daemons send signed `table.action.request` envelopes to the current host.
-3. The host validates the action signature and turn binding, advances public state, appends `PlayerAction`, and persists the updated table.
-4. Each receiving daemon verifies the accepted hand transcript, public replay, and historical ledger before persisting the replicated table.
-5. When the hand settles, the host appends `HandResult`, builds a snapshot, and schedules the next hand.
-6. Each participating daemon updates its local table-funds checkpoint state from the replicated table copy.
+3. The host validates the action signature and custody base hash, applies Hold'em rules, finalizes the required custody transition, then appends `PlayerAction` and persists the updated table.
+4. Each receiving daemon verifies the accepted hand transcript, public replay, custody history, approval signatures, and Ark-linked proof material before persisting the replicated table.
+5. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
+6. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
 
 ### Public read flow
 
@@ -338,16 +356,16 @@ If the host stops updating `LastHostHeartbeatAt`:
 - witnesses can take over when configured
 - if no witnesses are configured, the seated player with the lowest peer ID is the failover candidate
 - the new host appends `HostRotated`
-- the next hand starts from the latest stored snapshot
+- the next hand starts from the latest accepted custody checkpoint and replay-valid derived state
 
 ### Mid-hand host loss
 
-If the host disappears during an active hand and a snapshot already exists:
+If the host disappears during an active hand:
 
 - the failover daemon appends `HostRotated`
-- it replays the accepted transcript plus snapshot to decide whether the hand can continue
+- it syncs the best known accepted table and replays custody, transcript, and public state to decide whether the hand can continue
 - if required protocol records are missing or invalid, it appends `HandAbort`
-- it restores from the latest stored snapshot when abort is required
+- it returns to the latest replay-valid custody-backed table state when abort is required
 
 ## Relationship To Other Docs
 

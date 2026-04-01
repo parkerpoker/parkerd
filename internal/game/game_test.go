@@ -177,7 +177,7 @@ func TestHoldemHandTransitions(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},
@@ -235,7 +235,7 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},
@@ -250,6 +250,9 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	if state.Phase != StreetSettled || len(state.Winners) != 1 || state.Winners[0].PlayerID != "beta" || state.Players[1].StackSats != 2050 {
 		t.Fatalf("unexpected fold settlement: %#v", state)
 	}
+	if state.PotSats != 0 || state.Players[0].TotalContributionSats != 0 || state.Players[1].TotalContributionSats != 0 {
+		t.Fatalf("expected fold settlement to clear contributions: %#v", state)
+	}
 
 	state, err = CreateHoldemHand(HoldemHandConfig{
 		HandID:          "770e8400-e29b-41d4-a716-446655440000",
@@ -257,7 +260,7 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},
@@ -328,6 +331,9 @@ func TestHoldemFoldAndShowdown(t *testing.T) {
 	if state.Phase != StreetSettled || len(state.Winners) != 2 || state.Winners[0].AmountSats != 100 || state.Winners[1].AmountSats != 100 {
 		t.Fatalf("unexpected showdown outcome: %#v", state)
 	}
+	if state.PotSats != 0 || state.Players[0].TotalContributionSats != 0 || state.Players[1].TotalContributionSats != 0 {
+		t.Fatalf("expected showdown settlement to clear contributions: %#v", state)
+	}
 }
 
 func TestApplyHoldemActionIncludesActingSeatNumberInTurnErrors(t *testing.T) {
@@ -337,7 +343,7 @@ func TestApplyHoldemActionIncludesActingSeatNumberInTurnErrors(t *testing.T) {
 		DealerSeatIndex: 0,
 		SmallBlindSats:  50,
 		BigBlindSats:    100,
-		Seats: [2]HoldemSeatConfig{
+		Seats: []HoldemSeatConfig{
 			{PlayerID: "alpha", StackSats: 2000},
 			{PlayerID: "beta", StackSats: 2000},
 		},

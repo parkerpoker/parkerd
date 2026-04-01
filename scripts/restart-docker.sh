@@ -1,6 +1,20 @@
 #!/bin/bash
 set -e
 
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+docker_bin="${DOCKER_BIN:-$(command -v docker || true)}"
+if [ -z "$docker_bin" ] && [ -x /opt/homebrew/bin/docker ]; then
+  docker_bin=/opt/homebrew/bin/docker
+fi
+if [ -z "$docker_bin" ] && [ -x /usr/local/bin/docker ]; then
+  docker_bin=/usr/local/bin/docker
+fi
+if [ -z "$docker_bin" ]; then
+  echo "ERROR: docker CLI was not found on PATH."
+  exit 1
+fi
+
 echo "==> Force killing all Docker processes..."
 pkill -9 -f 'docker' 2>/dev/null || true
 pkill -9 -f 'Docker' 2>/dev/null || true
@@ -28,7 +42,7 @@ open -a Docker
 
 echo "==> Waiting for Docker daemon to become responsive..."
 for i in $(seq 1 30); do
-  if docker info &>/dev/null; then
+  if "$docker_bin" info &>/dev/null; then
     echo "    Docker is ready!"
     exit 0
   fi

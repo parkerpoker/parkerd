@@ -1,12 +1,22 @@
 package wallet
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
+	"github.com/arkade-os/arkd/pkg/ark-lib/tree"
+	sdktypes "github.com/arkade-os/go-sdk/types"
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
+)
 
 type WalletSummary struct {
-	AvailableSats   int    `json:"availableSats"`
-	TotalSats       int    `json:"totalSats"`
-	ArkAddress      string `json:"arkAddress"`
-	BoardingAddress string `json:"boardingAddress"`
+	AvailableSats       int    `json:"availableSats"`
+	TotalSats           int    `json:"totalSats"`
+	WalletSpendableSats int    `json:"walletSpendableSats"`
+	TableLockedSats     int    `json:"tableLockedSats"`
+	PendingExitSats     int    `json:"pendingExitSats"`
+	ArkAddress          string `json:"arkAddress"`
+	BoardingAddress     string `json:"boardingAddress"`
 }
 
 type TableSessionState struct {
@@ -83,4 +93,52 @@ type LocalIdentity struct {
 	PlayerID      string `json:"playerId"`
 	PrivateKeyHex string `json:"privateKeyHex"`
 	PublicKeyHex  string `json:"publicKeyHex"`
+}
+
+type CustodyFundingBundle struct {
+	PlayerID  string                 `json:"playerId"`
+	Refs      []tablecustody.VTXORef `json:"refs"`
+	TotalSats int                    `json:"totalSats"`
+}
+
+type CustodyIntentRequest struct {
+	CosignerPubkeys []string               `json:"cosignerPubkeys,omitempty"`
+	Notes           []string               `json:"notes,omitempty"`
+	Outputs         []sdktypes.Receiver    `json:"outputs,omitempty"`
+	Refs            []tablecustody.VTXORef `json:"refs,omitempty"`
+}
+
+type CustodyIntentResult struct {
+	IntentID string                 `json:"intentId,omitempty"`
+	TxID     string                 `json:"txid,omitempty"`
+	Refs     []tablecustody.VTXORef `json:"refs,omitempty"`
+}
+
+type CustodySignerSession struct {
+	DerivationPath string             `json:"derivationPath"`
+	PublicKeyHex   string             `json:"publicKeyHex"`
+	Session        tree.SignerSession `json:"-"`
+}
+
+type CustodyExitResult struct {
+	BroadcastTxIDs []string               `json:"broadcastTxIds,omitempty"`
+	Pending        bool                   `json:"pending"`
+	SourceRefs     []tablecustody.VTXORef `json:"sourceRefs,omitempty"`
+	SweepTxID      string                 `json:"sweepTxId,omitempty"`
+}
+
+type CustodyArkConfig struct {
+	ArkServerURL          string                  `json:"arkServerUrl"`
+	CheckpointTapscript   string                  `json:"checkpointTapscript,omitempty"`
+	DustSats              uint64                  `json:"dustSats"`
+	ExplorerURL           string                  `json:"explorerUrl,omitempty"`
+	ForfeitAddress        string                  `json:"forfeitAddress,omitempty"`
+	ForfeitPubkeyHex      string                  `json:"forfeitPubkeyHex"`
+	Network               arklib.Network          `json:"network"`
+	OffchainInputFeeSats  int                     `json:"offchainInputFeeSats,omitempty"`
+	OffchainOutputFeeSats int                     `json:"offchainOutputFeeSats,omitempty"`
+	OnchainInputFeeSats   int                     `json:"onchainInputFeeSats,omitempty"`
+	OnchainOutputFeeSats  int                     `json:"onchainOutputFeeSats,omitempty"`
+	SignerPubkeyHex       string                  `json:"signerPubkeyHex"`
+	UnilateralExitDelay   arklib.RelativeLocktime `json:"unilateralExitDelay"`
 }

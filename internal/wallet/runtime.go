@@ -12,14 +12,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
+	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
+	arktree "github.com/arkade-os/arkd/pkg/ark-lib/tree"
 	arksdk "github.com/arkade-os/go-sdk"
 	sdkstore "github.com/arkade-os/go-sdk/store"
 	sdktypes "github.com/arkade-os/go-sdk/types"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
 )
 
 type Runtime struct {
@@ -111,6 +116,58 @@ func (runtime *Runtime) GetWallet(profileName string) (WalletSummary, error) {
 	return runtime.getWalletLocked(profileName, *state)
 }
 
+func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) {
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return CustodyArkConfig{}, err
+	}
+	if runtime.config.UseMockSettlement {
+		return CustodyArkConfig{
+			ArkServerURL:        runtime.config.ArkServerURL,
+			DustSats:            1,
+			ForfeitPubkeyHex:    mockCustodyPubkeyHex("parker-mock-ark-forfeit"),
+			SignerPubkeyHex:     mockCustodyPubkeyHex("parker-mock-ark-signer"),
+			UnilateralExitDelay: arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512},
+		}, nil
+	}
+
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	client, unlock, cleanup, err := runtime.openArkClient(profileName, *state)
+	if err != nil {
+		return CustodyArkConfig{}, err
+	}
+	defer cleanup()
+	if err := unlock(); err != nil {
+		return CustodyArkConfig{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	config, err := client.GetConfigData(ctx)
+	if err != nil {
+		return CustodyArkConfig{}, err
+	}
+	if config == nil || config.SignerPubKey == nil || config.ForfeitPubKey == nil {
+		return CustodyArkConfig{}, errors.New("ark client config is incomplete")
+	}
+	return CustodyArkConfig{
+		ArkServerURL:          runtime.config.ArkServerURL,
+		CheckpointTapscript:   config.CheckpointTapscript,
+		DustSats:              config.Dust,
+		ExplorerURL:           config.ExplorerURL,
+		ForfeitAddress:        config.ForfeitAddress,
+		ForfeitPubkeyHex:      hex.EncodeToString(config.ForfeitPubKey.SerializeCompressed()),
+		Network:               config.Network,
+		OffchainInputFeeSats:  parseSatsString(config.Fees.IntentFees.OffchainInput),
+		OffchainOutputFeeSats: parseSatsString(config.Fees.IntentFees.OffchainOutput),
+		OnchainInputFeeSats:   int(config.Fees.IntentFees.OnchainInput),
+		OnchainOutputFeeSats:  int(config.Fees.IntentFees.OnchainOutput),
+		SignerPubkeyHex:       hex.EncodeToString(config.SignerPubKey.SerializeCompressed()),
+		UnilateralExitDelay:   config.UnilateralExitDelay,
+	}, nil
+}
+
 func (runtime *Runtime) getWalletLocked(profileName string, state PlayerProfileState) (WalletSummary, error) {
 	debugWalletf("wallet summary start profile=%s", profileName)
 	client, unlock, cleanup, err := runtime.openArkClient(profileName, state)
@@ -137,10 +194,281 @@ func (runtime *Runtime) getWalletLocked(profileName string, state PlayerProfileS
 	debugWalletf("wallet summary addresses ready profile=%s ark=%s boarding=%s", profileName, arkAddress, boardingAddress)
 
 	return WalletSummary{
-		AvailableSats:   int(balance.OffchainBalance.Total),
-		TotalSats:       int(balance.OffchainBalance.Total + balance.OnchainBalance.SpendableAmount),
-		ArkAddress:      arkAddress,
-		BoardingAddress: boardingAddress,
+		AvailableSats:       int(balance.OffchainBalance.Total),
+		TotalSats:           int(balance.OffchainBalance.Total + balance.OnchainBalance.SpendableAmount),
+		WalletSpendableSats: int(balance.OffchainBalance.Total),
+		TableLockedSats:     0,
+		PendingExitSats:     0,
+		ArkAddress:          arkAddress,
+		BoardingAddress:     boardingAddress,
+	}, nil
+}
+
+func (runtime *Runtime) ListVtxoRefs(profileName string) ([]tablecustody.VTXORef, error) {
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return nil, err
+	}
+	if runtime.config.UseMockSettlement {
+		wallet, err := runtime.GetWallet(profileName)
+		if err != nil {
+			return nil, err
+		}
+		arkConfig, err := runtime.ArkConfig(profileName)
+		if err != nil {
+			return nil, err
+		}
+		identity, err := localIdentity(state.WalletPrivateKeyHex)
+		if err != nil {
+			return nil, err
+		}
+		ownerPubkeyBytes, err := hex.DecodeString(identity.PublicKeyHex)
+		if err != nil {
+			return nil, err
+		}
+		ownerPubkey, err := btcec.ParsePubKey(ownerPubkeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		signerPubkeyBytes, err := hex.DecodeString(arkConfig.SignerPubkeyHex)
+		if err != nil {
+			return nil, err
+		}
+		signerPubkey, err := btcec.ParsePubKey(signerPubkeyBytes)
+		if err != nil {
+			return nil, err
+		}
+		defaultScript := arkscript.NewDefaultVtxoScript(ownerPubkey, signerPubkey, arkConfig.UnilateralExitDelay)
+		defaultTapscripts, err := defaultScript.Encode()
+		if err != nil {
+			return nil, err
+		}
+		tapKey, _, err := defaultScript.TapTree()
+		if err != nil {
+			return nil, err
+		}
+		pkScript, err := arkscript.P2TRScript(tapKey)
+		if err != nil {
+			return nil, err
+		}
+		arkTxID := tablecustody.HashValue(map[string]any{
+			"profile": profileName,
+			"type":    "mock-ark-vtxo",
+		})
+		return []tablecustody.VTXORef{{
+			AmountSats:    wallet.AvailableSats,
+			ArkIntentID:   "mock-intent-" + suffix(profileName, 8),
+			ArkTxID:       arkTxID,
+			ExpiresAt:     addDurationISO(24 * time.Hour),
+			OwnerPlayerID: derivePlayerIDFromState(*state),
+			Script:        hex.EncodeToString(pkScript),
+			Tapscripts:    append([]string(nil), defaultTapscripts...),
+			TxID:          arkTxID,
+			VOut:          0,
+		}}, nil
+	}
+
+	arkConfig, err := runtime.ArkConfig(profileName)
+	if err != nil {
+		return nil, err
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	client, unlock, cleanup, err := runtime.openArkClient(profileName, *state)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+	if err := unlock(); err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	spendable, _, err := client.ListVtxos(ctx)
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]tablecustody.VTXORef, 0, len(spendable))
+	identity, err := localIdentity(state.WalletPrivateKeyHex)
+	if err != nil {
+		return nil, err
+	}
+	ownerPubkeyBytes, err := hex.DecodeString(identity.PublicKeyHex)
+	if err != nil {
+		return nil, err
+	}
+	ownerPubkey, err := btcec.ParsePubKey(ownerPubkeyBytes)
+	if err != nil {
+		return nil, err
+	}
+	signerPubkeyBytes, err := hex.DecodeString(arkConfig.SignerPubkeyHex)
+	if err != nil {
+		return nil, err
+	}
+	signerPubkey, err := btcec.ParsePubKey(signerPubkeyBytes)
+	if err != nil {
+		return nil, err
+	}
+	defaultScript := arkscript.NewDefaultVtxoScript(ownerPubkey, signerPubkey, arkConfig.UnilateralExitDelay)
+	defaultTapscripts, err := defaultScript.Encode()
+	if err != nil {
+		return nil, err
+	}
+	for _, vtxo := range spendable {
+		refs = append(refs, tablecustody.VTXORef{
+			AmountSats:    int(vtxo.Amount),
+			ArkTxID:       vtxo.ArkTxid,
+			ExpiresAt:     vtxo.ExpiresAt.UTC().Format(time.RFC3339),
+			OwnerPlayerID: derivePlayerIDFromState(*state),
+			Script:        vtxo.Script,
+			Tapscripts:    append([]string(nil), defaultTapscripts...),
+			TxID:          vtxo.Txid,
+			VOut:          vtxo.VOut,
+		})
+	}
+	return refs, nil
+}
+
+func (runtime *Runtime) BuildBuyInFundingBundle(profileName string, amountSats int) (CustodyFundingBundle, error) {
+	refs, err := runtime.ListVtxoRefs(profileName)
+	if err != nil {
+		return CustodyFundingBundle{}, err
+	}
+	selected := make([]tablecustody.VTXORef, 0, len(refs))
+	total := 0
+	for _, ref := range refs {
+		selected = append(selected, ref)
+		total += ref.AmountSats
+		if total >= amountSats {
+			break
+		}
+	}
+	if total < amountSats {
+		return CustodyFundingBundle{}, fmt.Errorf("insufficient spendable vtxos: have %d need %d", total, amountSats)
+	}
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return CustodyFundingBundle{}, err
+	}
+	return CustodyFundingBundle{
+		PlayerID:  derivePlayerIDFromState(*state),
+		Refs:      selected,
+		TotalSats: total,
+	}, nil
+}
+
+func (runtime *Runtime) RegisterCustodyIntent(profileName string, request CustodyIntentRequest) (CustodyIntentResult, error) {
+	if runtime.config.UseMockSettlement {
+		intentID, err := randomHex(16)
+		if err != nil {
+			return CustodyIntentResult{}, err
+		}
+		return CustodyIntentResult{
+			IntentID: "mock-intent-" + intentID,
+			Refs:     append([]tablecustody.VTXORef(nil), request.Refs...),
+		}, nil
+	}
+
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return CustodyIntentResult{}, err
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	client, unlock, cleanup, err := runtime.openArkClient(profileName, *state)
+	if err != nil {
+		return CustodyIntentResult{}, err
+	}
+	defer cleanup()
+	if err := unlock(); err != nil {
+		return CustodyIntentResult{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	intentID, err := client.RegisterIntent(ctx, sdkVtxosFromRefs(request.Refs), nil, request.Notes, request.Outputs, request.CosignerPubkeys)
+	if err != nil {
+		return CustodyIntentResult{}, err
+	}
+	return CustodyIntentResult{
+		IntentID: intentID,
+		Refs:     append([]tablecustody.VTXORef(nil), request.Refs...),
+	}, nil
+}
+
+func (runtime *Runtime) SendCustodyOffChain(profileName string, receivers []sdktypes.Receiver) (CustodyIntentResult, error) {
+	if runtime.config.UseMockSettlement {
+		txID, err := randomHex(16)
+		if err != nil {
+			return CustodyIntentResult{}, err
+		}
+		return CustodyIntentResult{TxID: "mock-send-" + txID}, nil
+	}
+
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return CustodyIntentResult{}, err
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	client, unlock, cleanup, err := runtime.openArkClient(profileName, *state)
+	if err != nil {
+		return CustodyIntentResult{}, err
+	}
+	defer cleanup()
+	if err := unlock(); err != nil {
+		return CustodyIntentResult{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	txID, err := client.SendOffChain(ctx, false, receivers)
+	if err != nil {
+		return CustodyIntentResult{}, err
+	}
+	return CustodyIntentResult{TxID: txID}, nil
+}
+
+func (runtime *Runtime) SignCustodyTransaction(profileName, tx string) (string, error) {
+	if runtime.config.UseMockSettlement {
+		return "mock-signed-" + tx, nil
+	}
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return "", err
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	client, unlock, cleanup, err := runtime.openArkClient(profileName, *state)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	if err := unlock(); err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return client.SignTransaction(ctx, tx)
+}
+
+func (runtime *Runtime) NewCustodySignerSession(profileName, derivationPath string) (CustodySignerSession, error) {
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return CustodySignerSession{}, err
+	}
+	sessionKey, pubkeyHex, err := deriveSignerPrivateKeyHex(state.WalletPrivateKeyHex, derivationPath)
+	if err != nil {
+		return CustodySignerSession{}, err
+	}
+	privBytes, err := hex.DecodeString(sessionKey)
+	if err != nil {
+		return CustodySignerSession{}, err
+	}
+	privKey, _ := btcec.PrivKeyFromBytes(privBytes)
+	return CustodySignerSession{
+		DerivationPath: derivationPath,
+		PublicKeyHex:   pubkeyHex,
+		Session:        arktree.NewTreeSignerSession(privKey),
 	}, nil
 }
 
@@ -601,6 +929,12 @@ func localIdentity(seedHex string) (LocalIdentity, error) {
 	}, nil
 }
 
+func mockCustodyPubkeyHex(label string) string {
+	seed := sha256.Sum256([]byte(label))
+	_, publicKey := btcec.PrivKeyFromBytes(seed[:])
+	return hex.EncodeToString(publicKey.SerializeCompressed())
+}
+
 func derivePlayerID(publicKey []byte) string {
 	sum := sha256.Sum256(publicKey)
 	return "player-" + hex.EncodeToString(sum[:])[:20]
@@ -616,10 +950,13 @@ func randomHex(byteLength int) (string, error) {
 
 func createMockWallet(playerID string) WalletSummary {
 	return WalletSummary{
-		AvailableSats:   50_000,
-		TotalSats:       50_000,
-		ArkAddress:      "tark1" + suffix(playerID, 16),
-		BoardingAddress: "bcrt1q" + padRight(suffix(playerID, 20), 20, "0"),
+		AvailableSats:       50_000,
+		TotalSats:           50_000,
+		WalletSpendableSats: 50_000,
+		TableLockedSats:     0,
+		PendingExitSats:     0,
+		ArkAddress:          "tark1qpt0syx7j0jspe69kldtljet0x9jz6ns4xw70m0w0xl30yfhn0mzm2qurrcmgc5p3xf8xvjg2crvl7d95wdgu5zal3k2vthw3l7mhq7utddkqv",
+		BoardingAddress:     "bcrt1q" + padRight(suffix(playerID, 20), 20, "0"),
 	}
 }
 
@@ -661,4 +998,50 @@ func slugProfile(profileName string) string {
 		}
 	}
 	return builder.String()
+}
+
+func sdkVtxosFromRefs(refs []tablecustody.VTXORef) []sdktypes.Vtxo {
+	values := make([]sdktypes.Vtxo, 0, len(refs))
+	for _, ref := range refs {
+		amount := ref.AmountSats
+		if amount < 0 {
+			amount = 0
+		}
+		values = append(values, sdktypes.Vtxo{
+			Outpoint: sdktypes.Outpoint{
+				Txid: ref.TxID,
+				VOut: ref.VOut,
+			},
+			Amount:  uint64(amount),
+			ArkTxid: ref.ArkTxID,
+			Script:  ref.Script,
+		})
+	}
+	return values
+}
+
+func derivePlayerIDFromState(state PlayerProfileState) string {
+	identity, err := localIdentity(state.WalletPrivateKeyHex)
+	if err != nil {
+		return ""
+	}
+	return identity.PlayerID
+}
+
+func deriveSignerPrivateKeyHex(seedHex, derivationPath string) (string, string, error) {
+	sum := sha256.Sum256([]byte(seedHex + ":" + derivationPath))
+	privateKey, publicKey := btcec.PrivKeyFromBytes(sum[:])
+	return hex.EncodeToString(privateKey.Serialize()), hex.EncodeToString(publicKey.SerializeCompressed()), nil
+}
+
+func addDurationISO(delta time.Duration) string {
+	return time.Now().UTC().Add(delta).Format(time.RFC3339)
+}
+
+func parseSatsString(value string) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0
+	}
+	return parsed
 }

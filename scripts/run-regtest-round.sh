@@ -14,8 +14,10 @@ ALICE_PORT="${ALICE_PORT:-}"
 BOB_PORT="${BOB_PORT:-}"
 USE_TOR="${USE_TOR:-false}"
 SETUP_ONLY="${SETUP_ONLY:-false}"
+KEEP_FAILED_RUN="${KEEP_FAILED_RUN:-false}"
 ROUND_SCENARIO="${ROUND_SCENARIO:-standard-4d}"
 PCLI_TIMEOUT_SECONDS="${PCLI_TIMEOUT_SECONDS:-}"
+HAND_SETTLE_TIMEOUT_SECONDS="${HAND_SETTLE_TIMEOUT_SECONDS:-}"
 TOR_TARGET_HOST="${TOR_TARGET_HOST:-host.docker.internal}"
 HOST_TOR_SOCKS_PORT="${HOST_TOR_SOCKS_PORT:-}"
 HOST_TOR_CONTROL_PORT="${HOST_TOR_CONTROL_PORT:-}"
@@ -60,6 +62,10 @@ setup_only_enabled() {
   setting_enabled "$SETUP_ONLY"
 }
 
+keep_failed_run_enabled() {
+  setting_enabled "$KEEP_FAILED_RUN"
+}
+
 host_player_scenario_enabled() {
   [[ "$ROUND_SCENARIO" == "$ROUND_SCENARIO_HOST_PLAYER" ]]
 }
@@ -72,6 +78,34 @@ validate_round_scenario() {
       exit 1
       ;;
   esac
+}
+
+resolve_nigiri_datadir() {
+  local preferred="$1"
+  local fallback_app_support="$HOME/Library/Application Support/Nigiri/parker-auto/$(printf '%s' "$BASE" | tr '/:' '__')"
+  local fallback_home_nigiri="$HOME/.nigiri/parker-auto/$(printf '%s' "$BASE" | tr '/:' '__')"
+  local candidate=""
+
+  docker_bind_mount_is_writable() {
+    local path="$1"
+    mkdir -p "$path" 2>/dev/null || return 1
+    docker run --rm --user 1000:1000 -v "$path:/probe" alpine:3.20 \
+      sh -lc 'touch /probe/.docker-write-test && rm /probe/.docker-write-test' >/dev/null 2>&1
+  }
+
+  for candidate in "$preferred" "$fallback_app_support" "$fallback_home_nigiri"; do
+    [[ -n "$candidate" ]] || continue
+    if docker_bind_mount_is_writable "$candidate"; then
+      if [[ "$candidate" != "$preferred" ]]; then
+        printf 'Falling back to Docker-writable Nigiri datadir at %s\n' "$candidate" >&2
+      fi
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  echo "unable to find a Docker-writable Nigiri datadir (tried $preferred, $fallback_app_support, $fallback_home_nigiri)" >&2
+  return 1
 }
 
 ensure_toolchains() {
@@ -123,12 +157,15 @@ terminate_pid() {
 }
 
 cleanup() {
+  local exit_status=$?
   set +e
   collect_run_daemon_pids() {
-    local metadata pid command_line
+    local metadata metadata_json pid command_line
     for metadata in "$BASE"/daemons/*.json; do
       [[ -f "$metadata" ]] || continue
-      pid="$(json_field pid <"$metadata" 2>/dev/null || true)"
+      metadata_json="$(cat "$metadata" 2>/dev/null || true)"
+      [[ -n "$metadata_json" ]] || continue
+      pid="$(json_field pid <<<"$metadata_json" 2>/dev/null || true)"
       [[ -n "$pid" ]] && printf '%s\n' "$pid"
     done
 
@@ -160,12 +197,18 @@ cleanup() {
     run_with_timeout 15 "$DOCKER_COMPOSE_BIN" -f "$TOR_COMPOSE_FILE" -p "$TOR_PROJECT" down -v --remove-orphans >/dev/null 2>&1 || true
   fi
   stop_nigiri_stack || true
+  if keep_failed_run_enabled && [[ "$exit_status" -ne 0 ]]; then
+    echo "Preserving failed run state under $BASE" >&2
+    echo "Preserving failed Nigiri datadir under $NIGIRI_DATADIR" >&2
+    return
+  fi
   rm -rf "$TOR_STATE_BASE"
 }
 trap cleanup EXIT INT TERM HUP
 
 ensure_toolchains
 validate_round_scenario
+NIGIRI_DATADIR="$(resolve_nigiri_datadir "$NIGIRI_DATADIR")"
 
 command_timeout_seconds() {
   if [[ -n "$PCLI_TIMEOUT_SECONDS" ]]; then
@@ -222,6 +265,36 @@ pdevtool() {
 
 json_field() {
   pdevtool json-field "$1"
+}
+
+table_has_settled_custody_checkpoint() {
+  local state_json="$1"
+  local phase=""
+  local hand_id=""
+  local latest_custody_hash=""
+
+  phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+  hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId 2>/dev/null || true)"
+  latest_custody_hash="$(printf '%s' "$state_json" | json_field data.latestCustodyState.stateHash 2>/dev/null || true)"
+  if [[ -z "$phase" || "$phase" != "settled" ]]; then
+    return 1
+  fi
+  if [[ -z "$hand_id" || "$hand_id" == "null" ]]; then
+    return 1
+  fi
+  if [[ -z "$latest_custody_hash" || "$latest_custody_hash" == "null" ]]; then
+    return 1
+  fi
+  if [[ "$state_json" != *"\"type\":\"HandResult\""* ]]; then
+    return 1
+  fi
+  if [[ "$state_json" != *"\"handId\":\"$hand_id\""* ]]; then
+    return 1
+  fi
+  if [[ "$state_json" != *"\"latestCustodyStateHash\":\"$latest_custody_hash\""* ]]; then
+    return 1
+  fi
+  return 0
 }
 
 docker_compose() {
@@ -573,6 +646,21 @@ cleanup_nigiri_data() {
   rm -rf "$NIGIRI_DATADIR"
 }
 
+prepare_nigiri_data_dirs() {
+  mkdir -p \
+    "$NIGIRI_DATADIR/volumes/bitcoin" \
+    "$NIGIRI_DATADIR/volumes/elements" \
+    "$NIGIRI_DATADIR/volumes/postgres" \
+    "$NIGIRI_DATADIR/volumes/tapd" \
+    "$NIGIRI_DATADIR/volumes/ark/wallet" \
+    "$NIGIRI_DATADIR/volumes/ark/data" \
+    "$NIGIRI_DATADIR/volumes/lnd" \
+    "$NIGIRI_DATADIR/volumes/nbxplorer" \
+    "$NIGIRI_DATADIR/volumes/lightningd"
+
+  chmod -R 0777 "$NIGIRI_DATADIR/volumes" 2>/dev/null || true
+}
+
 stop_nigiri_stack() {
   local pid=""
   local i
@@ -588,7 +676,9 @@ stop_nigiri_stack() {
   terminate_pid "$pid"
   wait "$pid" 2>/dev/null || true
   force_cleanup_nigiri_docker
-  cleanup_nigiri_data
+  if ! keep_failed_run_enabled; then
+    cleanup_nigiri_data
+  fi
 }
 
 free_port() {
@@ -676,11 +766,13 @@ start_nigiri_stack() {
   for attempt in 1 2 3; do
     stop_nigiri_stack
     mkdir -p "$NIGIRI_DATADIR"
+    prepare_nigiri_data_dirs
     : >"$BASE/nigiri-start.log"
 
     echo "Starting Nigiri (attempt ${attempt}/3)..."
     nigiri_cmd start --ark --ln --ci >"$BASE/nigiri-start.log" 2>&1 &
     NIGIRI_START_PID=$!
+    prepare_nigiri_data_dirs
 
     if wait_for_http_json "http://127.0.0.1:7070/v1/info" 120 1 >/dev/null &&
       seed_ark_liquidity &&
@@ -701,6 +793,12 @@ start_nigiri_stack() {
 
   echo "Nigiri failed to become ready after 3 attempts" >&2
   return 1
+}
+
+prebuild_parker_go_binaries() {
+  echo "Prebuilding Parker Go binaries..."
+  PARKER_BUILD_ONLY=1 "$ROOT_DIR/scripts/bin/parker-daemon" >/dev/null
+  PARKER_BUILD_ONLY=1 "$ROOT_DIR/scripts/bin/parker-cli" >/dev/null
 }
 
 select_table_action() {
@@ -927,7 +1025,9 @@ print_local_stack_summary() {
 }
 
 play_hand_automatically() {
+  local require_hand_number_gt="${1:-}"
   local state_json=""
+  local candidate_state_json=""
   local hand_id=""
   local hand_number=""
   local initial_hand_number=""
@@ -940,14 +1040,32 @@ play_hand_automatically() {
   local amount=""
   local current_bet=""
   local pot_sats=""
-  local turns=60
+  local max_wait_seconds=90
+  local start_epoch=0
   local turn
+  local -a watch_profiles=()
+  local profile=""
+  local action_profile=""
 
   if tor_enabled; then
-    turns=180
+    max_wait_seconds=180
+  fi
+  if [[ -n "$HAND_SETTLE_TIMEOUT_SECONDS" ]]; then
+    max_wait_seconds="$HAND_SETTLE_TIMEOUT_SECONDS"
   fi
 
-  for ((turn = 0; turn < turns; turn += 1)); do
+  watch_profiles=("$WATCH_PROFILE")
+  for profile in "$PLAYER_ONE_PROFILE" "$PLAYER_TWO_PROFILE"; do
+    if [[ -n "$profile" && ! " ${watch_profiles[*]} " =~ " ${profile} " ]]; then
+      watch_profiles+=("$profile")
+    fi
+  done
+
+  start_epoch="$(date +%s)"
+  for ((turn = 0; ; turn += 1)); do
+    if (( "$(date +%s)" - start_epoch >= max_wait_seconds )); then
+      break
+    fi
     state_json="$(watch_table_state_with_retry "$WATCH_PROFILE")"
     hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId)"
     hand_number="$(printf '%s' "$state_json" | json_field data.publicState.handNumber)"
@@ -958,28 +1076,47 @@ play_hand_automatically() {
       sleep 0.25
       continue
     fi
-    if [[ -z "$initial_hand_number" && -n "$hand_number" && "$hand_number" != "null" ]]; then
-      initial_hand_number="$hand_number"
-    fi
-    if [[ "$phase" == "settled" ]]; then
-      printf '%s\n' "$state_json"
-      return 0
-    fi
-    if [[ -n "$initial_hand_number" && "$initial_hand_number" != "null" && "$latest_snapshot_phase" == "settled" && "$latest_snapshot_hand_number" == "$initial_hand_number" ]]; then
-      printf '%s\n' "$state_json"
-      return 0
-    fi
-
-    action_line="$(printf '%s' "$state_json" | select_table_action)"
-    if [[ -z "$action_line" ]]; then
+    if [[ -n "$require_hand_number_gt" && "$require_hand_number_gt" != "null" && "$hand_number" =~ ^[0-9]+$ ]] && (( hand_number <= require_hand_number_gt )); then
       sleep 0.25
       continue
     fi
-    if [[ "$action_line" == "settled" ]]; then
+    if [[ -z "$initial_hand_number" && -n "$hand_number" && "$hand_number" != "null" ]]; then
+      initial_hand_number="$hand_number"
+    fi
+    if table_has_settled_custody_checkpoint "$state_json"; then
       printf '%s\n' "$state_json"
       return 0
     fi
+    if [[ "$phase" == "settled" ]]; then
+      sleep 0.25
+      continue
+    fi
+    if [[ -n "$initial_hand_number" && "$initial_hand_number" != "null" && "$latest_snapshot_phase" == "settled" && "$latest_snapshot_hand_number" == "$initial_hand_number" ]]; then
+      sleep 0.25
+      continue
+    fi
 
+    action_line=""
+    action_profile="$WATCH_PROFILE"
+    for profile in "${watch_profiles[@]}"; do
+      if [[ "$profile" != "$WATCH_PROFILE" ]]; then
+        candidate_state_json="$(watch_table_state_with_retry "$profile")"
+        if table_has_settled_custody_checkpoint "$candidate_state_json"; then
+          printf '%s\n' "$candidate_state_json"
+          return 0
+        fi
+        state_json="$candidate_state_json"
+      fi
+      action_line="$(printf '%s' "$state_json" | select_table_action)"
+      if [[ -n "$action_line" && "$action_line" != "settled" ]]; then
+        action_profile="$profile"
+        break
+      fi
+    done
+    if [[ -z "$action_line" || "$action_line" == "settled" ]]; then
+      sleep 0.25
+      continue
+    fi
     actor=""
     action=""
     amount=""
@@ -992,13 +1129,36 @@ play_hand_automatically() {
       "$action" \
       "$(if [[ -n "$amount" ]]; then printf ',"totalSats":%s' "$amount"; fi)" \
       "$phase" \
-      "${pot_sats:-0}"
+      "${pot_sats:-0}" >&2
     send_table_action_with_retry "$actor" "$action" "$amount"
     sleep 0.4
   done
 
   echo "hand did not settle in time" >&2
   return 1
+}
+
+hand_has_net_transfer() {
+  local state_json="$1"
+  local player_one_balance=""
+  local player_two_balance=""
+
+  player_one_balance="$(json_field "data.publicState.chipBalances.${PLAYER_ONE_PLAYER_ID}" <<<"$state_json" 2>/dev/null || true)"
+  player_two_balance="$(json_field "data.publicState.chipBalances.${PLAYER_TWO_PLAYER_ID}" <<<"$state_json" 2>/dev/null || true)"
+  if [[ -z "$player_one_balance" || "$player_one_balance" == "null" || -z "$player_two_balance" || "$player_two_balance" == "null" ]]; then
+    return 1
+  fi
+  if [[ "$player_one_balance" != "$BUY_IN_SATS" || "$player_two_balance" != "$BUY_IN_SATS" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+write_table_artifact() {
+  local profile="$1"
+  local path="$2"
+  mkdir -p "$(dirname "$path")"
+  watch_table_state_with_retry "$profile" >"$path"
 }
 
 INDEXER_PORT="${INDEXER_PORT:-$(free_port)}"
@@ -1020,7 +1180,6 @@ fi
 rm -rf "$BASE" "$TOR_STATE_BASE"
 mkdir -p "$BASE"/{daemons,profiles,runs,tor}
 mkdir -p "$TOR_STATE_BASE"
-mkdir -p "$NIGIRI_DATADIR"
 
 common_flags=(
   --network regtest
@@ -1060,6 +1219,7 @@ if tor_enabled; then
   WATCH_PROFILE="host"
 fi
 
+prebuild_parker_go_binaries
 start_nigiri_stack
 
 if tor_enabled; then
@@ -1200,6 +1360,8 @@ INVITE_CODE="$(printf '%s' "$CREATE_JSON" | json_field data.inviteCode)"
 TABLE_ID="$(printf '%s' "$CREATE_JSON" | json_field data.table.tableId)"
 
 echo "TABLE_ID=$TABLE_ID"
+echo "Waiting for host to observe the new table..."
+watch_table_state_with_retry host >/dev/null
 
 echo "Joining players..."
 buy_in_profile "$PLAYER_ONE_PROFILE"
@@ -1207,6 +1369,7 @@ buy_in_profile "$PLAYER_TWO_PROFILE"
 echo "Waiting for players to observe the active table..."
 wait_for_table_status "$PLAYER_ONE_PROFILE" active 2 >/dev/null
 wait_for_table_status "$PLAYER_TWO_PROFILE" active 2 >/dev/null
+write_table_artifact host "$BASE/artifacts/table-active.json"
 
 write_runtime_env
 
@@ -1216,15 +1379,54 @@ if setup_only_enabled; then
   exit 0
 fi
 
-echo "Playing one hand automatically..."
-play_hand_automatically >/dev/null
+echo "Playing automatic hands until funds move..."
+FINAL_TABLE_JSON=""
+LAST_SETTLED_HAND_NUMBER=""
+MAX_SETTLED_HANDS=1
+if ! host_player_scenario_enabled; then
+  MAX_SETTLED_HANDS=5
+fi
+for ((settled_hand = 1; settled_hand <= MAX_SETTLED_HANDS; settled_hand += 1)); do
+  FINAL_TABLE_JSON="$(play_hand_automatically "$LAST_SETTLED_HAND_NUMBER")"
+  LAST_SETTLED_HAND_NUMBER="$(json_field data.publicState.handNumber <<<"$FINAL_TABLE_JSON")"
+  if host_player_scenario_enabled || hand_has_net_transfer "$FINAL_TABLE_JSON"; then
+    break
+  fi
+  printf 'Hand %s settled without net chip transfer; continuing to the next hand...\n' "${LAST_SETTLED_HAND_NUMBER:-unknown}"
+  FINAL_TABLE_JSON=""
+done
+if [[ -z "$FINAL_TABLE_JSON" ]]; then
+  echo "round did not produce a net chip transfer within $MAX_SETTLED_HANDS settled hands" >&2
+  exit 1
+fi
+mkdir -p "$BASE/artifacts"
+printf '%s\n' "$FINAL_TABLE_JSON" >"$BASE/artifacts/table-after-hand.json"
 
 echo "Final table state:"
-watch_table_state_with_retry "$WATCH_PROFILE"
+printf '%s\n' "$FINAL_TABLE_JSON"
+
+CASHOUT_FIRST_PROFILE="$PLAYER_ONE_PROFILE"
+CASHOUT_SECOND_PROFILE="$PLAYER_TWO_PROFILE"
+CURRENT_HOST_PEER_ID="$(printf '%s' "$FINAL_TABLE_JSON" | json_field data.currentHost.peer.peerId)"
+if [[ -z "$CURRENT_HOST_PEER_ID" || "$CURRENT_HOST_PEER_ID" == "null" ]]; then
+  CURRENT_HOST_PEER_ID="$(printf '%s' "$FINAL_TABLE_JSON" | json_field data.config.hostPeerId)"
+fi
+if [[ -n "$CURRENT_HOST_PEER_ID" ]]; then
+  if [[ "$CURRENT_HOST_PEER_ID" == "${PLAYER_TWO_PEER_ID:-}" ]]; then
+    CASHOUT_FIRST_PROFILE="$PLAYER_TWO_PROFILE"
+    CASHOUT_SECOND_PROFILE="$PLAYER_ONE_PROFILE"
+  elif [[ "$CURRENT_HOST_PEER_ID" == "${PLAYER_ONE_PEER_ID:-}" ]]; then
+    CASHOUT_FIRST_PROFILE="$PLAYER_ONE_PROFILE"
+    CASHOUT_SECOND_PROFILE="$PLAYER_TWO_PROFILE"
+  fi
+fi
 
 echo "Cashing out..."
-cashout_profile "$PLAYER_ONE_PROFILE"
-cashout_profile "$PLAYER_TWO_PROFILE"
+cashout_profile "$CASHOUT_FIRST_PROFILE"
+if [[ "$CASHOUT_SECOND_PROFILE" != "$CASHOUT_FIRST_PROFILE" ]]; then
+  cashout_profile "$CASHOUT_SECOND_PROFILE"
+fi
+write_table_artifact host "$BASE/artifacts/table-after-cashout.json"
 
 echo "Final wallet summaries:"
 pcli wallet --profile "$PLAYER_ONE_PROFILE" --json

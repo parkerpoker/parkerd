@@ -3,6 +3,8 @@ package meshruntime
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -17,10 +19,13 @@ const (
 	nativeHostHeartbeatMS       = 1000
 	nativeHostFailureMS         = 3500
 	nativeHandProtocolTimeoutMS = 1500
+	nativeActionTimeoutMS       = 4000
 	nativeNextHandDelayMS       = 1000
 	nativePollIntervalMS        = 500
 	nativeTableSyncInterval     = 1 * time.Second
 )
+
+var errStoredProtocolVersionMismatch = errors.New("stored table protocol version mismatch")
 
 type meshStore struct {
 	config      cfg.RuntimeConfig
@@ -57,6 +62,9 @@ func (store *meshStore) readTable(tableID string) (*nativeTableState, error) {
 	var table nativeTableState
 	if err := json.Unmarshal(data, &table); err != nil {
 		return nil, err
+	}
+	if err := validateStoredTableProtocolVersion(table); err != nil {
+		return nil, fmt.Errorf("%w: %v", errStoredProtocolVersionMismatch, err)
 	}
 	return &table, nil
 }
@@ -130,9 +138,38 @@ func (store *meshStore) readPublicAds() (map[string]NativeAdvertisement, error) 
 		if err := json.Unmarshal(raw, &ad); err != nil {
 			return nil, err
 		}
+		if strings.TrimSpace(ad.ProtocolVersion) != nativeProtocolVersion {
+			continue
+		}
 		decoded[tableID] = ad
 	}
 	return decoded, nil
+}
+
+func validateStoredTableProtocolVersion(table nativeTableState) error {
+	if strings.TrimSpace(table.Config.ProtocolVersion) != nativeProtocolVersion {
+		return fmt.Errorf("table protocol version mismatch")
+	}
+	if table.Advertisement != nil && strings.TrimSpace(table.Advertisement.ProtocolVersion) != nativeProtocolVersion {
+		return fmt.Errorf("advertisement protocol version mismatch")
+	}
+	if table.LatestSnapshot != nil && strings.TrimSpace(table.LatestSnapshot.ProtocolVersion) != nativeProtocolVersion {
+		return fmt.Errorf("latest snapshot protocol version mismatch")
+	}
+	if table.LatestFullySignedSnapshot != nil && strings.TrimSpace(table.LatestFullySignedSnapshot.ProtocolVersion) != nativeProtocolVersion {
+		return fmt.Errorf("latest fully signed snapshot protocol version mismatch")
+	}
+	for index, event := range table.Events {
+		if strings.TrimSpace(event.ProtocolVersion) != nativeProtocolVersion {
+			return fmt.Errorf("event %d protocol version mismatch", index)
+		}
+	}
+	for index, snapshot := range table.Snapshots {
+		if strings.TrimSpace(snapshot.ProtocolVersion) != nativeProtocolVersion {
+			return fmt.Errorf("snapshot %d protocol version mismatch", index)
+		}
+	}
+	return nil
 }
 
 func (store *meshStore) readTableFunds() (NativeTableFundsState, error) {
@@ -202,11 +239,22 @@ func decodeInvite(invite string) (map[string]any, error) {
 }
 
 func nowISO() string {
-	return time.Now().UTC().Format(time.RFC3339)
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+func parseISOTimestamp(timestamp string) (time.Time, error) {
+	trimmed := strings.TrimSpace(timestamp)
+	if trimmed == "" {
+		return time.Time{}, errors.New("empty timestamp")
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, trimmed)
 }
 
 func addMillis(timestamp string, delta int) string {
-	base, err := time.Parse(time.RFC3339, timestamp)
+	base, err := parseISOTimestamp(timestamp)
 	if err != nil {
 		base = time.Now().UTC()
 	}
@@ -217,7 +265,7 @@ func elapsedMillis(timestamp string) int64 {
 	if timestamp == "" {
 		return 1 << 62
 	}
-	value, err := time.Parse(time.RFC3339, timestamp)
+	value, err := parseISOTimestamp(timestamp)
 	if err != nil {
 		return 1 << 62
 	}

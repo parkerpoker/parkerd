@@ -138,7 +138,7 @@ type HoldemHandConfig struct {
 	DealerSeatIndex int
 	SmallBlindSats  int
 	BigBlindSats    int
-	Seats           [2]HoldemSeatConfig
+	Seats           []HoldemSeatConfig
 }
 
 type HoldemState struct {
@@ -155,7 +155,7 @@ type HoldemState struct {
 	RaiseLockedSeatIndex *int
 	PotSats              int
 	Board                []CardCode
-	Players              [2]HoldemPlayerState
+	Players              []HoldemPlayerState
 	Winners              []HoldemWinner
 	ShowdownScores       map[string]HandScore
 	ActionLog            []HoldemActionRecord
