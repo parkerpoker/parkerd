@@ -51,6 +51,7 @@ type cliDataEnvelope[T any] struct {
 }
 
 type regtestRoundResult struct {
+	Scenario           string
 	Output             string
 	RunRoot            string
 	TableActivePath    string
@@ -114,7 +115,7 @@ func runRegtestRoundScenario(t *testing.T, scenario string) regtestRoundResult {
 	text := string(output)
 	for _, marker := range []string{
 		"TABLE_ID=",
-		"Playing one hand automatically...",
+		"Playing automatic hands until funds move...",
 		"Cashing out...",
 		"Final wallet summaries:",
 		"Done. Logs are under",
@@ -125,6 +126,7 @@ func runRegtestRoundScenario(t *testing.T, scenario string) regtestRoundResult {
 	}
 	cleanupRunRoot = true
 	return regtestRoundResult{
+		Scenario:           scenario,
 		Output:             text,
 		RunRoot:            runRoot,
 		TableActivePath:    filepath.Join(baseDir, "artifacts", "table-active.json"),
@@ -211,6 +213,8 @@ func assertRegtestRoundCustodyArtifacts(t *testing.T, result regtestRoundResult)
 
 	afterHand := loadIntegrationTableView(t, result.TableAfterHandPath)
 	afterCashout := loadIntegrationTableView(t, result.TableAfterCashout)
+
+	assertRegtestRoundMovedFunds(t, afterHand)
 
 	handResultCount := 0
 	for index, event := range afterHand.Events {
@@ -340,5 +344,30 @@ func assertRegtestRoundCustodyArtifacts(t *testing.T, result regtestRoundResult)
 	}
 	if cashOutCount < 2 {
 		t.Fatalf("expected at least two CashOut events in regtest round, got %d", cashOutCount)
+	}
+}
+
+func assertRegtestRoundMovedFunds(t *testing.T, table NativeMeshTableView) {
+	t.Helper()
+
+	if table.PublicState == nil {
+		t.Fatal("regtest round is missing public state")
+	}
+	if len(table.PublicState.SeatedPlayers) != 2 {
+		t.Fatalf("expected exactly two seated players in regtest round, got %d", len(table.PublicState.SeatedPlayers))
+	}
+
+	unchangedBalances := 0
+	for _, seated := range table.PublicState.SeatedPlayers {
+		balance, ok := table.PublicState.ChipBalances[seated.PlayerID]
+		if !ok {
+			t.Fatalf("missing chip balance for seated player %s", seated.PlayerID)
+		}
+		if balance == seated.BuyInSats {
+			unchangedBalances++
+		}
+	}
+	if unchangedBalances == len(table.PublicState.SeatedPlayers) {
+		t.Fatalf("regtest round ended without net chip transfer: balances=%v", table.PublicState.ChipBalances)
 	}
 }

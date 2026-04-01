@@ -160,10 +160,12 @@ cleanup() {
   local exit_status=$?
   set +e
   collect_run_daemon_pids() {
-    local metadata pid command_line
+    local metadata metadata_json pid command_line
     for metadata in "$BASE"/daemons/*.json; do
       [[ -f "$metadata" ]] || continue
-      pid="$(json_field pid <"$metadata" 2>/dev/null || true)"
+      metadata_json="$(cat "$metadata" 2>/dev/null || true)"
+      [[ -n "$metadata_json" ]] || continue
+      pid="$(json_field pid <<<"$metadata_json" 2>/dev/null || true)"
       [[ -n "$pid" ]] && printf '%s\n' "$pid"
     done
 
@@ -1023,6 +1025,7 @@ print_local_stack_summary() {
 }
 
 play_hand_automatically() {
+  local require_hand_number_gt="${1:-}"
   local state_json=""
   local candidate_state_json=""
   local hand_id=""
@@ -1070,6 +1073,10 @@ play_hand_automatically() {
     latest_snapshot_phase="$(printf '%s' "$state_json" | json_field data.latestSnapshot.phase)"
     latest_snapshot_hand_number="$(printf '%s' "$state_json" | json_field data.latestSnapshot.handNumber)"
     if [[ -z "$hand_id" || -z "$phase" || "$phase" == "null" ]]; then
+      sleep 0.25
+      continue
+    fi
+    if [[ -n "$require_hand_number_gt" && "$require_hand_number_gt" != "null" && "$hand_number" =~ ^[0-9]+$ ]] && (( hand_number <= require_hand_number_gt )); then
       sleep 0.25
       continue
     fi
@@ -1122,12 +1129,28 @@ play_hand_automatically() {
       "$action" \
       "$(if [[ -n "$amount" ]]; then printf ',"totalSats":%s' "$amount"; fi)" \
       "$phase" \
-      "${pot_sats:-0}"
+      "${pot_sats:-0}" >&2
     send_table_action_with_retry "$actor" "$action" "$amount"
     sleep 0.4
   done
 
   echo "hand did not settle in time" >&2
+  return 1
+}
+
+hand_has_net_transfer() {
+  local state_json="$1"
+  local player_one_balance=""
+  local player_two_balance=""
+
+  player_one_balance="$(json_field "data.publicState.chipBalances.${PLAYER_ONE_PLAYER_ID}" <<<"$state_json" 2>/dev/null || true)"
+  player_two_balance="$(json_field "data.publicState.chipBalances.${PLAYER_TWO_PLAYER_ID}" <<<"$state_json" 2>/dev/null || true)"
+  if [[ -z "$player_one_balance" || "$player_one_balance" == "null" || -z "$player_two_balance" || "$player_two_balance" == "null" ]]; then
+    return 1
+  fi
+  if [[ "$player_one_balance" != "$BUY_IN_SATS" || "$player_two_balance" != "$BUY_IN_SATS" ]]; then
+    return 0
+  fi
   return 1
 }
 
@@ -1356,12 +1379,30 @@ if setup_only_enabled; then
   exit 0
 fi
 
-echo "Playing one hand automatically..."
-play_hand_automatically >/dev/null
-write_table_artifact host "$BASE/artifacts/table-after-hand.json"
+echo "Playing automatic hands until funds move..."
+FINAL_TABLE_JSON=""
+LAST_SETTLED_HAND_NUMBER=""
+MAX_SETTLED_HANDS=1
+if ! host_player_scenario_enabled; then
+  MAX_SETTLED_HANDS=5
+fi
+for ((settled_hand = 1; settled_hand <= MAX_SETTLED_HANDS; settled_hand += 1)); do
+  FINAL_TABLE_JSON="$(play_hand_automatically "$LAST_SETTLED_HAND_NUMBER")"
+  LAST_SETTLED_HAND_NUMBER="$(json_field data.publicState.handNumber <<<"$FINAL_TABLE_JSON")"
+  if host_player_scenario_enabled || hand_has_net_transfer "$FINAL_TABLE_JSON"; then
+    break
+  fi
+  printf 'Hand %s settled without net chip transfer; continuing to the next hand...\n' "${LAST_SETTLED_HAND_NUMBER:-unknown}"
+  FINAL_TABLE_JSON=""
+done
+if [[ -z "$FINAL_TABLE_JSON" ]]; then
+  echo "round did not produce a net chip transfer within $MAX_SETTLED_HANDS settled hands" >&2
+  exit 1
+fi
+mkdir -p "$BASE/artifacts"
+printf '%s\n' "$FINAL_TABLE_JSON" >"$BASE/artifacts/table-after-hand.json"
 
 echo "Final table state:"
-FINAL_TABLE_JSON="$(watch_table_state_with_retry "$WATCH_PROFILE")"
 printf '%s\n' "$FINAL_TABLE_JSON"
 
 CASHOUT_FIRST_PROFILE="$PLAYER_ONE_PROFILE"
