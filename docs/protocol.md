@@ -29,10 +29,10 @@ The deterministic recovery path is deliberately narrower than the normal coopera
 Bundles are only stored when the current accepted transition leaves contested pot refs and the next money result is objective:
 
 - action timeout that must auto-fold
-- showdown/private-delivery/reveal timeout that kills the missing player for the contested pot
+- `showdown-reveal` timeout that kills the missing player for the contested pot
 - settled `showdown-payout` timeout
 
-They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result.
+They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result. Earlier protocol-timeout phases such as `private-delivery` still fail closed in v1 unless or until the runtime reaches one of the objectively money-resolving states above.
 
 Each stored bundle carries:
 

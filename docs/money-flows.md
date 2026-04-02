@@ -199,7 +199,7 @@ Current timeout behavior:
 - if `check` is legal, timeout can auto-check
 - otherwise timeout auto-folds
 - reveal/private-delivery/showdown timeout makes the missing player dead for contested pots while refunding unmatched uncontested chips
-- only deterministic money-resolving timeout states get stored recovery bundles
+- only deterministic money-resolving timeout states get stored recovery bundles; in the current v1 runtime that means action auto-fold, `showdown-reveal` timeout, or settled `showdown-payout`
 - those bundles become executable only after the unilateral exit delay `U`
 
 Timeout-driven successors may exclude the dead player from the approval set for the successor that resolves the hand.

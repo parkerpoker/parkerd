@@ -287,8 +287,11 @@ func (runtime *meshRuntime) selectPotCSVExitSpendPath(table nativeTableState, re
 			return custodySpendPath{}, err
 		}
 		playerIDs := make([]string, 0, len(csvClosure.PubKeys))
+		signerXOnlyPubkeys := make([]string, 0, len(csvClosure.PubKeys))
 		for _, pubkey := range csvClosure.PubKeys {
-			playerID, ok, err := runtime.playerIDByXOnlyPubkey(table, hex.EncodeToString(schnorr.SerializePubKey(pubkey)))
+			xOnly := hex.EncodeToString(schnorr.SerializePubKey(pubkey))
+			signerXOnlyPubkeys = append(signerXOnlyPubkeys, xOnly)
+			playerID, ok, err := runtime.playerIDByXOnlyPubkey(table, xOnly)
 			if err != nil {
 				return custodySpendPath{}, err
 			}
@@ -296,14 +299,16 @@ func (runtime *meshRuntime) selectPotCSVExitSpendPath(table nativeTableState, re
 				playerIDs = append(playerIDs, playerID)
 			}
 		}
+		signerXOnlyPubkeys = uniqueNonEmptyStrings(signerXOnlyPubkeys)
 		return custodySpendPath{
-			LeafProof:        leafProof,
-			PKScript:         pkScript,
-			PlayerIDs:        uniqueSortedPlayerIDs(playerIDs),
-			Script:           scriptBytes,
-			Tapscripts:       append([]string(nil), ref.Tapscripts...),
-			UsesCSVLocktime:  true,
-			CSVLocktime:      csvClosure.Locktime,
+			LeafProof:          leafProof,
+			PKScript:           pkScript,
+			PlayerIDs:          uniqueSortedPlayerIDs(playerIDs),
+			SignerXOnlyPubkeys: signerXOnlyPubkeys,
+			Script:             scriptBytes,
+			Tapscripts:         append([]string(nil), ref.Tapscripts...),
+			UsesCSVLocktime:    true,
+			CSVLocktime:        csvClosure.Locktime,
 		}, nil
 	}
 	return custodySpendPath{}, fmt.Errorf("no CSV custody exit leaf found for %s:%d", ref.TxID, ref.VOut)
@@ -591,19 +596,118 @@ func signedRecoveryPSBTInputsComplete(packet *psbt.Packet, spendPaths []custodyS
 		return false
 	}
 	for index, input := range packet.Inputs {
-		required := len(spendPaths[index].PlayerIDs)
-		if required == 0 {
+		requiredSigners := uniqueNonEmptyStrings(spendPaths[index].SignerXOnlyPubkeys)
+		if len(requiredSigners) == 0 {
 			return false
 		}
+		required := make(map[string]struct{}, len(requiredSigners))
+		for _, xOnly := range requiredSigners {
+			required[xOnly] = struct{}{}
+		}
+		leafHash := txscript.NewBaseTapLeaf(spendPaths[index].Script).TapHash()
 		seen := map[string]struct{}{}
 		for _, signature := range input.TaprootScriptSpendSig {
-			seen[hex.EncodeToString(signature.XOnlyPubKey)] = struct{}{}
+			if signature == nil || !bytes.Equal(signature.LeafHash, leafHash[:]) {
+				return false
+			}
+			xOnly := hex.EncodeToString(signature.XOnlyPubKey)
+			if _, ok := required[xOnly]; !ok {
+				return false
+			}
+			seen[xOnly] = struct{}{}
 		}
-		if len(seen) < required {
+		if len(seen) != len(required) {
 			return false
 		}
 	}
 	return true
+}
+
+func finalizedRecoveryTxFromPacket(packet *psbt.Packet) (*wire.MsgTx, error) {
+	if packet == nil {
+		return nil, errors.New("custody recovery psbt is missing")
+	}
+	recoveryTx := packet.UnsignedTx.Copy()
+	for inputIndex, input := range packet.Inputs {
+		if len(input.TaprootLeafScript) != 1 {
+			return nil, fmt.Errorf("custody recovery psbt input %d is missing its csv leaf proof", inputIndex)
+		}
+		leafScript := input.TaprootLeafScript[0]
+		closure, err := arkscript.DecodeClosure(leafScript.Script)
+		if err != nil {
+			return nil, err
+		}
+		csvClosure, ok := closure.(*arkscript.CSVMultisigClosure)
+		if !ok {
+			return nil, fmt.Errorf("custody recovery psbt input %d does not use a csv multisig leaf", inputIndex)
+		}
+		leafHash := txscript.NewTapLeaf(leafScript.LeafVersion, leafScript.Script).TapHash()
+		signatures := make(map[string][]byte, len(input.TaprootScriptSpendSig))
+		for _, signature := range input.TaprootScriptSpendSig {
+			if signature == nil || !bytes.Equal(signature.LeafHash, leafHash[:]) {
+				return nil, fmt.Errorf("custody recovery psbt input %d contains a signature for the wrong leaf", inputIndex)
+			}
+			rawSignature := append([]byte(nil), signature.Signature...)
+			if signature.SigHash != txscript.SigHashDefault {
+				rawSignature = append(rawSignature, byte(signature.SigHash))
+			}
+			signatures[hex.EncodeToString(signature.XOnlyPubKey)] = rawSignature
+		}
+		witness, err := csvClosure.Witness(leafScript.ControlBlock, signatures)
+		if err != nil {
+			return nil, err
+		}
+		recoveryTx.TxIn[inputIndex].Witness = witness
+	}
+	return recoveryTx, nil
+}
+
+func validateSignedRecoveryPSBT(packet *psbt.Packet, sourceRefs []tablecustody.VTXORef, spendPaths []custodySpendPath) (*wire.MsgTx, error) {
+	if packet == nil {
+		return nil, errors.New("custody recovery psbt is missing")
+	}
+	if len(packet.Inputs) != len(sourceRefs) || len(packet.Inputs) != len(spendPaths) {
+		return nil, errors.New("custody recovery psbt input set is incomplete")
+	}
+	recoveryTx, err := finalizedRecoveryTxFromPacket(packet)
+	if err != nil {
+		return nil, err
+	}
+	prevOuts := txscript.NewMultiPrevOutFetcher(nil)
+	for index, txIn := range recoveryTx.TxIn {
+		prevOut := packet.Inputs[index].WitnessUtxo
+		if prevOut == nil {
+			return nil, fmt.Errorf("custody recovery psbt input %d is missing witness utxo metadata", index)
+		}
+		prevOuts.AddPrevOut(txIn.PreviousOutPoint, &wire.TxOut{
+			PkScript: append([]byte(nil), prevOut.PkScript...),
+			Value:    prevOut.Value,
+		})
+	}
+	sigHashes := txscript.NewTxSigHashes(recoveryTx, prevOuts)
+	for index := range recoveryTx.TxIn {
+		prevOut := prevOuts.FetchPrevOutput(recoveryTx.TxIn[index].PreviousOutPoint)
+		if prevOut == nil {
+			return nil, fmt.Errorf("custody recovery psbt input %d prevout is unavailable", index)
+		}
+		vm, err := txscript.NewEngine(
+			spendPaths[index].PKScript,
+			recoveryTx,
+			index,
+			txscript.StandardVerifyFlags,
+			nil,
+			sigHashes,
+			prevOut.Value,
+			prevOuts,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("custody recovery psbt input %d witness setup failed: %w", index, err)
+		}
+		if err := vm.Execute(); err != nil {
+			return nil, fmt.Errorf("custody recovery psbt input %d witness does not satisfy the shared csv leaf: %w", index, err)
+		}
+	}
+	return recoveryTx, nil
 }
 
 func recoveryOutputRefsFromBundle(bundle tablecustody.CustodyRecoveryBundle) (map[string][]tablecustody.VTXORef, string, error) {
@@ -611,9 +715,13 @@ func recoveryOutputRefsFromBundle(bundle tablecustody.CustodyRecoveryBundle) (ma
 	if err != nil {
 		return nil, "", err
 	}
-	txid := packet.UnsignedTx.TxID()
-	available := make([]tablecustody.VTXORef, 0, len(packet.UnsignedTx.TxOut))
-	for outputIndex, txOut := range packet.UnsignedTx.TxOut {
+	recoveryTx, err := finalizedRecoveryTxFromPacket(packet)
+	if err != nil {
+		return nil, "", err
+	}
+	txid := recoveryTx.TxHash().String()
+	available := make([]tablecustody.VTXORef, 0, len(recoveryTx.TxOut))
+	for outputIndex, txOut := range recoveryTx.TxOut {
 		if bytes.Equal(txOut.PkScript, arktxutils.ANCHOR_PKSCRIPT) && txOut.Value == arktxutils.ANCHOR_VALUE {
 			continue
 		}
@@ -697,6 +805,10 @@ func (runtime *meshRuntime) matchingStoredRecoveryBundle(table nativeTableState,
 		return nil, "", nil
 	}
 	sourceTransition := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	sourceTransitionHash := strings.TrimSpace(sourceTransition.Proof.TransitionHash)
+	if sourceTransitionHash == "" {
+		sourceTransitionHash = tablecustody.HashCustodyTransition(sourceTransition)
+	}
 	outputs, err := runtime.recoveryAuthorizedOutputsForTransition(table, table.LatestCustodyState, target)
 	if err != nil {
 		return nil, "", err
@@ -719,33 +831,18 @@ func (runtime *meshRuntime) matchingStoredRecoveryBundle(table nativeTableState,
 			continue
 		}
 		candidate := bundle
-		return &candidate, sourceTransition.Proof.TransitionHash, nil
+		return &candidate, sourceTransitionHash, nil
 	}
 	return nil, "", nil
 }
 
-func (runtime *meshRuntime) recoveryBundleForTransition(table nativeTableState, target tablecustody.CustodyTransition) (*tablecustody.CustodyRecoveryBundle, string, bool, error) {
+func (runtime *meshRuntime) recoveryBundleForTransition(table nativeTableState, target tablecustody.CustodyTransition) (*tablecustody.CustodyRecoveryBundle, string, error) {
 	if bundle, sourceTransitionHash, err := runtime.matchingStoredRecoveryBundle(table, target); err != nil {
-		return nil, "", false, err
+		return nil, "", err
 	} else if bundle != nil {
-		return bundle, sourceTransitionHash, false, nil
+		return bundle, sourceTransitionHash, nil
 	}
-	if len(table.CustodyTransitions) == 0 {
-		return nil, "", false, nil
-	}
-	sourceTransition := table.CustodyTransitions[len(table.CustodyTransitions)-1]
-	outputs, err := runtime.recoveryAuthorizedOutputsForTransition(table, table.LatestCustodyState, target)
-	if err != nil {
-		return nil, "", false, err
-	}
-	if len(outputs) == 0 {
-		return nil, "", false, nil
-	}
-	bundle, err := runtime.buildRecoveryBundle(table, sourceTransition, target, nil, outputs)
-	if err != nil {
-		return nil, "", false, err
-	}
-	return bundle, "", true, nil
+	return nil, "", nil
 }
 
 func (runtime *meshRuntime) validateStoredRecoveryBundle(table nativeTableState, bundle tablecustody.CustodyRecoveryBundle) error {
@@ -766,6 +863,9 @@ func (runtime *meshRuntime) validateStoredRecoveryBundle(table nativeTableState,
 	}
 	if !signedRecoveryPSBTInputsComplete(packet, spendPaths) {
 		return errors.New("custody recovery bundle is not fully signed")
+	}
+	if _, err := validateSignedRecoveryPSBT(packet, bundle.SourcePotRefs, spendPaths); err != nil {
+		return err
 	}
 	if expected := recoveryBundleHash(bundle); bundle.BundleHash != "" && bundle.BundleHash != expected {
 		return errors.New("custody recovery bundle hash mismatch")
@@ -803,7 +903,7 @@ func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTable
 		return false, nil
 	}
 
-	bundle, sourceTransitionHash, inlineBundle, err := runtime.recoveryBundleForTransition(*table, *transition)
+	bundle, sourceTransitionHash, err := runtime.recoveryBundleForTransition(*table, *transition)
 	if err != nil || bundle == nil {
 		return false, err
 	}
@@ -853,9 +953,6 @@ func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTable
 		Signatures: append([]tablecustody.CustodySignature(nil), approvals...),
 		StateHash:  transition.NextStateHash,
 		VTXORefs:   stackProofRefs(transition.NextState),
-	}
-	if inlineBundle {
-		transition.Proof.RecoveryBundles = []tablecustody.CustodyRecoveryBundle{*bundle}
 	}
 	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(*transition)
 	return true, tablecustody.ValidateTransition(table.LatestCustodyState, *transition)

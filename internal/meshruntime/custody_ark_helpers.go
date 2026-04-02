@@ -21,15 +21,16 @@ import (
 )
 
 type custodySpendPath struct {
-	LeafProof        *arklib.TaprootMerkleProof
-	CSVLocktime      arklib.RelativeLocktime
-	Locktime         arklib.AbsoluteLocktime
-	PKScript         []byte
-	PlayerIDs        []string
-	Script           []byte
-	Tapscripts       []string
-	UsesCSVLocktime  bool
-	UsesCLTVLocktime bool
+	LeafProof          *arklib.TaprootMerkleProof
+	CSVLocktime        arklib.RelativeLocktime
+	Locktime           arklib.AbsoluteLocktime
+	PKScript           []byte
+	PlayerIDs          []string
+	SignerXOnlyPubkeys []string
+	Script             []byte
+	Tapscripts         []string
+	UsesCSVLocktime    bool
+	UsesCLTVLocktime   bool
 }
 
 type custodyInputSpec struct {

@@ -197,6 +197,9 @@ func TestRecoveryPSBTValidationAndRemoteSigningAuthorization(t *testing.T) {
 	if bundle == nil {
 		t.Fatal("expected recovery bundle")
 	}
+	if err := host.validateStoredRecoveryBundle(table, *bundle); err != nil {
+		t.Fatalf("validate signed recovery bundle: %v", err)
+	}
 	sourceRefs := sourcePotRecoveryRefs(&blindTransition.NextState)
 	spendPaths := make([]custodySpendPath, 0, len(sourceRefs))
 	for _, ref := range sourceRefs {
@@ -292,6 +295,50 @@ func TestActionTimeoutRecoveryMatchesCooperativeSuccessor(t *testing.T) {
 	}
 	if !reflect.DeepEqual(comparableSemanticCustodyTransition(lastTransition), comparableSemanticCustodyTransition(expectedTransition)) {
 		t.Fatalf("expected recovered timeout to match cooperative semantics")
+	}
+}
+
+func TestRecoveryFailsClosedWithoutStoredSourceBundle(t *testing.T) {
+	host, _, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
+
+	lastIndex := len(before.CustodyTransitions) - 1
+	before.CustodyTransitions[lastIndex].Proof.RecoveryBundles = nil
+	latest := cloneJSON(before.CustodyTransitions[lastIndex].NextState)
+	before.LatestCustodyState = &latest
+	before.LatestCustodyState.ActionDeadlineAt = addMillis(nowISO(), -1)
+	before.LatestCustodyState.PublicStateHash = host.publicMoneyStateHash(before, &before.ActiveHand.State)
+
+	actingSeatIndex := *before.ActiveHand.State.ActingSeatIndex
+	actingPlayerID := seatPlayerID(before, actingSeatIndex)
+	legalActions := game.GetLegalActions(before.ActiveHand.State, before.ActiveHand.State.ActingSeatIndex)
+	actionTypes := make([]string, 0, len(legalActions))
+	for _, legalAction := range legalActions {
+		actionTypes = append(actionTypes, string(legalAction.Type))
+	}
+	resolution := tablecustody.BuildTimeoutResolution(defaultCustodyTimeoutPolicy, actingPlayerID, actionTypes, []string{actingPlayerID})
+	action := game.Action{Type: game.ActionFold}
+	nextState, err := game.ApplyHoldemAction(before.ActiveHand.State, actingSeatIndex, action)
+	if err != nil {
+		t.Fatalf("apply timeout fold: %v", err)
+	}
+	recoveredTransition, err := host.buildCustodyTransition(before, tablecustody.TransitionKindTimeout, &nextState, &action, &resolution)
+	if err != nil {
+		t.Fatalf("build timeout transition: %v", err)
+	}
+
+	recoveredTable := cloneJSON(before)
+	handled, err := host.finalizeCustodyRecoveryTransition(&recoveredTable, &recoveredTransition, nil)
+	if err != nil {
+		t.Fatalf("finalize recovery without stored source bundle: %v", err)
+	}
+	if handled {
+		t.Fatal("expected recovery to fail closed without a stored source bundle")
+	}
+	if recoveredTransition.Proof.RecoveryWitness != nil {
+		t.Fatal("expected no recovery witness when no stored source bundle exists")
+	}
+	if len(recoveredTransition.Proof.RecoveryBundles) != 0 {
+		t.Fatal("expected no inline recovery bundle fallback on the recovered transition")
 	}
 }
 
@@ -418,6 +465,18 @@ func TestAcceptedCustodyHistoryReplaysRecoveryWitnessOfflineAndRejectsTampering(
 	})
 	if err := host.validateAcceptedCustodyHistory(nil, tamperedBundle); err == nil {
 		t.Fatal("expected tampered recovery bundle to be rejected")
+	}
+	tamperedSignatureBundle := tamperAcceptedCustodyTransitionForTest(recovered, sourceIndex, func(transition *tablecustody.CustodyTransition) {
+		packet := mustDecodePSBTForReplayTest(t, transition.Proof.RecoveryBundles[0].SignedPSBT)
+		if len(packet.Inputs[0].TaprootScriptSpendSig) == 0 {
+			t.Fatal("expected recovery bundle signatures")
+		}
+		packet.Inputs[0].TaprootScriptSpendSig[0].Signature[0] ^= 0x01
+		transition.Proof.RecoveryBundles[0].SignedPSBT = mustEncodePSBTForReplayTest(t, packet)
+		transition.Proof.RecoveryBundles[0].BundleHash = tablecustody.HashCustodyRecoveryBundle(transition.Proof.RecoveryBundles[0])
+	})
+	if err := host.validateAcceptedCustodyHistory(nil, tamperedSignatureBundle); err == nil || !strings.Contains(strings.ToLower(err.Error()), "witness") {
+		t.Fatalf("expected tampered recovery signature to be rejected, got %v", err)
 	}
 
 	witnessIndex := len(recovered.CustodyTransitions) - 1

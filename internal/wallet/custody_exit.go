@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
 	arktxutils "github.com/arkade-os/arkd/pkg/ark-lib/txutils"
 	arksdk "github.com/arkade-os/go-sdk"
 	arkexplorer "github.com/arkade-os/go-sdk/explorer"
@@ -27,6 +28,45 @@ import (
 )
 
 const unilateralExitSweepTimeout = 90 * time.Second
+
+func finalizedCustodyRecoveryTx(packet *psbt.Packet) (*wire.MsgTx, error) {
+	if packet == nil {
+		return nil, errors.New("custody recovery psbt is missing")
+	}
+	recoveryTx := packet.UnsignedTx.Copy()
+	for inputIndex, input := range packet.Inputs {
+		if len(input.TaprootLeafScript) != 1 {
+			return nil, fmt.Errorf("custody recovery psbt input %d is missing its csv leaf proof", inputIndex)
+		}
+		leafScript := input.TaprootLeafScript[0]
+		closure, err := arkscript.DecodeClosure(leafScript.Script)
+		if err != nil {
+			return nil, err
+		}
+		csvClosure, ok := closure.(*arkscript.CSVMultisigClosure)
+		if !ok {
+			return nil, fmt.Errorf("custody recovery psbt input %d does not use a csv multisig leaf", inputIndex)
+		}
+		leafHash := txscript.NewTapLeaf(leafScript.LeafVersion, leafScript.Script).TapHash()
+		signatures := make(map[string][]byte, len(input.TaprootScriptSpendSig))
+		for _, signature := range input.TaprootScriptSpendSig {
+			if signature == nil || !bytes.Equal(signature.LeafHash, leafHash[:]) {
+				return nil, fmt.Errorf("custody recovery psbt input %d contains a signature for the wrong leaf", inputIndex)
+			}
+			rawSignature := append([]byte(nil), signature.Signature...)
+			if signature.SigHash != txscript.SigHashDefault {
+				rawSignature = append(rawSignature, byte(signature.SigHash))
+			}
+			signatures[hex.EncodeToString(signature.XOnlyPubKey)] = rawSignature
+		}
+		witness, err := csvClosure.Witness(leafScript.ControlBlock, signatures)
+		if err != nil {
+			return nil, err
+		}
+		recoveryTx.TxIn[inputIndex].Witness = witness
+	}
+	return recoveryTx, nil
+}
 
 func (runtime *Runtime) liveOrCachedArkConfig(ctx context.Context, profileName string, state PlayerProfileState, client arksdk.ArkClient) (*CustodyArkConfig, error) {
 	config, err := client.GetConfigData(ctx)
@@ -224,12 +264,7 @@ func (runtime *Runtime) ExecuteCustodyRecoveryTransaction(profileName, signedPSB
 	if err != nil {
 		return CustodyRecoveryResult{}, err
 	}
-	for inputIndex := range packet.Inputs {
-		if _, err := psbt.MaybeFinalize(packet, inputIndex); err != nil {
-			return CustodyRecoveryResult{}, err
-		}
-	}
-	parentTx, err := arktxutils.ExtractWithAnchors(packet)
+	parentTx, err := finalizedCustodyRecoveryTx(packet)
 	if err != nil {
 		return CustodyRecoveryResult{}, err
 	}
