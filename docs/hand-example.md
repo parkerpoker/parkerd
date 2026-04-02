@@ -59,8 +59,9 @@ Important note on `R`:
 
 Important note on deterministic recovery:
 
-- deterministic contested-pot recovery uses fully signed recovery PSBTs over the shared pot CSV exit whenever the later money result is already objective
-- if the cooperative path stalls, that stored bundle can execute after `U` and still produce the same winner-owned stack refs the cooperative successor would have created
+- v1 does not rely on an output-inspecting tapscript branch to detect who won a contested pot
+- instead, when an accepted heads-up source transition leaves live contested pot refs and a later timeout or payout result is already objective, Parker stores a fully signed recovery PSBT over the shared pot CSV exit
+- if the cooperative path later stalls, that stored bundle can execute after `U` and still produce the same ordinary winner-owned stack refs the cooperative successor would have created
 
 Notation used below:
 
@@ -159,13 +160,13 @@ Important details:
 
 ### 3. How Parker Chooses the Leaf
 
-When a batch is built, Parker parses the ref's tapscript tree and picks the leaf whose signer set matches the current successor:
+When Parker prepares a live cooperative spend, it parses the ref's tapscript tree and picks the leaf whose signer set matches the current successor:
 
 - ordinary live updates pick the cooperative leaf
 - timeout successors prefer the CLTV timeout leaf
-- emergency or unilateral recovery eventually uses the CSV exit leaf
+- deterministic contested-pot recovery instead uses the shared CSV exit leaf through the stored pre-signed bundle
 
-This matching is done by `selectCustodySpendPath(...)`.
+Live cooperative spends use `selectCustodySpendPath(...)`. Deterministic pot recovery uses the dedicated shared-pot CSV selector in `selectPotCSVExitSpendPath(...)`.
 
 ## What Cards Do And Do Not Do
 
@@ -663,9 +664,10 @@ So Bob does not need Alice to sign after Alice has already missed the deadline a
 
 The accepted source transition that left `P_2` live also stores a deterministic recovery bundle:
 
-- it spends `P_2` through the shared CSV pot exit
+- it is attached to that accepted source transition before the source step is treated as complete
+- it spends `P_2` through the shared CSV pot exit, not through a special winner-detecting tapscript branch
 - it is fully signed before the source transition is accepted
-- it exact-commits to `S_B_timeout` as the only money-resolving output
+- it exact-commits to `S_B_timeout` as the only money-resolving custody output, plus the required anchor output
 - it becomes executable only after `U`
 
 So if the live cooperative timeout finalization fails after `D`, the table can still recover later by:
@@ -682,6 +684,7 @@ If timeout had resolved to `check` instead:
 - the custody sequence would still advance
 - the refs could stay unchanged
 - no new Ark batch would be required
+- no winner-take-all recovery bundle would exist yet, because no objective redistribution had happened
 
 ## Worked Example 4: A Player Abandons During Showdown Reveal
 
@@ -730,8 +733,9 @@ Again, the missing player is excluded where appropriate from the payout successo
 
 One subtle but important rule from the current runtime:
 
-- reveal/private-delivery/showdown timeout refunds uncontested stack
-- it does not gift uncontested chips to the surviving player
+- showdown-reveal timeout refunds uncontested stack
+- earlier protocol failures such as `private-delivery` still fail closed unless or until the runtime reaches a later objective money-resolving state
+- the timeout path does not gift uncontested chips to the surviving player
 
 So the timeout only transfers the actually contested money.
 
@@ -848,7 +852,7 @@ Deterministic recovery uses a second proof surface:
 
 - the source transition stores `CustodyProof.RecoveryBundles`
 - the executed `timeout` or `showdown-payout` transition stores `CustodyProof.RecoveryWitness`
-- replay validates the stored signed PSBT, the exact source pot refs, the CSV leaf/sequence, the authorized outputs, and the recovery tx metadata
+- replay validates the stored signed PSBT, executes the finalized witness against the CSV leaf offline, and checks the exact source pot refs, authorized outputs, and recovery tx metadata
 - replay then derives the winner-owned stack refs from the recovery PSBT itself and exact-matches them against `NextState` and `Proof.VTXORefs`
 
 So the important distinction is:
