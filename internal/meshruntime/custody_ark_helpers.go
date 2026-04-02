@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
 	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
@@ -59,6 +60,10 @@ type custodySettlementPlan struct {
 const (
 	defaultRealCustodyReserveTransitions = 8
 	minimumRealCustodyReserveSats        = 10_000
+	// Ark/Bitcoin evaluates CLTV against chain time, which can lag local wall
+	// clock. Encode timeout leaves slightly before the visible protocol deadline
+	// so the timeout path is mature once the runtime decides the deadline elapsed.
+	custodyTimeoutLocktimeSlack = 2 * time.Minute
 )
 
 func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, error) {
@@ -136,7 +141,7 @@ func xOnlyPubkeyHexFromCompressed(value string) (string, error) {
 	return hex.EncodeToString(schnorr.SerializePubKey(pubkey)), nil
 }
 
-func absoluteLocktimeFromISO(value string) (arklib.AbsoluteLocktime, error) {
+func timeoutLocktimeFromISO(value string) (arklib.AbsoluteLocktime, error) {
 	if strings.TrimSpace(value) == "" {
 		return 0, errors.New("missing action deadline")
 	}
@@ -144,6 +149,7 @@ func absoluteLocktimeFromISO(value string) (arklib.AbsoluteLocktime, error) {
 	if err != nil {
 		return 0, err
 	}
+	timestamp = timestamp.Add(-custodyTimeoutLocktimeSlack)
 	return arklib.AbsoluteLocktime(timestamp.Unix()), nil
 }
 
@@ -311,7 +317,7 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 	closures = append(closures, &arkscript.MultisigClosure{PubKeys: collaborativeKeys})
 
 	if transition.NextState.ActionDeadlineAt != "" {
-		locktime, err := absoluteLocktimeFromISO(transition.NextState.ActionDeadlineAt)
+		locktime, err := timeoutLocktimeFromISO(transition.NextState.ActionDeadlineAt)
 		if err != nil {
 			return custodyOutputSpec{}, err
 		}
@@ -593,13 +599,15 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			transition.NextState.StackClaims[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
 			continue
 		}
-		inputRefs := append([]tablecustody.VTXORef(nil), nextClaim.VTXORefs...)
+		inputRefs := []tablecustody.VTXORef(nil)
 		if hadPrev {
 			inputRefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
 		} else if transition.Kind == tablecustody.TransitionKindBuyInLock {
 			if seat, ok := seatRecordForPlayer(table, nextClaim.PlayerID); ok && len(seat.FundingRefs) > 0 {
 				inputRefs = append([]tablecustody.VTXORef(nil), seat.FundingRefs...)
 			}
+		} else if len(nextClaim.VTXORefs) > 0 {
+			inputRefs = append([]tablecustody.VTXORef(nil), nextClaim.VTXORefs...)
 		}
 		transition.NextState.StackClaims[index].VTXORefs = nil
 		if len(inputRefs) > 0 {

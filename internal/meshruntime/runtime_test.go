@@ -858,6 +858,65 @@ func TestSettlingActionCarriesCurrentCustodyDeadline(t *testing.T) {
 	}
 }
 
+func TestBuildCustodySettlementPlanDoesNotDuplicateChangedStackRefs(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, host, tableID)
+	if table.ActiveHand == nil || table.ActiveHand.State.ActingSeatIndex == nil {
+		t.Fatalf("expected actionable hand, got %+v", table.ActiveHand)
+	}
+
+	legalActions := game.GetLegalActions(table.ActiveHand.State, table.ActiveHand.State.ActingSeatIndex)
+	if len(legalActions) == 0 {
+		t.Fatal("expected legal actions")
+	}
+	action := game.Action{Type: legalActions[0].Type}
+	for _, candidate := range legalActions {
+		if candidate.Type == game.ActionCall || candidate.Type == game.ActionCheck {
+			action = game.Action{Type: candidate.Type}
+			if candidate.MinTotalSats != nil {
+				action.TotalSats = *candidate.MinTotalSats
+			}
+			break
+		}
+	}
+	nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, *table.ActiveHand.State.ActingSeatIndex, action)
+	if err != nil {
+		t.Fatalf("apply action: %v", err)
+	}
+	transition, err := host.buildCustodyTransition(table, tablecustody.TransitionKindAction, &nextState, &action, nil)
+	if err != nil {
+		t.Fatalf("build action transition: %v", err)
+	}
+	plan, err := host.buildCustodySettlementPlan(table, transition)
+	if err != nil {
+		t.Fatalf("build action settlement plan: %v", err)
+	}
+
+	seenRefs := map[string]int{}
+	for _, input := range plan.Inputs {
+		seenRefs[fundingRefKey(input.Ref)]++
+	}
+	for key, count := range seenRefs {
+		if count != 1 {
+			t.Fatalf("expected settlement plan to spend %s exactly once, got %d", key, count)
+		}
+	}
+
+	actingPlayerID := seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex)
+	claim, ok := latestStackClaimForPlayer(table.LatestCustodyState, actingPlayerID)
+	if !ok {
+		t.Fatalf("missing active stack claim for %s", actingPlayerID)
+	}
+	for _, ref := range claim.VTXORefs {
+		if seenRefs[fundingRefKey(ref)] != 1 {
+			t.Fatalf("expected prior acting stack ref %s to appear exactly once in the settlement plan", fundingRefKey(ref))
+		}
+	}
+}
+
 func TestRefreshPersistedSettledHandKeepsPreviousSnapshotHash(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -4197,6 +4256,86 @@ func TestActionDrivenShowdownArmsProtocolDeadline(t *testing.T) {
 	}
 }
 
+func TestPotTimeoutLocktimeBacksOffVisibleDeadline(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := mustReadNativeTable(t, host, tableID)
+	if table.ActiveHand == nil || table.ActiveHand.State.ActingSeatIndex == nil {
+		t.Fatalf("expected actionable started hand, got %+v", table.ActiveHand)
+	}
+	legalActions := game.GetLegalActions(table.ActiveHand.State, table.ActiveHand.State.ActingSeatIndex)
+	if len(legalActions) == 0 {
+		t.Fatal("expected legal actions")
+	}
+	action := game.Action{Type: legalActions[0].Type}
+	if legalActions[0].MinTotalSats != nil {
+		action.TotalSats = *legalActions[0].MinTotalSats
+	}
+	for _, candidate := range legalActions {
+		if candidate.Type != game.ActionCall && candidate.Type != game.ActionCheck {
+			continue
+		}
+		action = game.Action{Type: candidate.Type}
+		if candidate.MinTotalSats != nil {
+			action.TotalSats = *candidate.MinTotalSats
+		}
+		break
+	}
+	nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, *table.ActiveHand.State.ActingSeatIndex, action)
+	if err != nil {
+		t.Fatalf("apply action: %v", err)
+	}
+	transition, err := host.buildCustodyTransition(table, tablecustody.TransitionKindAction, &nextState, &action, nil)
+	if err != nil {
+		t.Fatalf("build action transition: %v", err)
+	}
+	if transition.NextState.ActionDeadlineAt == "" {
+		t.Fatal("expected visible action deadline on next custody state")
+	}
+	var livePot tablecustody.PotSlice
+	foundPot := false
+	for _, slice := range transition.NextState.PotSlices {
+		if slice.TotalSats <= 0 {
+			continue
+		}
+		livePot = slice
+		foundPot = true
+		break
+	}
+	if !foundPot {
+		t.Fatal("expected a live contested pot on the action successor")
+	}
+	spec, err := host.potOutputSpec(table, transition, livePot, host.potSpendSignerIDsForTransition(table, transition))
+	if err != nil {
+		t.Fatalf("build pot output spec: %v", err)
+	}
+	vtxoScript, err := arkscript.ParseVtxoScript(spec.Tapscripts)
+	if err != nil {
+		t.Fatalf("parse pot tapscripts: %v", err)
+	}
+	deadline, err := parseISOTimestamp(transition.NextState.ActionDeadlineAt)
+	if err != nil {
+		t.Fatalf("parse visible deadline: %v", err)
+	}
+	expectedLocktime := arklib.AbsoluteLocktime(deadline.Add(-custodyTimeoutLocktimeSlack).Unix())
+	foundCLTV := false
+	for _, closure := range vtxoScript.ForfeitClosures() {
+		cltv, ok := closure.(*arkscript.CLTVMultisigClosure)
+		if !ok {
+			continue
+		}
+		foundCLTV = true
+		if cltv.Locktime != expectedLocktime {
+			t.Fatalf("expected timeout locktime %d, got %d", expectedLocktime, cltv.Locktime)
+		}
+	}
+	if !foundCLTV {
+		t.Fatal("expected timeout pot output to include at least one cltv closure")
+	}
+}
+
 func TestSendActionResyncsAfterHostRotation(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -4269,6 +4408,37 @@ func TestSendActionResyncsAfterHostRotation(t *testing.T) {
 	}
 }
 
+func TestActionRetryStateChangedDetectsAcceptedHistoryAdvance(t *testing.T) {
+	previous := nativeTableState{
+		CurrentEpoch: 1,
+		CurrentHost: nativeKnownParticipant{
+			Peer: NativePeerAddress{PeerID: "host-1", PeerURL: "http://host-1"},
+		},
+		Events:        []NativeSignedTableEvent{{Seq: 1}},
+		LastEventHash: "hash-1",
+		Snapshots:     []NativeCooperativeTableSnapshot{{SnapshotID: "snapshot-1"}},
+	}
+	refreshed := cloneJSON(previous)
+	refreshed.Events = append(refreshed.Events, NativeSignedTableEvent{Seq: 2})
+	refreshed.LastEventHash = "hash-2"
+
+	if !actionRetryStateChanged(previous, refreshed) {
+		t.Fatal("expected accepted-history growth to trigger an action retry")
+	}
+}
+
+func TestRetryableActionResponseStateErrorIncludesAcceptedHistoryRollback(t *testing.T) {
+	if !isRetryableActionResponseStateError(errors.New("accepted history would roll back table events")) {
+		t.Fatal("expected event rollback to be retryable")
+	}
+	if !isRetryableActionResponseStateError(errors.New("accepted history would roll back table snapshots")) {
+		t.Fatal("expected snapshot rollback to be retryable")
+	}
+	if isRetryableActionResponseStateError(errors.New("historical event 0 was rewritten")) {
+		t.Fatal("did not expect rewritten history to be retryable")
+	}
+}
+
 func TestRealSettlementUsesExtendedHostFailureWindow(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -4294,6 +4464,18 @@ func TestRealSettlementUsesExtendedHostFailureWindow(t *testing.T) {
 	updated := mustReadNativeTable(t, witness, tableID)
 	if updated.CurrentHost.Peer.PeerID != host.selfPeerID() {
 		t.Fatalf("expected host to remain current host under real-mode heartbeat window, got %q", updated.CurrentHost.Peer.PeerID)
+	}
+}
+
+func TestRealSettlementUsesExtendedTimingWindows(t *testing.T) {
+	runtime := newMeshTestRuntime(t, "host")
+	runtime.config.UseMockSettlement = false
+
+	if got := runtime.handProtocolTimeoutMS(); got != 20_000 {
+		t.Fatalf("expected real-mode hand protocol timeout 20000ms, got %d", got)
+	}
+	if got := runtime.actionTimeoutMS(); got != 16_000 {
+		t.Fatalf("expected real-mode action timeout 16000ms, got %d", got)
 	}
 }
 
@@ -4765,7 +4947,17 @@ func waitForActionableHandState(t *testing.T, runtimes []*meshRuntime, reader *m
 func waitForSettledHand(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(10 * time.Second)
+	waitBudget := 10 * time.Second
+	for _, runtime := range runtimes {
+		if runtime == nil {
+			continue
+		}
+		protocolBudget := time.Duration(runtime.handProtocolTimeoutMS()) * time.Millisecond
+		if candidate := protocolBudget + 5*time.Second; candidate > waitBudget {
+			waitBudget = candidate
+		}
+	}
+	deadline := time.Now().Add(waitBudget)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, reader, tableID)
 		if table.ActiveHand != nil && table.ActiveHand.State.Phase == game.StreetSettled {

@@ -277,11 +277,23 @@ table_has_settled_custody_checkpoint() {
   local state_json="$1"
   local phase=""
   local hand_id=""
+  local hand_number=""
   local latest_custody_hash=""
+  local latest_snapshot_phase=""
+  local latest_snapshot_hand_number=""
+  local pot_sats=""
+  local current_bet_sats=""
+  local acting_seat_index=""
 
   phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
   hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId 2>/dev/null || true)"
+  hand_number="$(printf '%s' "$state_json" | json_field data.publicState.handNumber 2>/dev/null || true)"
   latest_custody_hash="$(printf '%s' "$state_json" | json_field data.latestCustodyState.stateHash 2>/dev/null || true)"
+  latest_snapshot_phase="$(printf '%s' "$state_json" | json_field data.latestSnapshot.phase 2>/dev/null || true)"
+  latest_snapshot_hand_number="$(printf '%s' "$state_json" | json_field data.latestSnapshot.handNumber 2>/dev/null || true)"
+  pot_sats="$(printf '%s' "$state_json" | json_field data.publicState.potSats 2>/dev/null || true)"
+  current_bet_sats="$(printf '%s' "$state_json" | json_field data.publicState.currentBetSats 2>/dev/null || true)"
+  acting_seat_index="$(printf '%s' "$state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
   if [[ -z "$phase" || "$phase" != "settled" ]]; then
     return 1
   fi
@@ -292,7 +304,19 @@ table_has_settled_custody_checkpoint() {
     return 1
   fi
   if [[ "$state_json" != *"\"type\":\"HandResult\""* ]]; then
-    return 1
+    if [[ "$latest_snapshot_phase" != "settled" ]]; then
+      return 1
+    fi
+    if [[ -n "$hand_number" && "$hand_number" != "null" ]] && [[ "$latest_snapshot_hand_number" != "$hand_number" ]]; then
+      return 1
+    fi
+    if [[ "${pot_sats:-}" != "0" || "${current_bet_sats:-}" != "0" ]]; then
+      return 1
+    fi
+    if [[ -n "$acting_seat_index" && "$acting_seat_index" != "null" ]]; then
+      return 1
+    fi
+    return 0
   fi
   if [[ "$state_json" != *"\"handId\":\"$hand_id\""* ]]; then
     return 1
@@ -999,23 +1023,23 @@ send_table_action_with_retry() {
 }
 
 wait_for_action_progress() {
-  local previous_state_json="$1"
-  shift
+  local actor="$1"
+  local previous_state_json="$2"
+  shift 2
   local -a watch_profiles=("$@")
   local previous_custody_seq=""
-  local previous_phase=""
-  local previous_acting_seat=""
+  local previous_event_hash=""
+  local actor_state_json=""
+  local actor_can_act=""
   local current_state_json=""
   local current_custody_seq=""
-  local current_phase=""
-  local current_acting_seat=""
+  local current_event_hash=""
   local attempts=80
   local sleep_seconds=0.25
   local i
 
   previous_custody_seq="$(printf '%s' "$previous_state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
-  previous_phase="$(printf '%s' "$previous_state_json" | json_field data.publicState.phase 2>/dev/null || true)"
-  previous_acting_seat="$(printf '%s' "$previous_state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
+  previous_event_hash="$(printf '%s' "$previous_state_json" | json_field data.publicState.latestEventHash 2>/dev/null || true)"
 
   if [[ "${#watch_profiles[@]}" -eq 0 ]]; then
     watch_profiles=("$WATCH_PROFILE")
@@ -1027,14 +1051,22 @@ wait_for_action_progress() {
   fi
 
   for ((i = 0; i < attempts; i += 1)); do
+    actor_state_json="$(watch_table_state_with_retry "$actor")"
+    if table_has_settled_custody_checkpoint "$actor_state_json"; then
+      return 0
+    fi
+    actor_can_act="$(printf '%s' "$actor_state_json" | json_field data.local.canAct 2>/dev/null || true)"
+    if [[ "$actor_can_act" != "true" ]]; then
+      return 0
+    fi
+
     current_state_json="$(freshest_table_state "${watch_profiles[@]}")"
     if table_has_settled_custody_checkpoint "$current_state_json"; then
       return 0
     fi
     current_custody_seq="$(printf '%s' "$current_state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
-    current_phase="$(printf '%s' "$current_state_json" | json_field data.publicState.phase 2>/dev/null || true)"
-    current_acting_seat="$(printf '%s' "$current_state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
-    if [[ "$current_phase" != "$previous_phase" || "$current_acting_seat" != "$previous_acting_seat" ]]; then
+    current_event_hash="$(printf '%s' "$current_state_json" | json_field data.publicState.latestEventHash 2>/dev/null || true)"
+    if [[ -n "$current_event_hash" && "$current_event_hash" != "$previous_event_hash" ]]; then
       return 0
     fi
     if [[ "$previous_custody_seq" =~ ^[0-9]+$ && "$current_custody_seq" =~ ^[0-9]+$ ]] && (( current_custody_seq > previous_custody_seq )); then
@@ -1076,6 +1108,13 @@ watch_table_state_with_retry() {
   return 1
 }
 
+phase_supports_direct_action() {
+  case "$1" in
+    preflop | flop | turn | river) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 round_watch_profiles() {
   local -a profiles=()
   local profile=""
@@ -1094,19 +1133,106 @@ round_watch_profiles() {
   printf '%s\n' "${profiles[@]}"
 }
 
+wait_for_actor_locally_actionable_state() {
+  local actor="$1"
+  local expected_state_json="$2"
+  local attempts="${3:-80}"
+  local sleep_seconds="${4:-0.15}"
+  local state_json=""
+  local expected_phase=""
+  local expected_hand_id=""
+  local expected_acting_seat=""
+  local expected_custody_seq=""
+  local expected_event_hash=""
+  local phase=""
+  local hand_id=""
+  local acting_seat=""
+  local custody_seq=""
+  local event_hash=""
+  local can_act=""
+  local attempt
+
+  expected_phase="$(printf '%s' "$expected_state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+  expected_hand_id="$(printf '%s' "$expected_state_json" | json_field data.publicState.handId 2>/dev/null || true)"
+  expected_acting_seat="$(printf '%s' "$expected_state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
+  expected_custody_seq="$(printf '%s' "$expected_state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+  expected_event_hash="$(printf '%s' "$expected_state_json" | json_field data.publicState.latestEventHash 2>/dev/null || true)"
+
+  if [[ -z "$actor" || -z "$expected_hand_id" || "$expected_hand_id" == "null" ]]; then
+    return 1
+  fi
+  if [[ -z "$expected_phase" || "$expected_phase" == "null" ]] || ! phase_supports_direct_action "$expected_phase"; then
+    return 1
+  fi
+
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    if ! state_json="$(watch_table_state_with_retry "$actor" 2>/dev/null)"; then
+      sleep "$sleep_seconds"
+      continue
+    fi
+
+    if table_has_settled_custody_checkpoint "$state_json"; then
+      printf '%s\n' "$state_json"
+      return 0
+    fi
+
+    phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+    hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId 2>/dev/null || true)"
+    acting_seat="$(printf '%s' "$state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
+    custody_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+    event_hash="$(printf '%s' "$state_json" | json_field data.publicState.latestEventHash 2>/dev/null || true)"
+    can_act="$(printf '%s' "$state_json" | json_field data.local.canAct 2>/dev/null || true)"
+
+    if [[ "$hand_id" != "$expected_hand_id" ]]; then
+      sleep "$sleep_seconds"
+      continue
+    fi
+    if [[ "$phase" != "$expected_phase" ]]; then
+      sleep "$sleep_seconds"
+      continue
+    fi
+    if [[ -n "$expected_acting_seat" && "$expected_acting_seat" != "null" && "$acting_seat" != "$expected_acting_seat" ]]; then
+      sleep "$sleep_seconds"
+      continue
+    fi
+    if [[ "$expected_custody_seq" =~ ^[0-9]+$ && "$custody_seq" =~ ^[0-9]+$ ]] && (( custody_seq < expected_custody_seq )); then
+      sleep "$sleep_seconds"
+      continue
+    fi
+    if [[ -n "$expected_event_hash" && "$expected_event_hash" != "null" && -n "$event_hash" && "$event_hash" != "$expected_event_hash" ]]; then
+      return 1
+    fi
+    if [[ "$can_act" == "true" ]]; then
+      printf '%s\n' "$state_json"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  return 1
+}
+
 freshest_table_state() {
   local -a profiles=("$@")
   local best_state_json=""
   local best_profile=""
   local best_epoch=-1
+  local best_settled_checkpoint=0
+  local best_settled_phase=0
   local best_custody_seq=-1
+  local best_updated_at=""
   local best_event_count=-1
   local profile=""
   local state_json=""
   local epoch=""
+  local settled_checkpoint=0
+  local settled_phase=0
   local custody_seq=""
+  local updated_at=""
   local event_count=""
   local events_json=""
+  local phase=""
+  local latest_snapshot_phase=""
 
   for profile in "${profiles[@]}"; do
     [[ -n "$profile" ]] || continue
@@ -1116,8 +1242,21 @@ freshest_table_state() {
 
     epoch="$(printf '%s' "$state_json" | json_field data.publicState.epoch 2>/dev/null || true)"
     custody_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+    updated_at="$(printf '%s' "$state_json" | json_field data.publicState.updatedAt 2>/dev/null || true)"
     events_json="$(printf '%s' "$state_json" | json_field data.events 2>/dev/null || true)"
     event_count="$(json_array_length "$events_json")"
+    phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+    latest_snapshot_phase="$(printf '%s' "$state_json" | json_field data.latestSnapshot.phase 2>/dev/null || true)"
+
+    settled_checkpoint=0
+    if table_has_settled_custody_checkpoint "$state_json"; then
+      settled_checkpoint=1
+    fi
+
+    settled_phase=0
+    if [[ "$phase" == "settled" || "$latest_snapshot_phase" == "settled" ]]; then
+      settled_phase=1
+    fi
 
     if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
       epoch=0
@@ -1125,17 +1264,26 @@ freshest_table_state() {
     if [[ ! "$custody_seq" =~ ^[0-9]+$ ]]; then
       custody_seq=-1
     fi
+    if [[ -z "$updated_at" || "$updated_at" == "null" ]]; then
+      updated_at=""
+    fi
     if [[ ! "$event_count" =~ ^[0-9]+$ ]]; then
       event_count=0
     fi
 
     if (( epoch > best_epoch )) ||
-      (( epoch == best_epoch && custody_seq > best_custody_seq )) ||
-      (( epoch == best_epoch && custody_seq == best_custody_seq && event_count > best_event_count )); then
+      (( epoch == best_epoch && settled_checkpoint > best_settled_checkpoint )) ||
+      (( epoch == best_epoch && settled_checkpoint == best_settled_checkpoint && settled_phase > best_settled_phase )) ||
+      (( epoch == best_epoch && settled_checkpoint == best_settled_checkpoint && settled_phase == best_settled_phase && custody_seq > best_custody_seq )) ||
+      [[ "$epoch" == "$best_epoch" && "$settled_checkpoint" == "$best_settled_checkpoint" && "$settled_phase" == "$best_settled_phase" && "$custody_seq" == "$best_custody_seq" && "$updated_at" > "$best_updated_at" ]] ||
+      (( epoch == best_epoch && settled_checkpoint == best_settled_checkpoint && settled_phase == best_settled_phase && custody_seq == best_custody_seq && event_count > best_event_count )); then
       best_state_json="$state_json"
       best_profile="$profile"
       best_epoch="$epoch"
+      best_settled_checkpoint="$settled_checkpoint"
+      best_settled_phase="$settled_phase"
       best_custody_seq="$custody_seq"
+      best_updated_at="$updated_at"
       best_event_count="$event_count"
     fi
   done
@@ -1659,6 +1807,7 @@ play_hand_automatically() {
   local now_epoch=0
   local turn
   local -a watch_profiles=()
+  local selection_state_json=""
 
   if tor_enabled; then
     max_wait_seconds=360
@@ -1722,12 +1871,28 @@ play_hand_automatically() {
       sleep 0.25
       continue
     fi
+
     actor=""
     action=""
     amount=""
     read -r actor action amount <<<"$action_line"
-    current_bet="$(printf '%s' "$state_json" | json_field data.publicState.currentBetSats)"
-    pot_sats="$(printf '%s' "$state_json" | json_field data.publicState.potSats)"
+    selection_state_json="$(wait_for_actor_locally_actionable_state "$actor" "$state_json" 120 0.15 2>/dev/null || true)"
+    if [[ -z "$selection_state_json" ]]; then
+      sleep 0.25
+      continue
+    fi
+    action_line="$(printf '%s' "$selection_state_json" | select_table_action)"
+    if [[ -z "$action_line" || "$action_line" == "settled" ]]; then
+      sleep 0.25
+      continue
+    fi
+    actor=""
+    action=""
+    amount=""
+    read -r actor action amount <<<"$action_line"
+    phase="$(printf '%s' "$selection_state_json" | json_field data.publicState.phase)"
+    current_bet="$(printf '%s' "$selection_state_json" | json_field data.publicState.currentBetSats)"
+    pot_sats="$(printf '%s' "$selection_state_json" | json_field data.publicState.potSats)"
     printf '{"actor":"%s","currentBetSats":%s,"payload":{"type":"%s"%s},"phase":"%s","potSats":%s}\n' \
       "$actor" \
       "${current_bet:-0}" \
@@ -1736,7 +1901,7 @@ play_hand_automatically() {
       "$phase" \
       "${pot_sats:-0}" >&2
     send_table_action_with_retry "$actor" "$action" "$amount"
-    wait_for_action_progress "$state_json" "${watch_profiles[@]}"
+    wait_for_action_progress "$actor" "$state_json" "${watch_profiles[@]}"
   done
 
   echo "hand did not settle in time" >&2

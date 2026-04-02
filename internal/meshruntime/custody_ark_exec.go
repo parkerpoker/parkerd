@@ -591,6 +591,184 @@ func validateCustodyForfeitPSBT(packet *psbt.Packet, plan *custodySettlementPlan
 	return nil
 }
 
+func connectorOutputFromLeaf(connectorLeaf *psbt.Packet) (*wire.TxOut, *wire.OutPoint, error) {
+	if connectorLeaf == nil {
+		return nil, nil, errors.New("connector leaf is missing")
+	}
+	for outputIndex, output := range connectorLeaf.UnsignedTx.TxOut {
+		if bytes.Equal(arktxutils.ANCHOR_PKSCRIPT, output.PkScript) {
+			continue
+		}
+		return output, &wire.OutPoint{
+			Hash:  connectorLeaf.UnsignedTx.TxHash(),
+			Index: uint32(outputIndex),
+		}, nil
+	}
+	return nil, nil, errors.New("connector output was not found")
+}
+
+func validateSignedCustodyForfeitPSBT(packet *psbt.Packet, input custodyInputSpec, connectorLeaf *psbt.Packet, forfeitPkScript []byte) error {
+	if packet == nil {
+		return errors.New("custody signed forfeit psbt is missing")
+	}
+	if len(packet.UnsignedTx.TxIn) != 2 || len(packet.Inputs) != 2 {
+		return errors.New("custody signed forfeit psbt input set does not match the expected pair")
+	}
+	if len(packet.UnsignedTx.TxOut) != 2 {
+		return errors.New("custody signed forfeit psbt output set does not match the expected pair")
+	}
+	connectorOutput, connectorOutpoint, err := connectorOutputFromLeaf(connectorLeaf)
+	if err != nil {
+		return err
+	}
+	vtxoHash, err := chainhash.NewHashFromStr(input.Ref.TxID)
+	if err != nil {
+		return err
+	}
+	expectedVtxo := wire.OutPoint{Hash: *vtxoHash, Index: input.Ref.VOut}
+	vtxoIndex := -1
+	connectorIndex := -1
+	switch {
+	case packet.UnsignedTx.TxIn[0].PreviousOutPoint == expectedVtxo && packet.UnsignedTx.TxIn[1].PreviousOutPoint == *connectorOutpoint:
+		vtxoIndex = 0
+		connectorIndex = 1
+	case packet.UnsignedTx.TxIn[1].PreviousOutPoint == expectedVtxo && packet.UnsignedTx.TxIn[0].PreviousOutPoint == *connectorOutpoint:
+		vtxoIndex = 1
+		connectorIndex = 0
+	default:
+		return fmt.Errorf("custody signed forfeit psbt does not spend the expected input %s together with connector %s", fundingRefKey(input.Ref), connectorOutpoint.String())
+	}
+
+	vtxoInput := packet.Inputs[vtxoIndex]
+	connectorInput := packet.Inputs[connectorIndex]
+	if vtxoInput.WitnessUtxo == nil || connectorInput.WitnessUtxo == nil {
+		return errors.New("custody signed forfeit psbt is missing witness utxo metadata")
+	}
+	if vtxoInput.WitnessUtxo.Value != int64(input.Ref.AmountSats) || !bytes.Equal(vtxoInput.WitnessUtxo.PkScript, input.SpendPath.PKScript) {
+		return errors.New("custody signed forfeit psbt witness utxo does not match the authorized custody input")
+	}
+	if connectorInput.WitnessUtxo.Value != connectorOutput.Value || !bytes.Equal(connectorInput.WitnessUtxo.PkScript, connectorOutput.PkScript) {
+		return errors.New("custody signed forfeit psbt witness utxo does not match the expected connector output")
+	}
+	if len(vtxoInput.TaprootScriptSpendSig) == 0 {
+		return errors.New("custody signed forfeit psbt is missing tapscript signatures for the custody input")
+	}
+	if len(vtxoInput.TaprootLeafScript) == 0 {
+		return errors.New("custody signed forfeit psbt is missing the custody leaf proof")
+	}
+	leaf := vtxoInput.TaprootLeafScript[0]
+	if !bytes.Equal(leaf.Script, input.SpendPath.Script) {
+		return errors.New("custody signed forfeit psbt tapscript does not match the authorized spend path")
+	}
+	if input.SpendPath.LeafProof != nil && !bytes.Equal(leaf.ControlBlock, input.SpendPath.LeafProof.ControlBlock) {
+		return errors.New("custody signed forfeit psbt control block does not match the authorized spend path")
+	}
+	if !bytes.Equal(packet.UnsignedTx.TxOut[0].PkScript, forfeitPkScript) {
+		return errors.New("custody signed forfeit psbt does not pay the Ark forfeit address")
+	}
+	if !bytes.Equal(packet.UnsignedTx.TxOut[1].PkScript, arktxutils.ANCHOR_PKSCRIPT) {
+		return errors.New("custody signed forfeit psbt is missing the anchor output")
+	}
+	sumInputs := vtxoInput.WitnessUtxo.Value + connectorInput.WitnessUtxo.Value
+	sumOutputs := packet.UnsignedTx.TxOut[0].Value + packet.UnsignedTx.TxOut[1].Value
+	if sumInputs != sumOutputs {
+		return errors.New("custody signed forfeit psbt does not conserve the expected value")
+	}
+
+	vtxoSequence := uint32(wire.MaxTxInSequenceNum)
+	locktime := uint32(0)
+	if input.SpendPath.UsesCLTVLocktime {
+		vtxoSequence = wire.MaxTxInSequenceNum - 1
+		locktime = uint32(input.SpendPath.Locktime)
+	}
+	if packet.UnsignedTx.LockTime != locktime {
+		return errors.New("custody signed forfeit psbt locktime does not match the authorized spend path")
+	}
+	if packet.UnsignedTx.TxIn[vtxoIndex].Sequence != vtxoSequence {
+		return errors.New("custody signed forfeit psbt sequence does not match the authorized spend path")
+	}
+	if packet.UnsignedTx.TxIn[connectorIndex].Sequence != wire.MaxTxInSequenceNum {
+		return errors.New("custody signed forfeit psbt connector sequence is invalid")
+	}
+
+	var inputs []*wire.OutPoint
+	var sequences []uint32
+	var prevouts []*wire.TxOut
+	if vtxoIndex == 0 {
+		inputs = []*wire.OutPoint{
+			&wire.OutPoint{Hash: expectedVtxo.Hash, Index: expectedVtxo.Index},
+			connectorOutpoint,
+		}
+		sequences = []uint32{vtxoSequence, wire.MaxTxInSequenceNum}
+		prevouts = []*wire.TxOut{
+			&wire.TxOut{Value: int64(input.Ref.AmountSats), PkScript: input.SpendPath.PKScript},
+			connectorOutput,
+		}
+	} else {
+		inputs = []*wire.OutPoint{
+			connectorOutpoint,
+			&wire.OutPoint{Hash: expectedVtxo.Hash, Index: expectedVtxo.Index},
+		}
+		sequences = []uint32{wire.MaxTxInSequenceNum, vtxoSequence}
+		prevouts = []*wire.TxOut{
+			connectorOutput,
+			&wire.TxOut{Value: int64(input.Ref.AmountSats), PkScript: input.SpendPath.PKScript},
+		}
+	}
+	rebuilt, err := arktree.BuildForfeitTx(inputs, sequences, prevouts, forfeitPkScript, locktime)
+	if err != nil {
+		return err
+	}
+	if rebuilt.UnsignedTx.TxID() != packet.UnsignedTx.TxID() {
+		return fmt.Errorf("custody signed forfeit psbt txid mismatch: expected %s, got %s", rebuilt.UnsignedTx.TxID(), packet.UnsignedTx.TxID())
+	}
+	return nil
+}
+
+func validateSignedCustodyForfeits(plan *custodySettlementPlan, connectorLeaves []*psbt.Packet, signedForfeits []string, forfeitPkScript []byte) error {
+	if plan == nil {
+		return errors.New("custody settlement plan is missing")
+	}
+	if len(plan.Inputs) == 0 {
+		if len(signedForfeits) != 0 {
+			return errors.New("custody signed forfeits are unexpected for a no-input transition")
+		}
+		return nil
+	}
+	if len(connectorLeaves) != len(plan.Inputs) {
+		return fmt.Errorf("connector tree leaf count does not match the authorized custody inputs: %d != %d", len(connectorLeaves), len(plan.Inputs))
+	}
+	if len(signedForfeits) != len(plan.Inputs) {
+		return fmt.Errorf("signed forfeit count does not match the authorized custody inputs: %d != %d", len(signedForfeits), len(plan.Inputs))
+	}
+	seenInputs := make(map[string]struct{}, len(plan.Inputs))
+	seenConnectors := make(map[string]struct{}, len(connectorLeaves))
+	for index, input := range plan.Inputs {
+		key := fundingRefKey(input.Ref)
+		if _, ok := seenInputs[key]; ok {
+			return fmt.Errorf("custody settlement plan reuses source input %s", key)
+		}
+		seenInputs[key] = struct{}{}
+		_, connectorOutpoint, err := connectorOutputFromLeaf(connectorLeaves[index])
+		if err != nil {
+			return err
+		}
+		connectorKey := connectorOutpoint.String()
+		if _, ok := seenConnectors[connectorKey]; ok {
+			return fmt.Errorf("connector tree reuses connector %s", connectorKey)
+		}
+		seenConnectors[connectorKey] = struct{}{}
+		packet, err := psbt.NewFromRawBytes(strings.NewReader(signedForfeits[index]), true)
+		if err != nil {
+			return err
+		}
+		if err := validateSignedCustodyForfeitPSBT(packet, input, connectorLeaves[index], forfeitPkScript); err != nil {
+			return fmt.Errorf("custody signed forfeit %d is invalid: %w", index, err)
+		}
+	}
+	return nil
+}
+
 func offchainVtxoTreeOutputs(vtxoTree *arktree.TxTree) []custodyBatchOutput {
 	if vtxoTree == nil {
 		return nil
@@ -1473,6 +1651,15 @@ func (handler *custodyBatchEventsHandler) OnTreeNoncesAggregated(ctx context.Con
 
 func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Context, event arkclient.BatchFinalizationEvent, vtxoTree, connectorTree *arktree.TxTree) error {
 	handler.commitmentTx = event.Tx
+	debugMeshf(
+		"custody batch finalization table=%s transition=%s batch=%s input_count=%d has_vtxo_tree=%t has_connector_tree=%t",
+		handler.table.Config.TableID,
+		handler.requestKey,
+		event.Id,
+		len(handler.plan.Inputs),
+		vtxoTree != nil,
+		connectorTree != nil,
+	)
 	if vtxoTree != nil {
 		commitment, err := psbt.NewFromRawBytes(strings.NewReader(event.Tx), true)
 		if err != nil {
@@ -1489,20 +1676,63 @@ func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Contex
 	handler.finalVtxoTree = vtxoTree
 	handler.finalConnectorTree = connectorTree
 	if len(handler.plan.Inputs) == 0 || connectorTree == nil {
+		if len(handler.plan.Inputs) > 0 && connectorTree == nil {
+			debugMeshf(
+				"custody batch finalization missing connector tree table=%s transition=%s batch=%s input_count=%d",
+				handler.table.Config.TableID,
+				handler.requestKey,
+				event.Id,
+				len(handler.plan.Inputs),
+			)
+		}
 		return nil
 	}
 	connectorLeaves := connectorTree.Leaves()
-	if len(connectorLeaves) < len(handler.plan.Inputs) {
-		return errors.New("connector tree does not contain enough leaves for custody forfeits")
+	debugMeshf(
+		"custody batch finalization connectors table=%s transition=%s batch=%s connector_leaf_count=%d",
+		handler.table.Config.TableID,
+		handler.requestKey,
+		event.Id,
+		len(connectorLeaves),
+	)
+	if len(connectorLeaves) != len(handler.plan.Inputs) {
+		return errors.New("connector tree leaf count does not match custody forfeits")
+	}
+	parsedForfeitAddr, err := btcutil.DecodeAddress(handler.arkConfig.ForfeitAddress, nil)
+	if err != nil {
+		return err
+	}
+	forfeitPkScript, err := txscript.PayToAddrScript(parsedForfeitAddr)
+	if err != nil {
+		return err
 	}
 	signedForfeits := make([]string, 0, len(handler.plan.Inputs))
 	for index, input := range handler.plan.Inputs {
+		debugMeshf(
+			"custody batch forfeit build table=%s transition=%s batch=%s input=%d ref=%s player_ids=%v",
+			handler.table.Config.TableID,
+			handler.requestKey,
+			event.Id,
+			index,
+			fundingRefKey(input.Ref),
+			input.SpendPath.PlayerIDs,
+		)
 		forfeit, err := handler.createSignedForfeit(ctx, input, connectorLeaves[index])
 		if err != nil {
 			return err
 		}
 		signedForfeits = append(signedForfeits, forfeit)
 	}
+	if err := validateSignedCustodyForfeits(handler.plan, connectorLeaves, signedForfeits, forfeitPkScript); err != nil {
+		return err
+	}
+	debugMeshf(
+		"custody batch forfeits submit table=%s transition=%s batch=%s signed_forfeit_count=%d",
+		handler.table.Config.TableID,
+		handler.requestKey,
+		event.Id,
+		len(signedForfeits),
+	)
 	return handler.transport.SubmitSignedForfeitTxs(ctx, signedForfeits, "")
 }
 
@@ -1515,21 +1745,9 @@ func (handler *custodyBatchEventsHandler) createSignedForfeit(ctx context.Contex
 	if err != nil {
 		return "", err
 	}
-	var connector *wire.TxOut
-	var connectorOutpoint *wire.OutPoint
-	for outputIndex, output := range connectorLeaf.UnsignedTx.TxOut {
-		if bytes.Equal(arktxutils.ANCHOR_PKSCRIPT, output.PkScript) {
-			continue
-		}
-		connector = output
-		connectorOutpoint = &wire.OutPoint{
-			Hash:  connectorLeaf.UnsignedTx.TxHash(),
-			Index: uint32(outputIndex),
-		}
-		break
-	}
-	if connector == nil || connectorOutpoint == nil {
-		return "", errors.New("connector output was not found")
+	connector, connectorOutpoint, err := connectorOutputFromLeaf(connectorLeaf)
+	if err != nil {
+		return "", err
 	}
 	vtxoHash, err := chainhash.NewHashFromStr(input.Ref.TxID)
 	if err != nil {
@@ -2021,6 +2239,22 @@ func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableStat
 	if err != nil {
 		return err
 	}
+	inputRefs := make([]string, 0, len(plan.Inputs))
+	for _, input := range plan.Inputs {
+		inputRefs = append(inputRefs, fundingRefKey(input.Ref))
+	}
+	debugMeshf(
+		"finalize real custody transition table=%s kind=%s seq=%d request=%s input_count=%d output_count=%d proof_signers=%v tree_signers=%v inputs=%v",
+		table.Config.TableID,
+		transition.Kind,
+		transition.CustodySeq,
+		signingTransition.Proof.RequestHash,
+		len(plan.Inputs),
+		len(plan.Outputs),
+		plan.ProofSignerIDs,
+		plan.TreeSignerIDs,
+		inputRefs,
+	)
 	if len(plan.Inputs) == 0 {
 		return runtime.finalizeNonSettlementCustodyTransition(table, transition, authorizer)
 	}

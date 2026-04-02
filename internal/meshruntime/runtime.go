@@ -27,43 +27,43 @@ import (
 )
 
 type meshRuntime struct {
-	backgroundTasks     int
-	config              cfg.RuntimeConfig
-	arkTransportFactory func() (arkclient.TransportClient, error)
-	clearPeerURL        string
-	custodyApprovalHook func(request nativeCustodyApprovalRequest) error
-	custodyArkVerify    func(refs []tablecustody.VTXORef, requireSpendable bool) error
-	custodyBatchExecute func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
-	custodyExitExecute  func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
-	custodyPSBTSign     func(profileName, tx string) (string, error)
+	backgroundTasks        int
+	config                 cfg.RuntimeConfig
+	arkTransportFactory    func() (arkclient.TransportClient, error)
+	clearPeerURL           string
+	custodyApprovalHook    func(request nativeCustodyApprovalRequest) error
+	custodyArkVerify       func(refs []tablecustody.VTXORef, requireSpendable bool) error
+	custodyBatchExecute    func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
+	custodyExitExecute     func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
+	custodyPSBTSign        func(profileName, tx string) (string, error)
 	custodyRecoveryExecute func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
-	custodySignerAuth   map[string]custodySignerAuthorization
-	custodySigners      map[string]walletpkg.CustodySignerSession
-	httpClient          *http.Client
-	lastSyncAt          map[string]time.Time
-	listener            net.Listener
-	mode                string
-	mu                  sync.Mutex
-	peerInfoCache       map[string]nativeCachedPeerInfo
-	peerIdentity        settlementcore.ScopedIdentity
-	profileName         string
-	profileStore        *walletpkg.ProfileStore
-	protocolID          string
-	protocolIdentity    settlementcore.ScopedIdentity
-	protocolDrives      map[string]struct{}
-	self                nativePeerSelf
-	server              *http.Server
-	fundsSenderHook     func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
-	tableSyncSender     func(peerURL string, input nativeTableSyncRequest) error
-	started             bool
-	store               *meshStore
-	taskCond            *sync.Cond
-	torService          *runtimeHiddenService
-	transportKeyID      string
-	transportPrivate    string
-	transportPublic     string
-	walletID            settlementcore.LocalIdentity
-	walletRuntime       *walletpkg.Runtime
+	custodySignerAuth      map[string]custodySignerAuthorization
+	custodySigners         map[string]walletpkg.CustodySignerSession
+	httpClient             *http.Client
+	lastSyncAt             map[string]time.Time
+	listener               net.Listener
+	mode                   string
+	mu                     sync.Mutex
+	peerInfoCache          map[string]nativeCachedPeerInfo
+	peerIdentity           settlementcore.ScopedIdentity
+	profileName            string
+	profileStore           *walletpkg.ProfileStore
+	protocolID             string
+	protocolIdentity       settlementcore.ScopedIdentity
+	protocolDrives         map[string]struct{}
+	self                   nativePeerSelf
+	server                 *http.Server
+	fundsSenderHook        func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
+	tableSyncSender        func(peerURL string, input nativeTableSyncRequest) error
+	started                bool
+	store                  *meshStore
+	taskCond               *sync.Cond
+	torService             *runtimeHiddenService
+	transportKeyID         string
+	transportPrivate       string
+	transportPublic        string
+	walletID               settlementcore.LocalIdentity
+	walletRuntime          *walletpkg.Runtime
 }
 
 const (
@@ -228,14 +228,16 @@ func (runtime *meshRuntime) hostFailureTimeoutMS() int {
 
 func (runtime *meshRuntime) handProtocolTimeoutMS() int {
 	if runtime != nil && !runtime.config.UseMockSettlement {
-		return 8_000
+		// Real Ark custody rounds add network and signer coordination latency to
+		// every protocol phase transition, so keep more budget than synthetic mode.
+		return 20_000
 	}
 	return nativeHandProtocolTimeoutMS
 }
 
 func (runtime *meshRuntime) actionTimeoutMS() int {
 	if runtime != nil && !runtime.config.UseMockSettlement {
-		return 12_000
+		return 16_000
 	}
 	return nativeActionTimeoutMS
 }
@@ -1188,7 +1190,7 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (Nati
 		table   *nativeTableState
 		updated nativeTableState
 	)
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; attempt < 3; attempt++ {
 		runtime.syncTableFromKnownParticipants(tableID)
 		table, err = runtime.refreshLocalTable(tableID)
 		if err != nil {
@@ -1214,36 +1216,45 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (Nati
 		} else {
 			updated, err = runtime.remoteAction(table.CurrentHost.Peer.PeerURL, request)
 		}
-		if err == nil {
-			break
-		}
-		if attempt == 0 &&
-			table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
-			table.CurrentHost.Peer.PeerURL != "" &&
-			isRetryableActionRequestStateError(err) {
-			runtime.syncTableFromKnownParticipants(tableID)
-			refreshed, refreshErr := runtime.refreshLocalTable(tableID)
-			if refreshErr == nil && refreshed != nil && actionRetryStateChanged(*table, *refreshed) {
-				continue
-			}
-			if refreshErr != nil {
-				return NativeMeshTableView{}, refreshErr
+		if err != nil {
+			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+				table.CurrentHost.Peer.PeerURL != "" &&
+				attempt < 2 &&
+				isRetryableActionRequestStateError(err) {
+				runtime.syncTableFromKnownParticipants(tableID)
+				refreshed, refreshErr := runtime.refreshLocalTable(tableID)
+				if refreshErr == nil && refreshed != nil && actionRetryStateChanged(*table, *refreshed) {
+					continue
+				}
+				if refreshErr != nil {
+					return NativeMeshTableView{}, refreshErr
+				}
 			}
 			return NativeMeshTableView{}, err
 		}
-		return NativeMeshTableView{}, err
+		if acceptErr := runtime.acceptRemoteTable(updated); acceptErr != nil {
+			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+				table.CurrentHost.Peer.PeerURL != "" &&
+				attempt < 2 &&
+				isRetryableActionResponseStateError(acceptErr) {
+				runtime.syncTableFromKnownParticipants(tableID)
+				refreshed, refreshErr := runtime.refreshLocalTable(tableID)
+				if refreshErr == nil && refreshed != nil && actionRetryStateChanged(*table, *refreshed) {
+					continue
+				}
+				if refreshErr != nil {
+					return NativeMeshTableView{}, refreshErr
+				}
+			}
+			return NativeMeshTableView{}, acceptErr
+		}
+		accepted, err := runtime.requireLocalTable(updated.Config.TableID)
+		if err != nil {
+			return NativeMeshTableView{}, err
+		}
+		return runtime.localTableView(*accepted), nil
 	}
-	if err != nil {
-		return NativeMeshTableView{}, err
-	}
-	if err := runtime.acceptRemoteTable(updated); err != nil {
-		return NativeMeshTableView{}, err
-	}
-	accepted, err := runtime.requireLocalTable(updated.Config.TableID)
-	if err != nil {
-		return NativeMeshTableView{}, err
-	}
-	return runtime.localTableView(*accepted), nil
+	return NativeMeshTableView{}, errors.New("action submission exhausted retries")
 }
 
 func (runtime *meshRuntime) RotateHost(tableID string) (NativeMeshTableView, error) {
@@ -1630,17 +1641,26 @@ func isRetryableActionRequestStateError(err error) bool {
 		strings.Contains(message, "EOF")
 }
 
+func isRetryableActionResponseStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "accepted history would roll back table events") ||
+		strings.Contains(message, "accepted history would roll back table snapshots")
+}
+
 func actionRetryStateChanged(previous, refreshed nativeTableState) bool {
-	if previous.CurrentEpoch != refreshed.CurrentEpoch {
+	if snapshotProtocolDrive(previous) != snapshotProtocolDrive(refreshed) {
 		return true
 	}
-	if previous.CurrentHost.Peer.PeerID != refreshed.CurrentHost.Peer.PeerID {
+	if previous.LastEventHash != refreshed.LastEventHash {
 		return true
 	}
-	if previous.CurrentHost.Peer.PeerURL != refreshed.CurrentHost.Peer.PeerURL {
+	if len(previous.Events) != len(refreshed.Events) {
 		return true
 	}
-	return latestCustodyStateHash(previous) != latestCustodyStateHash(refreshed)
+	return len(previous.Snapshots) != len(refreshed.Snapshots)
 }
 
 func cloneFundsExitExecution(execution *nativeFundsExitExecution) *nativeFundsExitExecution {

@@ -54,19 +54,19 @@ fund-alice:
 kill-floating:
 	./scripts/kill-floating-parker-processes.sh
 
-poker-regtest-round: rebuild-binaries
+poker-regtest-round: rebuild-binaries kill-floating
 	./scripts/run-regtest-round.sh
 
-poker-regtest-round-tor: rebuild-binaries
+poker-regtest-round-tor: rebuild-binaries kill-floating
 	USE_TOR=true ./scripts/run-regtest-round.sh
 
-poker-regtest-round-host-player: rebuild-binaries
+poker-regtest-round-host-player: rebuild-binaries kill-floating
 	ROUND_SCENARIO=host-player-2d ./scripts/run-regtest-round.sh
 
-poker-regtest-round-host-player-tor: rebuild-binaries
+poker-regtest-round-host-player-tor: rebuild-binaries kill-floating
 	USE_TOR=true ROUND_SCENARIO=host-player-2d ./scripts/run-regtest-round.sh
 
-poker-regtest-round-recovery: rebuild-binaries
+poker-regtest-round-recovery: rebuild-binaries kill-floating
 	ROUND_SCENARIO=recovery-timeout-2d ./scripts/run-regtest-round.sh
 
 test-integration:
