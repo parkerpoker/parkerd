@@ -44,6 +44,19 @@ func sourcePotRecoveryRefs(state *tablecustody.CustodyState) []tablecustody.VTXO
 	return canonicalVTXORefs(refs)
 }
 
+type recoverySourceContext struct {
+	recoverySigners []string
+	sourceRefs      []tablecustody.VTXORef
+	spendPaths      []custodySpendPath
+}
+
+func deterministicRecoveryImpossibleForSource(table nativeTableState, transition *tablecustody.CustodyTransition, postHand *game.HoldemState) bool {
+	if transition == nil || postHand == nil || !custodyRecoverySupportedTable(table) {
+		return true
+	}
+	return len(sourcePotRecoveryRefs(&transition.NextState)) == 0
+}
+
 func stackRecoveryDeltaOutputs(previous *tablecustody.CustodyState, next tablecustody.CustodyState) (map[string]int, bool) {
 	previousAmountByPlayer := map[string]int{}
 	if previous != nil {
@@ -395,11 +408,18 @@ func recoveryOutputsToProof(outputs []custodyBatchOutput) []tablecustody.Custody
 	return recoveryOutputs
 }
 
-func (runtime *meshRuntime) buildRecoveryBundle(table nativeTableState, sourceTransition tablecustody.CustodyTransition, target tablecustody.CustodyTransition, sourceAuthorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (*tablecustody.CustodyRecoveryBundle, error) {
+func (runtime *meshRuntime) prepareRecoverySourceContext(table nativeTableState, sourceTransition tablecustody.CustodyTransition) (ctx *recoverySourceContext, err error) {
 	sourceRefs := sourcePotRecoveryRefs(&sourceTransition.NextState)
-	if len(sourceRefs) == 0 || len(outputs) == 0 {
+	if len(sourceRefs) == 0 {
 		return nil, nil
 	}
+	timingFields := custodyTimingFields(table, sourceTransition, "recovery_spend_path_select")
+	timingFields.Purpose = "recovery-source"
+	timingFields.InputCount = len(sourceRefs)
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
 	spendPaths := make([]custodySpendPath, 0, len(sourceRefs))
 	recoverySignerSet := map[string]struct{}{}
 	for _, ref := range sourceRefs {
@@ -412,33 +432,52 @@ func (runtime *meshRuntime) buildRecoveryBundle(table nativeTableState, sourceTr
 			recoverySignerSet[playerID] = struct{}{}
 		}
 	}
-	unsigned, err := recoveryUnsignedPSBT(sourceRefs, spendPaths, outputs)
-	if err != nil {
-		return nil, err
-	}
 	recoverySigners := make([]string, 0, len(recoverySignerSet))
 	for playerID := range recoverySignerSet {
 		recoverySigners = append(recoverySigners, playerID)
 	}
 	sort.Strings(recoverySigners)
+	return &recoverySourceContext{
+		recoverySigners: recoverySigners,
+		sourceRefs:      sourceRefs,
+		spendPaths:      spendPaths,
+	}, nil
+}
+
+func (runtime *meshRuntime) buildRecoveryBundleWithSourceContext(table nativeTableState, sourceTransition tablecustody.CustodyTransition, target tablecustody.CustodyTransition, sourceAuthorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput, sourceCtx *recoverySourceContext) (*tablecustody.CustodyRecoveryBundle, error) {
+	if sourceCtx == nil || len(sourceCtx.sourceRefs) == 0 || len(outputs) == 0 {
+		return nil, nil
+	}
+	unsigned, err := recoveryUnsignedPSBT(sourceCtx.sourceRefs, sourceCtx.spendPaths, outputs)
+	if err != nil {
+		return nil, err
+	}
 	requestHash := strings.TrimSpace(sourceTransition.Proof.RequestHash)
 	if requestHash == "" {
 		requestHash = custodyTransitionRequestHash(sourceTransition)
 	}
-	signedPSBT, err := runtime.fullySignCustodyPSBT(table, sourceTransition.PrevStateHash, requestHash, "recovery", recoverySigners, unsigned, sourceTransition, sourceAuthorizer, outputs)
+	signedPSBT, err := runtime.fullySignCustodyPSBT(table, sourceTransition.PrevStateHash, requestHash, "recovery", sourceCtx.recoverySigners, unsigned, sourceTransition, sourceAuthorizer, outputs)
 	if err != nil {
 		return nil, err
 	}
 	bundle := &tablecustody.CustodyRecoveryBundle{
 		AuthorizedOutputs: recoveryOutputsToProof(outputs),
-		EarliestExecuteAt: recoveryBundleEarliestExecuteAt(sourceTransition.Proof.FinalizedAt, spendPaths),
+		EarliestExecuteAt: recoveryBundleEarliestExecuteAt(sourceTransition.Proof.FinalizedAt, sourceCtx.spendPaths),
 		Kind:              target.Kind,
 		SignedPSBT:        signedPSBT,
-		SourcePotRefs:     append([]tablecustody.VTXORef(nil), sourceRefs...),
+		SourcePotRefs:     append([]tablecustody.VTXORef(nil), sourceCtx.sourceRefs...),
 		TimeoutResolution: cloneTimeoutResolution(target.TimeoutResolution),
 	}
 	bundle.BundleHash = recoveryBundleHash(*bundle)
 	return bundle, nil
+}
+
+func (runtime *meshRuntime) buildRecoveryBundle(table nativeTableState, sourceTransition tablecustody.CustodyTransition, target tablecustody.CustodyTransition, sourceAuthorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (*tablecustody.CustodyRecoveryBundle, error) {
+	sourceCtx, err := runtime.prepareRecoverySourceContext(table, sourceTransition)
+	if err != nil || sourceCtx == nil {
+		return nil, err
+	}
+	return runtime.buildRecoveryBundleWithSourceContext(table, sourceTransition, target, sourceAuthorizer, outputs, sourceCtx)
 }
 
 func (runtime *meshRuntime) deterministicRecoveryTargetsForTransition(table nativeTableState, transition tablecustody.CustodyTransition, postHand *game.HoldemState) ([]tablecustody.CustodyTransition, error) {
@@ -473,12 +512,33 @@ func (runtime *meshRuntime) deterministicRecoveryTargetsForTransition(table nati
 	return targets, nil
 }
 
-func (runtime *meshRuntime) attachDeterministicRecoveryBundles(table nativeTableState, transition *tablecustody.CustodyTransition, sourceAuthorizer *nativeTransitionAuthorizer, postHand *game.HoldemState) error {
+func (runtime *meshRuntime) attachDeterministicRecoveryBundles(table nativeTableState, transition *tablecustody.CustodyTransition, sourceAuthorizer *nativeTransitionAuthorizer, postHand *game.HoldemState) (err error) {
 	if runtime.config.UseMockSettlement || transition == nil {
 		return nil
 	}
+	if deterministicRecoveryImpossibleForSource(table, transition, postHand) {
+		return nil
+	}
+	attachFields := custodyTimingFields(table, *transition, "recovery_bundle_attach")
+	attachFields.InputCount = len(sourcePotRecoveryRefs(&transition.NextState))
+	attachTiming := startMeshTiming(attachFields)
+	defer func() {
+		attachTiming.EndWith(attachFields, err)
+	}()
+	targetFields := custodyTimingFields(table, *transition, "recovery_target_derivation")
+	targetFields.InputCount = attachFields.InputCount
+	targetTiming := startMeshTiming(targetFields)
 	targets, err := runtime.deterministicRecoveryTargetsForTransition(table, *transition, postHand)
+	targetFields.BundleCount = len(targets)
+	targetTiming.EndWith(targetFields, err)
 	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	sourceCtx, err := runtime.prepareRecoverySourceContext(table, *transition)
+	if err != nil || sourceCtx == nil {
 		return err
 	}
 	bundles := make([]tablecustody.CustodyRecoveryBundle, 0, len(targets))
@@ -490,7 +550,7 @@ func (runtime *meshRuntime) attachDeterministicRecoveryBundles(table nativeTable
 		if len(outputs) == 0 {
 			continue
 		}
-		bundle, err := runtime.buildRecoveryBundle(table, *transition, target, sourceAuthorizer, outputs)
+		bundle, err := runtime.buildRecoveryBundleWithSourceContext(table, *transition, target, sourceAuthorizer, outputs, sourceCtx)
 		if err != nil {
 			return err
 		}
@@ -499,6 +559,7 @@ func (runtime *meshRuntime) attachDeterministicRecoveryBundles(table nativeTable
 		}
 		bundles = append(bundles, *bundle)
 	}
+	attachFields.BundleCount = len(bundles)
 	if len(bundles) == 0 {
 		return nil
 	}
@@ -898,15 +959,24 @@ func uniqueNonEmptyStrings(values []string) []string {
 	return out
 }
 
-func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTableState, transition *tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) (bool, error) {
+func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTableState, transition *tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) (recovered bool, err error) {
 	if runtime.config.UseMockSettlement || table == nil || transition == nil {
 		return false, nil
 	}
+	timingFields := custodyTimingFields(*table, *transition, "recovery_finalize")
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
 
 	bundle, sourceTransitionHash, err := runtime.recoveryBundleForTransition(*table, *transition)
 	if err != nil || bundle == nil {
 		return false, err
 	}
+	timingFields.BundleCount = 1
+	timingFields.BundleKind = string(bundle.Kind)
+	timingFields.InputCount = len(bundle.SourcePotRefs)
+	timingFields.OutputCount = len(bundle.AuthorizedOutputs)
 	if err := runtime.validateStoredRecoveryBundle(*table, *bundle); err != nil {
 		return false, err
 	}

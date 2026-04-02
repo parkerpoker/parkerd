@@ -1090,8 +1090,15 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 	return signedPSBT, nil
 }
 
-func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (string, error) {
-	signed := unsigned
+func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (signed string, err error) {
+	timingFields := custodyTimingFields(table, transition, "custody_psbt_fully_sign")
+	timingFields.Purpose = purpose
+	timingFields.OutputCount = len(outputs)
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
+	signed = unsigned
 	for _, playerID := range uniqueSortedPlayerIDs(signerIDs) {
 		nextSigned, err := runtime.signCustodyPSBTWithPlayer(table, playerID, prevStateHash, transitionHash, purpose, signed, transition, authorizer, outputs)
 		if err != nil {
@@ -1439,11 +1446,14 @@ type custodyBatchEventsHandler struct {
 	derivationPath     string
 	signerSessions     map[string]walletpkg.CustodySignerSession
 	signerPubkeys      map[string]string
+	outputCount        int
 	batchSessionID     string
 	batchExpiry        arklib.RelativeLocktime
 	commitmentTx       string
 	finalVtxoTree      *arktree.TxTree
 	finalConnectorTree *arktree.TxTree
+	intentRegisteredAt time.Time
+	treeSigningAt      time.Time
 }
 
 func (handler *custodyBatchEventsHandler) OnBatchStarted(ctx context.Context, event arkclient.BatchStartedEvent) (bool, error) {
@@ -1493,9 +1503,22 @@ func (handler *custodyBatchEventsHandler) OnTreeSigningStarted(ctx context.Conte
 	if found == 0 {
 		return true, nil
 	}
+	if !handler.intentRegisteredAt.IsZero() {
+		emitMeshTiming(meshTimingFields{
+			Metric:         "custody_tree_signing_wait",
+			TableID:        handler.table.Config.TableID,
+			CustodySeq:     handler.transition.CustodySeq,
+			TransitionKind: string(handler.transition.Kind),
+			Phase:          tablePhaseForTiming(handler.table),
+			RequestHash:    handler.requestKey,
+			InputCount:     len(handler.plan.Inputs),
+			OutputCount:    handler.outputCount,
+		}, time.Since(handler.intentRegisteredAt), nil)
+	}
 	if found != len(requiredPubkeys) {
 		return false, errors.New("not all custody signer pubkeys were included in tree signing")
 	}
+	handler.treeSigningAt = time.Now()
 	debugMeshf("custody tree signing started table=%s transition=%s batch=%s expected_signers=%d found_signers=%d", handler.table.Config.TableID, handler.requestKey, event.Id, len(requiredPubkeys), found)
 
 	operatorPubkey, err := compressedPubkeyFromHex(handler.arkConfig.ForfeitPubkeyHex)
@@ -1651,6 +1674,18 @@ func (handler *custodyBatchEventsHandler) OnTreeNoncesAggregated(ctx context.Con
 
 func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Context, event arkclient.BatchFinalizationEvent, vtxoTree, connectorTree *arktree.TxTree) error {
 	handler.commitmentTx = event.Tx
+	if !handler.treeSigningAt.IsZero() {
+		emitMeshTiming(meshTimingFields{
+			Metric:         "custody_tree_nonce_signature_exchange",
+			TableID:        handler.table.Config.TableID,
+			CustodySeq:     handler.transition.CustodySeq,
+			TransitionKind: string(handler.transition.Kind),
+			Phase:          tablePhaseForTiming(handler.table),
+			RequestHash:    handler.requestKey,
+			InputCount:     len(handler.plan.Inputs),
+			OutputCount:    handler.outputCount,
+		}, time.Since(handler.treeSigningAt), nil)
+	}
 	debugMeshf(
 		"custody batch finalization table=%s transition=%s batch=%s input_count=%d has_vtxo_tree=%t has_connector_tree=%t",
 		handler.table.Config.TableID,
@@ -1706,6 +1741,7 @@ func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Contex
 	if err != nil {
 		return err
 	}
+	forfeitSubmitStartedAt := time.Now()
 	signedForfeits := make([]string, 0, len(handler.plan.Inputs))
 	for index, input := range handler.plan.Inputs {
 		debugMeshf(
@@ -1733,7 +1769,18 @@ func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Contex
 		event.Id,
 		len(signedForfeits),
 	)
-	return handler.transport.SubmitSignedForfeitTxs(ctx, signedForfeits, "")
+	err = handler.transport.SubmitSignedForfeitTxs(ctx, signedForfeits, "")
+	emitMeshTiming(meshTimingFields{
+		Metric:         "custody_connector_forfeit_submit",
+		TableID:        handler.table.Config.TableID,
+		CustodySeq:     handler.transition.CustodySeq,
+		TransitionKind: string(handler.transition.Kind),
+		Phase:          tablePhaseForTiming(handler.table),
+		RequestHash:    handler.requestKey,
+		InputCount:     len(handler.plan.Inputs),
+		OutputCount:    handler.outputCount,
+	}, time.Since(forfeitSubmitStartedAt), err)
+	return err
 }
 
 func (handler *custodyBatchEventsHandler) createSignedForfeit(ctx context.Context, input custodyInputSpec, connectorLeaf *psbt.Packet) (string, error) {
@@ -2067,7 +2114,19 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		return nil, errors.New("custody batch is missing proof signers")
 	}
 
+	prepareStartedAt := time.Now()
 	signerSessions, signerPubkeys, derivationPath, err := runtime.prepareCustodyBatchSigners(table, prevStateHash, transitionHash, transition, authorizer, treeSignerIDs, outputs)
+	emitMeshTiming(meshTimingFields{
+		Metric:         "custody_signer_prepare",
+		TableID:        table.Config.TableID,
+		CustodySeq:     transition.CustodySeq,
+		TransitionKind: string(transition.Kind),
+		Phase:          tablePhaseForTiming(table),
+		RequestHash:    transitionHash,
+		Purpose:        "tree",
+		InputCount:     len(inputs),
+		OutputCount:    len(outputs),
+	}, time.Since(prepareStartedAt), err)
 	if err != nil {
 		return nil, err
 	}
@@ -2093,7 +2152,18 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
+	registerStartedAt := time.Now()
 	intentID, err := transport.RegisterIntent(ctx, signedProof, message)
+	emitMeshTiming(meshTimingFields{
+		Metric:         "custody_intent_register",
+		TableID:        table.Config.TableID,
+		CustodySeq:     transition.CustodySeq,
+		TransitionKind: string(transition.Kind),
+		Phase:          tablePhaseForTiming(table),
+		RequestHash:    transitionHash,
+		InputCount:     len(inputs),
+		OutputCount:    len(outputs),
+	}, time.Since(registerStartedAt), err)
 	if err != nil {
 		return nil, err
 	}
@@ -2122,6 +2192,8 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		derivationPath: derivationPath,
 		signerSessions: signerSessions,
 		signerPubkeys:  signerPubkeys,
+		outputCount:    len(outputs),
+		intentRegisteredAt: time.Now(),
 	}
 
 	options := []arksdk.BatchSessionOption{}
@@ -2231,14 +2303,23 @@ func (runtime *meshRuntime) finalizeNonSettlementCustodyTransition(table *native
 	return tablecustody.ValidateTransition(table.LatestCustodyState, *transition)
 }
 
-func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableState, transition *tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) error {
+func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableState, transition *tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) (err error) {
 	if table == nil || transition == nil {
 		return nil
 	}
+	timingFields := custodyTimingFields(*table, *transition, "custody_finalize_real_total")
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
 	signingTransition, plan, err := runtime.normalizedCustodyApprovalTransition(*table, *transition)
 	if err != nil {
 		return err
 	}
+	timingFields.CustodySeq = transition.CustodySeq
+	timingFields.RequestHash = signingTransition.Proof.RequestHash
+	timingFields.InputCount = len(plan.Inputs)
+	timingFields.OutputCount = len(plan.Outputs)
 	inputRefs := make([]string, 0, len(plan.Inputs))
 	for _, input := range plan.Inputs {
 		inputRefs = append(inputRefs, fundingRefKey(input.Ref))

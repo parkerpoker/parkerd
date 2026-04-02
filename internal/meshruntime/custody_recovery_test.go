@@ -151,6 +151,80 @@ func TestRecoveryBundlesOnlyAttachOnDeterministicMoneyResolvingStates(t *testing
 	}
 }
 
+func TestDeterministicRecoveryFastPathSkipsSourcesWithoutPotRefs(t *testing.T) {
+	host, _, table, hand, blindTransition := manualBlindTransitionSourceForRecoveryTest(t)
+
+	if deterministicRecoveryImpossibleForSource(table, &blindTransition, &hand) {
+		t.Fatal("expected blind-post source to allow deterministic recovery")
+	}
+
+	noPotTransition := cloneJSON(blindTransition)
+	noPotTransition.NextState.PotSlices = nil
+	noPotTransition.Proof.RecoveryBundles = nil
+	if !deterministicRecoveryImpossibleForSource(table, &noPotTransition, &hand) {
+		t.Fatal("expected missing source pot refs to make deterministic recovery impossible")
+	}
+	if err := host.attachDeterministicRecoveryBundles(table, &noPotTransition, nil, &hand); err != nil {
+		t.Fatalf("attach recovery bundles on no-pot source: %v", err)
+	}
+	if len(noPotTransition.Proof.RecoveryBundles) != 0 {
+		t.Fatalf("expected no recovery bundles for no-pot source, got %d", len(noPotTransition.Proof.RecoveryBundles))
+	}
+}
+
+func TestRecoveryBundleSourceContextReusePreservesBundleContents(t *testing.T) {
+	host, _, table, hand, blindTransition := manualBlindTransitionSourceForRecoveryTest(t)
+
+	targets, err := host.deterministicRecoveryTargetsForTransition(table, blindTransition, &hand)
+	if err != nil {
+		t.Fatalf("derive deterministic recovery targets: %v", err)
+	}
+	if len(targets) == 0 {
+		t.Fatal("expected deterministic recovery targets")
+	}
+
+	var (
+		target  tablecustody.CustodyTransition
+		outputs []custodyBatchOutput
+		found   bool
+	)
+	for _, candidate := range targets {
+		outputs, err = host.recoveryAuthorizedOutputsForTransition(table, &blindTransition.NextState, candidate)
+		if err != nil {
+			t.Fatalf("derive recovery outputs: %v", err)
+		}
+		if len(outputs) == 0 {
+			continue
+		}
+		target = candidate
+		found = true
+		break
+	}
+	if !found {
+		t.Fatal("expected at least one recovery target with authorized outputs")
+	}
+
+	sourceCtx, err := host.prepareRecoverySourceContext(table, blindTransition)
+	if err != nil {
+		t.Fatalf("prepare recovery source context: %v", err)
+	}
+	if sourceCtx == nil {
+		t.Fatal("expected recovery source context")
+	}
+
+	directBundle, err := host.buildRecoveryBundle(table, blindTransition, target, nil, outputs)
+	if err != nil {
+		t.Fatalf("build direct recovery bundle: %v", err)
+	}
+	reusedBundle, err := host.buildRecoveryBundleWithSourceContext(table, blindTransition, target, nil, outputs, sourceCtx)
+	if err != nil {
+		t.Fatalf("build reused recovery bundle: %v", err)
+	}
+	if !reflect.DeepEqual(directBundle, reusedBundle) {
+		t.Fatalf("expected reused recovery bundle to match direct build\n direct=%+v\n reused=%+v", directBundle, reusedBundle)
+	}
+}
+
 func TestSelectPotCSVExitSpendPathChoosesSharedCSVLeaf(t *testing.T) {
 	host, _, tableID := createSyntheticRealStartedTableForRecoveryTest(t)
 

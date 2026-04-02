@@ -68,6 +68,10 @@ keep_failed_run_enabled() {
   setting_enabled "$KEEP_FAILED_RUN"
 }
 
+timing_metrics_enabled() {
+  setting_enabled "${PARKER_TIMING_METRICS:-}"
+}
+
 host_player_scenario_enabled() {
   [[ "$ROUND_SCENARIO" == "$ROUND_SCENARIO_HOST_PLAYER" ]]
 }
@@ -1785,6 +1789,14 @@ print_local_stack_summary() {
   printf 'SOURCE_ENV=source %q\n' "$runtime_env_path"
 }
 
+print_timing_summary() {
+  if ! timing_metrics_enabled; then
+    return 0
+  fi
+  echo "Timing summary:"
+  perl "$ROOT_DIR/scripts/summarize-mesh-timing.pl" "$BASE" || true
+}
+
 play_hand_automatically() {
   local require_hand_number_gt="${1:-}"
   local state_json=""
@@ -2166,6 +2178,7 @@ if recovery_timeout_scenario_enabled; then
   echo "Final table state:"
   printf '%s\n' "$FINAL_TABLE_JSON"
   echo "Skipping cash out because the recovery scenario intentionally leaves the Ark server offline."
+  print_timing_summary
   echo "Done. Logs are under $BASE"
   exit 0
 fi
@@ -2223,5 +2236,7 @@ write_table_artifact host "$BASE/artifacts/table-after-cashout.json"
 echo "Final wallet summaries:"
 pcli wallet --profile "$PLAYER_ONE_PROFILE" --json
 pcli wallet --profile "$PLAYER_TWO_PROFILE" --json
+
+print_timing_summary
 
 echo "Done. Logs are under $BASE"

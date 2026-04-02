@@ -374,6 +374,20 @@ type protocolDriveSnapshot struct {
 	phase       game.Street
 }
 
+type guestContributionSendSnapshot struct {
+	fingerprint string
+	snapshot    protocolDriveSnapshot
+}
+
+func guestContributionSupportsDedupe(kind string) bool {
+	switch kind {
+	case nativeHandMessageFairnessCommit, nativeHandMessageFairnessReveal, nativeHandMessagePrivateDelivery:
+		return true
+	default:
+		return false
+	}
+}
+
 func snapshotProtocolDrive(table nativeTableState) protocolDriveSnapshot {
 	snapshot := protocolDriveSnapshot{
 		custodyHash: latestCustodyStateHash(table),
@@ -390,6 +404,75 @@ func snapshotProtocolDrive(table nativeTableState) protocolDriveSnapshot {
 func sameProtocolDriveSnapshot(table nativeTableState, snapshot protocolDriveSnapshot) bool {
 	current := snapshotProtocolDrive(table)
 	return current == snapshot
+}
+
+func tablePhaseForTiming(table nativeTableState) string {
+	if table.ActiveHand == nil {
+		return ""
+	}
+	return string(table.ActiveHand.State.Phase)
+}
+
+func custodyTimingFields(table nativeTableState, transition tablecustody.CustodyTransition, metric string) meshTimingFields {
+	return meshTimingFields{
+		Metric:         metric,
+		TableID:        table.Config.TableID,
+		CustodySeq:     transition.CustodySeq,
+		TransitionKind: string(transition.Kind),
+		Phase:          tablePhaseForTiming(table),
+		RequestHash:    custodyApprovalTargetHash(transition),
+	}
+}
+
+func localContributionFingerprint(table nativeTableState, record game.HandTranscriptRecord) string {
+	payload := map[string]any{
+		"cardPositions":      append([]int(nil), record.CardPositions...),
+		"cards":              handMessageCards(record.Cards),
+		"commitmentHash":     record.CommitmentHash,
+		"deckStage":          append([]string(nil), record.DeckStage...),
+		"deckStageRoot":      record.DeckStageRoot,
+		"epoch":              table.CurrentEpoch,
+		"handId":             stringValue(table.PublicState.HandID),
+		"handNumber":         0,
+		"kind":               record.Kind,
+		"lockPublicExponent": record.LockPublicExponentHex,
+		"partialCiphertexts": append([]string(nil), record.PartialCiphertexts...),
+		"phase":              record.Phase,
+		"playerId":           record.PlayerID,
+		"recipientSeatIndex": copyOptionalInt(record.RecipientSeatIndex),
+		"seatIndex":          copyOptionalInt(record.SeatIndex),
+		"shuffleSeed":        record.ShuffleSeedHex,
+		"tableId":            table.Config.TableID,
+	}
+	if table.ActiveHand != nil {
+		payload["handId"] = table.ActiveHand.State.HandID
+		payload["handNumber"] = table.ActiveHand.State.HandNumber
+	}
+	return tablecustody.HashValue(payload)
+}
+
+func (runtime *meshRuntime) shouldSendGuestContribution(tableID string, snapshot protocolDriveSnapshot, fingerprint string) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+
+	previous, ok := runtime.lastGuestContribution[tableID]
+	if !ok {
+		return true
+	}
+	return previous.snapshot != snapshot || previous.fingerprint != fingerprint
+}
+
+func (runtime *meshRuntime) recordGuestContributionSend(tableID string, snapshot protocolDriveSnapshot, fingerprint string) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+
+	if runtime.lastGuestContribution == nil {
+		runtime.lastGuestContribution = map[string]guestContributionSendSnapshot{}
+	}
+	runtime.lastGuestContribution[tableID] = guestContributionSendSnapshot{
+		fingerprint: fingerprint,
+		snapshot:    snapshot,
+	}
 }
 
 func sameInts(left, right []int) bool {
@@ -1403,10 +1486,21 @@ func (runtime *meshRuntime) handleProtocolTimeoutLocked(table *nativeTableState)
 	return nil
 }
 
-func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (bool, error) {
+func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (handled bool, err error) {
 	if table == nil || table.ActiveHand == nil || table.LatestCustodyState == nil {
 		return false, nil
 	}
+	timingFields := meshTimingFields{
+		Metric:         "action_transition_total",
+		TableID:        table.Config.TableID,
+		TransitionKind: string(tablecustody.TransitionKindTimeout),
+		Phase:          tablePhaseForTiming(*table),
+		Purpose:        "timeout",
+	}
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
 	if !game.PhaseAllowsActions(table.ActiveHand.State.Phase) || table.ActiveHand.State.ActingSeatIndex == nil {
 		return false, nil
 	}
@@ -1457,6 +1551,9 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 			return false, nil
 		}
 	}
+	timingFields.CustodySeq = custodyTransition.CustodySeq
+	timingFields.PlayerID = actingPlayerID
+	timingFields.RequestHash = custodyApprovalTargetHash(custodyTransition)
 	if err := runtime.attachDeterministicRecoveryBundles(*table, &custodyTransition, nil, &nextState); err != nil {
 		return false, err
 	}
@@ -1532,10 +1629,20 @@ func (runtime *meshRuntime) abortActiveHandLocked(table *nativeTableState, reaso
 	return nil
 }
 
-func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, timeoutResolution *tablecustody.TimeoutResolution) error {
+func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, timeoutResolution *tablecustody.TimeoutResolution) (err error) {
 	if table == nil || table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetSettled {
 		return nil
 	}
+	timingFields := meshTimingFields{
+		Metric:         "settled_hand_finalize_total",
+		TableID:        table.Config.TableID,
+		TransitionKind: string(tablecustody.TransitionKindShowdownPayout),
+		Phase:          tablePhaseForTiming(*table),
+	}
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
 	if table.NextHandAt != "" {
 		return nil
 	}
@@ -1565,6 +1672,8 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 		if err != nil {
 			return err
 		}
+		timingFields.CustodySeq = custodyTransition.CustodySeq
+		timingFields.RequestHash = custodyApprovalTargetHash(custodyTransition)
 		if err := runtime.syncTableToCustodySigners(*table, runtime.requiredCustodySigners(*table, custodyTransition)); err != nil {
 			if recovered, recoveryErr := runtime.finalizeCustodyRecoveryTransition(table, &custodyTransition, nil); recoveryErr != nil {
 				return recoveryErr
@@ -2075,12 +2184,21 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 	return nil
 }
 
-func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageRequest) (nativeTableState, error) {
+func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageRequest) (updated nativeTableState, err error) {
 	var (
-		updated       nativeTableState
 		replicateView *nativeTableState
 	)
-	err := runtime.store.withTableLock(request.TableID, func() error {
+	timing := startMeshTiming(meshTimingFields{
+		Metric:   "hand_message_handle_total",
+		TableID:  request.TableID,
+		Phase:    request.Phase,
+		Purpose:  request.Kind,
+		PlayerID: request.PlayerID,
+	})
+	defer func() {
+		timing.End(err)
+	}()
+	err = runtime.store.withTableLock(request.TableID, func() error {
 		table, err := runtime.store.readTable(request.TableID)
 		if err != nil || table == nil {
 			return fmt.Errorf("table %s not found", request.TableID)
@@ -2178,33 +2296,78 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 		}
 		return
 	}
+	fingerprint := ""
+	shouldRecordSend := false
+	if guestContributionSupportsDedupe(record.Kind) {
+		fingerprint = localContributionFingerprint(*table, *record)
+		if !runtime.shouldSendGuestContribution(tableID, snapshot, fingerprint) {
+			emitMeshTiming(meshTimingFields{
+				Metric:   "guest_protocol_dedupe_skip",
+				TableID:  tableID,
+				Phase:    record.Phase,
+				Purpose:  record.Kind,
+				PlayerID: runtime.walletID.PlayerID,
+			}, 0, nil)
+			debugMeshf("skip duplicate guest contribution table=%s phase=%s kind=%s self=%s", tableID, record.Phase, record.Kind, runtime.walletID.PlayerID)
+			return
+		}
+		shouldRecordSend = true
+	}
+	driveTiming := startMeshTiming(meshTimingFields{
+		Metric:   "guest_protocol_drive_total",
+		TableID:  tableID,
+		Phase:    record.Phase,
+		Purpose:  record.Kind,
+		PlayerID: runtime.walletID.PlayerID,
+	})
+	var driveErr error
+	defer func() {
+		driveTiming.End(driveErr)
+	}()
 	debugMeshf("build local contribution record ready table=%s phase=%s kind=%s self=%s", tableID, table.ActiveHand.State.Phase, record.Kind, runtime.walletID.PlayerID)
 	request, err := runtime.buildSignedHandMessageRequest(*table, *record)
 	if err != nil {
+		driveErr = err
 		debugMeshf("build signed hand message failed table=%s err=%v", tableID, err)
 		return
 	}
 	latest, latestErr := runtime.requireLocalTable(tableID)
 	if latestErr != nil || latest == nil || !sameProtocolDriveSnapshot(*latest, snapshot) {
+		driveErr = latestErr
 		return
 	}
 	if !runtime.isRunning() {
 		return
 	}
+	transportTiming := startMeshTiming(meshTimingFields{
+		Metric:   "guest_transport_roundtrip_total",
+		TableID:  tableID,
+		Phase:    request.Phase,
+		Purpose:  request.Kind,
+		PlayerID: request.PlayerID,
+	})
 	updated, err := runtime.remoteHandMessage(table.CurrentHost.Peer.PeerURL, request)
+	transportTiming.End(err)
 	if err != nil {
+		driveErr = err
 		debugMeshf("remote hand message failed table=%s kind=%s err=%v", tableID, record.Kind, err)
 		return
 	}
 	debugMeshf("remote hand message accepted table=%s kind=%s phase=%s self=%s", tableID, record.Kind, table.ActiveHand.State.Phase, runtime.walletID.PlayerID)
 	latest, latestErr = runtime.requireLocalTable(tableID)
 	if latestErr != nil || latest == nil || !sameProtocolDriveSnapshot(*latest, snapshot) {
+		driveErr = latestErr
 		return
 	}
 	if !runtime.isRunning() {
 		return
 	}
 	if err := runtime.acceptRemoteTable(updated); err != nil {
+		driveErr = err
 		debugMeshf("accept remote table after hand message failed table=%s err=%v", tableID, err)
+		return
+	}
+	if shouldRecordSend {
+		runtime.recordGuestContributionSend(tableID, snapshot, fingerprint)
 	}
 }

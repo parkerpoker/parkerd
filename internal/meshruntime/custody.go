@@ -668,8 +668,14 @@ func (runtime *meshRuntime) handleCustodyApprovalFromPeer(request nativeCustodyA
 	return nativeCustodyApprovalResponse{Approval: approval}, nil
 }
 
-func (runtime *meshRuntime) collectCustodyApprovals(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, requiredPlayerIDs []string) ([]tablecustody.CustodySignature, error) {
-	approvals := make([]tablecustody.CustodySignature, 0, len(requiredPlayerIDs))
+func (runtime *meshRuntime) collectCustodyApprovals(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, requiredPlayerIDs []string) (approvals []tablecustody.CustodySignature, err error) {
+	timingFields := custodyTimingFields(table, transition, "custody_approval_collect")
+	timingFields.Purpose = "approval"
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
+	approvals = make([]tablecustody.CustodySignature, 0, len(requiredPlayerIDs))
 	for _, playerID := range requiredPlayerIDs {
 		seat, ok := seatRecordForPlayer(table, playerID)
 		if !ok {

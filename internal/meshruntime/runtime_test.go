@@ -278,6 +278,64 @@ func TestHandleHandMessageReturnsBeforeSlowReplication(t *testing.T) {
 	}
 }
 
+func TestDriveLocalHandProtocolDedupesRepeatedGuestContributionSends(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetCommitment)
+
+	sendCount := 0
+	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+		sendCount++
+		if input.Kind != nativeHandMessageFairnessCommit {
+			t.Fatalf("expected fairness commit send, got %s", input.Kind)
+		}
+		return table, nil
+	}
+
+	guest.driveLocalHandProtocol(tableID)
+	guest.driveLocalHandProtocol(tableID)
+
+	if sendCount != 1 {
+		t.Fatalf("expected duplicate guest contribution sends to be suppressed, got %d sends", sendCount)
+	}
+}
+
+func TestDriveLocalHandProtocolDoesNotDedupeBoardShares(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+		t.Fatalf("guest send preflop check: %v", err)
+	}
+
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetFlopReveal)
+	sendCount := 0
+	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+		sendCount++
+		if input.Kind != nativeHandMessageBoardShare {
+			t.Fatalf("expected board-share send, got %s", input.Kind)
+		}
+		return table, nil
+	}
+
+	guest.driveLocalHandProtocol(tableID)
+	guest.driveLocalHandProtocol(tableID)
+
+	if sendCount != 2 {
+		t.Fatalf("expected board-share retries to remain enabled, got %d sends", sendCount)
+	}
+}
+
 func TestNetworkTableViewRepairsStaleActiveHandPublicState(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")

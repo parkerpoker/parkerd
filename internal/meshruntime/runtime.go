@@ -39,8 +39,10 @@ type meshRuntime struct {
 	custodyRecoveryExecute func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
 	custodySignerAuth      map[string]custodySignerAuthorization
 	custodySigners         map[string]walletpkg.CustodySignerSession
+	handMessageSenderHook  func(peerURL string, input nativeHandMessageRequest) (nativeTableState, error)
 	httpClient             *http.Client
 	lastSyncAt             map[string]time.Time
+	lastGuestContribution  map[string]guestContributionSendSnapshot
 	listener               net.Listener
 	mode                   string
 	mu                     sync.Mutex
@@ -90,6 +92,7 @@ func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (
 		custodySigners:    map[string]walletpkg.CustodySignerSession{},
 		httpClient:        &http.Client{Timeout: 5 * time.Second},
 		lastSyncAt:        map[string]time.Time{},
+		lastGuestContribution: map[string]guestContributionSendSnapshot{},
 		mode:              mode,
 		peerInfoCache:     map[string]nativeCachedPeerInfo{},
 		profileName:       profileName,
@@ -1181,12 +1184,20 @@ func (runtime *meshRuntime) GetTable(tableID string) (NativeMeshTableView, error
 	return runtime.localTableView(*table), nil
 }
 
-func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (NativeMeshTableView, error) {
+func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (result NativeMeshTableView, err error) {
+	timing := startMeshTiming(meshTimingFields{
+		Metric:   "action_submit_roundtrip_total",
+		TableID:  tableID,
+		Purpose:  string(action.Type),
+		PlayerID: runtime.walletID.PlayerID,
+	})
+	defer func() {
+		timing.End(err)
+	}()
 	if err := runtime.Start(); err != nil {
 		return NativeMeshTableView{}, err
 	}
 	var (
-		err     error
 		table   *nativeTableState
 		updated nativeTableState
 	)
@@ -2419,9 +2430,18 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 	return updated, err
 }
 
-func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (nativeTableState, error) {
-	var updated nativeTableState
-	err := runtime.store.withTableLock(request.TableID, func() error {
+func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (updated nativeTableState, err error) {
+	timingFields := meshTimingFields{
+		Metric:   "action_transition_total",
+		TableID:  request.TableID,
+		Purpose:  "peer-request",
+		PlayerID: request.PlayerID,
+	}
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
+	err = runtime.store.withTableLock(request.TableID, func() error {
 		table, err := runtime.store.readTable(request.TableID)
 		if err != nil || table == nil {
 			return fmt.Errorf("table %s not found", request.TableID)
@@ -2456,6 +2476,10 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (n
 		if err != nil {
 			return err
 		}
+		timingFields.CustodySeq = custodyTransition.CustodySeq
+		timingFields.TransitionKind = string(custodyTransition.Kind)
+		timingFields.Phase = tablePhaseForTiming(*table)
+		timingFields.RequestHash = custodyApprovalTargetHash(custodyTransition)
 		if err := runtime.finalizeCustodyTransition(table, &custodyTransition, authorizer); err != nil {
 			return err
 		}

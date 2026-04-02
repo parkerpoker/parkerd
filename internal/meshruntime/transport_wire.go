@@ -440,6 +440,9 @@ func (runtime *meshRuntime) remoteFunds(peerURL string, input nativeFundsRequest
 }
 
 func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+	if runtime.handMessageSenderHook != nil {
+		return runtime.handMessageSenderHook(peerURL, input)
+	}
 	return runtime.sendPeerTableRequest(peerURL, nativeTransportMessageTableHandReq, nativeTransportMessageTableHandResp, input.TableID, input)
 }
 
