@@ -14,10 +14,33 @@ The important protocol changes in this generation are:
 - local funds bookkeeping is `arkade-table-funds/v1`
 - join requests include funded buy-in refs
 - action and funds requests are bound to `prevCustodyStateHash`
+- approval/request hashing strips recovery bundles and recovery witnesses until the final accepted proof is assembled
 - accepted `PlayerAction`, `CashOut`, and `EmergencyExit` events carry the full signed initiator request as the canonical payload
 - host sequencing is proposer-only; action and result events are appended only after custody finalization succeeds
+- Parker v1 no longer relies on impossible output-inspecting tapscript for deterministic contested pots; it stores fully signed CSV recovery bundles over the existing shared pot exit leaf
+- accepted custody history can now prove either a live Ark batch path or a stored recovery-bundle path
 - in the current heads-up runtime, accepted betting and payout steps become the new cash-out and exit baseline; later funds requests are evaluated against the latest custody state, not a pre-loss balance
 - the game engine is N-player-capable for money logic, but runtime table creation is still capped at 2 seats
+
+## Recovery Semantics
+
+The deterministic recovery path is deliberately narrower than the normal cooperative batch path.
+
+Bundles are only stored when the current accepted transition leaves contested pot refs and the next money result is objective:
+
+- action timeout that must auto-fold
+- showdown/private-delivery/reveal timeout that kills the missing player for the contested pot
+- settled `showdown-payout` timeout
+
+They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result.
+
+Each stored bundle carries:
+
+- semantic successor metadata
+- source pot refs
+- a fully signed PSBT using the pot's shared CSV leaf
+- the exact authorized outputs
+- the earliest execution time after the unilateral delay `U`
 
 ## Runtime Surfaces
 
@@ -230,9 +253,11 @@ Semantic successor validation derives the expected next custody step locally fro
 - `cash-out` and `emergency-exit` use the embedded `nativeFundsRequest`
 - `blind-post`, `showdown-payout`, and `carry-forward` are rebuilt locally with no host-authored semantic input
 
-Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers still verify Ark-linked refs, authorized output sets, and Ark proof material even after the semantic successor matches.
+Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers still verify Ark-linked refs, authorized output sets, and proof material even after the semantic successor matches.
 
-In real-settlement mode, accepted replay for real Ark-settled, non-emergency transitions now uses the stored `CustodyProof.SettlementWitness` bundle as the canonical proof surface. That witness bundle includes:
+Accepted history can now replay two proof surfaces offline.
+
+The first is the ordinary real Ark batch path through `CustodyProof.SettlementWitness`. That witness bundle includes:
 
 - `arkIntentId`
 - `arkTxid`
@@ -245,6 +270,19 @@ In real-settlement mode, accepted replay for real Ark-settled, non-emergency tra
 - optional `connectorTree`
 
 Accepted replay re-derives the authorized spend paths and batch outputs from the previous custody state plus the accepted transition, validates the witness bundle offline, and exact-matches the witness-derived refs against `NextState` and `Proof.VTXORefs`.
+
+The second is the deterministic recovery path:
+
+- the source accepted transition stores one or more `CustodyProof.RecoveryBundles`
+- the executed `timeout` or `showdown-payout` transition carries `CustodyProof.RecoveryWitness`
+- replay validates the stored signed PSBT, the exact source pot refs, the CSV leaf/sequence, the authorized outputs, and the recovery transaction metadata
+- replay then derives the winner-owned stack refs from the PSBT itself and exact-matches them against `NextState` and `Proof.VTXORefs`
+
+Hashing and approval semantics follow the same split:
+
+- `HashCustodyRequest` intentionally strips recovery bundles and recovery witnesses
+- once the bundle is attached to the accepted source transition, the final transition hash commits to it
+- recovery execution later appends a normal semantic `timeout` or `showdown-payout` transition whose proof commits to the executed `RecoveryWitness`
 
 Live Ark/indexer checks remain in the current protocol only where liveness or spendability matters, such as join funding admission and other interactive safety checks.
 

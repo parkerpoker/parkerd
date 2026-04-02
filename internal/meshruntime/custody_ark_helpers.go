@@ -22,11 +22,13 @@ import (
 
 type custodySpendPath struct {
 	LeafProof        *arklib.TaprootMerkleProof
+	CSVLocktime      arklib.RelativeLocktime
 	Locktime         arklib.AbsoluteLocktime
 	PKScript         []byte
 	PlayerIDs        []string
 	Script           []byte
 	Tapscripts       []string
+	UsesCSVLocktime  bool
 	UsesCLTVLocktime bool
 }
 
@@ -386,6 +388,41 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 	}, nil
 }
 
+func canonicalStrings(values []string) []string {
+	canonical := append([]string(nil), values...)
+	sort.Strings(canonical)
+	return canonical
+}
+
+func sameCanonicalStrings(left, right []string) bool {
+	return reflect.DeepEqual(canonicalStrings(left), canonicalStrings(right))
+}
+
+func (runtime *meshRuntime) potSpendSignerIDsForTransition(table nativeTableState, transition tablecustody.CustodyTransition) []string {
+	signerIDs := append([]string(nil), runtime.requiredCustodySigners(table, transition)...)
+	if len(signerIDs) == 0 {
+		signerIDs = playerIDsFromSeats(table.Seats)
+	}
+	return uniqueSortedPlayerIDs(signerIDs)
+}
+
+func (runtime *meshRuntime) potSliceRefsReusableForTransition(table nativeTableState, transition tablecustody.CustodyTransition, previous, next tablecustody.PotSlice) bool {
+	if !reflect.DeepEqual(comparablePotSlice(previous), comparablePotSlice(next)) {
+		return false
+	}
+	if len(previous.VTXORefs) != 1 {
+		return false
+	}
+	spec, err := runtime.potOutputSpec(table, transition, next, runtime.potSpendSignerIDsForTransition(table, transition))
+	if err != nil {
+		return false
+	}
+	ref := previous.VTXORefs[0]
+	return ref.AmountSats == spec.AmountSats &&
+		ref.Script == spec.Script &&
+		sameCanonicalStrings(ref.Tapscripts, spec.Tapscripts)
+}
+
 func (runtime *meshRuntime) playerIDByXOnlyPubkey(table nativeTableState, xOnlyHex string) (string, bool, error) {
 	for _, seat := range table.Seats {
 		seatXOnly, err := xOnlyPubkeyHexFromCompressed(seat.WalletPubkeyHex)
@@ -431,6 +468,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 	bestLocktime := arklib.AbsoluteLocktime(0)
 	bestScript := []byte(nil)
 	bestPlayers := []string(nil)
+	triedClosures := make([]string, 0, len(vtxoScript.ForfeitClosures()))
 	for index, closure := range vtxoScript.ForfeitClosures() {
 		keys := make([]string, 0)
 		unmappedNonOperatorKeys := 0
@@ -468,6 +506,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 			keys = append(keys, ref.OwnerPlayerID)
 		}
 		keys = uniqueSortedPlayerIDs(keys)
+		triedClosures = append(triedClosures, fmt.Sprintf("%T:%v:unmapped=%d", closure, keys, unmappedNonOperatorKeys))
 		if !reflect.DeepEqual(keys, desired) {
 			continue
 		}
@@ -497,7 +536,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 		break
 	}
 	if bestIndex < 0 {
-		return custodySpendPath{}, fmt.Errorf("no custody spend path matches signers %v for %s:%d", desired, ref.TxID, ref.VOut)
+		return custodySpendPath{}, fmt.Errorf("no custody spend path matches signers %v for %s:%d (owner=%s closures=%v)", desired, ref.TxID, ref.VOut, ref.OwnerPlayerID, triedClosures)
 	}
 	tapKey, tapTree, err := vtxoScript.TapTree()
 	if err != nil {
@@ -542,10 +581,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 		TreeSignerIDs: append([]string(nil), treeSignerIDs...),
 	}
 	proofSignerSet := map[string]struct{}{}
-	potSpendSignerIDs := append([]string(nil), treeSignerIDs...)
-	if len(potSpendSignerIDs) == 0 {
-		potSpendSignerIDs = playerIDsFromSeats(table.Seats)
-	}
+	potSpendSignerIDs := runtime.potSpendSignerIDsForTransition(table, transition)
 	preferTimeout := transition.TimeoutResolution != nil
 	nextPotIDs := map[string]struct{}{}
 
@@ -569,7 +605,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			for _, ref := range inputRefs {
 				spendPath, err := runtime.selectCustodySpendPath(table, ref, []string{nextClaim.PlayerID}, false)
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("select stack spend path for %s: %w", nextClaim.PlayerID, err)
 				}
 				plan.Inputs = append(plan.Inputs, custodyInputSpec{
 					ClaimKey:      stackClaimKey(nextClaim.PlayerID),
@@ -601,7 +637,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 		nextSlice := transition.NextState.PotSlices[index]
 		nextPotIDs[nextSlice.PotID] = struct{}{}
 		prevSlice, hadPrev := prevPots[nextSlice.PotID]
-		if hadPrev && reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(nextSlice)) {
+		if hadPrev && runtime.potSliceRefsReusableForTransition(table, transition, prevSlice, nextSlice) {
 			transition.NextState.PotSlices[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevSlice.VTXORefs...)
 			continue
 		}
@@ -610,7 +646,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			for _, ref := range prevSlice.VTXORefs {
 				spendPath, err := runtime.selectCustodySpendPath(table, ref, potSpendSignerIDs, preferTimeout)
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("select pot spend path for %s: %w", nextSlice.PotID, err)
 				}
 				plan.Inputs = append(plan.Inputs, custodyInputSpec{
 					ClaimKey:  potClaimKey(nextSlice.PotID),
@@ -637,7 +673,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 		for _, ref := range prevSlice.VTXORefs {
 			spendPath, err := runtime.selectCustodySpendPath(table, ref, potSpendSignerIDs, preferTimeout)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("select removed-pot spend path for %s: %w", potID, err)
 			}
 			plan.Inputs = append(plan.Inputs, custodyInputSpec{
 				ClaimKey:  potClaimKey(potID),
@@ -749,7 +785,7 @@ func (runtime *meshRuntime) custodyFeePayerIDs(table nativeTableState, transitio
 	potsChanged := false
 	for _, slice := range transition.NextState.PotSlices {
 		prevSlice, hadPrev := previousPots[slice.PotID]
-		if !hadPrev || !reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(slice)) {
+		if !hadPrev || !runtime.potSliceRefsReusableForTransition(table, transition, prevSlice, slice) {
 			potsChanged = true
 			break
 		}

@@ -291,15 +291,18 @@ func (runtime *meshRuntime) validateAcceptedInitiatorHistory(table nativeTableSt
 				if request.Epoch != transition.NextState.Epoch {
 					return fmt.Errorf("event %d action request epoch mismatch", index)
 				}
-				if request.DecisionIndex != previousState.DecisionIndex {
-					return fmt.Errorf("event %d action request decision index mismatch", index)
-				}
-				if request.HandID != previousState.HandID {
-					return fmt.Errorf("event %d action request hand mismatch", index)
-				}
-				if transition.Action == nil {
-					return fmt.Errorf("event %d action transition is missing its action descriptor", index)
-				}
+					if request.DecisionIndex != previousState.DecisionIndex {
+						return fmt.Errorf("event %d action request decision index mismatch", index)
+					}
+					if request.HandID != previousState.HandID {
+						return fmt.Errorf("event %d action request hand mismatch", index)
+					}
+					if expectedActor := strings.TrimSpace(previousState.ActingPlayerID); expectedActor != "" && request.PlayerID != expectedActor {
+						return fmt.Errorf("event %d action request player mismatch", index)
+					}
+					if transition.Action == nil {
+						return fmt.Errorf("event %d action transition is missing its action descriptor", index)
+					}
 				if transition.Action.Type != string(request.Action.Type) || transition.Action.TotalSats != request.Action.TotalSats {
 					return fmt.Errorf("event %d action request does not match custody transition", index)
 				}

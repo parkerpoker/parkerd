@@ -151,7 +151,7 @@ func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) 
 	if config == nil || config.SignerPubKey == nil || config.ForfeitPubKey == nil {
 		return CustodyArkConfig{}, errors.New("ark client config is incomplete")
 	}
-	return CustodyArkConfig{
+	cached := CustodyArkConfig{
 		ArkServerURL:          runtime.config.ArkServerURL,
 		CheckpointTapscript:   config.CheckpointTapscript,
 		DustSats:              config.Dust,
@@ -165,7 +165,12 @@ func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) 
 		OnchainOutputFeeSats:  int(config.Fees.IntentFees.OnchainOutput),
 		SignerPubkeyHex:       hex.EncodeToString(config.SignerPubKey.SerializeCompressed()),
 		UnilateralExitDelay:   config.UnilateralExitDelay,
-	}, nil
+	}
+	state.CachedArkConfig = &cached
+	if err := runtime.store.Save(*state); err != nil {
+		return CustodyArkConfig{}, err
+	}
+	return cached, nil
 }
 
 func (runtime *Runtime) getWalletLocked(profileName string, state PlayerProfileState) (WalletSummary, error) {
@@ -187,11 +192,15 @@ func (runtime *Runtime) getWalletLocked(profileName string, state PlayerProfileS
 		return WalletSummary{}, err
 	}
 	debugWalletf("wallet summary balance ready profile=%s offchain=%d onchain=%d", profileName, balance.OffchainBalance.Total, onchainBalanceTotal(balance))
-	arkAddress, boardingAddress, err := runtime.currentWalletAddresses(ctx, client)
+	arkAddress, boardingAddress, onchainAddresses, err := runtime.currentWalletAddresses(ctx, client)
 	if err != nil {
 		return WalletSummary{}, err
 	}
 	debugWalletf("wallet summary addresses ready profile=%s ark=%s boarding=%s", profileName, arkAddress, boardingAddress)
+	state.CachedOnchainAddresses = append([]string(nil), onchainAddresses...)
+	if err := runtime.store.Save(state); err != nil {
+		return WalletSummary{}, err
+	}
 
 	return WalletSummary{
 		AvailableSats:       int(balance.OffchainBalance.Total),
@@ -828,16 +837,16 @@ func (runtime *Runtime) waitForBoardingFunds(ctx context.Context, client arksdk.
 	return waitForOnchainFunds(ctx, client)
 }
 
-func (runtime *Runtime) currentWalletAddresses(ctx context.Context, client arksdk.ArkClient) (string, string, error) {
+func (runtime *Runtime) currentWalletAddresses(ctx context.Context, client arksdk.ArkClient) (string, string, []string, error) {
 	onchainAddresses, offchainAddresses, boardingAddresses, _, err := client.GetAddresses(ctx)
 	if err != nil {
-		return "", "", err
+		return "", "", nil, err
 	}
 	if len(offchainAddresses) == 0 {
-		return "", "", errors.New("wallet has no Ark address")
+		return "", "", nil, errors.New("wallet has no Ark address")
 	}
 	if len(boardingAddresses) == 0 {
-		return "", "", errors.New("wallet has no boarding address")
+		return "", "", nil, errors.New("wallet has no boarding address")
 	}
 
 	arkAddress := offchainAddresses[len(offchainAddresses)-1]
@@ -845,7 +854,18 @@ func (runtime *Runtime) currentWalletAddresses(ctx context.Context, client arksd
 	if len(onchainAddresses) > 0 && arkAddress == "" {
 		arkAddress = onchainAddresses[len(onchainAddresses)-1]
 	}
-	return arkAddress, boardingAddress, nil
+	return arkAddress, boardingAddress, append([]string(nil), onchainAddresses...), nil
+}
+
+func cachedArkConfig(state PlayerProfileState) (CustodyArkConfig, bool) {
+	if state.CachedArkConfig == nil {
+		return CustodyArkConfig{}, false
+	}
+	return *state.CachedArkConfig, true
+}
+
+func cachedOnchainAddresses(state PlayerProfileState) []string {
+	return append([]string(nil), state.CachedOnchainAddresses...)
 }
 
 func debugWalletf(format string, args ...any) {

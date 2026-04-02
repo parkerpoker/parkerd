@@ -249,6 +249,21 @@ func validateConnectorTreeWitness(commitmentTxID string, plan *custodySettlement
 	return nil
 }
 
+func stackClaimRefSummary(state *tablecustody.CustodyState) []string {
+	if state == nil {
+		return nil
+	}
+	summaries := make([]string, 0, len(state.StackClaims))
+	for _, claim := range canonicalCustodyMoneyStacks(state) {
+		refs := make([]string, 0, len(claim.VTXORefs))
+		for _, ref := range claim.VTXORefs {
+			refs = append(refs, fundingRefKey(ref))
+		}
+		summaries = append(summaries, fmt.Sprintf("%s=%v", claim.PlayerID, refs))
+	}
+	return summaries
+}
+
 func (runtime *meshRuntime) validateAcceptedCustodySettlementWitness(table nativeTableState, previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) error {
 	witness := transition.Proof.SettlementWitness
 	if err := validateCustodySettlementWitnessSummary(transition, witness); err != nil {
@@ -325,7 +340,11 @@ func (runtime *meshRuntime) validateAcceptedCustodySettlementWitness(table nativ
 	expected := cloneJSON(transition)
 	applyTransitionSettlementPlan(&expected, plan, outputRefs)
 	if !reflect.DeepEqual(canonicalCustodyMoneyStacks(&expected.NextState), canonicalCustodyMoneyStacks(&transition.NextState)) {
-		return errors.New("witness-derived stack refs do not match the accepted next state")
+		return fmt.Errorf(
+			"witness-derived stack refs do not match the accepted next state: expected=%v actual=%v",
+			stackClaimRefSummary(&expected.NextState),
+			stackClaimRefSummary(&transition.NextState),
+		)
 	}
 	if !reflect.DeepEqual(canonicalCustodyMoneyPots(&expected.NextState), canonicalCustodyMoneyPots(&transition.NextState)) {
 		return errors.New("witness-derived pot refs do not match the accepted next state")
@@ -338,6 +357,9 @@ func (runtime *meshRuntime) validateAcceptedCustodySettlementWitness(table nativ
 
 func (runtime *meshRuntime) validateCustodyTransitionArkProof(previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition, requireSpendable bool) error {
 	if runtime.config.UseMockSettlement {
+		return nil
+	}
+	if transition.Proof.RecoveryWitness != nil {
 		return nil
 	}
 

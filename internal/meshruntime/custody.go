@@ -289,7 +289,7 @@ func (runtime *meshRuntime) buildCustodyTransitionWithOverrides(table nativeTabl
 			return tablecustody.CustodyTransition{}, err
 		}
 	}
-	carryForwardUnchangedCustodyRefs(table.LatestCustodyState, &transition)
+	runtime.carryForwardUnchangedCustodyRefs(table, &transition)
 	transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
 	transition.NextStateHash = transition.NextState.StateHash
 	transition.Proof.StateHash = transition.NextStateHash
@@ -302,7 +302,8 @@ func (runtime *meshRuntime) buildCustodyTransition(table nativeTableState, kind 
 	return runtime.buildCustodyTransitionWithOverrides(table, kind, hand, action, timeout, nil)
 }
 
-func carryForwardUnchangedCustodyRefs(previous *tablecustody.CustodyState, transition *tablecustody.CustodyTransition) {
+func (runtime *meshRuntime) carryForwardUnchangedCustodyRefs(table nativeTableState, transition *tablecustody.CustodyTransition) {
+	previous := table.LatestCustodyState
 	if previous == nil || transition == nil {
 		return
 	}
@@ -324,7 +325,7 @@ func carryForwardUnchangedCustodyRefs(previous *tablecustody.CustodyState, trans
 	for index := range transition.NextState.PotSlices {
 		nextSlice := transition.NextState.PotSlices[index]
 		prevSlice, ok := prevPots[nextSlice.PotID]
-		if ok && reflect.DeepEqual(comparablePotSlice(prevSlice), comparablePotSlice(nextSlice)) {
+		if ok && runtime.potSliceRefsReusableForTransition(table, *transition, prevSlice, nextSlice) {
 			transition.NextState.PotSlices[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevSlice.VTXORefs...)
 		}
 	}

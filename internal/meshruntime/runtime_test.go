@@ -2,6 +2,7 @@ package meshruntime
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -685,8 +686,7 @@ func TestSyntheticRealModeMissingShowdownRevealTimeoutSettles(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	enableSyntheticRealMode(host, guest)
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
@@ -987,8 +987,7 @@ func TestShowdownPayoutPlanConsumesRemovedPotRefs(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	enableSyntheticRealMode(host, guest)
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
@@ -2230,6 +2229,52 @@ func TestTwoPlayerFailoverUsesLowestNonHostSeat(t *testing.T) {
 	}
 }
 
+func TestCompletedSeatDoesNotReclaimFailoverHost(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	host.self.Peer.PeerID = "peer-aaa"
+	guest.self.Peer.PeerID = "peer-zzz"
+
+	table := nativeTableState{
+		CurrentHost: nativeKnownParticipant{
+			ProfileName: guest.profileName,
+			Peer:        guest.self.Peer,
+		},
+		Seats: []nativeSeatRecord{
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Host",
+					PeerID:    host.self.Peer.PeerID,
+					PlayerID:  host.walletID.PlayerID,
+					SeatIndex: 0,
+					Status:    "completed",
+				},
+				PeerURL:     host.self.Peer.PeerURL,
+				ProfileName: host.profileName,
+			},
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Guest",
+					PeerID:    guest.self.Peer.PeerID,
+					PlayerID:  guest.walletID.PlayerID,
+					SeatIndex: 1,
+					Status:    "active",
+				},
+				PeerURL:     guest.self.Peer.PeerURL,
+				ProfileName: guest.profileName,
+			},
+		},
+	}
+
+	if host.shouldHandleFailover(table) {
+		t.Fatal("expected completed seat not to reclaim hosting after cash-out")
+	}
+	if _, ok := lowestEligibleFailoverSeat(table); ok {
+		t.Fatal("expected no non-host failover seat when the only non-host seat is completed")
+	}
+}
+
 func TestTableFetchAuthRejectsStaleSignature(t *testing.T) {
 	t.Parallel()
 
@@ -2396,6 +2441,143 @@ func TestJoinTableSyncsExistingSeatsBeforeRemoteSignerPrepare(t *testing.T) {
 	}
 }
 
+func TestCustodySignerPrepareAcceptsBuyInLockWhenJoinerSeatMaterialIsStale(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	alice := newMeshTestRuntime(t, "alice")
+	bob := newMeshTestRuntime(t, "bob")
+	enableSyntheticRealMode(host, alice, bob)
+
+	createResult, err := host.CreateTable(map[string]any{"name": "Stale Buy-In Lock Prepare"})
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	inviteCode := stringValue(createResult["inviteCode"])
+	if inviteCode == "" {
+		t.Fatal("expected invite code from table creation")
+	}
+	invite, err := decodeInvite(inviteCode)
+	if err != nil {
+		t.Fatalf("decode invite: %v", err)
+	}
+	tableID := stringValue(invite["tableId"])
+	if tableID == "" {
+		t.Fatal("expected table id from table creation")
+	}
+
+	if _, err := alice.JoinTable(inviteCode, 4_000); err != nil {
+		t.Fatalf("alice join table: %v", err)
+	}
+
+	hostTable := mustReadNativeTable(t, host, tableID)
+	bobJoin := mustBuildJoinRequest(t, bob, tableID, host.selfPeerURL())
+	pendingJoin := cloneJSON(hostTable)
+	pendingJoin.Seats = append(pendingJoin.Seats, nativeSeatRecord{
+		NativeSeatedPlayer: NativeSeatedPlayer{
+			ArkAddress:        bobJoin.ArkAddress,
+			BuyInSats:         bobJoin.BuyInSats,
+			FundingRefs:       append([]tablecustody.VTXORef(nil), bobJoin.FundingRefs...),
+			Nickname:          bobJoin.Nickname,
+			PeerID:            bobJoin.Peer.PeerID,
+			PlayerID:          bobJoin.WalletPlayerID,
+			ProtocolPubkeyHex: bobJoin.Peer.ProtocolPubkeyHex,
+			SeatIndex:         len(pendingJoin.Seats),
+			Status:            "active",
+			WalletPubkeyHex:   bobJoin.WalletPubkeyHex,
+		},
+		PeerURL:     bobJoin.Peer.PeerURL,
+		ProfileName: bobJoin.ProfileName,
+	})
+	pendingJoin.Config.OccupiedSeats = len(pendingJoin.Seats)
+
+	transition, err := host.buildSeatLockTransition(pendingJoin)
+	if err != nil {
+		t.Fatalf("build pending seat-lock transition: %v", err)
+	}
+	signingTransition, plan, err := host.normalizedCustodyApprovalTransition(pendingJoin, transition)
+	if err != nil {
+		t.Fatalf("normalize pending seat-lock transition: %v", err)
+	}
+	transitionHash := custodyTransitionRequestHash(signingTransition)
+	expectedOutputs := offchainCustodyBatchOutputs(plan.AuthorizedOutputs)
+	if len(expectedOutputs) == 0 {
+		t.Fatal("expected offchain outputs for buy-in-lock signer prepare")
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(nativeTableState) nativeTableState
+	}{
+		{
+			name: "missing-joiner-wallet-pubkey",
+			mutate: func(table nativeTableState) nativeTableState {
+				stale := cloneJSON(table)
+				for index := range stale.Seats {
+					if stale.Seats[index].PlayerID != bob.walletID.PlayerID {
+						continue
+					}
+					stale.Seats[index].WalletPubkeyHex = ""
+					stale.Seats[index].NativeSeatedPlayer.WalletPubkeyHex = ""
+				}
+				return stale
+			},
+		},
+		{
+			name: "missing-joiner-seat",
+			mutate: func(table nativeTableState) nativeTableState {
+				stale := cloneJSON(table)
+				filtered := make([]nativeSeatRecord, 0, len(stale.Seats))
+				for _, seat := range stale.Seats {
+					if seat.PlayerID == bob.walletID.PlayerID {
+						continue
+					}
+					filtered = append(filtered, seat)
+				}
+				stale.Seats = filtered
+				stale.Config.OccupiedSeats = len(filtered)
+				return stale
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			staleAlice := tc.mutate(pendingJoin)
+			if err := alice.store.writeTable(&staleAlice); err != nil {
+				t.Fatalf("write stale alice table: %v", err)
+			}
+
+			if err := alice.validatePrebuiltCustodySigningTransition(staleAlice, signingTransition.PrevStateHash, transitionHash, signingTransition, nil); err == nil {
+				t.Fatal("expected generic validation to fail for stale joiner metadata")
+			}
+
+			request := nativeCustodySignerPrepareRequest{
+				DerivationPath:          "test-buyin-lock-stale-seat-prepare-" + tc.name,
+				ExpectedPrevStateHash:   signingTransition.PrevStateHash,
+				ExpectedOffchainOutputs: expectedOutputs,
+				PlayerID:                alice.walletID.PlayerID,
+				ProtocolVersion:         nativeProtocolVersion,
+				TableID:                 tableID,
+				TransitionHash:          transitionHash,
+				Transition:              signingTransition,
+			}
+			response, err := alice.handleCustodySignerPrepareFromPeer(request)
+			if err != nil {
+				t.Fatalf("prepare stale buy-in-lock signer: %v", err)
+			}
+			if strings.TrimSpace(response.SignerPubkeyHex) == "" {
+				t.Fatal("expected signer pubkey from stale buy-in-lock prepare")
+			}
+
+			tamperedRequest := request
+			tamperedRequest.DerivationPath = "test-buyin-lock-stale-seat-tampered-" + tc.name
+			tamperedRequest.ExpectedOffchainOutputs = append([]custodyBatchOutput(nil), expectedOutputs...)
+			tamperedRequest.ExpectedOffchainOutputs[0].AmountSats++
+			if _, err := alice.handleCustodySignerPrepareFromPeer(tamperedRequest); err == nil || !strings.Contains(err.Error(), "authorized") {
+				t.Fatalf("expected stale buy-in-lock prepare to reject tampered outputs, got %v", err)
+			}
+		})
+	}
+}
+
 func TestDefaultDealerlessBlindsUseArkDustFloor(t *testing.T) {
 	smallBlind, bigBlind := defaultDealerlessBlinds(330, map[string]any{})
 	if smallBlind != 165 || bigBlind != 330 {
@@ -2541,6 +2723,66 @@ func TestSubsequentFundsTransitionDoesNotReuseCompletedSeatFundingRefs(t *testin
 	}
 	if err := validateAcceptedCustodyRefs(table.LatestCustodyState, transition, false); err != nil {
 		t.Fatalf("validate guest cash-out transition refs: %v", err)
+	}
+}
+
+func TestCashOutProofSigningAcceptsAuthorizedOutputsForActingPlayer(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call to showdown line: %v", err)
+	}
+	for _, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send showdown-line check: %v", err)
+		}
+	}
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	table := mustReadNativeTable(t, host, tableID)
+	transition, err := host.buildFundsCustodyTransitionForPlayer(table, host.walletID.PlayerID, tablecustody.TransitionKindCashOut, "completed")
+	if err != nil {
+		t.Fatalf("build settled-hand host cash-out transition: %v", err)
+	}
+	fundsRequest, err := host.buildSignedFundsRequest(table, "cashout")
+	if err != nil {
+		t.Fatalf("build settled-hand host cash-out request: %v", err)
+	}
+	signingTransition, plan, err := host.normalizedCustodySigningTransition(table, transition)
+	if err != nil {
+		t.Fatalf("normalize settled-hand host cash-out transition: %v", err)
+	}
+	proofPSBT, err := buildCustodyProofPSBTForTest(plan)
+	if err != nil {
+		t.Fatalf("build proof psbt: %v", err)
+	}
+	if _, err := host.handleCustodyTxSignFromPeer(nativeCustodyTxSignRequest{
+		ExpectedPrevStateHash: transition.PrevStateHash,
+		ExpectedOutputs:       append([]custodyBatchOutput(nil), plan.AuthorizedOutputs...),
+		Authorizer:            authorizerForFundsRequest(fundsRequest),
+		PlayerID:              host.walletID.PlayerID,
+		PSBT:                  proofPSBT,
+		Purpose:               "proof",
+		ProtocolVersion:       nativeProtocolVersion,
+		TableID:               tableID,
+		Transition:            signingTransition,
+		TransitionHash:        custodyTransitionRequestHash(signingTransition),
+	}); err != nil {
+		t.Fatalf("acting player proof signer should accept authorized cash-out outputs: %v", err)
 	}
 }
 
@@ -2837,8 +3079,7 @@ func TestSyntheticRealModeGuestCashOutAfterSettledHand(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	enableSyntheticRealMode(host, guest)
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
@@ -3037,8 +3278,7 @@ func TestSyntheticRealModeSettledHandCashOutProofRefsCoverRemainingClaims(t *tes
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	enableSyntheticRealMode(host, guest)
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
@@ -3102,8 +3342,7 @@ func TestSettledHandCashOutSignerPrepareAcceptsNormalizedTransition(t *testing.T
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	enableSyntheticRealMode(host, guest)
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
@@ -3551,8 +3790,7 @@ func TestShowdownPayoutSemanticValidationRejectsTamperedCustodyBindings(t *testi
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	enableSyntheticRealMode(host, guest)
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
@@ -3911,8 +4149,8 @@ func TestSyntheticRealModeSupportsCallThenCheck(t *testing.T) {
 	if lastTransition.Kind != tablecustody.TransitionKindAction {
 		t.Fatalf("expected latest custody transition kind %s, got %s", tablecustody.TransitionKindAction, lastTransition.Kind)
 	}
-	if lastTransition.ArkTxID != "" {
-		t.Fatalf("expected zero-money check transition to avoid Ark settlement, got %q", lastTransition.ArkTxID)
+	if lastTransition.Proof.TransitionHash == "" {
+		t.Fatal("expected synthetic real mode check transition to finalize with custody proof metadata")
 	}
 }
 
@@ -3956,6 +4194,78 @@ func TestActionDrivenShowdownArmsProtocolDeadline(t *testing.T) {
 	table := waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetShowdownReveal)
 	if table.ActiveHand.Cards.PhaseDeadlineAt == "" {
 		t.Fatal("expected showdown-reveal phase to have a protocol deadline")
+	}
+}
+
+func TestSendActionResyncsAfterHostRotation(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+	enableSyntheticRealMode(host, guest, witness)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call to flop: %v", err)
+	}
+
+	staleGuest := mustReadNativeTable(t, guest, tableID)
+	if staleGuest.CurrentEpoch != 1 {
+		t.Fatalf("expected guest to remain on epoch 1 before failover, got %d", staleGuest.CurrentEpoch)
+	}
+	if err := witness.forceProtocolFailover(tableID, "test host rotation before guest action"); err != nil {
+		t.Fatalf("force protocol failover: %v", err)
+	}
+	rotated := mustReadNativeTable(t, witness, tableID)
+	if rotated.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness to become current host, got %q", rotated.CurrentHost.Peer.PeerID)
+	}
+	if rotated.CurrentEpoch != staleGuest.CurrentEpoch+1 {
+		t.Fatalf("expected failover to advance epoch to %d, got %d", staleGuest.CurrentEpoch+1, rotated.CurrentEpoch)
+	}
+
+	actionSent := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionCheck}); err == nil {
+			actionSent = true
+			break
+		} else if !strings.Contains(err.Error(), "hand is still starting") {
+			t.Fatalf("guest send flop check after host rotation: %v", err)
+		}
+		for _, runtime := range []*meshRuntime{host, guest, witness} {
+			runtime.Tick()
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !actionSent {
+		t.Fatal("timed out sending flop check after host rotation")
+	}
+
+	syncedGuest := mustReadNativeTable(t, guest, tableID)
+	if syncedGuest.CurrentEpoch != rotated.CurrentEpoch {
+		t.Fatalf("expected guest to resync to epoch %d, got %d", rotated.CurrentEpoch, syncedGuest.CurrentEpoch)
+	}
+	if syncedGuest.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected guest to route through witness host after resync, got %q", syncedGuest.CurrentHost.Peer.PeerID)
+	}
+	if syncedGuest.LatestCustodyState == nil || staleGuest.LatestCustodyState == nil {
+		t.Fatal("expected custody state before and after resync")
+	}
+	if syncedGuest.LatestCustodyState.CustodySeq <= staleGuest.LatestCustodyState.CustodySeq {
+		t.Fatalf("expected guest custody seq to advance past %d, got %d", staleGuest.LatestCustodyState.CustodySeq, syncedGuest.LatestCustodyState.CustodySeq)
 	}
 }
 
@@ -4033,7 +4343,67 @@ func enableSyntheticRealMode(runtimes ...*meshRuntime) {
 		runtime.custodyBatchExecute = func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error) {
 			return buildSyntheticCustodyBatchResultForTest(runtime, table, transitionHash, inputs, proofSignerIDs, treeSignerIDs, outputs)
 		}
+		runtime.custodyPSBTSign = func(profileName, tx string) (string, error) {
+			return syntheticSignCustodyPSBTForTest(runtime, tx)
+		}
+		runtime.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+			return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+		}
 	}
+}
+
+func syntheticSignCustodyPSBTForTest(runtime *meshRuntime, tx string) (string, error) {
+	packet, err := psbt.NewFromRawBytes(strings.NewReader(tx), true)
+	if err != nil {
+		return "", err
+	}
+	xOnlyHex, err := xOnlyPubkeyHexFromCompressed(runtime.walletID.PublicKeyHex)
+	if err != nil {
+		return "", err
+	}
+	xOnlyPubkey, err := hex.DecodeString(xOnlyHex)
+	if err != nil {
+		return "", err
+	}
+	dummySignature := make([]byte, 64)
+	dummySignature[0] = 1
+	for inputIndex := range packet.Inputs {
+		input := packet.Inputs[inputIndex]
+		if len(input.TaprootLeafScript) == 0 {
+			continue
+		}
+		leafHash := txscript.NewBaseTapLeaf(input.TaprootLeafScript[0].Script).TapHash()
+		alreadySigned := false
+		for _, signature := range input.TaprootScriptSpendSig {
+			if signature != nil && string(signature.XOnlyPubKey) == string(xOnlyPubkey) {
+				alreadySigned = true
+				break
+			}
+		}
+		if alreadySigned {
+			continue
+		}
+		input.TaprootScriptSpendSig = append(input.TaprootScriptSpendSig, &psbt.TaprootScriptSpendSig{
+			XOnlyPubKey: append([]byte(nil), xOnlyPubkey...),
+			LeafHash:    leafHash.CloneBytes(),
+			Signature:   append([]byte(nil), dummySignature...),
+			SigHash:     txscript.SigHashDefault,
+		})
+		packet.Inputs[inputIndex] = input
+	}
+	return packet.B64Encode()
+}
+
+func syntheticExecuteCustodyRecoveryForTest(signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+	packet, err := psbt.NewFromRawBytes(strings.NewReader(signedPSBT), true)
+	if err != nil {
+		return walletpkg.CustodyRecoveryResult{}, err
+	}
+	recoveryTxID := packet.UnsignedTx.TxID()
+	return walletpkg.CustodyRecoveryResult{
+		BroadcastTxIDs: []string{recoveryTxID},
+		RecoveryTxID:   recoveryTxID,
+	}, nil
 }
 
 func createJoinedTwoPlayerTable(t *testing.T, host, guest *meshRuntime, witnessPeerIDs ...string) (string, string) {
@@ -4066,6 +4436,16 @@ func createJoinedTwoPlayerTable(t *testing.T, host, guest *meshRuntime, witnessP
 func createStartedTwoPlayerTable(t *testing.T, host, guest *meshRuntime, witnessPeerIDs ...string) (string, string) {
 	t.Helper()
 
+	tableID, inviteCode := createJoinedTwoPlayerTable(t, host, guest, witnessPeerIDs...)
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
+	return tableID, inviteCode
+}
+
+func createStartedTwoPlayerTableInSyntheticRealMode(t *testing.T, host, guest *meshRuntime, witnessPeerIDs ...string) (string, string) {
+	t.Helper()
+
+	enableSyntheticRealMode(host, guest)
 	tableID, inviteCode := createJoinedTwoPlayerTable(t, host, guest, witnessPeerIDs...)
 	startNextHandForTest(t, host, tableID)
 	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)

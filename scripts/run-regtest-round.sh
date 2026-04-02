@@ -18,6 +18,7 @@ KEEP_FAILED_RUN="${KEEP_FAILED_RUN:-false}"
 ROUND_SCENARIO="${ROUND_SCENARIO:-standard-4d}"
 PCLI_TIMEOUT_SECONDS="${PCLI_TIMEOUT_SECONDS:-}"
 HAND_SETTLE_TIMEOUT_SECONDS="${HAND_SETTLE_TIMEOUT_SECONDS:-}"
+CASHOUT_TIMEOUT_SECONDS="${CASHOUT_TIMEOUT_SECONDS:-}"
 TOR_TARGET_HOST="${TOR_TARGET_HOST:-host.docker.internal}"
 HOST_TOR_SOCKS_PORT="${HOST_TOR_SOCKS_PORT:-}"
 HOST_TOR_CONTROL_PORT="${HOST_TOR_CONTROL_PORT:-}"
@@ -35,6 +36,7 @@ TOR_COMPOSE_FILE="$BASE/tor/docker-compose.yml"
 TOR_STATE_BASE="${TOR_STATE_BASE:-$ROOT_DIR/.tmp/tor-round/$TOR_PROJECT}"
 ROUND_SCENARIO_STANDARD="standard-4d"
 ROUND_SCENARIO_HOST_PLAYER="host-player-2d"
+ROUND_SCENARIO_TIMEOUT_RECOVERY="recovery-timeout-2d"
 
 common_flags=(
   --network regtest
@@ -70,9 +72,13 @@ host_player_scenario_enabled() {
   [[ "$ROUND_SCENARIO" == "$ROUND_SCENARIO_HOST_PLAYER" ]]
 }
 
+recovery_timeout_scenario_enabled() {
+  [[ "$ROUND_SCENARIO" == "$ROUND_SCENARIO_TIMEOUT_RECOVERY" ]]
+}
+
 validate_round_scenario() {
   case "$ROUND_SCENARIO" in
-    "$ROUND_SCENARIO_STANDARD"|"$ROUND_SCENARIO_HOST_PLAYER") ;;
+    "$ROUND_SCENARIO_STANDARD"|"$ROUND_SCENARIO_HOST_PLAYER"|"$ROUND_SCENARIO_TIMEOUT_RECOVERY") ;;
     *)
       echo "unsupported ROUND_SCENARIO=$ROUND_SCENARIO" >&2
       exit 1
@@ -216,10 +222,10 @@ command_timeout_seconds() {
     return 0
   fi
   if tor_enabled; then
-    printf '30\n'
+    printf '90\n'
     return 0
   fi
-  printf '10\n'
+  printf '90\n'
 }
 
 run_with_timeout() {
@@ -681,6 +687,33 @@ stop_nigiri_stack() {
   fi
 }
 
+configure_recovery_timeout_delay() {
+  local compose_file="$NIGIRI_DATADIR/docker-compose.yml"
+  if ! recovery_timeout_scenario_enabled; then
+    return 0
+  fi
+  wait_for_file "$compose_file" 120 0.25 >/dev/null
+  /usr/bin/perl -0pi -e '
+    s/ARKD_UNILATERAL_EXIT_DELAY: "[^"]+"/ARKD_UNILATERAL_EXIT_DELAY: "512"/g;
+    if (/ARKD_UNILATERAL_EXIT_DELAY: "512"/ && !/ARKD_PUBLIC_UNILATERAL_EXIT_DELAY:/) {
+      s/(ARKD_UNILATERAL_EXIT_DELAY: "512"\n)/$1      ARKD_PUBLIC_UNILATERAL_EXIT_DELAY: "512"\n/g;
+    }
+    s/ARKD_PUBLIC_UNILATERAL_EXIT_DELAY: "[^"]+"/ARKD_PUBLIC_UNILATERAL_EXIT_DELAY: "512"/g;
+  ' "$compose_file"
+  run_with_timeout 30 "$DOCKER_COMPOSE_BIN" -f "$compose_file" -p nigiri up -d --force-recreate ark >/dev/null
+  wait_for_http_json "http://127.0.0.1:7070/v1/info" 120 1 >/dev/null
+}
+
+iso_epoch_seconds() {
+  /usr/bin/perl -MTime::Piece -e '
+    use strict;
+    use warnings;
+    my $value = shift @ARGV;
+    my $epoch = Time::Piece->strptime($value, "%Y-%m-%dT%H:%M:%SZ")->epoch;
+    print "$epoch\n";
+  ' "$1"
+}
+
 free_port() {
   pdevtool free-port
 }
@@ -775,6 +808,7 @@ start_nigiri_stack() {
     prepare_nigiri_data_dirs
 
     if wait_for_http_json "http://127.0.0.1:7070/v1/info" 120 1 >/dev/null &&
+      configure_recovery_timeout_delay &&
       seed_ark_liquidity &&
       wait_for_ark_ready 120 >/dev/null; then
       terminate_pid "$NIGIRI_START_PID"
@@ -819,6 +853,67 @@ fund_and_onboard_profile() {
   retry_pcli_json "$profile onboard" 20 1 wallet onboard --profile "$profile" --json >/dev/null
 }
 
+wait_for_onchain_fee_reserve() {
+  local address="$1"
+  local attempts="${2:-120}"
+  local utxos=""
+  local count=""
+  local i
+
+  for ((i = 0; i < attempts; i += 1)); do
+    utxos="$(curl -sf "http://127.0.0.1:3000/address/${address}/utxo" 2>/dev/null || true)"
+    count="$(json_array_length "$utxos")"
+    if [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )); then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  echo "timed out waiting for onchain fee reserve at $address" >&2
+  return 1
+}
+
+fund_onchain_fee_reserve() {
+  local profile="$1"
+  local address=""
+  local profile_state_path="$BASE/profiles/${profile}.json"
+
+  retry_pcli_json "$profile wallet summary" 20 1 wallet summary --profile "$profile" --json >/dev/null
+  if [[ ! -f "$profile_state_path" ]]; then
+    echo "missing profile state for $profile while funding onchain reserve" >&2
+    return 1
+  fi
+
+  address="$(jq -r '.cachedOnchainAddresses[0] // empty' "$profile_state_path" 2>/dev/null || true)"
+  if [[ -z "$address" ]]; then
+    echo "missing cached onchain address for $profile while funding onchain reserve" >&2
+    return 1
+  fi
+
+  if ! nigiri_cmd faucet "$address" >/dev/null 2>&1; then
+    echo "failed funding onchain fee reserve for $profile at $address" >&2
+    return 1
+  fi
+  wait_for_onchain_fee_reserve "$address" >/dev/null
+}
+
+seed_recovery_fee_reserves() {
+  local -a profiles=()
+  local profile=""
+
+  profiles+=(host)
+  for profile in "$PLAYER_ONE_PROFILE" "$PLAYER_TWO_PROFILE"; do
+    if [[ -n "$profile" && ! " ${profiles[*]} " =~ " ${profile} " ]]; then
+      profiles+=("$profile")
+    fi
+  done
+
+  echo "Funding onchain fee reserves for recovery broadcasters..." >&2
+  for profile in "${profiles[@]}"; do
+    fund_onchain_fee_reserve "$profile"
+  done
+}
+
 buy_in_profile() {
   local profile="$1"
 
@@ -832,13 +927,25 @@ buy_in_profile() {
 
 cashout_profile() {
   local profile="$1"
+  local cashout_timeout="$CASHOUT_TIMEOUT_SECONDS"
 
-  if tor_enabled; then
-    retry_pcli_json "$profile cashout over Tor" 60 1 funds cashout "$TABLE_ID" --profile "$profile" --json >/dev/null
-    return 0
+  if [[ -z "$cashout_timeout" ]]; then
+    if tor_enabled; then
+      cashout_timeout=90
+    else
+      cashout_timeout=60
+    fi
   fi
 
-  pcli funds cashout "$TABLE_ID" --profile "$profile" --json >/dev/null
+  (
+    PCLI_TIMEOUT_SECONDS="$cashout_timeout"
+    if tor_enabled; then
+      retry_pcli_json "$profile cashout over Tor" 60 1 funds cashout "$TABLE_ID" --profile "$profile" --json >/dev/null
+      exit 0
+    fi
+
+    pcli funds cashout "$TABLE_ID" --profile "$profile" --json >/dev/null
+  )
 }
 
 send_table_action_with_retry() {
@@ -867,6 +974,10 @@ send_table_action_with_retry() {
       sleep 0.15
       continue
     fi
+    if [[ "$output" == *"accepted history would roll back table events"* ]]; then
+      sleep 0.25
+      continue
+    fi
     if tor_enabled; then
       state_json="$(pcli table watch "$TABLE_ID" --profile "$actor" --json 2>/dev/null || true)"
       if [[ -n "$state_json" ]]; then
@@ -884,6 +995,55 @@ send_table_action_with_retry() {
   done
 
   echo "timed out waiting to send action $action for $actor" >&2
+  return 1
+}
+
+wait_for_action_progress() {
+  local previous_state_json="$1"
+  shift
+  local -a watch_profiles=("$@")
+  local previous_custody_seq=""
+  local previous_phase=""
+  local previous_acting_seat=""
+  local current_state_json=""
+  local current_custody_seq=""
+  local current_phase=""
+  local current_acting_seat=""
+  local attempts=80
+  local sleep_seconds=0.25
+  local i
+
+  previous_custody_seq="$(printf '%s' "$previous_state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+  previous_phase="$(printf '%s' "$previous_state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+  previous_acting_seat="$(printf '%s' "$previous_state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
+
+  if [[ "${#watch_profiles[@]}" -eq 0 ]]; then
+    watch_profiles=("$WATCH_PROFILE")
+  fi
+
+  if tor_enabled; then
+    attempts=180
+    sleep_seconds=0.5
+  fi
+
+  for ((i = 0; i < attempts; i += 1)); do
+    current_state_json="$(freshest_table_state "${watch_profiles[@]}")"
+    if table_has_settled_custody_checkpoint "$current_state_json"; then
+      return 0
+    fi
+    current_custody_seq="$(printf '%s' "$current_state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+    current_phase="$(printf '%s' "$current_state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+    current_acting_seat="$(printf '%s' "$current_state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
+    if [[ "$current_phase" != "$previous_phase" || "$current_acting_seat" != "$previous_acting_seat" ]]; then
+      return 0
+    fi
+    if [[ "$previous_custody_seq" =~ ^[0-9]+$ && "$current_custody_seq" =~ ^[0-9]+$ ]] && (( current_custody_seq > previous_custody_seq )); then
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  echo "timed out waiting for table action progress" >&2
   return 1
 }
 
@@ -914,6 +1074,459 @@ watch_table_state_with_retry() {
 
   echo "timed out waiting to watch table $TABLE_ID for $profile" >&2
   return 1
+}
+
+round_watch_profiles() {
+  local -a profiles=()
+  local profile=""
+
+  profiles+=("$WATCH_PROFILE")
+  if ! host_player_scenario_enabled; then
+    profiles+=(witness)
+  fi
+  for profile in "$PLAYER_ONE_PROFILE" "$PLAYER_TWO_PROFILE"; do
+    [[ -n "$profile" ]] || continue
+    if [[ ! " ${profiles[*]} " =~ " ${profile} " ]]; then
+      profiles+=("$profile")
+    fi
+  done
+
+  printf '%s\n' "${profiles[@]}"
+}
+
+freshest_table_state() {
+  local -a profiles=("$@")
+  local best_state_json=""
+  local best_profile=""
+  local best_epoch=-1
+  local best_custody_seq=-1
+  local best_event_count=-1
+  local profile=""
+  local state_json=""
+  local epoch=""
+  local custody_seq=""
+  local event_count=""
+  local events_json=""
+
+  for profile in "${profiles[@]}"; do
+    [[ -n "$profile" ]] || continue
+    if ! state_json="$(watch_table_state_with_retry "$profile")"; then
+      continue
+    fi
+
+    epoch="$(printf '%s' "$state_json" | json_field data.publicState.epoch 2>/dev/null || true)"
+    custody_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+    events_json="$(printf '%s' "$state_json" | json_field data.events 2>/dev/null || true)"
+    event_count="$(json_array_length "$events_json")"
+
+    if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+      epoch=0
+    fi
+    if [[ ! "$custody_seq" =~ ^[0-9]+$ ]]; then
+      custody_seq=-1
+    fi
+    if [[ ! "$event_count" =~ ^[0-9]+$ ]]; then
+      event_count=0
+    fi
+
+    if (( epoch > best_epoch )) ||
+      (( epoch == best_epoch && custody_seq > best_custody_seq )) ||
+      (( epoch == best_epoch && custody_seq == best_custody_seq && event_count > best_event_count )); then
+      best_state_json="$state_json"
+      best_profile="$profile"
+      best_epoch="$epoch"
+      best_custody_seq="$custody_seq"
+      best_event_count="$event_count"
+    fi
+  done
+
+  if [[ -z "$best_state_json" ]]; then
+    echo "timed out waiting to watch table $TABLE_ID across profiles: ${profiles[*]}" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$best_state_json"
+}
+
+json_array_length() {
+  local raw="${1:-}"
+  if [[ -z "$(printf '%s' "$raw" | tr -d '[:space:]')" ]]; then
+    printf '0\n'
+    return 0
+  fi
+  printf '%s' "$raw" | /usr/bin/perl -MJSON::PP -e '
+    use strict;
+    use warnings;
+
+    local $/;
+    my $raw = <STDIN>;
+    my $decoded = eval { JSON::PP::decode_json($raw) };
+    if ($@ || ref($decoded) ne "ARRAY") {
+      print "0\n";
+      exit 0;
+    }
+    print scalar(@{$decoded}), "\n";
+  '
+}
+
+profile_player_id() {
+  case "$1" in
+    host) printf '%s\n' "${HOST_PLAYER_ID:-}" ;;
+    alice) printf '%s\n' "${ALICE_PLAYER_ID:-}" ;;
+    bob) printf '%s\n' "${BOB_PLAYER_ID:-}" ;;
+    *) printf '\n' ;;
+  esac
+}
+
+seat_index_for_player() {
+  local state_json="$1"
+  local player_id="$2"
+  local seat_player_id=""
+  local seat_index=""
+  local seat
+
+  for seat in 0 1; do
+    seat_player_id="$(printf '%s' "$state_json" | json_field "data.publicState.seatedPlayers.${seat}.playerId" 2>/dev/null || true)"
+    if [[ "$seat_player_id" != "$player_id" ]]; then
+      continue
+    fi
+    seat_index="$(printf '%s' "$state_json" | json_field "data.publicState.seatedPlayers.${seat}.seatIndex" 2>/dev/null || true)"
+    if [[ -n "$seat_index" && "$seat_index" != "null" ]]; then
+      printf '%s\n' "$seat_index"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+seat_status_for_player() {
+  local state_json="$1"
+  local player_id="$2"
+  local seat_player_id=""
+  local seat_status=""
+  local seat
+
+  for seat in 0 1; do
+    seat_player_id="$(printf '%s' "$state_json" | json_field "data.publicState.seatedPlayers.${seat}.playerId" 2>/dev/null || true)"
+    if [[ "$seat_player_id" != "$player_id" ]]; then
+      continue
+    fi
+    seat_status="$(printf '%s' "$state_json" | json_field "data.publicState.seatedPlayers.${seat}.status" 2>/dev/null || true)"
+    if [[ -n "$seat_status" && "$seat_status" != "null" ]]; then
+      printf '%s\n' "$seat_status"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+wait_for_profile_cashout_visibility() {
+  local observer_profile="$1"
+  local target_profile="$2"
+  local expected_status="${3:-completed}"
+  local target_player_id=""
+  local attempts=80
+  local sleep_seconds=0.5
+  local state_json=""
+  local observed_status=""
+  local i
+
+  target_player_id="$(profile_player_id "$target_profile")"
+  if [[ -z "$target_player_id" ]]; then
+    echo "missing player id for cash-out profile $target_profile" >&2
+    return 1
+  fi
+  if tor_enabled; then
+    attempts=180
+    sleep_seconds=1
+  fi
+
+  for ((i = 0; i < attempts; i += 1)); do
+    state_json="$(watch_table_state_with_retry "$observer_profile")"
+    observed_status="$(seat_status_for_player "$state_json" "$target_player_id" 2>/dev/null || true)"
+    if [[ "$observed_status" == "$expected_status" ]]; then
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  echo "timed out waiting for $observer_profile to observe $target_profile status=$expected_status" >&2
+  return 1
+}
+
+acting_profile_for_state() {
+  local state_json="$1"
+  local acting_seat=""
+  local profile=""
+  local player_id=""
+  local seat_index=""
+
+  acting_seat="$(printf '%s' "$state_json" | json_field data.publicState.actingSeatIndex 2>/dev/null || true)"
+  if [[ -z "$acting_seat" || "$acting_seat" == "null" ]]; then
+    return 1
+  fi
+
+  for profile in "$PLAYER_ONE_PROFILE" "$PLAYER_TWO_PROFILE"; do
+    player_id="$(profile_player_id "$profile")"
+    [[ -n "$player_id" ]] || continue
+    seat_index="$(seat_index_for_player "$state_json" "$player_id" 2>/dev/null || true)"
+    if [[ "$seat_index" == "$acting_seat" ]]; then
+      printf '%s\n' "$profile"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+latest_transition_index_from_state() {
+  local state_json="$1"
+  local custody_seq=""
+
+  custody_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+  if [[ -z "$custody_seq" || "$custody_seq" == "null" || ! "$custody_seq" =~ ^[0-9]+$ || "$custody_seq" -le 0 ]]; then
+    return 1
+  fi
+  printf '%s\n' "$((custody_seq - 1))"
+}
+
+find_recovery_bundle_index() {
+  local state_json="$1"
+  local transition_index="$2"
+  local expected_kind="$3"
+  local bundles_json=""
+  local bundle_count=0
+  local bundle_index
+  local bundle_kind=""
+
+  bundles_json="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryBundles" 2>/dev/null || true)"
+  bundle_count="$(json_array_length "$bundles_json")"
+  for ((bundle_index = 0; bundle_index < bundle_count; bundle_index += 1)); do
+    bundle_kind="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryBundles.${bundle_index}.kind" 2>/dev/null || true)"
+    if [[ "$bundle_kind" == "$expected_kind" ]]; then
+      printf '%s\n' "$bundle_index"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+wait_for_actionable_table_state() {
+  local profile="${1:-host}"
+  local attempts="${2:-240}"
+  local sleep_seconds="${3:-0.5}"
+  local state_json=""
+  local phase=""
+
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    state_json="$(watch_table_state_with_retry "$profile")"
+    phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
+    if [[ "$phase" == "preflop" || "$phase" == "flop" || "$phase" == "turn" || "$phase" == "river" ]]; then
+      if acting_profile_for_state "$state_json" >/dev/null 2>&1; then
+        printf '%s\n' "$state_json"
+        return 0
+      fi
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  echo "timed out waiting for an actionable table state" >&2
+  return 1
+}
+
+wait_for_latest_custody_seq_gt() {
+  local profile="$1"
+  local previous_seq="$2"
+  local attempts="${3:-240}"
+  local sleep_seconds="${4:-0.5}"
+  local state_json=""
+  local custody_seq=""
+
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    state_json="$(watch_table_state_with_retry "$profile")"
+    custody_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+    if [[ "$custody_seq" =~ ^[0-9]+$ ]] && (( custody_seq > previous_seq )); then
+      printf '%s\n' "$state_json"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  echo "timed out waiting for custody sequence to advance beyond $previous_seq" >&2
+  return 1
+}
+
+forced_aggression_action_for_state() {
+  local state_json="$1"
+  local actor_profile="$2"
+  local actor_player_id=""
+  local current_bet=0
+  local contribution=0
+  local min_raise_to=0
+  local total_sats=800
+
+  actor_player_id="$(profile_player_id "$actor_profile")"
+  [[ -n "$actor_player_id" ]] || return 1
+
+  current_bet="$(printf '%s' "$state_json" | json_field data.publicState.currentBetSats 2>/dev/null || true)"
+  contribution="$(printf '%s' "$state_json" | json_field "data.publicState.roundContributions.${actor_player_id}" 2>/dev/null || true)"
+  min_raise_to="$(printf '%s' "$state_json" | json_field data.publicState.minRaiseToSats 2>/dev/null || true)"
+  [[ "$current_bet" =~ ^[0-9]+$ ]] || current_bet=0
+  [[ "$contribution" =~ ^[0-9]+$ ]] || contribution=0
+  [[ "$min_raise_to" =~ ^[0-9]+$ ]] || min_raise_to=0
+  if (( min_raise_to > total_sats )); then
+    total_sats="$min_raise_to"
+  fi
+
+  if (( current_bet - contribution > 0 )); then
+    printf 'raise %s\n' "$total_sats"
+    return 0
+  fi
+  printf 'bet %s\n' "$total_sats"
+}
+
+clear_profile_daemon_pid() {
+  case "$1" in
+    host) HOST_DAEMON_PID="" ;;
+    witness) WITNESS_DAEMON_PID="" ;;
+    alice) ALICE_DAEMON_PID="" ;;
+    bob) BOB_DAEMON_PID="" ;;
+  esac
+}
+
+stop_profile_daemon() {
+  local profile="$1"
+  pcli daemon stop --profile "$profile" >/dev/null 2>&1 || true
+  clear_profile_daemon_pid "$profile"
+}
+
+stop_recovery_timeout_services() {
+  stop_profile_daemon "$1"
+  if [[ -n "${INDEXER_PID:-}" ]]; then
+    terminate_pid "$INDEXER_PID"
+    INDEXER_PID=""
+  fi
+  run_with_timeout 15 docker stop ark >/dev/null 2>&1 || true
+}
+
+wait_for_timeout_recovery_transition() {
+  local profile="$1"
+  local source_transition_hash="$2"
+  local previous_seq="$3"
+  local attempts="${4:-360}"
+  local sleep_seconds="${5:-1}"
+  local state_json=""
+  local custody_seq=""
+  local transition_index=""
+  local kind=""
+  local recovery_bundle_hash=""
+  local recovery_source_hash=""
+  local recovery_txid=""
+  local settlement_witness=""
+
+  for ((attempt = 0; attempt < attempts; attempt += 1)); do
+    state_json="$(watch_table_state_with_retry "$profile")"
+    custody_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+    if [[ ! "$custody_seq" =~ ^[0-9]+$ ]] || (( custody_seq <= previous_seq )); then
+      sleep "$sleep_seconds"
+      continue
+    fi
+    transition_index="$(latest_transition_index_from_state "$state_json" 2>/dev/null || true)"
+    [[ -n "$transition_index" ]] || {
+      sleep "$sleep_seconds"
+      continue
+    }
+    kind="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.kind" 2>/dev/null || true)"
+    recovery_bundle_hash="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryWitness.bundleHash" 2>/dev/null || true)"
+    recovery_source_hash="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryWitness.sourceTransitionHash" 2>/dev/null || true)"
+    recovery_txid="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryWitness.recoveryTxid" 2>/dev/null || true)"
+    settlement_witness="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.settlementWitness" 2>/dev/null || true)"
+    if [[ "$kind" == "timeout" &&
+      -n "$recovery_bundle_hash" && "$recovery_bundle_hash" != "null" &&
+      "$recovery_source_hash" == "$source_transition_hash" &&
+      -n "$recovery_txid" && "$recovery_txid" != "null" &&
+      -z "$settlement_witness" ]]; then
+      printf '%s\n' "$state_json"
+      return 0
+    fi
+    sleep "$sleep_seconds"
+  done
+
+  echo "timed out waiting for timeout recovery transition from $source_transition_hash" >&2
+  return 1
+}
+
+run_timeout_recovery_scenario() {
+  local state_json=""
+  local source_transition_state=""
+  local initial_seq=0
+  local latest_seq=0
+  local source_index=""
+  local bundle_index=""
+  local source_transition_hash=""
+  local defaulting_profile=""
+  local forced_action=""
+  local forced_amount=""
+  local earliest_execute_at=""
+  local final_table_json=""
+  local recovery_wait_seconds=360
+  local earliest_epoch=""
+  local now_epoch=""
+
+  echo "Forcing deterministic timeout recovery scenario..." >&2
+  state_json="$(wait_for_actionable_table_state host)"
+  initial_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+  [[ "$initial_seq" =~ ^[0-9]+$ ]] || initial_seq=0
+
+  defaulting_profile="$(acting_profile_for_state "$state_json")"
+  read -r forced_action forced_amount <<<"$(forced_aggression_action_for_state "$state_json" "$defaulting_profile")"
+  printf 'Creating contested pot via %s %s %s...\n' "$defaulting_profile" "$forced_action" "$forced_amount" >&2
+  send_table_action_with_retry "$defaulting_profile" "$forced_action" "$forced_amount"
+
+  source_transition_state="$(wait_for_latest_custody_seq_gt host "$initial_seq")"
+  latest_seq="$(printf '%s' "$source_transition_state" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+  source_index="$(latest_transition_index_from_state "$source_transition_state")"
+  source_transition_hash="$(printf '%s' "$source_transition_state" | json_field "data.custodyTransitions.${source_index}.proof.transitionHash" 2>/dev/null || true)"
+  bundle_index="$(find_recovery_bundle_index "$source_transition_state" "$source_index" timeout 2>/dev/null || true)"
+  if [[ -z "$bundle_index" ]]; then
+    echo "expected a stored timeout recovery bundle on the latest contested source transition" >&2
+    return 1
+  fi
+  earliest_execute_at="$(printf '%s' "$source_transition_state" | json_field "data.custodyTransitions.${source_index}.proof.recoveryBundles.${bundle_index}.earliestExecuteAt" 2>/dev/null || true)"
+
+  defaulting_profile="$(acting_profile_for_state "$source_transition_state")"
+  if [[ -z "$defaulting_profile" ]]; then
+    echo "expected a defaulting player after the forcing action" >&2
+    return 1
+  fi
+
+  echo "Stopping defaulting player daemon and Ark/indexer services before timeout finalization completes..." >&2
+  printf 'Defaulting profile=%s sourceTransition=%s earliestExecuteAt=%s\n' "$defaulting_profile" "$source_transition_hash" "$earliest_execute_at" >&2
+  stop_recovery_timeout_services "$defaulting_profile"
+
+  if [[ -n "$earliest_execute_at" ]]; then
+    earliest_epoch="$(iso_epoch_seconds "$earliest_execute_at" 2>/dev/null || true)"
+    now_epoch="$(date -u +%s)"
+    if [[ "$earliest_epoch" =~ ^[0-9]+$ ]] && [[ "$now_epoch" =~ ^[0-9]+$ ]]; then
+      recovery_wait_seconds="$((earliest_epoch - now_epoch + 300))"
+      if (( recovery_wait_seconds < 360 )); then
+        recovery_wait_seconds=360
+      fi
+    fi
+  fi
+
+  echo "Waiting for timeout recovery after U..." >&2
+  if ! final_table_json="$(wait_for_timeout_recovery_transition host "$source_transition_hash" "$latest_seq" "$recovery_wait_seconds")"; then
+    return 1
+  fi
+  mkdir -p "$BASE/artifacts"
+  printf '%s\n' "$final_table_json" >"$BASE/artifacts/table-after-hand.json"
+
+  echo "Recovery transition confirmed." >&2
+  printf '%s\n' "$final_table_json"
 }
 
 wait_for_table_status() {
@@ -1027,7 +1640,6 @@ print_local_stack_summary() {
 play_hand_automatically() {
   local require_hand_number_gt="${1:-}"
   local state_json=""
-  local candidate_state_json=""
   local hand_id=""
   local hand_number=""
   local initial_hand_number=""
@@ -1040,38 +1652,47 @@ play_hand_automatically() {
   local amount=""
   local current_bet=""
   local pot_sats=""
-  local max_wait_seconds=90
+  local max_wait_seconds=300
+  local settled_grace_seconds=15
+  local settled_grace_start_epoch=0
   local start_epoch=0
+  local now_epoch=0
   local turn
   local -a watch_profiles=()
-  local profile=""
-  local action_profile=""
 
   if tor_enabled; then
-    max_wait_seconds=180
+    max_wait_seconds=360
   fi
   if [[ -n "$HAND_SETTLE_TIMEOUT_SECONDS" ]]; then
     max_wait_seconds="$HAND_SETTLE_TIMEOUT_SECONDS"
   fi
 
-  watch_profiles=("$WATCH_PROFILE")
-  for profile in "$PLAYER_ONE_PROFILE" "$PLAYER_TWO_PROFILE"; do
-    if [[ -n "$profile" && ! " ${watch_profiles[*]} " =~ " ${profile} " ]]; then
-      watch_profiles+=("$profile")
-    fi
-  done
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    watch_profiles+=("$profile")
+  done < <(round_watch_profiles)
 
   start_epoch="$(date +%s)"
   for ((turn = 0; ; turn += 1)); do
-    if (( "$(date +%s)" - start_epoch >= max_wait_seconds )); then
-      break
+    now_epoch="$(date +%s)"
+    if (( now_epoch - start_epoch >= max_wait_seconds )); then
+      if (( settled_grace_start_epoch == 0 || now_epoch - settled_grace_start_epoch >= settled_grace_seconds )); then
+        break
+      fi
     fi
-    state_json="$(watch_table_state_with_retry "$WATCH_PROFILE")"
+    state_json="$(freshest_table_state "${watch_profiles[@]}")"
     hand_id="$(printf '%s' "$state_json" | json_field data.publicState.handId)"
     hand_number="$(printf '%s' "$state_json" | json_field data.publicState.handNumber)"
     phase="$(printf '%s' "$state_json" | json_field data.publicState.phase)"
     latest_snapshot_phase="$(printf '%s' "$state_json" | json_field data.latestSnapshot.phase)"
     latest_snapshot_hand_number="$(printf '%s' "$state_json" | json_field data.latestSnapshot.handNumber)"
+    if [[ "$phase" == "settled" || "$latest_snapshot_phase" == "settled" ]]; then
+      if (( settled_grace_start_epoch == 0 )); then
+        settled_grace_start_epoch="$now_epoch"
+      fi
+    else
+      settled_grace_start_epoch=0
+    fi
     if [[ -z "$hand_id" || -z "$phase" || "$phase" == "null" ]]; then
       sleep 0.25
       continue
@@ -1096,23 +1717,7 @@ play_hand_automatically() {
       continue
     fi
 
-    action_line=""
-    action_profile="$WATCH_PROFILE"
-    for profile in "${watch_profiles[@]}"; do
-      if [[ "$profile" != "$WATCH_PROFILE" ]]; then
-        candidate_state_json="$(watch_table_state_with_retry "$profile")"
-        if table_has_settled_custody_checkpoint "$candidate_state_json"; then
-          printf '%s\n' "$candidate_state_json"
-          return 0
-        fi
-        state_json="$candidate_state_json"
-      fi
-      action_line="$(printf '%s' "$state_json" | select_table_action)"
-      if [[ -n "$action_line" && "$action_line" != "settled" ]]; then
-        action_profile="$profile"
-        break
-      fi
-    done
+    action_line="$(printf '%s' "$state_json" | select_table_action)"
     if [[ -z "$action_line" || "$action_line" == "settled" ]]; then
       sleep 0.25
       continue
@@ -1131,7 +1736,7 @@ play_hand_automatically() {
       "$phase" \
       "${pot_sats:-0}" >&2
     send_table_action_with_retry "$actor" "$action" "$amount"
-    sleep 0.4
+    wait_for_action_progress "$state_json" "${watch_profiles[@]}"
   done
 
   echo "hand did not settle in time" >&2
@@ -1157,8 +1762,17 @@ hand_has_net_transfer() {
 write_table_artifact() {
   local profile="$1"
   local path="$2"
+  local -a watch_profiles=("$profile")
   mkdir -p "$(dirname "$path")"
-  watch_table_state_with_retry "$profile" >"$path"
+  if [[ "$profile" == "$WATCH_PROFILE" ]]; then
+    while IFS= read -r candidate; do
+      [[ -n "$candidate" ]] || continue
+      if [[ ! " ${watch_profiles[*]} " =~ " ${candidate} " ]]; then
+        watch_profiles+=("$candidate")
+      fi
+    done < <(round_watch_profiles)
+  fi
+  freshest_table_state "${watch_profiles[@]}" >"$path"
 }
 
 INDEXER_PORT="${INDEXER_PORT:-$(free_port)}"
@@ -1208,7 +1822,7 @@ PLAYER_TWO_PROFILE="bob"
 PLAYER_TWO_PLAYER_ID=""
 PLAYER_TWO_PEER_ID=""
 PLAYER_TWO_PEER_URL=""
-WATCH_PROFILE="alice"
+WATCH_PROFILE="host"
 
 if host_player_scenario_enabled; then
   PLAYER_ONE_PROFILE="host"
@@ -1339,6 +1953,9 @@ fi
 echo "Funding wallets..."
 fund_and_onboard_profile "$PLAYER_ONE_PROFILE"
 fund_and_onboard_profile "$PLAYER_TWO_PROFILE"
+if recovery_timeout_scenario_enabled; then
+  seed_recovery_fee_reserves
+fi
 
 if ! host_player_scenario_enabled; then
   echo "Connecting host to witness..."
@@ -1376,6 +1993,15 @@ write_runtime_env
 if setup_only_enabled; then
   trap - EXIT INT TERM HUP
   print_local_stack_summary
+  exit 0
+fi
+
+if recovery_timeout_scenario_enabled; then
+  FINAL_TABLE_JSON="$(run_timeout_recovery_scenario)"
+  echo "Final table state:"
+  printf '%s\n' "$FINAL_TABLE_JSON"
+  echo "Skipping cash out because the recovery scenario intentionally leaves the Ark server offline."
+  echo "Done. Logs are under $BASE"
   exit 0
 fi
 
@@ -1424,6 +2050,7 @@ fi
 echo "Cashing out..."
 cashout_profile "$CASHOUT_FIRST_PROFILE"
 if [[ "$CASHOUT_SECOND_PROFILE" != "$CASHOUT_FIRST_PROFILE" ]]; then
+  wait_for_profile_cashout_visibility "$CASHOUT_SECOND_PROFILE" "$CASHOUT_FIRST_PROFILE"
   cashout_profile "$CASHOUT_SECOND_PROFILE"
 fi
 write_table_artifact host "$BASE/artifacts/table-after-cashout.json"

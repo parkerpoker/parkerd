@@ -57,6 +57,12 @@ Important note on `R`:
 - in real artifacts, the reserve can be much larger than the visible in-game stack
 - when a player cashes out, the player receives their remaining stack plus their remaining reserve, minus the cash-out batch fee
 
+Important note on deterministic recovery:
+
+- v1 no longer assumes an output-inspecting tapscript branch can directly detect who won a contested pot
+- instead, accepted source transitions store fully signed recovery PSBTs over the shared pot CSV exit whenever the later money result is already objective
+- if the cooperative path stalls, that stored bundle can execute after `U` and still produce the same winner-owned stack refs the cooperative successor would have created
+
 Notation used below:
 
 - `W_A0`: Alice wallet ref before joining
@@ -656,6 +662,21 @@ Two important enforcement details are at work here:
 
 So Bob does not need Alice to sign after Alice has already missed the deadline and lost eligibility on the contested money.
 
+In v1 there is now also a deterministic recovery bundle on the accepted source transition that left `P_2` live:
+
+- it spends `P_2` through the shared CSV pot exit, not through an impossible winner-detecting tapscript
+- it is fully signed before the source transition is accepted
+- it exact-commits to `S_B_timeout` as the only money-resolving output
+- it becomes executable only after `U`
+
+So if the live cooperative timeout finalization fails after `D`, the table can still recover later by:
+
+1. waiting until the stored bundle's `EarliestExecuteAt`
+2. broadcasting the pre-signed recovery PSBT
+3. appending the same semantic `timeout` transition with `RecoveryWitness` instead of `SettlementWitness`
+
+The semantic money story does not change. Only the proof surface changes.
+
 If timeout had resolved to `check` instead:
 
 - the hand would advance
@@ -714,6 +735,14 @@ One subtle but important rule from the current runtime:
 - it does not gift uncontested chips to the surviving player
 
 So the timeout only transfers the actually contested money.
+
+If the live cooperative `showdown-payout` cannot complete, Parker now handles this exactly the same way as the action-timeout case:
+
+- the accepted source transition already stored a fully signed recovery bundle over the shared pot CSV exit
+- that bundle only exists because the money result is objective once the missing showdown participant is dead
+- after `U`, the host can execute that stored PSBT and append the ordinary semantic `showdown-payout` transition with `RecoveryWitness`
+
+That recovered payout still lands in an ordinary winner-owned stack ref. It is not a direct wallet payout.
 
 ## What If More Than One Player Is Missing?
 
@@ -798,7 +827,7 @@ Once a fold or showdown payout is accepted:
 
 From that point on, later cash-out or emergency-exit flows read the post-win stack claim, not the pre-win pot.
 
-### 5. Real Ark batches are witness-backed and replayable
+### 5. Real Ark batches and recovery bundles are witness-backed and replayable
 
 When a real batch is required, Parker stores a settlement witness bundle in `CustodyProof.SettlementWitness`:
 
@@ -815,6 +844,18 @@ Later accepted-history replay:
 - checks that the witness-derived refs match `NextState` and `Proof.VTXORefs`
 
 So already-accepted history does not need a fresh Ark lookup to prove who ended up owning what.
+
+Deterministic recovery uses a second proof surface:
+
+- the source transition stores `CustodyProof.RecoveryBundles`
+- the executed `timeout` or `showdown-payout` transition stores `CustodyProof.RecoveryWitness`
+- replay validates the stored signed PSBT, the exact source pot refs, the CSV leaf/sequence, the authorized outputs, and the recovery tx metadata
+- replay then derives the winner-owned stack refs from the recovery PSBT itself and exact-matches them against `NextState` and `Proof.VTXORefs`
+
+So the important distinction is:
+
+- `SettlementWitness` proves "this money moved through a live Ark batch"
+- `RecoveryWitness` proves "this money moved through the pre-signed deterministic CSV recovery bundle"
 
 ## Where Forfeits Fit
 

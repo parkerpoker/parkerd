@@ -34,6 +34,12 @@ func HashCustodyTransition(transition CustodyTransition) string {
 	return HashValue(unsigned)
 }
 
+func HashCustodyRecoveryBundle(bundle CustodyRecoveryBundle) string {
+	canonical := canonicalRecoveryBundle(bundle)
+	canonical.BundleHash = ""
+	return HashValue(canonical)
+}
+
 func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned := canonicalTransition(transition)
 	unsigned.Approvals = nil
@@ -44,6 +50,8 @@ func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned.Proof.ExitProofRef = ""
 	unsigned.Proof.FinalizedAt = ""
 	unsigned.Proof.RequestHash = ""
+	unsigned.Proof.RecoveryBundles = nil
+	unsigned.Proof.RecoveryWitness = nil
 	unsigned.Proof.ReplayValidated = false
 	unsigned.Proof.SettlementWitness = nil
 	unsigned.Proof.StateHash = ""
@@ -103,6 +111,25 @@ func canonicalTransition(transition CustodyTransition) CustodyTransition {
 		canonicalWitness := canonicalSettlementWitness(*transition.Proof.SettlementWitness)
 		transition.Proof.SettlementWitness = &canonicalWitness
 	}
+	transition.Proof.RecoveryBundles = append([]CustodyRecoveryBundle(nil), transition.Proof.RecoveryBundles...)
+	for index := range transition.Proof.RecoveryBundles {
+		transition.Proof.RecoveryBundles[index] = canonicalRecoveryBundle(transition.Proof.RecoveryBundles[index])
+	}
+	sort.SliceStable(transition.Proof.RecoveryBundles, func(left, right int) bool {
+		leftBundle := transition.Proof.RecoveryBundles[left]
+		rightBundle := transition.Proof.RecoveryBundles[right]
+		if leftBundle.Kind != rightBundle.Kind {
+			return leftBundle.Kind < rightBundle.Kind
+		}
+		if leftBundle.BundleHash != rightBundle.BundleHash {
+			return leftBundle.BundleHash < rightBundle.BundleHash
+		}
+		return compareVTXORefSlices(leftBundle.SourcePotRefs, rightBundle.SourcePotRefs) < 0
+	})
+	if transition.Proof.RecoveryWitness != nil {
+		canonicalWitness := canonicalRecoveryWitness(*transition.Proof.RecoveryWitness)
+		transition.Proof.RecoveryWitness = &canonicalWitness
+	}
 	transition.Proof.VTXORefs = append([]VTXORef(nil), transition.Proof.VTXORefs...)
 	sort.SliceStable(transition.Proof.VTXORefs, func(left, right int) bool {
 		return compareVTXORefs(transition.Proof.VTXORefs[left], transition.Proof.VTXORefs[right]) < 0
@@ -114,6 +141,47 @@ func canonicalSettlementWitness(witness CustodySettlementWitness) CustodySettlem
 	witness.VtxoTree = canonicalFlatTxTree(witness.VtxoTree)
 	witness.ConnectorTree = canonicalFlatTxTree(witness.ConnectorTree)
 	return witness
+}
+
+func canonicalRecoveryBundle(bundle CustodyRecoveryBundle) CustodyRecoveryBundle {
+	bundle.AuthorizedOutputs = append([]CustodyRecoveryOutput(nil), bundle.AuthorizedOutputs...)
+	for index := range bundle.AuthorizedOutputs {
+		bundle.AuthorizedOutputs[index].Tapscripts = append([]string(nil), bundle.AuthorizedOutputs[index].Tapscripts...)
+		sort.Strings(bundle.AuthorizedOutputs[index].Tapscripts)
+	}
+	sort.SliceStable(bundle.AuthorizedOutputs, func(left, right int) bool {
+		leftOutput := bundle.AuthorizedOutputs[left]
+		rightOutput := bundle.AuthorizedOutputs[right]
+		switch {
+		case leftOutput.OwnerPlayerID != rightOutput.OwnerPlayerID:
+			return leftOutput.OwnerPlayerID < rightOutput.OwnerPlayerID
+		case leftOutput.AmountSats != rightOutput.AmountSats:
+			return leftOutput.AmountSats < rightOutput.AmountSats
+		default:
+			return leftOutput.Script < rightOutput.Script
+		}
+	})
+	bundle.SourcePotRefs = append([]VTXORef(nil), bundle.SourcePotRefs...)
+	sort.SliceStable(bundle.SourcePotRefs, func(left, right int) bool {
+		return compareVTXORefs(bundle.SourcePotRefs[left], bundle.SourcePotRefs[right]) < 0
+	})
+	if bundle.TimeoutResolution != nil {
+		canonicalResolution := canonicalTimeoutResolution(*bundle.TimeoutResolution)
+		bundle.TimeoutResolution = &canonicalResolution
+	}
+	return bundle
+}
+
+func canonicalRecoveryWitness(witness CustodyRecoveryWitness) CustodyRecoveryWitness {
+	witness.BroadcastTxIDs = append([]string(nil), witness.BroadcastTxIDs...)
+	sort.Strings(witness.BroadcastTxIDs)
+	return witness
+}
+
+func canonicalTimeoutResolution(resolution TimeoutResolution) TimeoutResolution {
+	resolution.DeadPlayerIDs = sortedStrings(resolution.DeadPlayerIDs)
+	resolution.LostEligibilityPlayerIDs = sortedStrings(resolution.LostEligibilityPlayerIDs)
+	return resolution
 }
 
 func canonicalFlatTxTree(tree arktree.FlatTxTree) arktree.FlatTxTree {
@@ -157,6 +225,35 @@ func compareVTXORefs(left, right VTXORef) int {
 		return 1
 	}
 	return 0
+}
+
+func compareVTXORefSlices(left, right []VTXORef) int {
+	leftRefs := append([]VTXORef(nil), left...)
+	rightRefs := append([]VTXORef(nil), right...)
+	sort.SliceStable(leftRefs, func(i, j int) bool {
+		return compareVTXORefs(leftRefs[i], leftRefs[j]) < 0
+	})
+	sort.SliceStable(rightRefs, func(i, j int) bool {
+		return compareVTXORefs(rightRefs[i], rightRefs[j]) < 0
+	})
+	limit := len(leftRefs)
+	if len(rightRefs) < limit {
+		limit = len(rightRefs)
+	}
+	for index := 0; index < limit; index++ {
+		comparison := compareVTXORefs(leftRefs[index], rightRefs[index])
+		if comparison != 0 {
+			return comparison
+		}
+	}
+	switch {
+	case len(leftRefs) < len(rightRefs):
+		return -1
+	case len(leftRefs) > len(rightRefs):
+		return 1
+	default:
+		return 0
+	}
 }
 
 func mustJSON(value any) []byte {

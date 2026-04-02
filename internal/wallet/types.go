@@ -55,6 +55,8 @@ type MeshTableReferenceState struct {
 }
 
 type PlayerProfileState struct {
+	CachedArkConfig        *CustodyArkConfig                  `json:"cachedArkConfig,omitempty"`
+	CachedOnchainAddresses []string                           `json:"cachedOnchainAddresses,omitempty"`
 	CurrentTable           *TableSessionState                 `json:"currentTable,omitempty"`
 	CurrentMeshTableID     string                             `json:"currentMeshTableId,omitempty"`
 	HandSeeds              map[string]string                  `json:"handSeeds"`
@@ -125,6 +127,11 @@ type CustodyExitResult struct {
 	Pending        bool                   `json:"pending"`
 	SourceRefs     []tablecustody.VTXORef `json:"sourceRefs,omitempty"`
 	SweepTxID      string                 `json:"sweepTxId,omitempty"`
+}
+
+type CustodyRecoveryResult struct {
+	BroadcastTxIDs []string `json:"broadcastTxIds,omitempty"`
+	RecoveryTxID   string   `json:"recoveryTxid,omitempty"`
 }
 
 type CustodyArkConfig struct {

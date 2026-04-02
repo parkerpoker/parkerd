@@ -210,6 +210,9 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 	if transition.Proof.ArkTxID != "" && transition.ArkTxID != "" && transition.Proof.ArkTxID != transition.ArkTxID {
 		return fmt.Errorf("custody proof txid mismatch")
 	}
+	if transition.Proof.RecoveryWitness != nil && transition.Proof.SettlementWitness != nil {
+		return fmt.Errorf("custody proof cannot carry both settlement and recovery witnesses")
+	}
 	if transition.Proof.SettlementWitness != nil {
 		witness := transition.Proof.SettlementWitness
 		if transition.ArkIntentID != "" && witness.ArkIntentID != transition.ArkIntentID {
@@ -226,6 +229,43 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 		}
 		if transition.Proof.FinalizedAt != "" && witness.FinalizedAt != transition.Proof.FinalizedAt {
 			return fmt.Errorf("custody proof witness finalized timestamp mismatch")
+		}
+	}
+	for index, bundle := range transition.Proof.RecoveryBundles {
+		if bundle.Kind == "" {
+			return fmt.Errorf("custody recovery bundle %d is missing a kind", index)
+		}
+		if len(bundle.SourcePotRefs) == 0 {
+			return fmt.Errorf("custody recovery bundle %d is missing source pot refs", index)
+		}
+		if len(bundle.AuthorizedOutputs) == 0 {
+			return fmt.Errorf("custody recovery bundle %d is missing authorized outputs", index)
+		}
+		if bundle.SignedPSBT == "" {
+			return fmt.Errorf("custody recovery bundle %d is missing signed psbt", index)
+		}
+		if expected := HashCustodyRecoveryBundle(bundle); bundle.BundleHash != "" && bundle.BundleHash != expected {
+			return fmt.Errorf("custody recovery bundle %d hash mismatch", index)
+		}
+	}
+	if witness := transition.Proof.RecoveryWitness; witness != nil {
+		if transition.Kind != TransitionKindTimeout && transition.Kind != TransitionKindShowdownPayout {
+			return fmt.Errorf("custody recovery witness is only valid for timeout or showdown-payout transitions")
+		}
+		if witness.BundleHash == "" {
+			return fmt.Errorf("custody recovery witness is missing bundle hash")
+		}
+		if witness.RecoveryTxID == "" {
+			return fmt.Errorf("custody recovery witness is missing recovery txid")
+		}
+		if len(witness.BroadcastTxIDs) == 0 {
+			return fmt.Errorf("custody recovery witness is missing broadcast txids")
+		}
+		if transition.Proof.FinalizedAt != "" && witness.ExecutedAt != "" && witness.ExecutedAt != transition.Proof.FinalizedAt {
+			return fmt.Errorf("custody recovery witness finalized timestamp mismatch")
+		}
+		if transition.ArkIntentID != "" || transition.ArkTxID != "" || transition.Proof.ArkIntentID != "" || transition.Proof.ArkTxID != "" {
+			return fmt.Errorf("custody recovery witness cannot coexist with Ark settlement ids")
 		}
 	}
 	expectedHash := HashCustodyTransition(transition)

@@ -4,6 +4,8 @@ This document describes the dealerless hand protocol implemented today in this r
 
 For broader system context, see [architecture.md](./architecture.md). For wire surfaces, see [protocol.md](./protocol.md). For trust boundaries, see [trust-model.md](./trust-model.md). For chip and wallet movement, see [money-flows.md](./money-flows.md).
 
+Important scope note: dealerless transcript flow still determines only card truth and public showdown facts. Deterministic pot recovery in v1 no longer tries to encode winner detection in tapscript. Once the transcript makes the money result objective, the custody layer relies on pre-signed CSV recovery bundles over the shared pot exit.
+
 ## What The Runtime Guarantees Today
 
 Parker currently runs heads-up Hold'em with a coordinator-led dealerless protocol named `dealerless-transcript-v1`.
@@ -491,9 +493,12 @@ After all required showdown reveals are present, or after a forced fold:
 
 1. the Hold'em engine settles stacks
 2. the host builds public state from the settled hand
-3. the host builds a snapshot
-4. the host appends `HandResult`
-5. the next hand is scheduled
+3. the host finalizes payout custody if the latest custody state does not already match the settled public money state
+4. the host builds a snapshot
+5. the host appends `HandResult`
+6. the next hand is scheduled
+
+If the settled money result is already objective but live cooperative payout cannot complete, the custody layer can later recover through the stored CSV recovery bundle after `U`. The dealerless transcript does not change; only the custody proof surface changes from `SettlementWitness` to `RecoveryWitness`.
 
 ### 10. Timeout and abort
 
@@ -506,6 +511,13 @@ Protocol deadlines apply to:
 - showdown reveal
 
 If exactly one seat is missing a required record, the runtime appends `HandAbort`, force-folds that seat, and settles the hand.
+
+For heads-up deterministic money-resolving cases, that now means:
+
+- the missing player becomes dead only for the contested pot
+- the uncontested stack still stays with its owner
+- if the live cooperative timeout successor stalls, the stored CSV recovery bundle can execute after `U`
+- dealerless still does not guess hidden-card-dependent winners when the money result is not objective
 
 If multiple seats are missing required records, the runtime aborts the hand and restores the latest fully signed snapshot instead of inventing missing hidden-card data.
 

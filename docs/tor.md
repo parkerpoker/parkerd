@@ -5,6 +5,8 @@
 - registering a v3 onion service that forwards to the mesh peer TCP listener
 - dialing remote `.onion` peers through Tor SOCKS5
 
+Tor changes transport reachability only. It does not change custody proof semantics: deterministic timeout/showdown recovery still uses the same stored CSV recovery bundles, the same `RecoveryWitness` proof surface, and the same eventual-after-`U` liveness tradeoff as direct `parker://` transport.
+
 Tor support is opt-in. Set `PARKER_USE_TOR=true` to enable hidden-service registration and outbound `.onion` dialing. When Tor is off, Parker keeps the existing `parker://<ip>:<port>` behavior and `.onion` dials fail with a clear error.
 
 ## Prerequisites
@@ -80,6 +82,7 @@ The Parker container needs read access to Tor’s cookie file when the control p
 - The returned private key is persisted in the daemon state directory at `<daemon-dir>/<profile>.state/tor-hidden-service.json`, so the onion address stays stable across restarts.
 - On shutdown Parker issues `DEL_ONION` for the service created during that run.
 - Outbound `.onion` peers are dialed through `PARKER_TOR_SOCKS_ADDR` with SOCKS hostname forwarding, so Tor resolves the onion name remotely.
+- If a Tor-backed peer becomes unreachable during a deterministic contested-pot timeout, recovery still follows the same custody rules: the live cooperative path can stall, but a stored recovery bundle can still execute after `U` without changing the accepted money result.
 
 ## Security Notes
 
