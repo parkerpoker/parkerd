@@ -4,7 +4,7 @@ This document describes the dealerless hand protocol implemented today in this r
 
 For broader system context, see [architecture.md](./architecture.md). For wire surfaces, see [protocol.md](./protocol.md). For trust boundaries, see [trust-model.md](./trust-model.md). For chip and wallet movement, see [money-flows.md](./money-flows.md).
 
-Important scope note: dealerless transcript flow still determines only card truth and public showdown facts. Deterministic pot recovery in v1 no longer tries to encode winner detection in tapscript. Once the transcript makes the money result objective, the custody layer relies on pre-signed CSV recovery bundles over the shared pot exit.
+Important scope note: dealerless transcript flow determines only card truth and public showdown facts. Once the transcript makes the money result objective, deterministic pot recovery uses pre-signed CSV recovery bundles over the shared pot exit.
 
 ## What The Runtime Guarantees Today
 
@@ -438,7 +438,7 @@ From here:
 
 - actions are still wallet-signed
 - the host validates turn binding and legality
-- the transcript is no longer used for betting actions
+- the transcript does not carry betting actions
 - hidden-card confidentiality still depends on the earlier dealerless records
 
 ### 7. Board reveal phases

@@ -8,7 +8,7 @@ For component topology, see [architecture.md](./architecture.md). For dealerless
 
 The current runtime is `poker/v1`.
 
-The important protocol changes in this generation are:
+The important protocol properties are:
 
 - money authority is the latest accepted `CustodyState`
 - local funds bookkeeping is `arkade-table-funds/v1`
@@ -17,8 +17,8 @@ The important protocol changes in this generation are:
 - approval/request hashing strips recovery bundles and recovery witnesses until the final accepted proof is assembled
 - accepted `PlayerAction`, `CashOut`, and `EmergencyExit` events carry the full signed initiator request as the canonical payload
 - host sequencing is proposer-only; action and result events are appended only after custody finalization succeeds
-- Parker v1 no longer relies on impossible output-inspecting tapscript for deterministic contested pots; it stores fully signed CSV recovery bundles over the existing shared pot exit leaf
-- accepted custody history can now prove either a live Ark batch path or a stored recovery-bundle path
+- deterministic contested-pot recovery uses fully signed CSV recovery bundles over the existing shared pot exit leaf
+- accepted custody history can prove either a live Ark batch path or a stored recovery-bundle path
 - in the current heads-up runtime, accepted betting and payout steps become the new cash-out and exit baseline; later funds requests are evaluated against the latest custody state, not a pre-loss balance
 - the game engine is N-player-capable for money logic, but runtime table creation is still capped at 2 seats
 
@@ -118,11 +118,11 @@ The runtime currently handles:
 
 The new pieces in the custody generation are the `table.funds.*`, `table.custody.*`, `table.custody.sign*`, and `table.custody.signer.*` routes plus the tighter coupling between table sync, action acceptance, and custody finalization.
 
-For user-initiated transitions, `table.custody.request`, `table.custody.sign.request`, and `table.custody.signer.prepare.request` now carry a transition authorizer object with the full signed `nativeActionRequest` or `nativeFundsRequest`. Later signer start/nonces/aggregated-nonces steps continue from the already-validated transition hash and stored signer session.
+For user-initiated transitions, `table.custody.request`, `table.custody.sign.request`, and `table.custody.signer.prepare.request` carry a transition authorizer object with the full signed `nativeActionRequest` or `nativeFundsRequest`. Later signer start/nonces/aggregated-nonces steps continue from the already-validated transition hash and stored signer session.
 
 ## Authoritative Table State
 
-`nativeTableState` now carries both the derived UI/debug views and the custody history:
+`nativeTableState` carries both the derived UI/debug views and the custody history:
 
 - `CustodyTransitions`
 - `LatestCustodyState`
@@ -147,7 +147,7 @@ Peers reject accepted tables that:
 
 ## Join Contract
 
-`table.join.request` now includes:
+`table.join.request` includes:
 
 - `BuyInSats`
 - `FundingRefs`
@@ -171,7 +171,7 @@ Seat lock is then committed as a `buy-in-lock` custody transition.
 
 ## Action Contract
 
-`table.action.request` now includes:
+`table.action.request` includes:
 
 - action payload
 - current `challengeAnchor`
@@ -203,7 +203,7 @@ For an accepted action, the host:
 
 This also covers zero-exposure successors such as `check` or timeout auto-check. Those still advance `custodySeq`, but if the successor reuses the same refs and needs no Ark spend inputs, the runtime finalizes a non-settlement custody transition instead of forcing a batch.
 
-Custody timing is also protocol-configured now. Table config carries `actionTimeoutMs`, `handProtocolTimeoutMs`, and `nextHandDelayMs`, and semantic replay uses those accepted table values instead of the local daemon's current mock-vs-real settlement mode.
+Custody timing is protocol-configured. Table config carries `actionTimeoutMs`, `handProtocolTimeoutMs`, and `nextHandDelayMs`, and semantic replay uses those accepted table values instead of the local daemon's current mock-vs-real settlement mode.
 
 ## Custody Transition Contract
 
@@ -241,7 +241,7 @@ Transition kinds currently used by the runtime include:
 - `cash-out`
 - `emergency-exit`
 
-User-initiated transition validation is now explicitly layered:
+User-initiated transition validation is explicitly layered:
 
 1. semantic successor validation
 2. Ark/output authorization and proof validation
@@ -255,7 +255,7 @@ Semantic successor validation derives the expected next custody step locally fro
 
 Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers still verify Ark-linked refs, authorized output sets, and proof material even after the semantic successor matches.
 
-Accepted history can now replay two proof surfaces offline.
+Accepted history can replay two proof surfaces offline.
 
 The first is the ordinary real Ark batch path through `CustodyProof.SettlementWitness`. That witness bundle includes:
 
@@ -315,7 +315,7 @@ The runtime still uses host heartbeat plus protocol deadlines for liveness:
 - host failure timeout: `3500ms`
 - next-hand delay: `1000ms`
 
-But failover now resumes from the latest accepted custody state, not from a snapshot overlay.
+Failover resumes from the latest accepted custody state, not from a snapshot overlay.
 
 Witness or player failover behavior:
 

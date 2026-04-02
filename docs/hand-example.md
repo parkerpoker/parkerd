@@ -59,8 +59,7 @@ Important note on `R`:
 
 Important note on deterministic recovery:
 
-- v1 no longer assumes an output-inspecting tapscript branch can directly detect who won a contested pot
-- instead, accepted source transitions store fully signed recovery PSBTs over the shared pot CSV exit whenever the later money result is already objective
+- deterministic contested-pot recovery uses fully signed recovery PSBTs over the shared pot CSV exit whenever the later money result is already objective
 - if the cooperative path stalls, that stored bundle can execute after `U` and still produce the same winner-owned stack refs the cooperative successor would have created
 
 Notation used below:
@@ -238,7 +237,7 @@ Outputs:
 
 Money meaning:
 
-- Alice's wallet ref is no longer free for unrelated wallet use
+- Alice's wallet ref is reserved for the table rather than unrelated wallet use
 - the table now has an authoritative Alice stack claim
 - the new output uses the default stack tapscript tree shown above
 
@@ -662,9 +661,9 @@ Two important enforcement details are at work here:
 
 So Bob does not need Alice to sign after Alice has already missed the deadline and lost eligibility on the contested money.
 
-In v1 there is now also a deterministic recovery bundle on the accepted source transition that left `P_2` live:
+The accepted source transition that left `P_2` live also stores a deterministic recovery bundle:
 
-- it spends `P_2` through the shared CSV pot exit, not through an impossible winner-detecting tapscript
+- it spends `P_2` through the shared CSV pot exit
 - it is fully signed before the source transition is accepted
 - it exact-commits to `S_B_timeout` as the only money-resolving output
 - it becomes executable only after `U`
@@ -708,7 +707,7 @@ Custody behavior:
 - Parker derives a `TimeoutResolution` marking Bob dead / ineligible for the contested pot
 - Parker finalizes a `showdown-payout` transition if the current custody state does not already match the settled money state
 
-If Alice is now the only eligible winner, the result becomes:
+If Alice is the only eligible winner, the result becomes:
 
 ```text
 Alice stack = 4,500
@@ -736,7 +735,7 @@ One subtle but important rule from the current runtime:
 
 So the timeout only transfers the actually contested money.
 
-If the live cooperative `showdown-payout` cannot complete, Parker now handles this exactly the same way as the action-timeout case:
+If the live cooperative `showdown-payout` cannot complete, Parker handles this exactly the same way as the action-timeout case:
 
 - the accepted source transition already stored a fully signed recovery bundle over the shared pot CSV exit
 - that bundle only exists because the money result is objective once the missing showdown participant is dead

@@ -26,13 +26,13 @@ The peer runtime is coordinator-led and dealerless today:
 - public discovery remains optional through the indexer
 - the browser stays outside daemon custody and peer-to-peer transport
 
-Daemons now advertise direct peer endpoints shaped like `parker://host:port` and exchange signed transport envelopes over the framed TCP transport implemented in the daemon.
+Daemons advertise direct peer endpoints shaped like `parker://host:port` and exchange signed transport envelopes over the framed TCP transport implemented in the daemon.
 
 ## Recovery Proof Surfaces
 
-Parker v1 no longer depends on an impossible output-inspecting tapscript branch to force deterministic pot resolution.
+Deterministic pot resolution uses pre-signed CSV recovery bundles over the shared pot exit instead of an output-inspecting tapscript branch.
 
-Instead, accepted custody history now has two proof surfaces:
+Accepted custody history has two proof surfaces:
 
 - `CustodyProof.SettlementWitness` for ordinary real Ark batch finalization
 - stored `CustodyProof.RecoveryBundles` plus an executed `CustodyProof.RecoveryWitness` for deterministic heads-up contested-pot recovery after the shared pot CSV delay `U`

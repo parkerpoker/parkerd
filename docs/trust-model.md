@@ -12,7 +12,7 @@ The current model is:
 - the browser/controller and indexer remain non-custodial
 - monetary truth is the latest accepted `CustodyState`, not replicated UI state
 - the host is a proposer and sequencer, not a unilateral money authority
-- deterministic contested-pot recovery no longer depends on impossible output-inspecting tapscript; it depends on pre-signed recovery bundles over the shared pot CSV exit
+- deterministic contested-pot recovery uses pre-signed recovery bundles over the shared pot CSV exit
 - in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty should not be able to claw that accepted result back through a later cash-out or exit
 - operator outage affects liveness and visibility, not ownership of the latest accepted custody claim
 - the accepted v1 liveness tradeoff is eventual deterministic recovery after `U`, not immediate forced recovery at `D`
@@ -32,7 +32,7 @@ That matters because:
 
 If a replica has a prettier UI projection but the wrong custody chain, that replica is wrong.
 
-That accepted chain can now prove history through two offline proof surfaces:
+That accepted chain can prove history through two offline proof surfaces:
 
 - `SettlementWitness` for ordinary real Ark batches
 - stored `RecoveryBundles` plus executed `RecoveryWitness` for deterministic recovery transitions
@@ -67,7 +67,7 @@ The host still has real responsibility for:
 - replication
 - failover sequencing
 
-But the host is no longer supposed to be the unilateral money sequencer.
+The host is not the unilateral money sequencer.
 
 For user-initiated transitions, honest replicas do not trust a host-authored summary of intent. They derive the expected successor locally from:
 
@@ -125,7 +125,7 @@ Accepted state is checked against:
 - historical snapshot continuity
 - historical custody continuity
 
-In real-settlement mode those checks replay accepted custody transitions from whichever proof surface the history actually used. `SettlementWitness` carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree for the ordinary Ark batch path. `RecoveryWitness` instead points at a stored signed recovery bundle, source pot refs, and recovery broadcast metadata. If those stored artifacts are intact, accepted history no longer depends on live Ark/indexer availability.
+In real-settlement mode those checks replay accepted custody transitions from whichever proof surface the history actually used. `SettlementWitness` carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree for the ordinary Ark batch path. `RecoveryWitness` points at a stored signed recovery bundle, source pot refs, and recovery broadcast metadata. If those stored artifacts are intact, accepted history replays without live Ark/indexer availability.
 
 `ReplayValidated` remains telemetry/debug metadata only. It is not treated as proof on its own.
 
