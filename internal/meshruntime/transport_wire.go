@@ -60,7 +60,7 @@ const (
 	nativeTransportRequestTTL      = 30 * time.Second
 	nativeTransportReadTimeout     = 10 * time.Second
 	nativeTransportWriteTimeout    = 20 * time.Second
-	nativeTransportExchangeTimeout = 20 * time.Second
+	nativeTransportExchangeTimeout = 90 * time.Second
 	nativePeerInfoCacheTTL         = 30 * time.Second
 )
 

@@ -27,41 +27,43 @@ import (
 )
 
 type meshRuntime struct {
-	backgroundTasks     int
-	config              cfg.RuntimeConfig
-	arkTransportFactory func() (arkclient.TransportClient, error)
-	clearPeerURL        string
-	custodyApprovalHook func(request nativeCustodyApprovalRequest) error
-	custodyArkVerify    func(refs []tablecustody.VTXORef, requireSpendable bool) error
-	custodyBatchExecute func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
-	custodyExitExecute  func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
-	custodySignerAuth   map[string]custodySignerAuthorization
-	custodySigners      map[string]walletpkg.CustodySignerSession
-	httpClient          *http.Client
-	lastSyncAt          map[string]time.Time
-	listener            net.Listener
-	mode                string
-	mu                  sync.Mutex
-	peerInfoCache       map[string]nativeCachedPeerInfo
-	peerIdentity        settlementcore.ScopedIdentity
-	profileName         string
-	profileStore        *walletpkg.ProfileStore
-	protocolID          string
-	protocolIdentity    settlementcore.ScopedIdentity
-	protocolDrives      map[string]struct{}
-	self                nativePeerSelf
-	server              *http.Server
-	fundsSenderHook     func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
-	tableSyncSender     func(peerURL string, input nativeTableSyncRequest) error
-	started             bool
-	store               *meshStore
-	taskCond            *sync.Cond
-	torService          *runtimeHiddenService
-	transportKeyID      string
-	transportPrivate    string
-	transportPublic     string
-	walletID            settlementcore.LocalIdentity
-	walletRuntime       *walletpkg.Runtime
+	backgroundTasks        int
+	config                 cfg.RuntimeConfig
+	arkTransportFactory    func() (arkclient.TransportClient, error)
+	clearPeerURL           string
+	custodyApprovalHook    func(request nativeCustodyApprovalRequest) error
+	custodyArkVerify       func(refs []tablecustody.VTXORef, requireSpendable bool) error
+	custodyBatchExecute    func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
+	custodyExitExecute     func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
+	custodyPSBTSign        func(profileName, tx string) (string, error)
+	custodyRecoveryExecute func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
+	custodySignerAuth      map[string]custodySignerAuthorization
+	custodySigners         map[string]walletpkg.CustodySignerSession
+	httpClient             *http.Client
+	lastSyncAt             map[string]time.Time
+	listener               net.Listener
+	mode                   string
+	mu                     sync.Mutex
+	peerInfoCache          map[string]nativeCachedPeerInfo
+	peerIdentity           settlementcore.ScopedIdentity
+	profileName            string
+	profileStore           *walletpkg.ProfileStore
+	protocolID             string
+	protocolIdentity       settlementcore.ScopedIdentity
+	protocolDrives         map[string]struct{}
+	self                   nativePeerSelf
+	server                 *http.Server
+	fundsSenderHook        func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
+	tableSyncSender        func(peerURL string, input nativeTableSyncRequest) error
+	started                bool
+	store                  *meshStore
+	taskCond               *sync.Cond
+	torService             *runtimeHiddenService
+	transportKeyID         string
+	transportPrivate       string
+	transportPublic        string
+	walletID               settlementcore.LocalIdentity
+	walletRuntime          *walletpkg.Runtime
 }
 
 const (
@@ -219,21 +221,23 @@ func (runtime *meshRuntime) hostHeartbeatIntervalMS() int {
 
 func (runtime *meshRuntime) hostFailureTimeoutMS() int {
 	if runtime != nil && !runtime.config.UseMockSettlement {
-		return 15_000
+		return 120_000
 	}
 	return nativeHostFailureMS
 }
 
 func (runtime *meshRuntime) handProtocolTimeoutMS() int {
 	if runtime != nil && !runtime.config.UseMockSettlement {
-		return 8_000
+		// Real Ark custody rounds add network and signer coordination latency to
+		// every protocol phase transition, so keep more budget than synthetic mode.
+		return 20_000
 	}
 	return nativeHandProtocolTimeoutMS
 }
 
 func (runtime *meshRuntime) actionTimeoutMS() int {
 	if runtime != nil && !runtime.config.UseMockSettlement {
-		return 12_000
+		return 16_000
 	}
 	return nativeActionTimeoutMS
 }
@@ -321,6 +325,12 @@ func (runtime *meshRuntime) Tick() {
 						return nil
 					}
 					latest.LastHostHeartbeatAt = nowISO()
+					// Persist the heartbeat before any potentially slow protocol work so
+					// witnesses polling the host do not mistake an in-flight real-mode
+					// settlement step for host failure.
+					if err := runtime.persistLocalTable(latest, false); err != nil {
+						return err
+					}
 					if latest.NextHandAt != "" && elapsedMillis(latest.NextHandAt) >= 0 {
 						if err := runtime.startNextHandLocked(latest); err != nil {
 							debugMeshf("host tick start next hand failed table=%s nextHandAt=%s err=%v", tableID, latest.NextHandAt, err)
@@ -1175,42 +1185,76 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (Nati
 	if err := runtime.Start(); err != nil {
 		return NativeMeshTableView{}, err
 	}
-	table, err := runtime.refreshLocalTable(tableID)
-	if err != nil {
-		return NativeMeshTableView{}, err
-	}
-	if table == nil {
-		return NativeMeshTableView{}, fmt.Errorf("table %s not found", tableID)
-	}
-	if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && table.ActiveHand != nil && !game.PhaseAllowsActions(table.ActiveHand.State.Phase) && table.CurrentHost.Peer.PeerURL != "" {
-		remote, fetchErr := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
-		if fetchErr == nil && remote != nil {
-			if acceptErr := runtime.acceptRemoteTable(*remote); acceptErr == nil {
-				table, _ = runtime.store.readTable(tableID)
+	var (
+		err     error
+		table   *nativeTableState
+		updated nativeTableState
+	)
+	for attempt := 0; attempt < 3; attempt++ {
+		runtime.syncTableFromKnownParticipants(tableID)
+		table, err = runtime.refreshLocalTable(tableID)
+		if err != nil {
+			return NativeMeshTableView{}, err
+		}
+		if table == nil {
+			return NativeMeshTableView{}, fmt.Errorf("table %s not found", tableID)
+		}
+		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && table.ActiveHand != nil && !game.PhaseAllowsActions(table.ActiveHand.State.Phase) && table.CurrentHost.Peer.PeerURL != "" {
+			remote, fetchErr := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
+			if fetchErr == nil && remote != nil {
+				if acceptErr := runtime.acceptRemoteTable(*remote); acceptErr == nil {
+					table, _ = runtime.store.readTable(tableID)
+				}
 			}
 		}
+		request, buildErr := runtime.buildSignedActionRequest(*table, action)
+		if buildErr != nil {
+			return NativeMeshTableView{}, buildErr
+		}
+		if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
+			updated, err = runtime.handleActionFromPeer(request)
+		} else {
+			updated, err = runtime.remoteAction(table.CurrentHost.Peer.PeerURL, request)
+		}
+		if err != nil {
+			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+				table.CurrentHost.Peer.PeerURL != "" &&
+				attempt < 2 &&
+				isRetryableActionRequestStateError(err) {
+				runtime.syncTableFromKnownParticipants(tableID)
+				refreshed, refreshErr := runtime.refreshLocalTable(tableID)
+				if refreshErr == nil && refreshed != nil && actionRetryStateChanged(*table, *refreshed) {
+					continue
+				}
+				if refreshErr != nil {
+					return NativeMeshTableView{}, refreshErr
+				}
+			}
+			return NativeMeshTableView{}, err
+		}
+		if acceptErr := runtime.acceptRemoteTable(updated); acceptErr != nil {
+			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+				table.CurrentHost.Peer.PeerURL != "" &&
+				attempt < 2 &&
+				isRetryableActionResponseStateError(acceptErr) {
+				runtime.syncTableFromKnownParticipants(tableID)
+				refreshed, refreshErr := runtime.refreshLocalTable(tableID)
+				if refreshErr == nil && refreshed != nil && actionRetryStateChanged(*table, *refreshed) {
+					continue
+				}
+				if refreshErr != nil {
+					return NativeMeshTableView{}, refreshErr
+				}
+			}
+			return NativeMeshTableView{}, acceptErr
+		}
+		accepted, err := runtime.requireLocalTable(updated.Config.TableID)
+		if err != nil {
+			return NativeMeshTableView{}, err
+		}
+		return runtime.localTableView(*accepted), nil
 	}
-	request, err := runtime.buildSignedActionRequest(*table, action)
-	if err != nil {
-		return NativeMeshTableView{}, err
-	}
-	var updated nativeTableState
-	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
-		updated, err = runtime.handleActionFromPeer(request)
-	} else {
-		updated, err = runtime.remoteAction(table.CurrentHost.Peer.PeerURL, request)
-	}
-	if err != nil {
-		return NativeMeshTableView{}, err
-	}
-	if err := runtime.acceptRemoteTable(updated); err != nil {
-		return NativeMeshTableView{}, err
-	}
-	accepted, err := runtime.requireLocalTable(updated.Config.TableID)
-	if err != nil {
-		return NativeMeshTableView{}, err
-	}
-	return runtime.localTableView(*accepted), nil
+	return NativeMeshTableView{}, errors.New("action submission exhausted retries")
 }
 
 func (runtime *meshRuntime) RotateHost(tableID string) (NativeMeshTableView, error) {
@@ -1584,6 +1628,41 @@ func isRetryableFundsRequestStateError(err error) bool {
 		strings.Contains(message, "funds request epoch mismatch")
 }
 
+func isRetryableActionRequestStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "action request custody mismatch") ||
+		strings.Contains(message, "action request epoch mismatch") ||
+		strings.Contains(message, "action request must be sent to the current host") ||
+		strings.Contains(message, "i/o timeout") ||
+		strings.Contains(message, "connection refused") ||
+		strings.Contains(message, "EOF")
+}
+
+func isRetryableActionResponseStateError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "accepted history would roll back table events") ||
+		strings.Contains(message, "accepted history would roll back table snapshots")
+}
+
+func actionRetryStateChanged(previous, refreshed nativeTableState) bool {
+	if snapshotProtocolDrive(previous) != snapshotProtocolDrive(refreshed) {
+		return true
+	}
+	if previous.LastEventHash != refreshed.LastEventHash {
+		return true
+	}
+	if len(previous.Events) != len(refreshed.Events) {
+		return true
+	}
+	return len(previous.Snapshots) != len(refreshed.Snapshots)
+}
+
 func cloneFundsExitExecution(execution *nativeFundsExitExecution) *nativeFundsExitExecution {
 	if execution == nil {
 		return nil
@@ -1732,6 +1811,20 @@ func (runtime *meshRuntime) executeLocalCustodyExit(sourceRefs []tablecustody.VT
 		return runtime.custodyExitExecute(runtime.profileName, append([]tablecustody.VTXORef(nil), sourceRefs...), destination)
 	}
 	return runtime.walletRuntime.UnilateralExitCustodyRefs(runtime.profileName, sourceRefs, destination)
+}
+
+func (runtime *meshRuntime) signLocalCustodyPSBT(current string) (string, error) {
+	if runtime.custodyPSBTSign != nil {
+		return runtime.custodyPSBTSign(runtime.profileName, current)
+	}
+	return runtime.walletRuntime.SignCustodyTransaction(runtime.profileName, current)
+}
+
+func (runtime *meshRuntime) executeLocalCustodyRecovery(signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+	if runtime.custodyRecoveryExecute != nil {
+		return runtime.custodyRecoveryExecute(runtime.profileName, signedPSBT)
+	}
+	return runtime.walletRuntime.ExecuteCustodyRecoveryTransaction(runtime.profileName, signedPSBT)
 }
 
 func emergencyExitProofRef(state tablecustody.CustodyState, playerID string, execution *nativeFundsExitExecution) string {
@@ -2366,6 +2459,9 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (n
 		if err := runtime.finalizeCustodyTransition(table, &custodyTransition, authorizer); err != nil {
 			return err
 		}
+		if err := runtime.attachDeterministicRecoveryBundles(*table, &custodyTransition, authorizer, &nextState); err != nil {
+			return err
+		}
 		table.ActiveHand.State = nextState
 		runtime.applyCustodyTransition(table, custodyTransition)
 		if err := runtime.appendEvent(table, map[string]any{
@@ -2454,6 +2550,9 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	if err := runtime.finalizeCustodyTransition(table, &blindTransition, nil); err != nil {
 		return err
 	}
+	if err := runtime.attachDeterministicRecoveryBundles(*table, &blindTransition, nil, &hand); err != nil {
+		return err
+	}
 	runtime.applyCustodyTransition(table, blindTransition)
 	table.Config.Status = "active"
 	table.NextHandAt = ""
@@ -2470,7 +2569,7 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	return runtime.advanceHandProtocolLocked(table)
 }
 
-func (runtime *meshRuntime) syncTableBeforeFailover(tableID string) {
+func (runtime *meshRuntime) syncTableFromKnownParticipants(tableID string) {
 	table, err := runtime.store.readTable(tableID)
 	if err != nil || table == nil {
 		return
@@ -2503,6 +2602,10 @@ func (runtime *meshRuntime) syncTableBeforeFailover(tableID string) {
 			debugMeshf("failover pre-sync rejected remote table=%s peer=%s err=%v", tableID, peerURL, acceptErr)
 		}
 	}
+}
+
+func (runtime *meshRuntime) syncTableBeforeFailover(tableID string) {
+	runtime.syncTableFromKnownParticipants(tableID)
 }
 
 func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostFailure bool, resetProtocolDeadline bool) error {
@@ -3376,6 +3479,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if transition.Proof.ReplayValidated != true {
 		return errors.New("custody proof must mark replay validation")
 	}
+	hasRecoveryWitness := transition.Proof.RecoveryWitness != nil
 	if transition.ArkIntentID != "" && transition.Proof.ArkIntentID != "" && transition.Proof.ArkIntentID != transition.ArkIntentID {
 		return errors.New("custody proof intent id mismatch")
 	}
@@ -3383,6 +3487,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		return errors.New("custody proof txid mismatch")
 	}
 	if requireArkSettlement &&
+		!hasRecoveryWitness &&
 		transition.Kind != tablecustody.TransitionKindEmergencyExit &&
 		(strings.TrimSpace(transition.ArkIntentID) == "" || strings.TrimSpace(transition.ArkTxID) == "") {
 		return errors.New("custody proof is missing Ark settlement ids")
@@ -3396,12 +3501,24 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if transition.Proof.RequestHash != approvalTransition.Proof.RequestHash {
 		return errors.New("custody proof request hash mismatch")
 	}
+	expectedRecoverySourceRefs := sourcePotRecoveryRefs(&transition.NextState)
+	for index, bundle := range transition.Proof.RecoveryBundles {
+		if !sameCanonicalVTXORefs(bundle.SourcePotRefs, expectedRecoverySourceRefs) {
+			return fmt.Errorf("custody recovery bundle %d source refs do not match the accepted transition", index)
+		}
+		if err := runtime.validateStoredRecoveryBundle(table, bundle); err != nil {
+			return fmt.Errorf("custody recovery bundle %d is invalid: %w", index, err)
+		}
+	}
 	required := runtime.requiredCustodySigners(table, transition)
 	if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
 		return err
 	}
-	if err := validateAcceptedCustodyRefs(previous, transition, requireArkSettlement); err != nil {
+	if err := validateAcceptedCustodyRefs(previous, transition, requireArkSettlement && !hasRecoveryWitness); err != nil {
 		return err
+	}
+	if hasRecoveryWitness {
+		return runtime.validateAcceptedCustodyRecoveryWitness(table, previous, transition)
 	}
 	if !requireArkSettlement || transition.Kind == tablecustody.TransitionKindEmergencyExit {
 		return nil
@@ -4613,6 +4730,9 @@ func lowestEligibleFailoverSeat(table nativeTableState) (nativeSeatRecord, bool)
 	var lowestSeat *nativeSeatRecord
 	for _, seat := range table.Seats {
 		if seat.PeerID == "" || seat.PeerID == table.CurrentHost.Peer.PeerID {
+			continue
+		}
+		if seat.Status == "pending-join" || terminalCustodySeatStatus(seat.Status) {
 			continue
 		}
 		if lowestPeerID == "" || seat.PeerID < lowestPeerID {

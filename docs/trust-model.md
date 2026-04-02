@@ -12,8 +12,10 @@ The current model is:
 - the browser/controller and indexer remain non-custodial
 - monetary truth is the latest accepted `CustodyState`, not replicated UI state
 - the host is a proposer and sequencer, not a unilateral money authority
+- deterministic contested-pot recovery uses pre-signed recovery bundles over the shared pot CSV exit
 - in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty should not be able to claw that accepted result back through a later cash-out or exit
 - operator outage affects liveness and visibility, not ownership of the latest accepted custody claim
+- the accepted v1 liveness tradeoff is eventual deterministic recovery after `U`, not immediate forced recovery at `D`
 
 ## Money Authority
 
@@ -29,6 +31,11 @@ That matters because:
 - failover resumes from the latest custody checkpoint
 
 If a replica has a prettier UI projection but the wrong custody chain, that replica is wrong.
+
+That accepted chain can prove history through two offline proof surfaces:
+
+- `SettlementWitness` for ordinary real Ark batches
+- stored `RecoveryBundles` plus executed `RecoveryWitness` for deterministic recovery transitions
 
 ## Keys And Local Secrets
 
@@ -60,7 +67,7 @@ The host still has real responsibility for:
 - replication
 - failover sequencing
 
-But the host is no longer supposed to be the unilateral money sequencer.
+The host is not the unilateral money sequencer.
 
 For user-initiated transitions, honest replicas do not trust a host-authored summary of intent. They derive the expected successor locally from:
 
@@ -88,6 +95,7 @@ Current runtime behavior:
 - reveal/private-delivery/showdown timeout refunds uncontested stack instead of gifting it to the surviving player
 - remote signers validate the prebuilt custody transition semantically before approval, PSBT signing, or signer-session prepare
 - Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
+- deterministic action-timeout and showdown-timeout bundles are pre-signed while the source transition is still cooperative, then executed later only if the live path stalls
 
 This keeps liveness from depending on continued cooperation by a player who has already lost eligibility in the contested portion of the hand.
 
@@ -117,7 +125,7 @@ Accepted state is checked against:
 - historical snapshot continuity
 - historical custody continuity
 
-In real-settlement mode those checks replay accepted Ark-settled custody transitions from the stored settlement witness bundle inside `CustodyProof`. That witness bundle carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree needed to re-derive the accepted refs offline. If the witness is intact, accepted history no longer depends on live Ark/indexer availability.
+In real-settlement mode those checks replay accepted custody transitions from whichever proof surface the history actually used. `SettlementWitness` carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree for the ordinary Ark batch path. `RecoveryWitness` points at a stored signed recovery bundle, source pot refs, and recovery broadcast metadata. If those stored artifacts are intact, accepted history replays without live Ark/indexer availability.
 
 `ReplayValidated` remains telemetry/debug metadata only. It is not treated as proof on its own.
 
@@ -193,7 +201,14 @@ If Ark-backed services are unavailable:
 - exit completion may stall
 - live spendability checks such as join funding admission can still stall
 
-Accepted historical replay of already-settled Ark custody steps can still succeed from the stored witness bundle even while Ark services are unavailable. Again, the remaining failures are liveness issues, not ownership changes.
+Accepted historical replay of already-settled Ark custody steps can still succeed from the stored witness material even while Ark services are unavailable. Deterministic contested pots can also recover after `U` if the required recovery bundle was already stored on the source transition. Again, the remaining failures are liveness issues, not ownership changes.
+
+Remaining v1 stall cases are explicit:
+
+- auto-check states do not get winner-take-all recovery bundles
+- non-deterministic missing-card situations can still fail closed
+- the daemon broadcasting a stored recovery bundle still needs enough ordinary unilateral-exit fee-bump liquidity to relay the recovery package after `U`
+- personal wallet exit/cash-out still depends on the ordinary stack-owned path after the pot has already been resolved
 
 ## Important Current Limits
 
@@ -216,5 +231,5 @@ The safest way to interpret the current system is:
 - trust each daemon to protect its own secrets
 - trust the host to propose and sequence, not to define money alone
 - trust custody replay more than snapshots or UI projections
-- treat stored settlement witnesses as the proof for accepted Ark-settled history, and live Ark/indexer checks as a current liveness/spendability safety layer
+- treat stored settlement witnesses and stored recovery witnesses as the proof for accepted history, and live Ark/indexer checks as a current liveness/spendability safety layer
 - treat controller and indexer outages as liveness failures, not custody failures

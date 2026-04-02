@@ -90,12 +90,39 @@ type CustodySettlementWitness struct {
 	ConnectorTree    arktree.FlatTxTree `json:"connectorTree,omitempty"`
 }
 
+type CustodyRecoveryOutput struct {
+	AmountSats    int      `json:"amountSats"`
+	OwnerPlayerID string   `json:"ownerPlayerId,omitempty"`
+	Script        string   `json:"script,omitempty"`
+	Tapscripts    []string `json:"tapscripts,omitempty"`
+}
+
+type CustodyRecoveryBundle struct {
+	AuthorizedOutputs []CustodyRecoveryOutput `json:"authorizedOutputs,omitempty"`
+	BundleHash        string                  `json:"bundleHash,omitempty"`
+	EarliestExecuteAt string                  `json:"earliestExecuteAt,omitempty"`
+	Kind              TransitionKind          `json:"kind"`
+	SignedPSBT        string                  `json:"signedPsbt,omitempty"`
+	SourcePotRefs     []VTXORef               `json:"sourcePotRefs,omitempty"`
+	TimeoutResolution *TimeoutResolution      `json:"timeoutResolution,omitempty"`
+}
+
+type CustodyRecoveryWitness struct {
+	BroadcastTxIDs      []string `json:"broadcastTxIds,omitempty"`
+	BundleHash          string   `json:"bundleHash,omitempty"`
+	ExecutedAt          string   `json:"executedAt,omitempty"`
+	RecoveryTxID        string   `json:"recoveryTxid,omitempty"`
+	SourceTransitionHash string  `json:"sourceTransitionHash,omitempty"`
+}
+
 type CustodyProof struct {
 	ArkIntentID       string                    `json:"arkIntentId,omitempty"`
 	ArkTxID           string                    `json:"arkTxid,omitempty"`
 	ExitProofRef      string                    `json:"exitProofRef,omitempty"`
 	FinalizedAt       string                    `json:"finalizedAt,omitempty"`
 	RequestHash       string                    `json:"requestHash,omitempty"`
+	RecoveryBundles   []CustodyRecoveryBundle   `json:"recoveryBundles,omitempty"`
+	RecoveryWitness   *CustodyRecoveryWitness   `json:"recoveryWitness,omitempty"`
 	ReplayValidated   bool                      `json:"replayValidated"`
 	SettlementWitness *CustodySettlementWitness `json:"settlementWitness,omitempty"`
 	Signatures        []CustodySignature        `json:"signatures,omitempty"`

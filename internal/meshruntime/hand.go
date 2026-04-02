@@ -1434,9 +1434,6 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 		TableID:           table.Config.TableID,
 		TimeoutResolution: &resolution,
 	})
-	if err := runtime.syncTableToCustodySigners(*table, requiredSigners); err != nil {
-		return false, err
-	}
 	nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, actingSeatIndex, action)
 	if err != nil {
 		return false, err
@@ -1445,7 +1442,22 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if err != nil {
 		return false, err
 	}
-	if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
+	if err := runtime.syncTableToCustodySigners(*table, requiredSigners); err != nil {
+		if recovered, recoveryErr := runtime.finalizeCustodyRecoveryTransition(table, &custodyTransition, nil); recoveryErr != nil {
+			return false, recoveryErr
+		} else if !recovered {
+			debugMeshf("action timeout recovery deferred table=%s err=%v", table.Config.TableID, err)
+			return false, nil
+		}
+	} else if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
+		if recovered, recoveryErr := runtime.finalizeCustodyRecoveryTransition(table, &custodyTransition, nil); recoveryErr != nil {
+			return false, recoveryErr
+		} else if !recovered {
+			debugMeshf("action timeout recovery deferred table=%s err=%v", table.Config.TableID, err)
+			return false, nil
+		}
+	}
+	if err := runtime.attachDeterministicRecoveryBundles(*table, &custodyTransition, nil, &nextState); err != nil {
 		return false, err
 	}
 	table.ActiveHand.State = nextState
@@ -1554,12 +1566,19 @@ func (runtime *meshRuntime) finalizeSettledHandLocked(table *nativeTableState, t
 			return err
 		}
 		if err := runtime.syncTableToCustodySigners(*table, runtime.requiredCustodySigners(*table, custodyTransition)); err != nil {
-			debugMeshf("settled hand payout sync deferred table=%s err=%v", table.Config.TableID, err)
-			return nil
-		}
-		if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
-			debugMeshf("settled hand payout finalize deferred table=%s err=%v", table.Config.TableID, err)
-			return nil
+			if recovered, recoveryErr := runtime.finalizeCustodyRecoveryTransition(table, &custodyTransition, nil); recoveryErr != nil {
+				return recoveryErr
+			} else if !recovered {
+				debugMeshf("settled hand payout sync deferred table=%s err=%v", table.Config.TableID, err)
+				return nil
+			}
+		} else if err := runtime.finalizeCustodyTransition(table, &custodyTransition, nil); err != nil {
+			if recovered, recoveryErr := runtime.finalizeCustodyRecoveryTransition(table, &custodyTransition, nil); recoveryErr != nil {
+				return recoveryErr
+			} else if !recovered {
+				debugMeshf("settled hand payout finalize deferred table=%s err=%v", table.Config.TableID, err)
+				return nil
+			}
 		}
 		runtime.applyCustodyTransition(table, custodyTransition)
 		custodySeq = custodyTransition.CustodySeq

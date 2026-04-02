@@ -26,7 +26,26 @@ The peer runtime is coordinator-led and dealerless today:
 - public discovery remains optional through the indexer
 - the browser stays outside daemon custody and peer-to-peer transport
 
-Daemons now advertise direct peer endpoints shaped like `parker://host:port` and exchange signed transport envelopes over the framed TCP transport implemented in the daemon.
+Daemons advertise direct peer endpoints shaped like `parker://host:port` and exchange signed transport envelopes over the framed TCP transport implemented in the daemon.
+
+## Recovery Proof Surfaces
+
+Deterministic pot resolution uses pre-signed CSV recovery bundles over the shared pot exit instead of an output-inspecting tapscript branch.
+
+Accepted custody history has two proof surfaces:
+
+- `CustodyProof.SettlementWitness` for ordinary real Ark batch finalization
+- stored `CustodyProof.RecoveryBundles` plus an executed `CustodyProof.RecoveryWitness` for deterministic heads-up contested-pot recovery after the shared pot CSV delay `U`
+
+The recovery path is intentionally narrow in v1:
+
+- heads-up only
+- only deterministic money-resolving states get stored bundles
+- action timeout that auto-folds
+- showdown reveal/showdown timeout that kills the missing player
+- settled `showdown-payout` timeout
+
+Auto-check states still fail closed until a later objective deadline exists. When recovery does apply, it recreates the same ordinary winner-owned stack refs that the cooperative successor would have produced.
 
 ## Practical Repo Mapping
 
@@ -37,6 +56,7 @@ Daemons now advertise direct peer endpoints shaped like `parker://host:port` and
 - [internal/storage/store.go](../internal/storage/store.go) provides the runtime and indexer storage backends
 - [internal/settlementcore/core.go](../internal/settlementcore/core.go) implements canonical JSON hashing and signatures
 - [internal/tablecustody](../internal/tablecustody) owns custody state hashing, transition validation, side-pot claims, and exit-proof material
+- [internal/meshruntime/custody_recovery.go](../internal/meshruntime/custody_recovery.go) owns deterministic recovery bundle generation, CSV-leaf selection, fallback execution, and offline witness replay
 - [internal/wallet/runtime.go](../internal/wallet/runtime.go) plus [internal/wallet/custody_exit.go](../internal/wallet/custody_exit.go) own Ark wallet access, signer sessions, and unilateral exit execution
 - [internal/game](../internal/game) contains the current Hold'em rules engine and N-player money evaluation
 - browser clients are maintained outside this repository
@@ -316,6 +336,7 @@ The repository currently exercises these local shapes:
 - `make deps`, `make host`, `make witness`, `make alice`, `make bob`, and their matching `-down` targets let you manage the local regtest services individually
 - `make fund-alice` and `make fund-bob` bootstrap those player profiles if needed, faucet funds, and onboard them
 - `make poker-regtest-round` starts Nigiri, the indexer, four Go daemons, funds the players, creates a table, auto-plays a hand, and cashes both players out
+- `make poker-regtest-round-recovery` creates a contested pot, forces a deterministic timeout state, stops the defaulting peer plus Ark/indexer services, waits for `U`, and confirms that the survivor finishes from a stored recovery bundle with `RecoveryWitness`
 
 ## Gameplay / Data Flows
 
@@ -366,6 +387,17 @@ If the host disappears during an active hand:
 - it syncs the best known accepted table and replays custody, transcript, and public state to decide whether the hand can continue
 - if required protocol records are missing or invalid, it appends `HandAbort`
 - it returns to the latest replay-valid custody-backed table state when abort is required
+
+### Deterministic money recovery
+
+If a hand reaches an objectively determined money result but cooperative Ark finalization cannot complete:
+
+- the source accepted transition already carries the fully signed recovery PSBT over the shared pot CSV exit
+- the host keeps retrying the normal path until the bundle's `EarliestExecuteAt`
+- after `U`, the host can execute the stored PSBT through the unilateral-exit broadcaster
+- the accepted successor is still the ordinary semantic `timeout` or `showdown-payout` transition, but it now carries `RecoveryWitness` instead of `SettlementWitness`
+
+This is an eventual-recovery design, not an instant-at-`D` design. The v1 tradeoff is explicit: deterministic contested pots can recover after `U`, while non-deterministic or auto-check states still fail closed.
 
 ## Relationship To Other Docs
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	arkscript "github.com/arkade-os/arkd/pkg/ark-lib/script"
 	arktxutils "github.com/arkade-os/arkd/pkg/ark-lib/txutils"
 	arksdk "github.com/arkade-os/go-sdk"
 	arkexplorer "github.com/arkade-os/go-sdk/explorer"
@@ -27,6 +28,83 @@ import (
 )
 
 const unilateralExitSweepTimeout = 90 * time.Second
+
+func finalizedCustodyRecoveryTx(packet *psbt.Packet) (*wire.MsgTx, error) {
+	if packet == nil {
+		return nil, errors.New("custody recovery psbt is missing")
+	}
+	recoveryTx := packet.UnsignedTx.Copy()
+	for inputIndex, input := range packet.Inputs {
+		if len(input.TaprootLeafScript) != 1 {
+			return nil, fmt.Errorf("custody recovery psbt input %d is missing its csv leaf proof", inputIndex)
+		}
+		leafScript := input.TaprootLeafScript[0]
+		closure, err := arkscript.DecodeClosure(leafScript.Script)
+		if err != nil {
+			return nil, err
+		}
+		csvClosure, ok := closure.(*arkscript.CSVMultisigClosure)
+		if !ok {
+			return nil, fmt.Errorf("custody recovery psbt input %d does not use a csv multisig leaf", inputIndex)
+		}
+		leafHash := txscript.NewTapLeaf(leafScript.LeafVersion, leafScript.Script).TapHash()
+		signatures := make(map[string][]byte, len(input.TaprootScriptSpendSig))
+		for _, signature := range input.TaprootScriptSpendSig {
+			if signature == nil || !bytes.Equal(signature.LeafHash, leafHash[:]) {
+				return nil, fmt.Errorf("custody recovery psbt input %d contains a signature for the wrong leaf", inputIndex)
+			}
+			rawSignature := append([]byte(nil), signature.Signature...)
+			if signature.SigHash != txscript.SigHashDefault {
+				rawSignature = append(rawSignature, byte(signature.SigHash))
+			}
+			signatures[hex.EncodeToString(signature.XOnlyPubKey)] = rawSignature
+		}
+		witness, err := csvClosure.Witness(leafScript.ControlBlock, signatures)
+		if err != nil {
+			return nil, err
+		}
+		recoveryTx.TxIn[inputIndex].Witness = witness
+	}
+	return recoveryTx, nil
+}
+
+func (runtime *Runtime) liveOrCachedArkConfig(ctx context.Context, profileName string, state PlayerProfileState, client arksdk.ArkClient) (*CustodyArkConfig, error) {
+	config, err := client.GetConfigData(ctx)
+	switch {
+	case err == nil && config != nil:
+		if config.SignerPubKey == nil || config.ForfeitPubKey == nil {
+			return nil, errors.New("ark client config is incomplete")
+		}
+		cached := CustodyArkConfig{
+			ArkServerURL:          runtime.config.ArkServerURL,
+			CheckpointTapscript:   config.CheckpointTapscript,
+			DustSats:              config.Dust,
+			ExplorerURL:           config.ExplorerURL,
+			ForfeitAddress:        config.ForfeitAddress,
+			ForfeitPubkeyHex:      hex.EncodeToString(config.ForfeitPubKey.SerializeCompressed()),
+			Network:               config.Network,
+			OffchainInputFeeSats:  parseSatsString(config.Fees.IntentFees.OffchainInput),
+			OffchainOutputFeeSats: parseSatsString(config.Fees.IntentFees.OffchainOutput),
+			OnchainInputFeeSats:   int(config.Fees.IntentFees.OnchainInput),
+			OnchainOutputFeeSats:  int(config.Fees.IntentFees.OnchainOutput),
+			SignerPubkeyHex:       hex.EncodeToString(config.SignerPubKey.SerializeCompressed()),
+			UnilateralExitDelay:   config.UnilateralExitDelay,
+		}
+		state.CachedArkConfig = &cached
+		if saveErr := runtime.store.Save(state); saveErr != nil {
+			return nil, saveErr
+		}
+		return &cached, nil
+	case err == nil:
+		return nil, nil
+	default:
+		if cached, ok := cachedArkConfig(state); ok {
+			debugWalletf("using cached ark config for custody recovery profile=%s err=%v", profileName, err)
+			return &cached, nil
+		}
+		return nil, err
+	}
+}
 
 func (runtime *Runtime) UnilateralExitCustodyRefs(profileName string, refs []tablecustody.VTXORef, destination string) (CustodyExitResult, error) {
 	if runtime.config.UseMockSettlement {
@@ -61,15 +139,15 @@ func (runtime *Runtime) UnilateralExitCustodyRefs(profileName string, refs []tab
 	ctx, cancel := context.WithTimeout(context.Background(), unilateralExitSweepTimeout)
 	defer cancel()
 
-	config, err := client.GetConfigData(ctx)
+	cachedConfig, err := runtime.liveOrCachedArkConfig(ctx, profileName, *state, client)
 	if err != nil {
 		return CustodyExitResult{}, err
 	}
-	if config == nil {
+	if cachedConfig == nil {
 		return CustodyExitResult{}, errors.New("ark config is unavailable")
 	}
 
-	explorerSvc, err := mempoolexplorer.NewExplorer(config.ExplorerURL, config.Network, mempoolexplorer.WithTracker(false))
+	explorerSvc, err := mempoolexplorer.NewExplorer(cachedConfig.ExplorerURL, cachedConfig.Network, mempoolexplorer.WithTracker(false))
 	if err != nil {
 		return CustodyExitResult{}, err
 	}
@@ -107,7 +185,7 @@ func (runtime *Runtime) UnilateralExitCustodyRefs(profileName string, refs []tab
 		if err := parent.Deserialize(hex.NewDecoder(strings.NewReader(nextTx))); err != nil {
 			return CustodyExitResult{}, err
 		}
-		childTx, err := runtime.bumpCustodyAnchorTx(ctx, client, explorerSvc, &parent)
+		childTx, err := runtime.bumpCustodyAnchorTx(ctx, profileName, *state, client, explorerSvc, &parent)
 		if err != nil {
 			return CustodyExitResult{}, err
 		}
@@ -136,7 +214,87 @@ func (runtime *Runtime) UnilateralExitCustodyRefs(profileName string, refs []tab
 	return result, nil
 }
 
-func (runtime *Runtime) bumpCustodyAnchorTx(ctx context.Context, client arksdk.ArkClient, explorerSvc arkexplorer.Explorer, parent *wire.MsgTx) (string, error) {
+func (runtime *Runtime) ExecuteCustodyRecoveryTransaction(profileName, signedPSBT string) (CustodyRecoveryResult, error) {
+	if runtime.config.UseMockSettlement {
+		txid := "mock-recovery-" + suffix(profileName, 8)
+		return CustodyRecoveryResult{
+			BroadcastTxIDs: []string{txid},
+			RecoveryTxID:   txid,
+		}, nil
+	}
+	if strings.TrimSpace(signedPSBT) == "" {
+		return CustodyRecoveryResult{}, errors.New("custody recovery requires a signed psbt")
+	}
+
+	state, err := runtime.ensureBootstrap(profileName, "", "")
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+
+	client, unlock, cleanup, err := runtime.openArkClient(profileName, *state)
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	defer cleanup()
+	if err := unlock(); err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), unilateralExitSweepTimeout)
+	defer cancel()
+
+	cachedConfig, err := runtime.liveOrCachedArkConfig(ctx, profileName, *state, client)
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	if cachedConfig == nil {
+		return CustodyRecoveryResult{}, errors.New("ark config is unavailable")
+	}
+
+	explorerSvc, err := mempoolexplorer.NewExplorer(cachedConfig.ExplorerURL, cachedConfig.Network, mempoolexplorer.WithTracker(false))
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	defer explorerSvc.Stop()
+
+	packet, err := psbt.NewFromRawBytes(strings.NewReader(signedPSBT), true)
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	parentTx, err := finalizedCustodyRecoveryTx(packet)
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	recoveryTxID := parentTx.TxHash().String()
+	childTx, err := runtime.bumpCustodyAnchorTx(ctx, profileName, *state, client, explorerSvc, parentTx)
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+
+	var serialized bytes.Buffer
+	if err := parentTx.Serialize(&serialized); err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	parentHex := hex.EncodeToString(serialized.Bytes())
+	broadcastTxID, err := explorerSvc.Broadcast(parentHex, childTx)
+	if err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+
+	result := CustodyRecoveryResult{
+		BroadcastTxIDs: []string{broadcastTxID},
+		RecoveryTxID:   recoveryTxID,
+	}
+	if broadcastTxID != recoveryTxID {
+		result.BroadcastTxIDs = append(result.BroadcastTxIDs, recoveryTxID)
+	}
+	return result, nil
+}
+
+func (runtime *Runtime) bumpCustodyAnchorTx(ctx context.Context, profileName string, state PlayerProfileState, client arksdk.ArkClient, explorerSvc arkexplorer.Explorer, parent *wire.MsgTx) (string, error) {
 	anchor, err := arktxutils.FindAnchorOutpoint(parent)
 	if err != nil {
 		return "", err
@@ -157,7 +315,11 @@ func (runtime *Runtime) bumpCustodyAnchorTx(ctx context.Context, client arksdk.A
 
 	onchainAddrs, _, _, _, err := client.GetAddresses(ctx)
 	if err != nil {
-		return "", err
+		onchainAddrs = cachedOnchainAddresses(state)
+		if len(onchainAddrs) == 0 {
+			return "", err
+		}
+		debugWalletf("using cached onchain addresses for custody recovery profile=%s err=%v", profileName, err)
 	}
 	selectedCoins := make([]arkexplorer.Utxo, 0)
 	selectedAmount := uint64(0)
@@ -185,7 +347,11 @@ func (runtime *Runtime) bumpCustodyAnchorTx(ctx context.Context, client arksdk.A
 
 	changeAddr, _, _, err := client.Receive(ctx)
 	if err != nil {
-		return "", err
+		if len(onchainAddrs) == 0 {
+			return "", err
+		}
+		changeAddr = onchainAddrs[len(onchainAddrs)-1]
+		debugWalletf("using cached change address for custody recovery profile=%s err=%v", profileName, err)
 	}
 	pkScript, err := payToAddressScript(changeAddr)
 	if err != nil {
