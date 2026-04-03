@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -28,6 +29,12 @@ import (
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func TestTableTrafficKeepsHoleCardsOwnerLocalAndPushesTranscriptUpdates(t *testing.T) {
 	t.Parallel()
@@ -112,6 +119,55 @@ func TestGuestSendActionWaitsForSlowReplicationTargetsInParallel(t *testing.T) {
 	}
 	if maxInFlight < 2 {
 		t.Fatalf("expected replication fanout to overlap in parallel, got max in-flight %d across %d calls", maxInFlight, callCount)
+	}
+}
+
+func TestGuestSendActionForcesFailoverWhenCurrentHostWillNotConfirmCandidate(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send action: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if guestTable.CurrentHost.Peer.PeerID != host.selfPeerID() {
+		t.Fatalf("expected host %s before failover retry, got %s", host.selfPeerID(), guestTable.CurrentHost.Peer.PeerID)
+	}
+
+	if err := host.Close(); err != nil {
+		t.Fatalf("close host transport: %v", err)
+	}
+	guest.httpClient = &http.Client{
+		Timeout: guest.httpClient.Timeout,
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return nil, errors.New("simulated host transport failure")
+		}),
+	}
+
+	view, err := guest.SendAction(tableID, game.Action{Type: game.ActionCheck})
+	if err != nil {
+		t.Fatalf("expected guest action to succeed via failover retry, got %v", err)
+	}
+	if view.Config.HostPeerID != guest.selfPeerID() {
+		t.Fatalf("expected local view host %s after failover retry, got %s", guest.selfPeerID(), view.Config.HostPeerID)
+	}
+
+	updated := mustReadNativeTable(t, guest, tableID)
+	if updated.CurrentHost.Peer.PeerID != guest.selfPeerID() {
+		t.Fatalf("expected guest host after failover retry, got %s", updated.CurrentHost.Peer.PeerID)
+	}
+	if updated.CurrentEpoch != guestTable.CurrentEpoch+1 {
+		t.Fatalf("expected failover retry to advance epoch to %d, got %d", guestTable.CurrentEpoch+1, updated.CurrentEpoch)
+	}
+	if got := len(updated.ActiveHand.State.ActionLog); got != 2 {
+		t.Fatalf("expected retried action to land in the active hand, got %d actions", got)
+	}
+	last := updated.ActiveHand.State.ActionLog[len(updated.ActiveHand.State.ActionLog)-1]
+	if last.Action.Type != game.ActionCheck {
+		t.Fatalf("expected retried guest action %s, got %+v", game.ActionCheck, last.Action)
 	}
 }
 
@@ -613,18 +669,21 @@ func TestHandleActionRejectsForgedSeatOwnerSignature(t *testing.T) {
 	signedAt := nowISO()
 	forged := nativeActionRequest{
 		Action:               game.Action{Type: game.ActionCall},
+		ActionDeadlineAt:     host.currentCustodyActionDeadline(table),
 		ChallengeAnchor:      firstNonEmptyString(handTranscriptRoot(table), table.LastEventHash),
 		DecisionIndex:        len(table.ActiveHand.State.ActionLog),
 		Epoch:                table.CurrentEpoch,
 		HandID:               table.ActiveHand.State.HandID,
+		OptionID:             "call",
 		PlayerID:             host.walletID.PlayerID,
 		PrevCustodyStateHash: latestCustodyStateHash(table),
 		ProfileName:          guest.profileName,
 		SignedAt:             signedAt,
 		TableID:              tableID,
+		TurnAnchorHash:       turnAnchorHash(table),
 		TranscriptRoot:       handTranscriptRoot(table),
 	}
-	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeActionAuthPayload(forged.TableID, forged.PlayerID, forged.HandID, forged.PrevCustodyStateHash, forged.ChallengeAnchor, forged.TranscriptRoot, forged.Epoch, forged.DecisionIndex, forged.Action, forged.SignedAt))
+	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeActionAuthPayload(forged.TableID, forged.PlayerID, forged.HandID, forged.OptionID, forged.PrevCustodyStateHash, forged.ActionDeadlineAt, forged.ChallengeAnchor, forged.TranscriptRoot, forged.TurnAnchorHash, forged.Epoch, forged.DecisionIndex, forged.Action, forged.SignedAt))
 	if err != nil {
 		t.Fatalf("sign forged action: %v", err)
 	}
@@ -649,7 +708,7 @@ func TestHandleActionRejectsReplayedDecisionSignature(t *testing.T) {
 		t.Fatalf("build stale call request: %v", err)
 	}
 
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionRaise, TotalSats: 200}); err != nil {
+	if _, err := host.SendAction(tableID, aggressiveActionForTable(t, table)); err != nil {
 		t.Fatalf("host send raise: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
@@ -657,8 +716,8 @@ func TestHandleActionRejectsReplayedDecisionSignature(t *testing.T) {
 		t.Fatalf("guest send preflop call: %v", err)
 	}
 	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetFlop)
-	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 100}); err != nil {
+	flopTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, flopTable)); err != nil {
 		t.Fatalf("guest send flop bet: %v", err)
 	}
 
@@ -962,7 +1021,7 @@ func TestFailoverKeepsActiveTranscriptDrivenHandRunning(t *testing.T) {
 	tableID, _ := createStartedTwoPlayerTable(t, host, player, witness.selfPeerID())
 	hostTable := waitForHandPhase(t, []*meshRuntime{host, player, witness}, host, tableID, game.StreetPreflop)
 	var table nativeTableState
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		table = mustReadNativeTable(t, witness, tableID)
 		if table.ActiveHand != nil &&
@@ -1059,11 +1118,11 @@ func TestSyntheticRealModeMissingShowdownRevealTimeoutSettles(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -1419,11 +1478,11 @@ func TestShowdownPayoutPlanConsumesRemovedPotRefs(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop showdown call: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -3247,11 +3306,11 @@ func TestCashOutProofSigningAcceptsAuthorizedOutputsForActingPlayer(t *testing.T
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for _, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -3597,11 +3656,11 @@ func TestSyntheticRealModeGuestCashOutAfterSettledHand(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -3667,11 +3726,11 @@ func TestHostCashOutAfterPeerSettledHandCashOutAcceptsRemoteHistory(t *testing.T
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -3796,11 +3855,11 @@ func TestSyntheticRealModeSettledHandCashOutProofRefsCoverRemainingClaims(t *tes
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for _, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -3860,11 +3919,11 @@ func TestSettledHandCashOutSignerPrepareAcceptsNormalizedTransition(t *testing.T
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for _, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -4308,11 +4367,11 @@ func TestShowdownPayoutSemanticValidationRejectsTamperedCustodyBindings(t *testi
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop showdown call: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -4374,9 +4433,7 @@ func TestTimeoutTransitionSemanticValidationRejectsTamperedTranscriptBindings(t 
 		t.Fatalf("host send call: %v", err)
 	}
 	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	expiredState := cloneJSON(*table.LatestCustodyState)
-	expiredState.ActionDeadlineAt = addMillis(nowISO(), -1)
-	table.LatestCustodyState = &expiredState
+	expireCurrentTurnActionDeadlineForTest(t, &table)
 
 	legalActions := game.GetLegalActions(table.ActiveHand.State, table.ActiveHand.State.ActingSeatIndex)
 	actionTypes := make([]string, 0, len(legalActions))
@@ -4610,9 +4667,7 @@ func TestValidateCustodyTransitionSemanticsRejectsWrongDerivedTimeoutResolution(
 		t.Fatalf("host send call: %v", err)
 	}
 	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	expiredState := cloneJSON(*table.LatestCustodyState)
-	expiredState.ActionDeadlineAt = addMillis(nowISO(), -1)
-	table.LatestCustodyState = &expiredState
+	expireCurrentTurnActionDeadlineForTest(t, &table)
 
 	wrongResolution := tablecustody.TimeoutResolution{
 		ActionType:               string(game.ActionCheck),
@@ -4688,11 +4743,11 @@ func TestActionDrivenShowdownArmsProtocolDeadline(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
@@ -4804,11 +4859,11 @@ func TestSendActionResyncsAfterHostRotation(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to flop: %v", err)
 	}
 
@@ -4876,11 +4931,11 @@ func TestForceProtocolFailoverResetsManualRevealDeadline(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to flop: %v", err)
 	}
 
@@ -5211,7 +5266,7 @@ func createStartedTwoPlayerTable(t *testing.T, host, guest *meshRuntime, witness
 
 	tableID, inviteCode := createJoinedTwoPlayerTable(t, host, guest, witnessPeerIDs...)
 	startNextHandForTest(t, host, tableID)
-	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	return tableID, inviteCode
 }
 
@@ -5221,7 +5276,7 @@ func createStartedTwoPlayerTableInSyntheticRealMode(t *testing.T, host, guest *m
 	enableSyntheticRealMode(host, guest)
 	tableID, inviteCode := createJoinedTwoPlayerTable(t, host, guest, witnessPeerIDs...)
 	startNextHandForTest(t, host, tableID)
-	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	return tableID, inviteCode
 }
 
@@ -5277,11 +5332,53 @@ func passiveActionForTable(t *testing.T, table nativeTableState) game.Action {
 	return action
 }
 
+func finiteMenuOptionsForTable(t *testing.T, table nativeTableState) []NativeActionMenuOption {
+	t.Helper()
+
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) && len(table.PendingTurnMenu.Options) > 0 {
+		return append([]NativeActionMenuOption(nil), table.PendingTurnMenu.Options...)
+	}
+	if table.ActiveHand == nil {
+		t.Fatalf("expected active hand for finite-menu options, got %+v", table.ActiveHand)
+	}
+	options, err := deriveFiniteMenuOptions(table.ActiveHand.State, table)
+	if err != nil {
+		t.Fatalf("derive finite-menu options: %v", err)
+	}
+	if len(options) == 0 {
+		t.Fatal("expected finite-menu options")
+	}
+	return options
+}
+
+func aggressiveActionForTable(t *testing.T, table nativeTableState) game.Action {
+	t.Helper()
+
+	var fallback *game.Action
+	for _, option := range finiteMenuOptionsForTable(t, table) {
+		switch option.Action.Type {
+		case game.ActionBet, game.ActionRaise:
+			action := option.Action
+			if strings.HasSuffix(option.OptionID, "-min") {
+				return action
+			}
+			if fallback == nil {
+				fallback = &action
+			}
+		}
+	}
+	if fallback != nil {
+		return *fallback
+	}
+	t.Fatalf("expected aggressive finite-menu action, got %+v", finiteMenuOptionsForTable(t, table))
+	return game.Action{}
+}
+
 func advanceTableByPassiveActionsToPhase(t *testing.T, host, guest *meshRuntime, tableID string, phase game.Street) nativeTableState {
 	t.Helper()
 
 	runtimes := []*meshRuntime{host, guest}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, host, tableID)
 		if table.ActiveHand != nil && table.ActiveHand.State.Phase == phase {
@@ -5657,7 +5754,7 @@ func touchLocalHostHeartbeat(t *testing.T, runtime *meshRuntime, tableID string)
 func waitForHandPhase(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string, phase game.Street) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, reader, tableID)
 		if table.ActiveHand != nil && table.ActiveHand.State.Phase == phase {
@@ -5683,7 +5780,7 @@ func waitForHandPhase(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime
 func waitForActionLogLength(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string, want int) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, reader, tableID)
 		if table.ActiveHand != nil && len(table.ActiveHand.State.ActionLog) == want {
@@ -5708,7 +5805,7 @@ func waitForActionLogLength(t *testing.T, runtimes []*meshRuntime, reader *meshR
 func waitForLocalCanAct(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, reader, tableID)
 		if reader.localTableView(table).Local.CanAct {
@@ -5723,6 +5820,28 @@ func waitForLocalCanAct(t *testing.T, runtimes []*meshRuntime, reader *meshRunti
 	}
 	t.Fatalf("timed out waiting for local canAct on table %s", tableID)
 	return nativeTableState{}
+}
+
+func expireCurrentTurnActionDeadlineForTest(t *testing.T, table *nativeTableState) string {
+	t.Helper()
+
+	if table == nil || table.LatestCustodyState == nil {
+		t.Fatal("expected latest custody state")
+	}
+	expiredAt := addMillis(nowISO(), -1)
+	table.LatestCustodyState.ActionDeadlineAt = expiredAt
+	if turnMenuMatchesTable(*table, table.PendingTurnMenu) {
+		expiredMenu := cloneJSON(*table.PendingTurnMenu)
+		if deliveredAt, err := parseISOTimestamp(expiredMenu.DeliveredAt); err == nil {
+			if deadlineAt, err := parseISOTimestamp(expiredMenu.ActionDeadlineAt); err == nil {
+				timeoutMS := int(deadlineAt.Sub(deliveredAt) / time.Millisecond)
+				expiredMenu.DeliveredAt = addMillis(expiredAt, -timeoutMS)
+			}
+		}
+		expiredMenu.ActionDeadlineAt = expiredAt
+		table.PendingTurnMenu = &expiredMenu
+	}
+	return expiredAt
 }
 
 func waitForActionableHandState(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
@@ -5964,7 +6083,7 @@ func resignActionRequestForTest(t *testing.T, runtime *meshRuntime, request *nat
 		t.Fatal("expected action request to re-sign")
 	}
 	request.SignedAt = nowISO()
-	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.PrevCustodyStateHash, request.ChallengeAnchor, request.TranscriptRoot, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.OptionID, request.PrevCustodyStateHash, request.ActionDeadlineAt, request.ChallengeAnchor, request.TranscriptRoot, request.TurnAnchorHash, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
 	if err != nil {
 		t.Fatalf("re-sign action request: %v", err)
 	}

@@ -80,10 +80,7 @@ func expireLocalActionDeadlineForRecoveryTest(t *testing.T, runtime *meshRuntime
 	t.Helper()
 
 	table := mustReadNativeTable(t, runtime, tableID)
-	if table.LatestCustodyState == nil {
-		t.Fatal("expected latest custody state")
-	}
-	table.LatestCustodyState.ActionDeadlineAt = addMillis(nowISO(), -1)
+	expireCurrentTurnActionDeadlineForTest(t, &table)
 	if err := runtime.store.writeTable(&table); err != nil {
 		t.Fatalf("write expired action deadline: %v", err)
 	}
@@ -424,11 +421,11 @@ func TestShowdownRevealRecoveryMatchesCooperativePayoutSuccessor(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {

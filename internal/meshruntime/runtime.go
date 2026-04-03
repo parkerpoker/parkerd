@@ -28,6 +28,7 @@ import (
 
 type meshRuntime struct {
 	backgroundTasks        int
+	candidateIntentAckHook func(table nativeTableState, bundle NativeTurnCandidateBundle) (*tablecustody.CandidateIntentAck, error)
 	config                 cfg.RuntimeConfig
 	arkTransportFactory    func() (arkclient.TransportClient, error)
 	clearPeerURL           string
@@ -908,6 +909,7 @@ func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, e
 	}
 	defaultSmallBlind, defaultBigBlind := defaultDealerlessBlinds(minOffchainSats, input)
 	config := NativeMeshTableConfig{
+		ActionMenuPolicy:          actionMenuPolicyFromCreateInput(input),
 		ActionTimeoutMS:           runtime.actionTimeoutMS(),
 		BigBlindSats:              intFromMap(input, "bigBlindSats", defaultBigBlind),
 		BuyInMaxSats:              intFromMap(input, "buyInMaxSats", 4000),
@@ -1198,17 +1200,27 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (resu
 		return NativeMeshTableView{}, err
 	}
 	var (
-		table   *nativeTableState
-		updated nativeTableState
+		lastSelection nativeActionSelectionRequest
+		table         *nativeTableState
+		updated       nativeTableState
 	)
 	for attempt := 0; attempt < 3; attempt++ {
-		runtime.syncTableFromKnownParticipants(tableID)
 		table, err = runtime.refreshLocalTable(tableID)
 		if err != nil {
 			return NativeMeshTableView{}, err
 		}
 		if table == nil {
 			return NativeMeshTableView{}, fmt.Errorf("table %s not found", tableID)
+		}
+		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
+			runtime.syncTableFromKnownParticipants(tableID)
+			table, err = runtime.refreshLocalTable(tableID)
+			if err != nil {
+				return NativeMeshTableView{}, err
+			}
+			if table == nil {
+				return NativeMeshTableView{}, fmt.Errorf("table %s not found", tableID)
+			}
 		}
 		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && table.ActiveHand != nil && !game.PhaseAllowsActions(table.ActiveHand.State.Phase) && table.CurrentHost.Peer.PeerURL != "" {
 			remote, fetchErr := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
@@ -1218,14 +1230,43 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (resu
 				}
 			}
 		}
-		request, buildErr := runtime.buildSignedActionRequest(*table, action)
+		selection, buildErr := runtime.buildActionSelectionRequest(*table, action)
 		if buildErr != nil {
+			if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() &&
+				attempt < 2 &&
+				strings.Contains(buildErr.Error(), "turn menu is not available") {
+				if err := runtime.store.withTableLock(tableID, func() error {
+					latest, err := runtime.store.readTable(tableID)
+					if err != nil || latest == nil {
+						return fmt.Errorf("table %s not found", tableID)
+					}
+					if err := runtime.ensurePendingTurnMenuLocked(latest); err != nil {
+						return err
+					}
+					return runtime.persistLocalTable(latest, true)
+				}); err != nil {
+					return NativeMeshTableView{}, err
+				}
+				continue
+			}
+			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+				table.CurrentHost.Peer.PeerURL != "" &&
+				attempt < 2 &&
+				strings.Contains(buildErr.Error(), "turn menu is not available") {
+				remote, fetchErr := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
+				if fetchErr == nil && remote != nil {
+					if acceptErr := runtime.acceptRemoteTable(*remote); acceptErr == nil {
+						continue
+					}
+				}
+			}
 			return NativeMeshTableView{}, buildErr
 		}
+		lastSelection = selection
 		if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
-			updated, err = runtime.handleActionFromPeer(request)
+			updated, err = runtime.handleActionSelectionFromPeer(selection)
 		} else {
-			updated, err = runtime.remoteAction(table.CurrentHost.Peer.PeerURL, request)
+			updated, err = runtime.remoteAction(table.CurrentHost.Peer.PeerURL, selection)
 		}
 		if err != nil {
 			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
@@ -1239,6 +1280,21 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (resu
 				}
 				if refreshErr != nil {
 					return NativeMeshTableView{}, refreshErr
+				}
+			}
+			if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
+				fallbackTable, fallbackErr := runtime.persistDirectActionSelection(tableID, lastSelection)
+				if fallbackErr == nil {
+					if attempt < 2 && runtime.shouldHandleFailover(fallbackTable) {
+						if failoverErr := runtime.forceProtocolFailover(tableID, "valid action candidate was not confirmed by the current host"); failoverErr == nil {
+							refreshed, refreshErr := runtime.refreshLocalTable(tableID)
+							if refreshErr == nil && refreshed != nil && actionAppliedLocally(*table, *refreshed, runtime.walletID.PlayerID, action) {
+								return runtime.localTableView(*refreshed), nil
+							}
+							continue
+						}
+					}
+					return runtime.localTableView(fallbackTable), fmt.Errorf("action selection was recorded locally but not confirmed by the host or operator: %w", err)
 				}
 			}
 			return NativeMeshTableView{}, err
@@ -1674,6 +1730,30 @@ func actionRetryStateChanged(previous, refreshed nativeTableState) bool {
 		return true
 	}
 	return len(previous.Snapshots) != len(refreshed.Snapshots)
+}
+
+func actionAppliedLocally(previous, refreshed nativeTableState, actorPlayerID string, action game.Action) bool {
+	if previous.ActiveHand == nil || refreshed.ActiveHand == nil {
+		return false
+	}
+	previousActions := previous.ActiveHand.State.ActionLog
+	refreshedActions := refreshed.ActiveHand.State.ActionLog
+	if len(refreshedActions) <= len(previousActions) {
+		return false
+	}
+	for _, record := range refreshedActions[len(previousActions):] {
+		if record.ActorPlayerID != actorPlayerID {
+			continue
+		}
+		if record.Action.Type != action.Type {
+			continue
+		}
+		if (action.Type == game.ActionBet || action.Type == game.ActionRaise) && record.Action.TotalSats != action.TotalSats {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func cloneFundsExitExecution(execution *nativeFundsExitExecution) *nativeFundsExitExecution {
@@ -2661,6 +2741,7 @@ func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostF
 		table.CurrentHost = nativeKnownParticipant{ProfileName: runtime.profileName, Peer: runtime.self.Peer}
 		table.Config.HostPeerID = runtime.selfPeerID()
 		table.LastHostHeartbeatAt = nowISO()
+		table.PendingTurnMenu = nil
 		lease := map[string]any{
 			"epoch":       table.CurrentEpoch,
 			"hostPeerId":  table.CurrentHost.Peer.PeerID,
@@ -3926,6 +4007,7 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 	var myHoleCards any
 	canAct := false
 	legalActions := []game.LegalAction{}
+	var turnMenu *NativePendingTurnMenu
 	if runtime.walletID.PlayerID != "" {
 		myPlayerID = runtime.walletID.PlayerID
 	}
@@ -3943,7 +4025,20 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 				seatIndex := seat.SeatIndex
 				canAct = table.ActiveHand.State.ActingSeatIndex != nil && *table.ActiveHand.State.ActingSeatIndex == seat.SeatIndex
 				if canAct {
-					legalActions = game.GetLegalActions(table.ActiveHand.State, &seatIndex)
+					if turnMenuMatchesTable(table, table.PendingTurnMenu) &&
+						table.PendingTurnMenu.ActingPlayerID == seat.PlayerID &&
+						runtime.validatePendingTurnMenu(table, table.PendingTurnMenu) == nil {
+						turnMenu = cloneJSON(table.PendingTurnMenu)
+						legalActions = exactMenuLegalActions(turnMenu)
+						if strings.TrimSpace(turnMenu.SelectedCandidateHash) != "" {
+							canAct = false
+						}
+					} else if game.PhaseAllowsActions(table.ActiveHand.State.Phase) {
+						canAct = false
+						legalActions = nil
+					} else {
+						legalActions = game.GetLegalActions(table.ActiveHand.State, &seatIndex)
+					}
 				}
 			}
 			break
@@ -3963,8 +4058,10 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 			MyHoleCards:  myHoleCards,
 			MyPlayerID:   myPlayerID,
 			MySeatIndex:  mySeatIndex,
+			TurnMenu:     turnMenu,
 		},
-		PublicState: clonePublicState(table.PublicState),
+		PendingTurnMenu: cloneJSON(table.PendingTurnMenu),
+		PublicState:     clonePublicState(table.PublicState),
 	}
 }
 
@@ -4129,6 +4226,7 @@ func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error
 	if err := runtime.normalizeAcceptedActiveHand(existing, &accepted); err != nil {
 		return err
 	}
+	mergeAcceptedPendingTurnMenu(existing, &accepted)
 	if err := runtime.validateAcceptedRemoteTable(existing, accepted); err != nil {
 		return err
 	}
@@ -4194,6 +4292,27 @@ func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error
 		return err
 	}
 	return nil
+}
+
+func mergeAcceptedPendingTurnMenu(existing *nativeTableState, accepted *nativeTableState) {
+	if existing == nil || accepted == nil {
+		return
+	}
+	existingValid := turnMenuMatchesTable(*existing, existing.PendingTurnMenu)
+	incomingValid := turnMenuMatchesTable(*accepted, accepted.PendingTurnMenu)
+	switch {
+	case existingValid && accepted.PendingTurnMenu == nil && turnMenuMatchesTable(*accepted, existing.PendingTurnMenu):
+		accepted.PendingTurnMenu = cloneJSON(existing.PendingTurnMenu)
+	case existingValid && incomingValid && existing.PendingTurnMenu.TurnAnchorHash == accepted.PendingTurnMenu.TurnAnchorHash:
+		if strings.TrimSpace(accepted.PendingTurnMenu.SelectedCandidateHash) == "" && strings.TrimSpace(existing.PendingTurnMenu.SelectedCandidateHash) != "" {
+			accepted.PendingTurnMenu.SelectedCandidateHash = existing.PendingTurnMenu.SelectedCandidateHash
+		}
+		if accepted.PendingTurnMenu.AcceptedIntentAck == nil &&
+			existing.PendingTurnMenu.AcceptedIntentAck != nil &&
+			firstNonEmptyString(accepted.PendingTurnMenu.SelectedCandidateHash, existing.PendingTurnMenu.SelectedCandidateHash) == existing.PendingTurnMenu.SelectedCandidateHash {
+			accepted.PendingTurnMenu.AcceptedIntentAck = cloneJSON(existing.PendingTurnMenu.AcceptedIntentAck)
+		}
+	}
 }
 
 func (runtime *meshRuntime) saveCreatedTableReference(table nativeTableState, inviteCode string) error {
@@ -4363,7 +4482,7 @@ func (runtime *meshRuntime) knownPeerURL(peerID string) string {
 	return ""
 }
 
-func (runtime *meshRuntime) buildSignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
+func (runtime *meshRuntime) unsignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
 	decisionIndex, err := nativeActionDecisionIndex(table)
 	if err != nil {
 		return nativeActionRequest{}, err
@@ -4378,27 +4497,105 @@ func (runtime *meshRuntime) buildSignedActionRequest(table nativeTableState, act
 	if handID == "" {
 		return nativeActionRequest{}, errors.New("hand is not active")
 	}
-	signedAt := nowISO()
+	actingPlayerID := runtime.walletID.PlayerID
+	if table.ActiveHand != nil && table.ActiveHand.State.ActingSeatIndex != nil {
+		actingPlayerID = seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex)
+	}
+	var menuOption NativeActionMenuOption
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		if option, ok := findTurnMenuOptionByAction(table.PendingTurnMenu, action); ok {
+			menuOption = option
+		}
+	}
+	if menuOption.OptionID == "" {
+		options, err := deriveFiniteMenuOptions(table.ActiveHand.State, table)
+		if err != nil {
+			return nativeActionRequest{}, err
+		}
+		for _, option := range options {
+			if option.Action.Type != action.Type {
+				continue
+			}
+			if action.Type == game.ActionBet || action.Type == game.ActionRaise {
+				if option.Action.TotalSats != action.TotalSats {
+					continue
+				}
+			}
+			menuOption = option
+			break
+		}
+	}
+	if menuOption.OptionID == "" {
+		return nativeActionRequest{}, errors.New("action is not one of the deterministic menu options for this turn")
+	}
 	challengeAnchor, transcriptRoot := runtime.currentCustodyTranscriptBindings(table)
+	currentTurnAnchorHash := turnAnchorHash(table)
 	request := nativeActionRequest{
 		Action:               action,
+		ActionDeadlineAt:     runtime.currentCustodyActionDeadline(table),
 		ChallengeAnchor:      challengeAnchor,
 		DecisionIndex:        decisionIndex,
 		Epoch:                table.CurrentEpoch,
 		HandID:               handID,
-		PlayerID:             runtime.walletID.PlayerID,
+		OptionID:             menuOption.OptionID,
+		PlayerID:             actingPlayerID,
 		PrevCustodyStateHash: latestCustodyStateHash(table),
-		ProfileName:          runtime.profileName,
-		SignedAt:             signedAt,
 		TableID:              table.Config.TableID,
+		TurnAnchorHash:       currentTurnAnchorHash,
 		TranscriptRoot:       transcriptRoot,
 	}
-	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.PrevCustodyStateHash, request.ChallengeAnchor, request.TranscriptRoot, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
+	return request, nil
+}
+
+func (runtime *meshRuntime) signActionRequest(request nativeActionRequest) (nativeActionRequest, error) {
+	request.ProfileName = runtime.profileName
+	request.SignedAt = nowISO()
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.OptionID, request.PrevCustodyStateHash, request.ActionDeadlineAt, request.ChallengeAnchor, request.TranscriptRoot, request.TurnAnchorHash, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt))
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
 	request.SignatureHex = signatureHex
 	return request, nil
+}
+
+func (runtime *meshRuntime) buildSignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {
+	request, err := runtime.unsignedActionRequest(table, action)
+	if err != nil {
+		return nativeActionRequest{}, err
+	}
+	return runtime.signActionRequest(request)
+}
+
+func (runtime *meshRuntime) handleActionSignRequest(request nativeActionSignRequest) (nativeActionRequest, error) {
+	unsigned := cloneJSON(request.Request)
+	table, err := runtime.requireLocalTable(unsigned.TableID)
+	if err != nil {
+		return nativeActionRequest{}, err
+	}
+	if table.ActiveHand == nil || table.ActiveHand.State.ActingSeatIndex == nil || !game.PhaseAllowsActions(table.ActiveHand.State.Phase) {
+		return nativeActionRequest{}, errors.New("action signing requires an actionable hand")
+	}
+	if seatPlayerID(*table, *table.ActiveHand.State.ActingSeatIndex) != runtime.walletID.PlayerID {
+		return nativeActionRequest{}, errors.New("action signing request is not addressed to the acting player")
+	}
+	seat, ok := seatRecordForPlayer(*table, runtime.walletID.PlayerID)
+	if !ok {
+		return nativeActionRequest{}, errors.New("action signing request is not addressed to the acting player")
+	}
+	if unsigned.PlayerID != runtime.walletID.PlayerID {
+		return nativeActionRequest{}, errors.New("action signing request player mismatch")
+	}
+	if strings.TrimSpace(unsigned.SignatureHex) != "" {
+		return nativeActionRequest{}, errors.New("action signing request unexpectedly includes a signature")
+	}
+	unsigned.SignatureHex = ""
+	unsigned.ProfileName = ""
+	unsigned.SignedAt = ""
+	validationTable := actionRequestValidationTable(*table, unsigned)
+	if err := runtime.validateActionRequestFields(validationTable, seat, unsigned, false); err != nil {
+		return nativeActionRequest{}, err
+	}
+	return runtime.signActionRequest(unsigned)
 }
 
 func (runtime *meshRuntime) validateJoinRequest(table nativeTableState, join nativeJoinRequest) error {
@@ -4543,7 +4740,7 @@ func (runtime *meshRuntime) validateTableSyncRequest(request nativeTableSyncRequ
 	return runtime.validateSyncTransition(existing, request.Table, request.SenderPeerID)
 }
 
-func (runtime *meshRuntime) validateActionRequest(table nativeTableState, seat nativeSeatRecord, request nativeActionRequest) error {
+func (runtime *meshRuntime) validateActionRequestFields(table nativeTableState, seat nativeSeatRecord, request nativeActionRequest, requireSignature bool) error {
 	if table.ActiveHand == nil {
 		return errors.New("action request requires an active hand")
 	}
@@ -4569,6 +4766,18 @@ func (runtime *meshRuntime) validateActionRequest(table nativeTableState, seat n
 	if request.PrevCustodyStateHash != latestCustodyStateHash(table) {
 		return errors.New("action request custody mismatch")
 	}
+	if strings.TrimSpace(request.ActionDeadlineAt) == "" {
+		return errors.New("action request deadline is missing")
+	}
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) && request.ActionDeadlineAt != table.PendingTurnMenu.ActionDeadlineAt {
+		return errors.New("action request deadline mismatch")
+	}
+	if strings.TrimSpace(request.OptionID) == "" {
+		return errors.New("action request option id is missing")
+	}
+	if request.TurnAnchorHash != turnAnchorHash(table) {
+		return errors.New("action request turn anchor mismatch")
+	}
 	expectedChallengeAnchor, expectedTranscriptRoot := runtime.currentCustodyTranscriptBindings(table)
 	if request.ChallengeAnchor != expectedChallengeAnchor {
 		return errors.New("action request challenge anchor mismatch")
@@ -4576,7 +4785,33 @@ func (runtime *meshRuntime) validateActionRequest(table nativeTableState, seat n
 	if request.TranscriptRoot != expectedTranscriptRoot {
 		return errors.New("action request transcript root mismatch")
 	}
+	options, err := deriveFiniteMenuOptions(table.ActiveHand.State, table)
+	if err != nil {
+		return err
+	}
+	var matched *NativeActionMenuOption
+	for index := range options {
+		option := options[index]
+		if option.OptionID != request.OptionID {
+			continue
+		}
+		matched = &option
+		break
+	}
+	if matched == nil {
+		return errors.New("action request option mismatch")
+	}
+	if matched.Action.Type != request.Action.Type || matched.Action.TotalSats != request.Action.TotalSats {
+		return errors.New("action request action does not match the deterministic turn menu")
+	}
+	if !requireSignature {
+		return nil
+	}
 	return verifyNativeActionRequestSignature(seat, request)
+}
+
+func (runtime *meshRuntime) validateActionRequest(table nativeTableState, seat nativeSeatRecord, request nativeActionRequest) error {
+	return runtime.validateActionRequestFields(table, seat, request, true)
 }
 
 func (runtime *meshRuntime) validateFundsRequest(table nativeTableState, seat nativeSeatRecord, request nativeFundsRequest) error {
@@ -4654,7 +4889,7 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 		return err
 	}
 	if existing == nil {
-		return nil
+		return runtime.validateAcceptedPendingTurnMenu(normalized, normalized.PendingTurnMenu)
 	}
 	if incoming.CurrentEpoch < existing.CurrentEpoch {
 		return errors.New("sync request would roll back table epoch")
@@ -4673,7 +4908,7 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 	if err := runtime.validateAcceptedHostTransition(existing, incoming, "sync request"); err != nil {
 		return err
 	}
-	return nil
+	return runtime.validateAcceptedPendingTurnMenu(normalized, normalized.PendingTurnMenu)
 }
 
 func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
@@ -4693,7 +4928,7 @@ func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableSta
 		return err
 	}
 	if existing == nil {
-		return nil
+		return runtime.validateAcceptedPendingTurnMenu(incoming, incoming.PendingTurnMenu)
 	}
 	if incoming.CurrentEpoch < existing.CurrentEpoch {
 		return errors.New("remote table would roll back table epoch")
@@ -4709,7 +4944,7 @@ func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableSta
 	if err := runtime.validateAcceptedHostTransition(existing, incoming, "remote table"); err != nil {
 		return err
 	}
-	return nil
+	return runtime.validateAcceptedPendingTurnMenu(incoming, incoming.PendingTurnMenu)
 }
 
 func (runtime *meshRuntime) validateAcceptedHostTransition(existing *nativeTableState, incoming nativeTableState, source string) error {
@@ -5085,17 +5320,20 @@ func nativeActionDecisionIndex(table nativeTableState) (int, error) {
 	return len(table.ActiveHand.State.ActionLog), nil
 }
 
-func nativeActionAuthPayload(tableID, playerID, handID, prevCustodyStateHash, challengeAnchor, transcriptRoot string, epoch int, decisionIndex int, action game.Action, signedAt string) map[string]any {
+func nativeActionAuthPayload(tableID, playerID, handID, optionID, prevCustodyStateHash, actionDeadlineAt, challengeAnchor, transcriptRoot, turnAnchorHash string, epoch int, decisionIndex int, action game.Action, signedAt string) map[string]any {
 	payload := map[string]any{
 		"action":               rawJSONMap(action),
+		"actionDeadlineAt":     actionDeadlineAt,
 		"challengeAnchor":      challengeAnchor,
 		"decisionIndex":        decisionIndex,
 		"epoch":                epoch,
 		"handId":               handID,
+		"optionId":             optionID,
 		"playerId":             playerID,
 		"signedAt":             signedAt,
 		"tableId":              tableID,
 		"transcriptRoot":       transcriptRoot,
+		"turnAnchorHash":       turnAnchorHash,
 		"type":                 "table-action",
 		"prevCustodyStateHash": prevCustodyStateHash,
 	}
@@ -5251,6 +5489,7 @@ func decodeCreatedTableConfig(reference walletpkg.MeshTableReferenceState) (Nati
 	if config.Visibility == "" {
 		config.Visibility = reference.Visibility
 	}
+	config.ActionMenuPolicy = normalizeActionMenuPolicy(config.ActionMenuPolicy)
 	if strings.TrimSpace(config.ProtocolVersion) != nativeProtocolVersion {
 		return NativeMeshTableConfig{}, fmt.Errorf("%w: created table protocol version mismatch", errStoredProtocolVersionMismatch)
 	}

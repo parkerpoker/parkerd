@@ -45,6 +45,7 @@ func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned.Approvals = nil
 	unsigned.ArkIntentID = ""
 	unsigned.ArkTxID = ""
+	unsigned.Proof.CandidateIntentAck = nil
 	unsigned.Proof.ArkIntentID = ""
 	unsigned.Proof.ArkTxID = ""
 	unsigned.Proof.ExitProofRef = ""
@@ -56,6 +57,8 @@ func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned.Proof.SettlementWitness = nil
 	unsigned.Proof.StateHash = ""
 	unsigned.Proof.Signatures = nil
+	unsigned.Proof.TurnAnchorHash = ""
+	unsigned.Proof.TurnCandidateHash = ""
 	unsigned.Proof.TransitionHash = ""
 	unsigned.Proof.VTXORefs = nil
 	return HashValue(unsigned)
@@ -130,6 +133,10 @@ func canonicalTransition(transition CustodyTransition) CustodyTransition {
 		canonicalWitness := canonicalRecoveryWitness(*transition.Proof.RecoveryWitness)
 		transition.Proof.RecoveryWitness = &canonicalWitness
 	}
+	if transition.Proof.CandidateIntentAck != nil {
+		canonicalAck := canonicalCandidateIntentAck(*transition.Proof.CandidateIntentAck)
+		transition.Proof.CandidateIntentAck = &canonicalAck
+	}
 	transition.Proof.VTXORefs = append([]VTXORef(nil), transition.Proof.VTXORefs...)
 	sort.SliceStable(transition.Proof.VTXORefs, func(left, right int) bool {
 		return compareVTXORefs(transition.Proof.VTXORefs[left], transition.Proof.VTXORefs[right]) < 0
@@ -176,6 +183,10 @@ func canonicalRecoveryWitness(witness CustodyRecoveryWitness) CustodyRecoveryWit
 	witness.BroadcastTxIDs = append([]string(nil), witness.BroadcastTxIDs...)
 	sort.Strings(witness.BroadcastTxIDs)
 	return witness
+}
+
+func canonicalCandidateIntentAck(ack CandidateIntentAck) CandidateIntentAck {
+	return ack
 }
 
 func canonicalTimeoutResolution(resolution TimeoutResolution) TimeoutResolution {

@@ -110,6 +110,9 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, kind t
 }
 
 func (runtime *meshRuntime) currentCustodyActionDeadline(table nativeTableState) string {
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) && strings.TrimSpace(table.PendingTurnMenu.ActionDeadlineAt) != "" {
+		return table.PendingTurnMenu.ActionDeadlineAt
+	}
 	if table.LatestCustodyState == nil {
 		return ""
 	}
@@ -225,6 +228,38 @@ func actionRequestBindingOverrides(request nativeActionRequest) *custodyBindingO
 		ChallengeAnchor: request.ChallengeAnchor,
 		TranscriptRoot:  request.TranscriptRoot,
 	}
+}
+
+func tableWithTurnDeadline(table nativeTableState, turnDeadlineAt string) nativeTableState {
+	if table.ActiveHand == nil || table.ActiveHand.State.ActingSeatIndex == nil || strings.TrimSpace(turnDeadlineAt) == "" {
+		return table
+	}
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		if table.PendingTurnMenu != nil && table.PendingTurnMenu.ActionDeadlineAt == turnDeadlineAt {
+			return table
+		}
+		validation := cloneJSON(table)
+		if validation.PendingTurnMenu == nil {
+			validation.PendingTurnMenu = &NativePendingTurnMenu{}
+		}
+		validation.PendingTurnMenu.ActionDeadlineAt = turnDeadlineAt
+		return validation
+	}
+	validation := cloneJSON(table)
+	validation.PendingTurnMenu = &NativePendingTurnMenu{
+		ActionDeadlineAt:     turnDeadlineAt,
+		ActingPlayerID:       seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex),
+		DecisionIndex:        custodyDecisionIndex(&table.ActiveHand.State),
+		Epoch:                table.CurrentEpoch,
+		HandID:               table.ActiveHand.State.HandID,
+		PrevCustodyStateHash: latestCustodyStateHash(table),
+		TurnAnchorHash:       turnAnchorHash(table),
+	}
+	return validation
+}
+
+func actionRequestValidationTable(table nativeTableState, request nativeActionRequest) nativeTableState {
+	return tableWithTurnDeadline(table, request.ActionDeadlineAt)
 }
 
 func (runtime *meshRuntime) custodyStateBinding(table nativeTableState, kind tablecustody.TransitionKind, hand *game.HoldemState, overrides *custodyBindingOverrides) tablecustody.StateBinding {
@@ -450,7 +485,7 @@ func validateStableSemanticCustodyBindings(expected, supplied tablecustody.Custo
 	return nil
 }
 
-func (runtime *meshRuntime) deriveTimeoutCustodyTransition(table nativeTableState) (tablecustody.CustodyTransition, error) {
+func (runtime *meshRuntime) deriveTimeoutCustodyTransitionWithOptions(table nativeTableState, requireElapsed bool, requireCompleteMenu bool) (tablecustody.CustodyTransition, error) {
 	if table.ActiveHand == nil {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition requires an active hand")
 	}
@@ -460,7 +495,13 @@ func (runtime *meshRuntime) deriveTimeoutCustodyTransition(table nativeTableStat
 	if table.LatestCustodyState == nil {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition requires a prior custody state")
 	}
-	if elapsedMillis(runtime.currentCustodyActionDeadline(table)) < 0 {
+	if runtime.hasTimelySelectedCandidate(table) {
+		return tablecustody.CustodyTransition{}, errors.New("timeout transition is stale after a valid selected turn candidate")
+	}
+	if requireCompleteMenu && runtime.validatePendingTurnMenu(table, table.PendingTurnMenu) != nil {
+		return tablecustody.CustodyTransition{}, errors.New("timeout transition requires a complete pending turn menu")
+	}
+	if requireElapsed && elapsedMillis(runtime.currentCustodyActionDeadline(table)) < 0 {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition is before the custody deadline")
 	}
 	actingSeatIndex := *table.ActiveHand.State.ActingSeatIndex
@@ -485,6 +526,14 @@ func (runtime *meshRuntime) deriveTimeoutCustodyTransition(table nativeTableStat
 	return runtime.buildCustodyTransition(table, tablecustody.TransitionKindTimeout, &nextState, &action, &resolution)
 }
 
+func (runtime *meshRuntime) deriveTimeoutCustodyTransitionWithDeadlineCheck(table nativeTableState, requireElapsed bool) (tablecustody.CustodyTransition, error) {
+	return runtime.deriveTimeoutCustodyTransitionWithOptions(table, requireElapsed, true)
+}
+
+func (runtime *meshRuntime) deriveTimeoutCustodyTransition(table nativeTableState) (tablecustody.CustodyTransition, error) {
+	return runtime.deriveTimeoutCustodyTransitionWithDeadlineCheck(table, true)
+}
+
 func (runtime *meshRuntime) deriveBlindPostCustodyTransition(table nativeTableState, handID string, handNumber int) (tablecustody.CustodyTransition, error) {
 	if len(table.Seats) < 2 {
 		return tablecustody.CustodyTransition{}, errors.New("blind-post transition requires two seated players")
@@ -507,7 +556,7 @@ func (runtime *meshRuntime) deriveBlindPostCustodyTransition(table nativeTableSt
 	return runtime.buildCustodyTransition(table, tablecustody.TransitionKindBlindPost, &hand, nil, nil)
 }
 
-func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) error {
+func (runtime *meshRuntime) validateCustodyTransitionSemanticsWithOptions(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, allowFutureTimeout bool) error {
 	var (
 		expected tablecustody.CustodyTransition
 		err      error
@@ -526,16 +575,24 @@ func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTable
 		if !ok {
 			return fmt.Errorf("missing seat for action player %s", request.PlayerID)
 		}
-		if err := runtime.validateActionRequest(table, seat, request); err != nil {
+		validationTable := actionRequestValidationTable(table, request)
+		if err := runtime.validateActionRequest(validationTable, seat, request); err != nil {
 			return err
 		}
-		nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, seat.SeatIndex, request.Action)
+		nextState, err := game.ApplyHoldemAction(validationTable.ActiveHand.State, seat.SeatIndex, request.Action)
 		if err != nil {
 			return err
 		}
-		expected, err = runtime.buildCustodyTransitionWithOverrides(table, tablecustody.TransitionKindAction, &nextState, &request.Action, nil, actionRequestBindingOverrides(request))
+		expected, err = runtime.buildCustodyTransitionWithOverrides(validationTable, tablecustody.TransitionKindAction, &nextState, &request.Action, nil, actionRequestBindingOverrides(request))
 	case tablecustody.TransitionKindTimeout:
-		expected, err = runtime.deriveTimeoutCustodyTransition(table)
+		validationTable := table
+		requireCompleteMenu := false
+		if authorizer != nil && strings.TrimSpace(authorizer.TurnDeadlineAt) != "" {
+			validationTable = tableWithTurnDeadline(table, authorizer.TurnDeadlineAt)
+		} else if turnMenuMatchesTable(table, table.PendingTurnMenu) && strings.TrimSpace(table.PendingTurnMenu.ActionDeadlineAt) != "" {
+			validationTable = tableWithTurnDeadline(table, table.PendingTurnMenu.ActionDeadlineAt)
+		}
+		expected, err = runtime.deriveTimeoutCustodyTransitionWithOptions(validationTable, !allowFutureTimeout, requireCompleteMenu)
 	case tablecustody.TransitionKindCashOut, tablecustody.TransitionKindEmergencyExit:
 		if authorizer == nil || authorizer.FundsRequest == nil {
 			return errors.New("funds transition is missing its signed funds request")
@@ -596,6 +653,10 @@ func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTable
 		return fmt.Errorf("custody %s transition does not match the locally derived successor", transition.Kind)
 	}
 	return nil
+}
+
+func (runtime *meshRuntime) validateCustodyTransitionSemantics(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) error {
+	return runtime.validateCustodyTransitionSemanticsWithOptions(table, transition, authorizer, false)
 }
 
 func custodyApprovalPayload(tableID, playerID, prevStateHash, approvalHash string, custodySeq int, signedAt string) map[string]any {
@@ -866,6 +927,7 @@ func (runtime *meshRuntime) applyCustodyTransition(table *nativeTableState, tran
 	table.CustodyTransitions = append(table.CustodyTransitions, transition)
 	state := transition.NextState
 	table.LatestCustodyState = &state
+	table.PendingTurnMenu = nil
 }
 
 func latestStackAmount(state *tablecustody.CustodyState, playerID string) int {

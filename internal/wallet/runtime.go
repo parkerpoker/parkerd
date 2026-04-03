@@ -439,7 +439,7 @@ func (runtime *Runtime) SendCustodyOffChain(profileName string, receivers []sdkt
 
 func (runtime *Runtime) SignCustodyTransaction(profileName, tx string) (string, error) {
 	if runtime.config.UseMockSettlement {
-		return "mock-signed-" + tx, nil
+		return tx, nil
 	}
 	state, err := runtime.ensureBootstrap(profileName, "", "")
 	if err != nil {

@@ -59,6 +59,33 @@ type custodySignerAuthorization struct {
 	TransitionHash          string
 }
 
+func mockCustodyBatchResult(transitionHash string, outputs []custodyBatchOutput) *custodyBatchResult {
+	intentID := "mock-intent-" + transitionHash[:12]
+	arkTxID := transitionHash
+	finalizedAt := nowISO()
+	outputRefs := map[string][]tablecustody.VTXORef{}
+	for index, output := range outputs {
+		ref := tablecustody.VTXORef{
+			AmountSats:    output.AmountSats,
+			ArkIntentID:   intentID,
+			ArkTxID:       arkTxID,
+			ExpiresAt:     addMillis(nowISO(), int((24*time.Hour)/time.Millisecond)),
+			OwnerPlayerID: output.OwnerPlayerID,
+			Script:        output.Script,
+			Tapscripts:    append([]string(nil), output.Tapscripts...),
+			TxID:          arkTxID,
+			VOut:          uint32(index),
+		}
+		outputRefs[output.ClaimKey] = append(outputRefs[output.ClaimKey], ref)
+	}
+	return &custodyBatchResult{
+		ArkTxID:     arkTxID,
+		FinalizedAt: finalizedAt,
+		IntentID:    intentID,
+		OutputRefs:  outputRefs,
+	}
+}
+
 func custodySignerSessionKey(tableID, transitionHash, playerID, derivationPath string) string {
 	return tableID + "|" + transitionHash + "|" + playerID + "|" + derivationPath
 }
@@ -893,7 +920,7 @@ func (runtime *meshRuntime) validatePrebuiltCustodySigningTransition(table nativ
 	if strings.TrimSpace(transitionHash) == "" {
 		return errors.New("custody signing request is missing transition hash")
 	}
-	if err := runtime.validateCustodyTransitionSemantics(table, transition, authorizer); err != nil {
+	if err := runtime.validateCustodyTransitionSemanticsWithOptions(table, transition, authorizer, true); err != nil {
 		return err
 	}
 	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(table, transition)
@@ -2089,6 +2116,9 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	if runtime.custodyBatchExecute != nil {
 		return runtime.custodyBatchExecute(table, prevStateHash, transitionHash, inputs, proofSignerIDs, treeSignerIDs, outputs)
 	}
+	if runtime.config.UseMockSettlement {
+		return mockCustodyBatchResult(transitionHash, outputs), nil
+	}
 	if len(inputs) == 0 {
 		return nil, errors.New("custody batch is missing inputs")
 	}
@@ -2179,20 +2209,20 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		return nil, err
 	}
 	handler := &custodyBatchEventsHandler{
-		runtime:        runtime,
-		table:          table,
-		prevStateHash:  prevStateHash,
-		requestKey:     transitionHash,
-		transition:     transition,
-		authorizer:     cloneTransitionAuthorizer(authorizer),
-		plan:           &custodySettlementPlan{Inputs: append([]custodyInputSpec(nil), inputs...)},
-		transport:      transport,
-		arkConfig:      arkConfig,
-		intentID:       intentID,
-		derivationPath: derivationPath,
-		signerSessions: signerSessions,
-		signerPubkeys:  signerPubkeys,
-		outputCount:    len(outputs),
+		runtime:            runtime,
+		table:              table,
+		prevStateHash:      prevStateHash,
+		requestKey:         transitionHash,
+		transition:         transition,
+		authorizer:         cloneTransitionAuthorizer(authorizer),
+		plan:               &custodySettlementPlan{Inputs: append([]custodyInputSpec(nil), inputs...)},
+		transport:          transport,
+		arkConfig:          arkConfig,
+		intentID:           intentID,
+		derivationPath:     derivationPath,
+		signerSessions:     signerSessions,
+		signerPubkeys:      signerPubkeys,
+		outputCount:        len(outputs),
 		intentRegisteredAt: time.Now(),
 	}
 

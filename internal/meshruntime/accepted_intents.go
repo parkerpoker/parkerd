@@ -15,7 +15,7 @@ func verifyNativeActionRequestSignature(seat nativeSeatRecord, request nativeAct
 	if request.SignedAt == "" || request.SignatureHex == "" {
 		return errors.New("action request is missing player signature")
 	}
-	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.PrevCustodyStateHash, request.ChallengeAnchor, request.TranscriptRoot, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt), request.SignatureHex)
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeActionAuthPayload(request.TableID, request.PlayerID, request.HandID, request.OptionID, request.PrevCustodyStateHash, request.ActionDeadlineAt, request.ChallengeAnchor, request.TranscriptRoot, request.TurnAnchorHash, request.Epoch, request.DecisionIndex, request.Action, request.SignedAt), request.SignatureHex)
 	if err != nil {
 		return err
 	}
@@ -291,18 +291,18 @@ func (runtime *meshRuntime) validateAcceptedInitiatorHistory(table nativeTableSt
 				if request.Epoch != transition.NextState.Epoch {
 					return fmt.Errorf("event %d action request epoch mismatch", index)
 				}
-					if request.DecisionIndex != previousState.DecisionIndex {
-						return fmt.Errorf("event %d action request decision index mismatch", index)
-					}
-					if request.HandID != previousState.HandID {
-						return fmt.Errorf("event %d action request hand mismatch", index)
-					}
-					if expectedActor := strings.TrimSpace(previousState.ActingPlayerID); expectedActor != "" && request.PlayerID != expectedActor {
-						return fmt.Errorf("event %d action request player mismatch", index)
-					}
-					if transition.Action == nil {
-						return fmt.Errorf("event %d action transition is missing its action descriptor", index)
-					}
+				if request.DecisionIndex != previousState.DecisionIndex {
+					return fmt.Errorf("event %d action request decision index mismatch", index)
+				}
+				if request.HandID != previousState.HandID {
+					return fmt.Errorf("event %d action request hand mismatch", index)
+				}
+				if expectedActor := strings.TrimSpace(previousState.ActingPlayerID); expectedActor != "" && request.PlayerID != expectedActor {
+					return fmt.Errorf("event %d action request player mismatch", index)
+				}
+				if transition.Action == nil {
+					return fmt.Errorf("event %d action transition is missing its action descriptor", index)
+				}
 				if transition.Action.Type != string(request.Action.Type) || transition.Action.TotalSats != request.Action.TotalSats {
 					return fmt.Errorf("event %d action request does not match custody transition", index)
 				}

@@ -1655,6 +1655,12 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if !game.PhaseAllowsActions(table.ActiveHand.State.Phase) || table.ActiveHand.State.ActingSeatIndex == nil {
 		return false, nil
 	}
+	if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
+		return false, nil
+	}
+	if runtime.hasTimelySelectedCandidate(*table) {
+		return false, nil
+	}
 	deadline := runtime.currentCustodyActionDeadline(*table)
 	if deadline == "" || elapsedMillis(deadline) < 0 {
 		return false, nil
@@ -1936,6 +1942,18 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 	}
 	for iteration := 0; iteration < 8; iteration++ {
 		changed := false
+		if tableHasActionableTurn(*table) && !turnMenuMatchesTable(*table, table.PendingTurnMenu) {
+			if err := runtime.ensurePendingTurnMenuLocked(table); err != nil {
+				return err
+			}
+			changed = true
+		}
+		if completed, err := runtime.finalizeSelectedTurnCandidateLocked(table); err != nil {
+			return err
+		} else if completed {
+			changed = true
+			continue
+		}
 		if shouldTrackProtocolDeadline(table.ActiveHand.State.Phase) && table.ActiveHand.Cards.PhaseDeadlineAt == "" {
 			runtime.setProtocolDeadline(table)
 			changed = true
