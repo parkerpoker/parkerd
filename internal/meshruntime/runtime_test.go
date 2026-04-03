@@ -174,6 +174,93 @@ func TestHostTickReleasesTableLockBeforeSlowReplication(t *testing.T) {
 	}
 }
 
+func TestTablePullWaitsForLockedTableUpdate(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+
+	initial := mustReadNativeTable(t, host, tableID)
+	if initial.ActiveHand == nil {
+		t.Fatal("expected active hand before locked table pull test")
+	}
+	originalDeadline := initial.ActiveHand.Cards.PhaseDeadlineAt
+	updatedDeadline := addMillis(nowISO(), 90_000)
+
+	type fetchResult struct {
+		completedAt time.Time
+		err         error
+		table       *nativeTableState
+	}
+	startFetch := make(chan struct{})
+	results := make(chan fetchResult, 1)
+	go func() {
+		<-startFetch
+		table, err := guest.fetchRemoteTable(host.selfPeerURL(), tableID)
+		results <- fetchResult{
+			completedAt: time.Now(),
+			err:         err,
+			table:       table,
+		}
+	}()
+
+	pullCompletedEarly := false
+	earlyErr := error(nil)
+	earlyDeadline := ""
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		if table.ActiveHand == nil {
+			return errors.New("expected active hand while holding host table lock")
+		}
+		table.LastHostHeartbeatAt = nowISO()
+		if err := host.persistLocalTable(table, false); err != nil {
+			return err
+		}
+		close(startFetch)
+		time.Sleep(150 * time.Millisecond)
+		select {
+		case result := <-results:
+			pullCompletedEarly = true
+			earlyErr = result.err
+			if result.table != nil && result.table.ActiveHand != nil {
+				earlyDeadline = result.table.ActiveHand.Cards.PhaseDeadlineAt
+			}
+		default:
+		}
+		table.ActiveHand.Cards.PhaseDeadlineAt = updatedDeadline
+		return host.persistLocalTable(table, false)
+	}); err != nil {
+		t.Fatalf("perform locked host update: %v", err)
+	}
+
+	if pullCompletedEarly {
+		t.Fatalf("expected table pull to wait for locked update, got deadline=%q err=%v", earlyDeadline, earlyErr)
+	}
+
+	releasedAt := time.Now()
+	select {
+	case result := <-results:
+		if result.err != nil {
+			t.Fatalf("fetch remote table after locked update: %v", result.err)
+		}
+		if result.table == nil || result.table.ActiveHand == nil {
+			t.Fatalf("expected active hand from pulled table, got %+v", result.table)
+		}
+		if result.completedAt.Before(releasedAt) {
+			t.Fatalf("expected table pull to complete after lock release, got %s before %s", result.completedAt.Format(time.RFC3339Nano), releasedAt.Format(time.RFC3339Nano))
+		}
+		if got := result.table.ActiveHand.Cards.PhaseDeadlineAt; got != updatedDeadline {
+			t.Fatalf("expected pulled table deadline %q after locked update, got %q (original %q)", updatedDeadline, got, originalDeadline)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for locked table pull to finish")
+	}
+}
+
 func TestHandleHandMessageReturnsBeforeSlowReplication(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -263,14 +350,14 @@ func TestHandleHandMessageReturnsBeforeSlowReplication(t *testing.T) {
 	if elapsed := time.Since(start); elapsed >= 1200*time.Millisecond {
 		t.Fatalf("expected hand message response before replication fanout, took %s", elapsed)
 	}
-	if updated.ActiveHand == nil {
+	if updated.Table.ActiveHand == nil {
 		t.Fatalf("expected active hand after private-delivery completion")
 	}
-	if updated.ActiveHand.State.Phase != game.StreetPreflop {
-		t.Fatalf("expected preflop after private-delivery completion, got %s", updated.ActiveHand.State.Phase)
+	if updated.Table.ActiveHand.State.Phase != game.StreetPreflop {
+		t.Fatalf("expected preflop after private-delivery completion, got %s", updated.Table.ActiveHand.State.Phase)
 	}
-	if updated.PublicState == nil || stringValue(updated.PublicState.Phase) != string(game.StreetPreflop) {
-		t.Fatalf("expected public state to advance to preflop, got %+v", updated.PublicState)
+	if updated.Table.PublicState == nil || stringValue(updated.Table.PublicState.Phase) != string(game.StreetPreflop) {
+		t.Fatalf("expected public state to advance to preflop, got %+v", updated.Table.PublicState)
 	}
 	persisted := mustReadNativeTable(t, host, tableID)
 	if persisted.PublicState == nil || stringValue(persisted.PublicState.Phase) != string(game.StreetPreflop) {
@@ -287,12 +374,20 @@ func TestDriveLocalHandProtocolDedupesRepeatedGuestContributionSends(t *testing.
 	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetCommitment)
 
 	sendCount := 0
-	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error) {
 		sendCount++
 		if input.Kind != nativeHandMessageFairnessCommit {
 			t.Fatalf("expected fairness commit send, got %s", input.Kind)
 		}
-		return table, nil
+		recordKey, err := handMessageRequestRecordKey(input)
+		if err != nil {
+			t.Fatalf("compute fairness commit record key: %v", err)
+		}
+		return nativeHandMessageResponse{
+			AcceptedTranscriptRoot: handTranscriptRoot(table),
+			RecordKey:              recordKey,
+			Table:                  table,
+		}, nil
 	}
 
 	guest.driveLocalHandProtocol(tableID)
@@ -303,7 +398,7 @@ func TestDriveLocalHandProtocolDedupesRepeatedGuestContributionSends(t *testing.
 	}
 }
 
-func TestDriveLocalHandProtocolDoesNotDedupeBoardShares(t *testing.T) {
+func TestDriveLocalHandProtocolDedupesBoardSharesAfterHostAck(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -320,19 +415,136 @@ func TestDriveLocalHandProtocolDoesNotDedupeBoardShares(t *testing.T) {
 
 	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetFlopReveal)
 	sendCount := 0
-	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeTableState, error) {
+	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error) {
 		sendCount++
 		if input.Kind != nativeHandMessageBoardShare {
 			t.Fatalf("expected board-share send, got %s", input.Kind)
 		}
-		return table, nil
+		recordKey, err := handMessageRequestRecordKey(input)
+		if err != nil {
+			t.Fatalf("compute board-share record key: %v", err)
+		}
+		return nativeHandMessageResponse{
+			AcceptedTranscriptRoot: handTranscriptRoot(table),
+			RecordKey:              recordKey,
+			Table:                  table,
+		}, nil
 	}
 
 	guest.driveLocalHandProtocol(tableID)
 	guest.driveLocalHandProtocol(tableID)
 
-	if sendCount != 2 {
-		t.Fatalf("expected board-share retries to remain enabled, got %d sends", sendCount)
+	if sendCount != 1 {
+		t.Fatalf("expected board-share retries to stop after host ack, got %d sends", sendCount)
+	}
+}
+
+func TestDriveLocalHandProtocolStopsRetryingAfterHandMessageReceiptOnStaleHistory(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	stale := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetCommitment)
+
+	sendCount := 0
+	guest.handMessageSenderHook = func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error) {
+		sendCount++
+		response, err := host.handleHandMessageFromPeer(input)
+		if err != nil {
+			return nativeHandMessageResponse{}, err
+		}
+		if sendCount == 1 {
+			if err := guest.store.withTableLock(tableID, func() error {
+				table, err := guest.store.readTable(tableID)
+				if err != nil || table == nil {
+					return err
+				}
+				extra := cloneJSON(table.Events[len(table.Events)-1])
+				extra.Seq++
+				extra.Timestamp = nowISO()
+				table.Events = append(table.Events, extra)
+				return guest.persistLocalTable(table, false)
+			}); err != nil {
+				t.Fatalf("seed stale guest history: %v", err)
+			}
+			if err := guest.acceptRemoteTable(cloneJSON(stale)); err == nil || !strings.Contains(err.Error(), "accepted history would roll back table events") {
+				t.Fatalf("expected stale history rollback while processing the hand receipt, got %v", err)
+			}
+			response.Table = stale
+		}
+		return response, nil
+	}
+
+	guest.driveLocalHandProtocol(tableID)
+	pending, ok := guest.lastGuestContribution[tableID]
+	if !ok {
+		t.Fatal("expected pending guest hand contribution after stale accept failure")
+	}
+	if !pending.acked {
+		t.Fatal("expected pending guest hand contribution to be acked after host receipt")
+	}
+
+	guest.driveLocalHandProtocol(tableID)
+	if sendCount != 1 {
+		t.Fatalf("expected host receipt to stop retries after stale accept failure, got %d sends", sendCount)
+	}
+
+	restored := cloneJSON(stale)
+	if err := guest.persistLocalTable(&restored, false); err != nil {
+		t.Fatalf("restore stale guest table before poll sync: %v", err)
+	}
+	remote, err := guest.fetchRemoteTable(host.selfPeerURL(), tableID)
+	if err != nil {
+		t.Fatalf("fetch host table after stale accept failure: %v", err)
+	}
+	if err := guest.acceptRemoteTable(*remote); err != nil {
+		t.Fatalf("reconcile guest table after stale accept failure: %v", err)
+	}
+	guest.reconcileGuestContribution(tableID, *remote)
+
+	reconciled := mustReadNativeTable(t, guest, tableID)
+	guestSeat := seatIndexForPlayer(t, reconciled, guest.walletID.PlayerID)
+	if _, ok := findTranscriptRecord(reconciled.ActiveHand.Cards.Transcript, nativeHandMessageFairnessCommit, &guestSeat, string(game.StreetCommitment), nil); !ok {
+		t.Fatalf("expected reconciled guest transcript to include the fairness commit, transcript=%+v", reconciled.ActiveHand.Cards.Transcript)
+	}
+	if reconciled.ActiveHand.State.Phase != game.StreetReveal {
+		t.Fatalf("expected reconciled guest hand phase to advance to reveal, got %s", reconciled.ActiveHand.State.Phase)
+	}
+	if _, ok := guest.lastGuestContribution[tableID]; ok {
+		t.Fatal("expected reconciled guest contribution state to clear after poll sync")
+	}
+}
+
+func TestAcceptRemoteTableRejectsActiveHandTranscriptRollback(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	stale := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetCommitment)
+
+	record, err := guest.buildLocalContributionRecord(stale)
+	if err != nil {
+		t.Fatalf("build guest commitment: %v", err)
+	}
+	if record == nil || record.Kind != nativeHandMessageFairnessCommit {
+		t.Fatalf("expected guest fairness commit, got %#v", record)
+	}
+	request, err := guest.buildSignedHandMessageRequest(stale, *record)
+	if err != nil {
+		t.Fatalf("build guest commitment request: %v", err)
+	}
+	updated, err := host.handleHandMessageFromPeer(request)
+	if err != nil {
+		t.Fatalf("host handle guest commitment: %v", err)
+	}
+	if err := guest.acceptRemoteTable(updated.Table); err != nil {
+		t.Fatalf("accept updated guest commitment: %v", err)
+	}
+
+	if err := guest.acceptRemoteTable(stale); err == nil || !strings.Contains(err.Error(), "accepted active hand transcript would roll back") {
+		t.Fatalf("expected stale active-hand transcript rollback to be rejected, got %v", err)
 	}
 }
 
@@ -468,41 +680,137 @@ func TestHandleActionRejectsReplayedDecisionSignature(t *testing.T) {
 	}
 }
 
-func TestHandleHandMessageRejectsReplayedCommit(t *testing.T) {
+func TestNativeHandMessageResponseJSONRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	host := newMeshTestRuntime(t, "host")
-	guest := newMeshTestRuntime(t, "guest")
-
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	table := mustReadNativeTable(t, host, tableID)
-	guestSeat := seatIndexForPlayer(t, table, guest.walletID.PlayerID)
-	commitRecord, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageFairnessCommit, &guestSeat, string(game.StreetCommitment), nil)
-	if !ok {
-		t.Fatal("expected guest fairness commit in transcript")
+	response := nativeHandMessageResponse{
+		AcceptedTranscriptRoot: "accepted-root",
+		Duplicate:              true,
+		RecordKey:              "record-key",
+		Table: nativeTableState{
+			Config: NativeMeshTableConfig{
+				ProtocolVersion: nativeProtocolVersion,
+				TableID:         "table-1",
+			},
+		},
 	}
-
-	replayed := nativeHandMessageRequest{
-		CommitmentHash: commitRecord.CommitmentHash,
-		Epoch:          table.CurrentEpoch,
-		HandID:         table.ActiveHand.State.HandID,
-		HandNumber:     table.ActiveHand.State.HandNumber,
-		Kind:           nativeHandMessageFairnessCommit,
-		Phase:          string(game.StreetCommitment),
-		PlayerID:       guest.walletID.PlayerID,
-		ProfileName:    guest.profileName,
-		SeatIndex:      guestSeat,
-		SignedAt:       nowISO(),
-		TableID:        tableID,
-	}
-	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeHandMessageAuthPayload(replayed))
+	raw, err := json.Marshal(response)
 	if err != nil {
-		t.Fatalf("sign replayed commit: %v", err)
+		t.Fatalf("marshal hand message response: %v", err)
 	}
-	replayed.SignatureHex = signatureHex
+	var decoded nativeHandMessageResponse
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal hand message response: %v", err)
+	}
+	if decoded.RecordKey != response.RecordKey {
+		t.Fatalf("expected record key %q, got %q", response.RecordKey, decoded.RecordKey)
+	}
+	if decoded.AcceptedTranscriptRoot != response.AcceptedTranscriptRoot {
+		t.Fatalf("expected accepted transcript root %q, got %q", response.AcceptedTranscriptRoot, decoded.AcceptedTranscriptRoot)
+	}
+	if !decoded.Duplicate {
+		t.Fatal("expected duplicate flag after round trip")
+	}
+	if decoded.Table.Config.TableID != response.Table.Config.TableID {
+		t.Fatalf("expected table id %q, got %q", response.Table.Config.TableID, decoded.Table.Config.TableID)
+	}
+}
 
-	if _, err := host.handleHandMessageFromPeer(replayed); err == nil || (!strings.Contains(err.Error(), "commit") && !strings.Contains(err.Error(), "accepting")) {
-		t.Fatalf("expected replayed commit to be rejected, got %v", err)
+func TestHandleHandMessageRejectsProtocolVersionMismatch(t *testing.T) {
+	host, guest, _, request := prepareGuestFairnessCommitRequest(t)
+
+	request.ProtocolVersion = "poker/v0"
+	signatureHex, err := settlementcore.SignStructuredData(guest.walletID.PrivateKeyHex, nativeHandMessageAuthPayload(request))
+	if err != nil {
+		t.Fatalf("sign protocol-version-mismatch request: %v", err)
+	}
+	request.SignatureHex = signatureHex
+	if _, err := host.handleHandMessageFromPeer(request); err == nil || !strings.Contains(err.Error(), "protocol version mismatch") {
+		t.Fatalf("expected protocol version mismatch, got %v", err)
+	}
+}
+
+func TestHandleHandMessageAcceptsExactDuplicateReplays(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest)
+	}{
+		{name: "fairness commit", prepare: prepareGuestFairnessCommitRequest},
+		{name: "fairness reveal", prepare: prepareGuestFairnessRevealRequest},
+		{name: "private delivery share", prepare: prepareGuestPrivateDeliveryRequest},
+		{name: "board share", prepare: prepareGuestBoardShareRequest},
+		{name: "board open", prepare: prepareGuestBoardOpenRequest},
+		{name: "showdown reveal", prepare: prepareGuestShowdownRevealRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			host, _, tableID, request := tc.prepare(t)
+			first, err := host.handleHandMessageFromPeer(request)
+			if err != nil {
+				t.Fatalf("accept initial hand message: %v", err)
+			}
+			if first.Duplicate {
+				t.Fatal("did not expect initial hand message acceptance to be marked duplicate")
+			}
+			if strings.TrimSpace(first.RecordKey) == "" {
+				t.Fatal("expected record key on initial hand message acceptance")
+			}
+			if strings.TrimSpace(first.AcceptedTranscriptRoot) == "" {
+				t.Fatal("expected accepted transcript root on initial hand message acceptance")
+			}
+			beforeReplay := mustReadNativeTable(t, host, tableID)
+			replayed, err := host.handleHandMessageFromPeer(request)
+			if err != nil {
+				t.Fatalf("accept duplicate hand message replay: %v", err)
+			}
+			if !replayed.Duplicate {
+				t.Fatal("expected duplicate hand message replay to be marked duplicate")
+			}
+			if replayed.RecordKey != first.RecordKey {
+				t.Fatalf("expected replay record key %q, got %q", first.RecordKey, replayed.RecordKey)
+			}
+			if replayed.AcceptedTranscriptRoot != first.AcceptedTranscriptRoot {
+				t.Fatalf("expected replay accepted root %q, got %q", first.AcceptedTranscriptRoot, replayed.AcceptedTranscriptRoot)
+			}
+			afterReplay := mustReadNativeTable(t, host, tableID)
+			if handTranscriptRoot(afterReplay) != handTranscriptRoot(beforeReplay) {
+				t.Fatalf("expected duplicate replay to leave transcript root at %q, got %q", handTranscriptRoot(beforeReplay), handTranscriptRoot(afterReplay))
+			}
+		})
+	}
+}
+
+func TestHandleHandMessageRejectsConflictingReplays(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest)
+	}{
+		{name: "fairness commit", prepare: prepareGuestFairnessCommitRequest},
+		{name: "fairness reveal", prepare: prepareGuestFairnessRevealRequest},
+		{name: "private delivery share", prepare: prepareGuestPrivateDeliveryRequest},
+		{name: "board share", prepare: prepareGuestBoardShareRequest},
+		{name: "board open", prepare: prepareGuestBoardOpenRequest},
+		{name: "showdown reveal", prepare: prepareGuestShowdownRevealRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			host, guest, _, request := tc.prepare(t)
+			first, err := host.handleHandMessageFromPeer(request)
+			if err != nil {
+				t.Fatalf("accept initial hand message: %v", err)
+			}
+			conflicting := tamperHandMessageForConflict(t, guest, request)
+			conflictingKey, err := handMessageRequestRecordKey(conflicting)
+			if err != nil {
+				t.Fatalf("compute conflicting record key: %v", err)
+			}
+			if conflictingKey == first.RecordKey {
+				t.Fatal("expected conflicting replay to change the record key")
+			}
+			if _, err := host.handleHandMessageFromPeer(conflicting); err == nil || !strings.Contains(err.Error(), "conflicts with existing transcript slot") {
+				t.Fatalf("expected conflicting replay to be rejected, got %v", err)
+			}
+		})
 	}
 }
 
@@ -1468,6 +1776,92 @@ func TestAcceptRemoteTablePreservesLocalProtocolDeadline(t *testing.T) {
 	}
 	if accepted.ActiveHand.Cards.PhaseDeadlineAt != originalDeadline {
 		t.Fatalf("expected local protocol deadline %q, got %q", originalDeadline, accepted.ActiveHand.Cards.PhaseDeadlineAt)
+	}
+}
+
+func TestAcceptRemoteTableRefreshesLocalProtocolDeadlineOnSamePhaseTranscriptProgress(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+
+	if err := guest.acceptRemoteTable(mustReadNativeTable(t, host, tableID)); err != nil {
+		t.Fatalf("initial accept remote table: %v", err)
+	}
+	initial := mustReadNativeTable(t, guest, tableID)
+	if initial.ActiveHand == nil {
+		t.Fatal("expected active hand after initial sync")
+	}
+	if initial.ActiveHand.State.Phase != game.StreetCommitment {
+		t.Fatalf("expected commitment phase, got %s", initial.ActiveHand.State.Phase)
+	}
+	if initial.ActiveHand.Cards.PhaseDeadlineAt == "" {
+		t.Fatal("expected locally derived protocol deadline")
+	}
+	if err := guest.store.withTableLock(tableID, func() error {
+		table, err := guest.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		if table.ActiveHand == nil {
+			return errors.New("expected active hand while aging local deadline")
+		}
+		table.ActiveHand.Cards.PhaseDeadlineAt = addMillis(nowISO(), -60_000)
+		return guest.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("age guest protocol deadline: %v", err)
+	}
+	stale := mustReadNativeTable(t, guest, tableID)
+	staleDeadline, err := parseISOTimestamp(stale.ActiveHand.Cards.PhaseDeadlineAt)
+	if err != nil {
+		t.Fatalf("parse stale deadline: %v", err)
+	}
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		record, err := guest.buildLocalContributionRecord(*table)
+		if err != nil {
+			return err
+		}
+		if record == nil {
+			return errors.New("expected guest to have a same-phase protocol contribution")
+		}
+		if err := host.appendHandTranscriptRecord(table, *record); err != nil {
+			return err
+		}
+		return host.persistLocalTable(table, false)
+	}); err != nil {
+		t.Fatalf("advance host transcript without replication: %v", err)
+	}
+	progressed := mustReadNativeTable(t, host, tableID)
+	if progressed.ActiveHand == nil {
+		t.Fatal("expected active hand after host protocol progress")
+	}
+	if progressed.ActiveHand.State.Phase != game.StreetCommitment {
+		t.Fatalf("expected commitment phase after host progress, got %s", progressed.ActiveHand.State.Phase)
+	}
+	guestSeat := seatIndexForPlayer(t, progressed, guest.walletID.PlayerID)
+	if _, ok := findTranscriptRecord(progressed.ActiveHand.Cards.Transcript, nativeHandMessageFairnessCommit, &guestSeat, string(game.StreetCommitment), nil); !ok {
+		t.Fatal("expected guest fairness commit to advance the same protocol phase")
+	}
+
+	if err := guest.acceptRemoteTable(progressed); err != nil {
+		t.Fatalf("accept same-phase progressed remote table: %v", err)
+	}
+	accepted := mustReadNativeTable(t, guest, tableID)
+	if accepted.ActiveHand == nil {
+		t.Fatal("expected active hand after accepting progressed table")
+	}
+	refreshedDeadline, err := parseISOTimestamp(accepted.ActiveHand.Cards.PhaseDeadlineAt)
+	if err != nil {
+		t.Fatalf("parse refreshed deadline: %v", err)
+	}
+	if !refreshedDeadline.After(staleDeadline) {
+		t.Fatalf("expected same-phase transcript progress to refresh the local deadline, got %q after %q", accepted.ActiveHand.Cards.PhaseDeadlineAt, stale.ActiveHand.Cards.PhaseDeadlineAt)
 	}
 }
 
@@ -4466,6 +4860,79 @@ func TestSendActionResyncsAfterHostRotation(t *testing.T) {
 	}
 }
 
+func TestForceProtocolFailoverResetsManualRevealDeadline(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+	enableSyntheticRealMode(host, guest, witness)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call to flop: %v", err)
+	}
+
+	before := waitForHandPhase(t, []*meshRuntime{host, guest, witness}, witness, tableID, game.StreetFlopReveal)
+	if before.ActiveHand == nil || before.ActiveHand.Cards.PhaseDeadlineAt == "" {
+		t.Fatal("expected tracked reveal deadline before host rotation")
+	}
+	if err := witness.store.withTableLock(tableID, func() error {
+		table, err := witness.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		if table.ActiveHand == nil {
+			return errors.New("expected active hand while aging reveal deadline")
+		}
+		table.ActiveHand.Cards.PhaseDeadlineAt = addMillis(nowISO(), -1_000)
+		return witness.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("age witness reveal deadline: %v", err)
+	}
+	before = mustReadNativeTable(t, witness, tableID)
+	beforeDeadline, err := parseISOTimestamp(before.ActiveHand.Cards.PhaseDeadlineAt)
+	if err != nil {
+		t.Fatalf("parse pre-rotation deadline: %v", err)
+	}
+
+	if err := witness.forceProtocolFailover(tableID, "test manual host rotation resets deadline"); err != nil {
+		t.Fatalf("force protocol failover: %v", err)
+	}
+
+	rotated := mustReadNativeTable(t, witness, tableID)
+	if rotated.ActiveHand == nil {
+		t.Fatal("expected active hand after host rotation")
+	}
+	if rotated.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness to become current host, got %q", rotated.CurrentHost.Peer.PeerID)
+	}
+	if rotated.ActiveHand.State.Phase != game.StreetFlopReveal {
+		t.Fatalf("expected flop reveal to remain active after manual rotation, got %s", rotated.ActiveHand.State.Phase)
+	}
+	if rotated.ActiveHand.Cards.PhaseDeadlineAt == "" {
+		t.Fatal("expected manual host rotation to refresh the reveal deadline")
+	}
+	rotatedDeadline, err := parseISOTimestamp(rotated.ActiveHand.Cards.PhaseDeadlineAt)
+	if err != nil {
+		t.Fatalf("parse rotated deadline: %v", err)
+	}
+	if !rotatedDeadline.After(beforeDeadline) {
+		t.Fatalf("expected rotated deadline %q to be later than %q", rotated.ActiveHand.Cards.PhaseDeadlineAt, before.ActiveHand.Cards.PhaseDeadlineAt)
+	}
+}
+
 func TestActionRetryStateChangedDetectsAcceptedHistoryAdvance(t *testing.T) {
 	previous := nativeTableState{
 		CurrentEpoch: 1,
@@ -4492,8 +4959,26 @@ func TestRetryableActionResponseStateErrorIncludesAcceptedHistoryRollback(t *tes
 	if !isRetryableActionResponseStateError(errors.New("accepted history would roll back table snapshots")) {
 		t.Fatal("expected snapshot rollback to be retryable")
 	}
+	if !isRetryableActionResponseStateError(errors.New("accepted active hand transcript would roll back")) {
+		t.Fatal("expected active hand transcript rollback to be retryable")
+	}
+	if !isRetryableActionResponseStateError(errors.New("ready public state latest event hash does not match accepted event history")) {
+		t.Fatal("expected ready public state accepted-history mismatch to be retryable")
+	}
 	if isRetryableActionResponseStateError(errors.New("historical event 0 was rewritten")) {
 		t.Fatal("did not expect rewritten history to be retryable")
+	}
+}
+
+func TestStaleRemoteTableErrorIncludesAcceptedTranscriptRollback(t *testing.T) {
+	if !isStaleRemoteTableError(errors.New("accepted active hand transcript would roll back")) {
+		t.Fatal("expected active hand transcript rollback to be treated as stale")
+	}
+	if !isStaleRemoteTableError(errors.New("ready public state latest event hash does not match accepted event history")) {
+		t.Fatal("expected ready public state accepted-history mismatch to be treated as stale")
+	}
+	if isStaleRemoteTableError(errors.New("accepted active hand transcript was rewritten")) {
+		t.Fatal("did not expect rewritten transcript history to be treated as stale")
 	}
 }
 
@@ -4738,6 +5223,270 @@ func createStartedTwoPlayerTableInSyntheticRealMode(t *testing.T, host, guest *m
 	startNextHandForTest(t, host, tableID)
 	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
 	return tableID, inviteCode
+}
+
+func mustBuildExpectedHandMessageRequest(t *testing.T, runtime *meshRuntime, table nativeTableState, kind string) nativeHandMessageRequest {
+	t.Helper()
+
+	record, err := runtime.buildLocalContributionRecord(table)
+	if err != nil {
+		t.Fatalf("build %s record: %v", kind, err)
+	}
+	if record == nil || record.Kind != kind {
+		t.Fatalf("expected %s record, got %#v", kind, record)
+	}
+	request, err := runtime.buildSignedHandMessageRequest(table, *record)
+	if err != nil {
+		t.Fatalf("build %s request: %v", kind, err)
+	}
+	return request
+}
+
+func acceptHandMessageResponseForTest(t *testing.T, runtime *meshRuntime, response nativeHandMessageResponse) {
+	t.Helper()
+
+	if err := runtime.acceptRemoteTable(response.Table); err != nil {
+		t.Fatalf("accept hand message response table: %v", err)
+	}
+}
+
+func passiveActionForTable(t *testing.T, table nativeTableState) game.Action {
+	t.Helper()
+
+	if table.ActiveHand == nil || table.ActiveHand.State.ActingSeatIndex == nil {
+		t.Fatalf("expected actionable hand state, got %+v", table.ActiveHand)
+	}
+	legalActions := game.GetLegalActions(table.ActiveHand.State, table.ActiveHand.State.ActingSeatIndex)
+	if len(legalActions) == 0 {
+		t.Fatal("expected legal actions")
+	}
+	action := game.Action{Type: legalActions[0].Type}
+	if legalActions[0].MinTotalSats != nil {
+		action.TotalSats = *legalActions[0].MinTotalSats
+	}
+	for _, candidate := range legalActions {
+		if candidate.Type != game.ActionCheck && candidate.Type != game.ActionCall {
+			continue
+		}
+		action = game.Action{Type: candidate.Type}
+		if candidate.MinTotalSats != nil {
+			action.TotalSats = *candidate.MinTotalSats
+		}
+		break
+	}
+	return action
+}
+
+func advanceTableByPassiveActionsToPhase(t *testing.T, host, guest *meshRuntime, tableID string, phase game.Street) nativeTableState {
+	t.Helper()
+
+	runtimes := []*meshRuntime{host, guest}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, host, tableID)
+		if table.ActiveHand != nil && table.ActiveHand.State.Phase == phase {
+			return table
+		}
+		if table.ActiveHand != nil && game.PhaseAllowsActions(table.ActiveHand.State.Phase) && table.ActiveHand.State.ActingSeatIndex != nil {
+			seat, ok := seatRecordByIndex(table, *table.ActiveHand.State.ActingSeatIndex)
+			if !ok {
+				t.Fatalf("acting seat %d missing from table", *table.ActiveHand.State.ActingSeatIndex)
+			}
+			actor := host
+			if seat.PlayerID == guest.walletID.PlayerID {
+				actor = guest
+			}
+			actorTable := waitForLocalCanAct(t, runtimes, actor, tableID)
+			action := passiveActionForTable(t, actorTable)
+			if _, err := actor.SendAction(tableID, action); err != nil {
+				t.Fatalf("send passive %s action while advancing to %s: %v", action.Type, phase, err)
+			}
+			continue
+		}
+		for _, runtime := range runtimes {
+			runtime.Tick()
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	table := mustReadNativeTable(t, host, tableID)
+	t.Fatalf("timed out advancing table to phase %s, last phase=%v", phase, func() any {
+		if table.ActiveHand == nil {
+			return nil
+		}
+		return table.ActiveHand.State.Phase
+	}())
+	return nativeTableState{}
+}
+
+func appendTranscriptRecordsForTest(t *testing.T, runtime *meshRuntime, tableID string, records ...game.HandTranscriptRecord) {
+	t.Helper()
+
+	if len(records) == 0 {
+		return
+	}
+	if err := runtime.store.withTableLock(tableID, func() error {
+		table, err := runtime.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		for _, record := range records {
+			if existing, ok, err := findParticipantHandMessageSlotRecord(table.ActiveHand.Cards.Transcript, record); err != nil {
+				return err
+			} else if ok {
+				existingKey, err := handMessageRecordKey(table.Config.TableID, table.ActiveHand.State.HandID, table.ActiveHand.State.HandNumber, existing)
+				if err != nil {
+					return err
+				}
+				recordKey, err := handMessageRecordKey(table.Config.TableID, table.ActiveHand.State.HandID, table.ActiveHand.State.HandNumber, record)
+				if err != nil {
+					return err
+				}
+				if existingKey == recordKey {
+					continue
+				}
+				return errors.New("conflicting transcript record already present")
+			}
+			if err := runtime.appendHandTranscriptRecord(table, record); err != nil {
+				return err
+			}
+		}
+		return runtime.persistLocalTable(table, false)
+	}); err != nil {
+		t.Fatalf("append transcript records for test: %v", err)
+	}
+}
+
+func prepareGuestFairnessCommitRequest(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest) {
+	t.Helper()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetCommitment)
+	return host, guest, tableID, mustBuildExpectedHandMessageRequest(t, guest, table, nativeHandMessageFairnessCommit)
+}
+
+func prepareGuestFairnessRevealRequest(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest) {
+	t.Helper()
+
+	host, guest, tableID, commitRequest := prepareGuestFairnessCommitRequest(t)
+	response, err := host.handleHandMessageFromPeer(commitRequest)
+	if err != nil {
+		t.Fatalf("accept guest fairness commit: %v", err)
+	}
+	acceptHandMessageResponseForTest(t, guest, response)
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetReveal)
+	return host, guest, tableID, mustBuildExpectedHandMessageRequest(t, guest, table, nativeHandMessageFairnessReveal)
+}
+
+func prepareGuestPrivateDeliveryRequest(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest) {
+	t.Helper()
+
+	host, guest, tableID, revealRequest := prepareGuestFairnessRevealRequest(t)
+	response, err := host.handleHandMessageFromPeer(revealRequest)
+	if err != nil {
+		t.Fatalf("accept guest fairness reveal: %v", err)
+	}
+	acceptHandMessageResponseForTest(t, guest, response)
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetPrivateDelivery)
+	return host, guest, tableID, mustBuildExpectedHandMessageRequest(t, guest, table, nativeHandMessagePrivateDelivery)
+}
+
+func prepareGuestBoardShareRequest(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest) {
+	t.Helper()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	advanceTableByPassiveActionsToPhase(t, host, guest, tableID, game.StreetFlopReveal)
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetFlopReveal)
+	return host, guest, tableID, mustBuildExpectedHandMessageRequest(t, guest, table, nativeHandMessageBoardShare)
+}
+
+func prepareGuestBoardOpenRequest(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest) {
+	t.Helper()
+
+	host, guest, tableID, _ := prepareGuestBoardShareRequest(t)
+	guestTable := mustReadNativeTable(t, guest, tableID)
+	hostTable := mustReadNativeTable(t, host, tableID)
+	phase := string(game.StreetFlopReveal)
+	records := make([]game.HandTranscriptRecord, 0, 2)
+
+	hostSeat := seatIndexForPlayer(t, guestTable, host.walletID.PlayerID)
+	if _, ok := findTranscriptRecord(guestTable.ActiveHand.Cards.Transcript, nativeHandMessageBoardShare, &hostSeat, phase, nil); !ok {
+		hostRecord, err := host.buildLocalContributionRecord(hostTable)
+		if err != nil {
+			t.Fatalf("build host board-share record: %v", err)
+		}
+		if hostRecord == nil || hostRecord.Kind != nativeHandMessageBoardShare {
+			t.Fatalf("expected host board-share record, got %#v", hostRecord)
+		}
+		records = append(records, *hostRecord)
+	}
+
+	guestRecord, err := guest.buildLocalContributionRecord(guestTable)
+	if err != nil {
+		t.Fatalf("build guest board-share record: %v", err)
+	}
+	if guestRecord == nil || guestRecord.Kind != nativeHandMessageBoardShare {
+		t.Fatalf("expected guest board-share record, got %#v", guestRecord)
+	}
+	guestSeat := seatIndexForPlayer(t, guestTable, guest.walletID.PlayerID)
+	if _, ok := findTranscriptRecord(guestTable.ActiveHand.Cards.Transcript, nativeHandMessageBoardShare, &guestSeat, phase, nil); !ok {
+		records = append(records, *guestRecord)
+	}
+
+	appendTranscriptRecordsForTest(t, host, tableID, records...)
+	appendTranscriptRecordsForTest(t, guest, tableID, records...)
+
+	table := mustReadNativeTable(t, guest, tableID)
+	return host, guest, tableID, mustBuildExpectedHandMessageRequest(t, guest, table, nativeHandMessageBoardOpen)
+}
+
+func prepareGuestShowdownRevealRequest(t *testing.T) (*meshRuntime, *meshRuntime, string, nativeHandMessageRequest) {
+	t.Helper()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	advanceTableByPassiveActionsToPhase(t, host, guest, tableID, game.StreetShowdownReveal)
+	table := waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetShowdownReveal)
+	return host, guest, tableID, mustBuildExpectedHandMessageRequest(t, guest, table, nativeHandMessageShowdownReveal)
+}
+
+func tamperHandMessageForConflict(t *testing.T, runtime *meshRuntime, request nativeHandMessageRequest) nativeHandMessageRequest {
+	t.Helper()
+
+	tampered := cloneJSON(request)
+	switch tampered.Kind {
+	case nativeHandMessageFairnessCommit:
+		tampered.CommitmentHash = strings.Repeat("a", 64)
+	case nativeHandMessageFairnessReveal:
+		tampered.DeckStageRoot = strings.Repeat("b", 64)
+	case nativeHandMessagePrivateDelivery, nativeHandMessageBoardShare:
+		if len(tampered.PartialCiphertexts) == 0 {
+			t.Fatalf("expected ciphertexts on %s request", tampered.Kind)
+		}
+		tampered.PartialCiphertexts[0] = "tampered-" + tampered.PartialCiphertexts[0]
+	case nativeHandMessageBoardOpen, nativeHandMessageShowdownReveal:
+		if len(tampered.Cards) == 0 {
+			t.Fatalf("expected cards on %s request", tampered.Kind)
+		}
+		if tampered.Cards[0] == "As" {
+			tampered.Cards[0] = "Kd"
+		} else {
+			tampered.Cards[0] = "As"
+		}
+	default:
+		t.Fatalf("unsupported hand message kind %q", tampered.Kind)
+	}
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, nativeHandMessageAuthPayload(tampered))
+	if err != nil {
+		t.Fatalf("sign tampered %s request: %v", tampered.Kind, err)
+	}
+	tampered.SignatureHex = signatureHex
+	return tampered
 }
 
 func mustReadNativeTable(t *testing.T, runtime *meshRuntime, tableID string) nativeTableState {

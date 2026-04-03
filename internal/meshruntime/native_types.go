@@ -507,12 +507,20 @@ type nativeHandMessageRequest struct {
 	Phase                 string   `json:"phase"`
 	PlayerID              string   `json:"playerId"`
 	ProfileName           string   `json:"profileName"`
+	ProtocolVersion       string   `json:"protocolVersion,omitempty"`
 	RecipientSeatIndex    *int     `json:"recipientSeatIndex,omitempty"`
 	SeatIndex             int      `json:"seatIndex"`
 	ShuffleSeedHex        string   `json:"shuffleSeedHex,omitempty"`
 	SignatureHex          string   `json:"signatureHex"`
 	SignedAt              string   `json:"signedAt"`
 	TableID               string   `json:"tableId"`
+}
+
+type nativeHandMessageResponse struct {
+	AcceptedTranscriptRoot string           `json:"acceptedTranscriptRoot,omitempty"`
+	Duplicate              bool             `json:"duplicate,omitempty"`
+	RecordKey              string           `json:"recordKey"`
+	Table                  nativeTableState `json:"table"`
 }
 
 type nativeTableFetchRequest struct {

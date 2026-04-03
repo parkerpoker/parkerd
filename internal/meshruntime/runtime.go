@@ -39,7 +39,7 @@ type meshRuntime struct {
 	custodyRecoveryExecute func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
 	custodySignerAuth      map[string]custodySignerAuthorization
 	custodySigners         map[string]walletpkg.CustodySignerSession
-	handMessageSenderHook  func(peerURL string, input nativeHandMessageRequest) (nativeTableState, error)
+	handMessageSenderHook  func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error)
 	httpClient             *http.Client
 	lastSyncAt             map[string]time.Time
 	lastGuestContribution  map[string]guestContributionSendSnapshot
@@ -87,18 +87,18 @@ func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (
 		return nil, err
 	}
 	runtime := &meshRuntime{
-		config:            config,
-		custodySignerAuth: map[string]custodySignerAuthorization{},
-		custodySigners:    map[string]walletpkg.CustodySignerSession{},
-		httpClient:        &http.Client{Timeout: 5 * time.Second},
-		lastSyncAt:        map[string]time.Time{},
+		config:                config,
+		custodySignerAuth:     map[string]custodySignerAuthorization{},
+		custodySigners:        map[string]walletpkg.CustodySignerSession{},
+		httpClient:            &http.Client{Timeout: 5 * time.Second},
+		lastSyncAt:            map[string]time.Time{},
 		lastGuestContribution: map[string]guestContributionSendSnapshot{},
-		mode:              mode,
-		peerInfoCache:     map[string]nativeCachedPeerInfo{},
-		profileName:       profileName,
-		protocolDrives:    map[string]struct{}{},
-		profileStore:      walletpkg.NewProfileStore(config.ProfileDir),
-		store:             store,
+		mode:                  mode,
+		peerInfoCache:         map[string]nativeCachedPeerInfo{},
+		profileName:           profileName,
+		protocolDrives:        map[string]struct{}{},
+		profileStore:          walletpkg.NewProfileStore(config.ProfileDir),
+		store:                 store,
 		walletRuntime: walletpkg.NewRuntime(walletpkg.RuntimeConfig{
 			ArkServerURL:      config.ArkServerURL,
 			Network:           config.Network,
@@ -386,7 +386,7 @@ func (runtime *meshRuntime) Tick() {
 
 		if table != nil && protocolDeadlineExpired(*table) && runtime.shouldHandleFailover(*table) {
 			debugMeshf("protocol failover check table=%s phase=%v deadline=%s host=%s", tableID, table.ActiveHand.State.Phase, table.ActiveHand.Cards.PhaseDeadlineAt, table.CurrentHost.Peer.PeerID)
-			if err := runtime.forceProtocolFailover(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
+			if err := runtime.failoverExpiredProtocolDeadline(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
 				table, _ = runtime.store.readTable(tableID)
 			}
 		}
@@ -1658,7 +1658,9 @@ func isRetryableActionResponseStateError(err error) bool {
 	}
 	message := err.Error()
 	return strings.Contains(message, "accepted history would roll back table events") ||
-		strings.Contains(message, "accepted history would roll back table snapshots")
+		strings.Contains(message, "accepted history would roll back table snapshots") ||
+		strings.Contains(message, "accepted active hand transcript would roll back") ||
+		strings.Contains(message, "ready public state latest event hash does not match accepted event history")
 }
 
 func actionRetryStateChanged(previous, refreshed nativeTableState) bool {
@@ -2177,7 +2179,7 @@ func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState
 		}
 	}
 	if table != nil && protocolDeadlineExpired(*table) && runtime.shouldHandleFailover(*table) {
-		if err := runtime.forceProtocolFailover(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
+		if err := runtime.failoverExpiredProtocolDeadline(tableID, fmt.Sprintf("protocol deadline expired during %s", table.ActiveHand.State.Phase)); err == nil {
 			table, _ = runtime.store.readTable(tableID)
 		}
 	}
@@ -2707,8 +2709,12 @@ func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
 	return runtime.rotateHostTable(tableID, reason, true, true)
 }
 
-func (runtime *meshRuntime) forceProtocolFailover(tableID, reason string) error {
+func (runtime *meshRuntime) failoverExpiredProtocolDeadline(tableID, reason string) error {
 	return runtime.rotateHostTable(tableID, reason, false, false)
+}
+
+func (runtime *meshRuntime) forceProtocolFailover(tableID, reason string) error {
+	return runtime.rotateHostTable(tableID, reason, false, true)
 }
 
 func (runtime *meshRuntime) persistLocalTable(table *nativeTableState, publish bool) error {
@@ -3426,6 +3432,9 @@ func (runtime *meshRuntime) validateAcceptedHistoricalLedger(existing *nativeTab
 	if err := runtime.validateAcceptedEventAnchors(incoming, history); err != nil {
 		return err
 	}
+	if err := validateAcceptedActiveHandTranscriptHistory(existing, incoming); err != nil {
+		return err
+	}
 	if existing == nil {
 		return nil
 	}
@@ -3446,6 +3455,40 @@ func (runtime *meshRuntime) validateAcceptedHistoricalLedger(existing *nativeTab
 		}
 	}
 	return nil
+}
+
+func transcriptExtends(prefix, full game.HandTranscript) bool {
+	if prefix.TableID != full.TableID ||
+		prefix.HandID != full.HandID ||
+		prefix.HandNumber != full.HandNumber ||
+		len(full.Records) < len(prefix.Records) {
+		return false
+	}
+	for index := range prefix.Records {
+		if !reflect.DeepEqual(cloneJSON(prefix.Records[index]), cloneJSON(full.Records[index])) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateAcceptedActiveHandTranscriptHistory(existing *nativeTableState, incoming nativeTableState) error {
+	if existing == nil || existing.ActiveHand == nil || incoming.ActiveHand == nil {
+		return nil
+	}
+	if existing.ActiveHand.State.HandID != incoming.ActiveHand.State.HandID ||
+		existing.ActiveHand.State.HandNumber != incoming.ActiveHand.State.HandNumber {
+		return nil
+	}
+	existingTranscript := existing.ActiveHand.Cards.Transcript
+	incomingTranscript := incoming.ActiveHand.Cards.Transcript
+	if transcriptExtends(existingTranscript, incomingTranscript) {
+		return nil
+	}
+	if transcriptExtends(incomingTranscript, existingTranscript) {
+		return errors.New("accepted active hand transcript would roll back")
+	}
+	return errors.New("accepted active hand transcript was rewritten")
 }
 
 func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTableState, incoming nativeTableState) error {
@@ -4283,7 +4326,9 @@ func isStaleRemoteTableError(err error) bool {
 	return strings.Contains(message, "would roll back table epoch") ||
 		strings.Contains(message, "would roll back table events") ||
 		strings.Contains(message, "would roll back table snapshots") ||
-		strings.Contains(message, "would roll back custody transitions")
+		strings.Contains(message, "would roll back custody transitions") ||
+		strings.Contains(message, "accepted active hand transcript would roll back") ||
+		strings.Contains(message, "ready public state latest event hash does not match accepted event history")
 }
 
 func (runtime *meshRuntime) shouldHandleFailover(table nativeTableState) bool {

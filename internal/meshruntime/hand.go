@@ -367,25 +367,21 @@ func seatPlayerID(table nativeTableState, seatIndex int) string {
 }
 
 type protocolDriveSnapshot struct {
-	custodyHash string
-	epoch       int
-	handID      string
-	hostPeerID  string
-	phase       game.Street
+	custodyHash    string
+	epoch          int
+	handID         string
+	hostPeerID     string
+	phase          game.Street
+	transcriptRoot string
 }
 
 type guestContributionSendSnapshot struct {
-	fingerprint string
-	snapshot    protocolDriveSnapshot
-}
-
-func guestContributionSupportsDedupe(kind string) bool {
-	switch kind {
-	case nativeHandMessageFairnessCommit, nativeHandMessageFairnessReveal, nativeHandMessagePrivateDelivery:
-		return true
-	default:
-		return false
-	}
+	acked      bool
+	handID     string
+	handNumber int
+	kind       string
+	phase      string
+	recordKey  string
 }
 
 func snapshotProtocolDrive(table nativeTableState) protocolDriveSnapshot {
@@ -397,6 +393,7 @@ func snapshotProtocolDrive(table nativeTableState) protocolDriveSnapshot {
 	if table.ActiveHand != nil {
 		snapshot.handID = table.ActiveHand.State.HandID
 		snapshot.phase = table.ActiveHand.State.Phase
+		snapshot.transcriptRoot = handTranscriptRoot(table)
 	}
 	return snapshot
 }
@@ -424,55 +421,189 @@ func custodyTimingFields(table nativeTableState, transition tablecustody.Custody
 	}
 }
 
-func localContributionFingerprint(table nativeTableState, record game.HandTranscriptRecord) string {
+func handMessageRecordPayload(tableID, handID string, handNumber int, record game.HandTranscriptRecord) map[string]any {
 	payload := map[string]any{
-		"cardPositions":      append([]int(nil), record.CardPositions...),
-		"cards":              handMessageCards(record.Cards),
-		"commitmentHash":     record.CommitmentHash,
-		"deckStage":          append([]string(nil), record.DeckStage...),
-		"deckStageRoot":      record.DeckStageRoot,
-		"epoch":              table.CurrentEpoch,
-		"handId":             stringValue(table.PublicState.HandID),
-		"handNumber":         0,
-		"kind":               record.Kind,
-		"lockPublicExponent": record.LockPublicExponentHex,
-		"partialCiphertexts": append([]string(nil), record.PartialCiphertexts...),
-		"phase":              record.Phase,
-		"playerId":           record.PlayerID,
-		"recipientSeatIndex": copyOptionalInt(record.RecipientSeatIndex),
-		"seatIndex":          copyOptionalInt(record.SeatIndex),
-		"shuffleSeed":        record.ShuffleSeedHex,
-		"tableId":            table.Config.TableID,
+		"handId":     handID,
+		"handNumber": handNumber,
+		"kind":       record.Kind,
+		"phase":      record.Phase,
+		"tableId":    tableID,
+		"type":       "dealerless-hand-record-key",
 	}
-	if table.ActiveHand != nil {
-		payload["handId"] = table.ActiveHand.State.HandID
-		payload["handNumber"] = table.ActiveHand.State.HandNumber
+	if record.PlayerID != "" {
+		payload["playerId"] = record.PlayerID
 	}
-	return tablecustody.HashValue(payload)
+	if record.SeatIndex != nil {
+		payload["seatIndex"] = *record.SeatIndex
+	}
+	if record.CommitmentHash != "" {
+		payload["commitmentHash"] = record.CommitmentHash
+	}
+	if record.ShuffleSeedHex != "" {
+		payload["shuffleSeedHex"] = record.ShuffleSeedHex
+	}
+	if record.LockPublicExponentHex != "" {
+		payload["lockPublicExponentHex"] = record.LockPublicExponentHex
+	}
+	if len(record.DeckStage) > 0 {
+		payload["deckStage"] = append([]string(nil), record.DeckStage...)
+	}
+	if record.DeckStageRoot != "" {
+		payload["deckStageRoot"] = record.DeckStageRoot
+	}
+	if record.RecipientSeatIndex != nil {
+		payload["recipientSeatIndex"] = *record.RecipientSeatIndex
+	}
+	if len(record.CardPositions) > 0 {
+		payload["cardPositions"] = append([]int(nil), record.CardPositions...)
+	}
+	if len(record.PartialCiphertexts) > 0 {
+		payload["partialCiphertexts"] = append([]string(nil), record.PartialCiphertexts...)
+	}
+	if len(record.Cards) > 0 {
+		payload["cards"] = handMessageCards(record.Cards)
+	}
+	return payload
 }
 
-func (runtime *meshRuntime) shouldSendGuestContribution(tableID string, snapshot protocolDriveSnapshot, fingerprint string) bool {
+func handMessageRecordKey(tableID, handID string, handNumber int, record game.HandTranscriptRecord) (string, error) {
+	return settlementcore.HashStructuredDataHex(handMessageRecordPayload(tableID, handID, handNumber, record))
+}
+
+func handMessageRequestRecordKey(request nativeHandMessageRequest) (string, error) {
+	record, err := transcriptRecordFromHandMessage(request)
+	if err != nil {
+		return "", err
+	}
+	return handMessageRecordKey(request.TableID, request.HandID, request.HandNumber, record)
+}
+
+func handMessageSlotLabel(record game.HandTranscriptRecord) string {
+	switch record.Kind {
+	case nativeHandMessageFairnessCommit, nativeHandMessageFairnessReveal, nativeHandMessageBoardShare, nativeHandMessageShowdownReveal:
+		if record.SeatIndex != nil {
+			return fmt.Sprintf("%s seat=%d phase=%s", record.Kind, *record.SeatIndex, record.Phase)
+		}
+	case nativeHandMessagePrivateDelivery:
+		if record.SeatIndex != nil && record.RecipientSeatIndex != nil {
+			return fmt.Sprintf("%s seat=%d recipient=%d phase=%s", record.Kind, *record.SeatIndex, *record.RecipientSeatIndex, record.Phase)
+		}
+	case nativeHandMessageBoardOpen:
+		return fmt.Sprintf("%s phase=%s", record.Kind, record.Phase)
+	}
+	return record.Kind
+}
+
+func findParticipantHandMessageSlotRecord(transcript game.HandTranscript, record game.HandTranscriptRecord) (game.HandTranscriptRecord, bool, error) {
+	switch record.Kind {
+	case nativeHandMessageFairnessCommit:
+		if record.SeatIndex == nil {
+			return game.HandTranscriptRecord{}, false, fmt.Errorf("%s is missing seat index", record.Kind)
+		}
+		existing, ok := findTranscriptRecord(transcript, record.Kind, record.SeatIndex, string(game.StreetCommitment), nil)
+		return existing, ok, nil
+	case nativeHandMessageFairnessReveal:
+		if record.SeatIndex == nil {
+			return game.HandTranscriptRecord{}, false, fmt.Errorf("%s is missing seat index", record.Kind)
+		}
+		existing, ok := findTranscriptRecord(transcript, record.Kind, record.SeatIndex, string(game.StreetReveal), nil)
+		return existing, ok, nil
+	case nativeHandMessagePrivateDelivery:
+		if record.SeatIndex == nil || record.RecipientSeatIndex == nil {
+			return game.HandTranscriptRecord{}, false, fmt.Errorf("%s is missing seat indexes", record.Kind)
+		}
+		existing, ok := findTranscriptRecord(transcript, record.Kind, record.SeatIndex, string(game.StreetPrivateDelivery), record.RecipientSeatIndex)
+		return existing, ok, nil
+	case nativeHandMessageBoardShare:
+		if record.SeatIndex == nil {
+			return game.HandTranscriptRecord{}, false, fmt.Errorf("%s is missing seat index", record.Kind)
+		}
+		existing, ok := findTranscriptRecord(transcript, record.Kind, record.SeatIndex, record.Phase, nil)
+		return existing, ok, nil
+	case nativeHandMessageBoardOpen:
+		existing, ok := findTranscriptRecord(transcript, record.Kind, nil, record.Phase, nil)
+		return existing, ok, nil
+	case nativeHandMessageShowdownReveal:
+		if record.SeatIndex == nil {
+			return game.HandTranscriptRecord{}, false, fmt.Errorf("%s is missing seat index", record.Kind)
+		}
+		existing, ok := findTranscriptRecord(transcript, record.Kind, record.SeatIndex, string(game.StreetShowdownReveal), nil)
+		return existing, ok, nil
+	default:
+		return game.HandTranscriptRecord{}, false, nil
+	}
+}
+
+func handTranscriptHasRecordKey(transcript game.HandTranscript, recordKey string) bool {
+	if strings.TrimSpace(recordKey) == "" {
+		return false
+	}
+	for _, record := range transcript.Records {
+		currentKey, err := handMessageRecordKey(transcript.TableID, transcript.HandID, transcript.HandNumber, record)
+		if err == nil && currentKey == recordKey {
+			return true
+		}
+	}
+	return false
+}
+
+func guestContributionSnapshot(table nativeTableState, record game.HandTranscriptRecord, recordKey string) guestContributionSendSnapshot {
+	snapshot := guestContributionSendSnapshot{
+		kind:      record.Kind,
+		phase:     record.Phase,
+		recordKey: recordKey,
+	}
+	if table.ActiveHand != nil {
+		snapshot.handID = table.ActiveHand.State.HandID
+		snapshot.handNumber = table.ActiveHand.State.HandNumber
+	}
+	return snapshot
+}
+
+func (runtime *meshRuntime) reconcileGuestContribution(tableID string, table nativeTableState) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 
 	previous, ok := runtime.lastGuestContribution[tableID]
 	if !ok {
-		return true
+		return
 	}
-	return previous.snapshot != snapshot || previous.fingerprint != fingerprint
+	if table.ActiveHand == nil ||
+		table.ActiveHand.State.HandID != previous.handID ||
+		table.ActiveHand.State.HandNumber != previous.handNumber {
+		delete(runtime.lastGuestContribution, tableID)
+		return
+	}
+	if handTranscriptHasRecordKey(table.ActiveHand.Cards.Transcript, previous.recordKey) {
+		delete(runtime.lastGuestContribution, tableID)
+	}
 }
 
-func (runtime *meshRuntime) recordGuestContributionSend(tableID string, snapshot protocolDriveSnapshot, fingerprint string) {
+func (runtime *meshRuntime) shouldSendGuestContribution(tableID string, pending guestContributionSendSnapshot) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 
 	if runtime.lastGuestContribution == nil {
 		runtime.lastGuestContribution = map[string]guestContributionSendSnapshot{}
 	}
-	runtime.lastGuestContribution[tableID] = guestContributionSendSnapshot{
-		fingerprint: fingerprint,
-		snapshot:    snapshot,
+	previous, ok := runtime.lastGuestContribution[tableID]
+	if !ok || previous.recordKey != pending.recordKey {
+		runtime.lastGuestContribution[tableID] = pending
+		return true
 	}
+	return !previous.acked
+}
+
+func (runtime *meshRuntime) markGuestContributionAcked(tableID, recordKey string) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+
+	previous, ok := runtime.lastGuestContribution[tableID]
+	if !ok || previous.recordKey != recordKey {
+		return
+	}
+	previous.acked = true
+	runtime.lastGuestContribution[tableID] = previous
 }
 
 func sameInts(left, right []int) bool {
@@ -944,6 +1075,23 @@ func allFairnessRevealsPresent(table nativeTableState) bool {
 	return len(transcriptRecordsByKind(table.ActiveHand.Cards.Transcript, nativeHandMessageFairnessReveal, string(game.StreetReveal))) == len(table.Seats)
 }
 
+func protocolPhaseTranscriptProgressed(existing *nativeTableState, incoming nativeTableState) bool {
+	if existing == nil || existing.ActiveHand == nil || incoming.ActiveHand == nil {
+		return false
+	}
+	if existing.CurrentHost.Peer.PeerID != incoming.CurrentHost.Peer.PeerID ||
+		existing.ActiveHand.State.HandID != incoming.ActiveHand.State.HandID ||
+		existing.ActiveHand.State.HandNumber != incoming.ActiveHand.State.HandNumber ||
+		existing.ActiveHand.State.Phase != incoming.ActiveHand.State.Phase ||
+		!shouldTrackProtocolDeadline(incoming.ActiveHand.State.Phase) {
+		return false
+	}
+	if len(incoming.ActiveHand.Cards.Transcript.Records) <= len(existing.ActiveHand.Cards.Transcript.Records) {
+		return false
+	}
+	return transcriptExtends(existing.ActiveHand.Cards.Transcript, incoming.ActiveHand.Cards.Transcript)
+}
+
 func (runtime *meshRuntime) deriveLocalProtocolDeadline(existing *nativeTableState, incoming nativeTableState) string {
 	if incoming.ActiveHand == nil || !shouldTrackProtocolDeadline(incoming.ActiveHand.State.Phase) {
 		return ""
@@ -954,6 +1102,9 @@ func (runtime *meshRuntime) deriveLocalProtocolDeadline(existing *nativeTableSta
 		existing.ActiveHand.State.Phase == incoming.ActiveHand.State.Phase &&
 		existing.ActiveHand.Cards.PhaseDeadlineAt != "" &&
 		shouldTrackProtocolDeadline(existing.ActiveHand.State.Phase) {
+		if protocolPhaseTranscriptProgressed(existing, incoming) {
+			return addMillis(nowISO(), runtime.handProtocolTimeoutMSForTable(incoming))
+		}
 		return existing.ActiveHand.Cards.PhaseDeadlineAt
 	}
 	return addMillis(nowISO(), runtime.handProtocolTimeoutMSForTable(incoming))
@@ -1927,16 +2078,17 @@ func transcriptRecordFromHandMessage(request nativeHandMessageRequest) (game.Han
 
 func nativeHandMessageAuthPayload(request nativeHandMessageRequest) map[string]any {
 	payload := map[string]any{
-		"epoch":      request.Epoch,
-		"handId":     request.HandID,
-		"handNumber": request.HandNumber,
-		"kind":       request.Kind,
-		"playerId":   request.PlayerID,
-		"phase":      request.Phase,
-		"seatIndex":  request.SeatIndex,
-		"signedAt":   request.SignedAt,
-		"tableId":    request.TableID,
-		"type":       "table-hand-message",
+		"epoch":           request.Epoch,
+		"handId":          request.HandID,
+		"handNumber":      request.HandNumber,
+		"kind":            request.Kind,
+		"playerId":        request.PlayerID,
+		"phase":           request.Phase,
+		"protocolVersion": request.ProtocolVersion,
+		"seatIndex":       request.SeatIndex,
+		"signedAt":        request.SignedAt,
+		"tableId":         request.TableID,
+		"type":            "table-hand-message",
 	}
 	if request.CommitmentHash != "" {
 		payload["commitmentHash"] = request.CommitmentHash
@@ -1988,6 +2140,7 @@ func (runtime *meshRuntime) buildSignedHandMessageRequest(table nativeTableState
 		Phase:                 record.Phase,
 		PlayerID:              runtime.walletID.PlayerID,
 		ProfileName:           runtime.profileName,
+		ProtocolVersion:       nativeProtocolVersion,
 		RecipientSeatIndex:    copyOptionalInt(record.RecipientSeatIndex),
 		SeatIndex:             seat.SeatIndex,
 		ShuffleSeedHex:        record.ShuffleSeedHex,
@@ -2002,47 +2155,53 @@ func (runtime *meshRuntime) buildSignedHandMessageRequest(table nativeTableState
 	return request, nil
 }
 
-func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, seat nativeSeatRecord, request nativeHandMessageRequest) error {
+func (runtime *meshRuntime) validateHandMessageRequestIdentity(table nativeTableState, seat nativeSeatRecord, request nativeHandMessageRequest) (game.HandTranscriptRecord, error) {
+	if strings.TrimSpace(request.ProtocolVersion) != nativeProtocolVersion {
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message protocol version mismatch")
+	}
 	if request.TableID != table.Config.TableID {
-		return fmt.Errorf("hand message table mismatch")
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message table mismatch")
 	}
 	if request.PlayerID != seat.PlayerID || request.SeatIndex != seat.SeatIndex {
-		return fmt.Errorf("hand message seat mismatch")
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message seat mismatch")
 	}
 	if table.ActiveHand == nil || request.HandID == "" || request.HandID != table.ActiveHand.State.HandID {
-		return fmt.Errorf("hand message hand mismatch")
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message hand mismatch")
 	}
 	if request.HandNumber != table.ActiveHand.State.HandNumber {
-		return fmt.Errorf("hand message hand number mismatch")
-	}
-	if request.Epoch != table.CurrentEpoch {
-		return fmt.Errorf("hand message epoch mismatch")
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message hand number mismatch")
 	}
 	if request.SignedAt == "" || request.SignatureHex == "" {
-		return fmt.Errorf("hand message is missing signature")
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message is missing signature")
 	}
 	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, nativeHandMessageAuthPayload(request), request.SignatureHex)
 	if err != nil {
-		return err
+		return game.HandTranscriptRecord{}, err
 	}
 	if !ok {
-		return fmt.Errorf("hand message signature is invalid")
+		return game.HandTranscriptRecord{}, fmt.Errorf("hand message signature is invalid")
 	}
 	record, err := transcriptRecordFromHandMessage(request)
 	if err != nil {
-		return err
+		return game.HandTranscriptRecord{}, err
 	}
 	if err := validateTranscriptRecordPlaintext(record); err != nil {
-		return err
+		return game.HandTranscriptRecord{}, err
 	}
+	return record, nil
+}
 
+func (runtime *meshRuntime) validateNewHandMessageRequest(table nativeTableState, seat nativeSeatRecord, request nativeHandMessageRequest, record game.HandTranscriptRecord) error {
+	if request.Epoch != table.CurrentEpoch {
+		return fmt.Errorf("hand message epoch mismatch")
+	}
 	switch request.Kind {
 	case nativeHandMessageFairnessCommit:
 		if table.ActiveHand.State.Phase != game.StreetCommitment {
 			return fmt.Errorf("hand is not accepting commitments")
 		}
-		if _, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageFairnessCommit, &seat.SeatIndex, string(game.StreetCommitment), nil); ok {
-			return fmt.Errorf("commit already recorded for seat %d", seat.SeatIndex)
+		if request.Phase != string(game.StreetCommitment) {
+			return fmt.Errorf("commitment phase mismatch")
 		}
 		if strings.TrimSpace(request.CommitmentHash) == "" {
 			return fmt.Errorf("commitment hash is required")
@@ -2050,6 +2209,9 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 	case nativeHandMessageFairnessReveal:
 		if table.ActiveHand.State.Phase != game.StreetReveal {
 			return fmt.Errorf("hand is not accepting reveals")
+		}
+		if request.Phase != string(game.StreetReveal) {
+			return fmt.Errorf("reveal phase mismatch")
 		}
 		for _, otherSeat := range table.Seats {
 			if otherSeat.SeatIndex >= seat.SeatIndex {
@@ -2062,9 +2224,6 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 		commit, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageFairnessCommit, &seat.SeatIndex, string(game.StreetCommitment), nil)
 		if !ok {
 			return fmt.Errorf("missing prior commitment for seat %d", seat.SeatIndex)
-		}
-		if _, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageFairnessReveal, &seat.SeatIndex, string(game.StreetReveal), nil); ok {
-			return fmt.Errorf("reveal already recorded for seat %d", seat.SeatIndex)
 		}
 		if err := game.VerifyFairnessReveal(table.Config.TableID, table.ActiveHand.State.HandNumber, seat.SeatIndex, seat.PlayerID, string(game.StreetCommitment), commit.CommitmentHash, request.ShuffleSeedHex, request.LockPublicExponentHex); err != nil {
 			return err
@@ -2114,12 +2273,12 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 		if table.ActiveHand.State.Phase != game.StreetPrivateDelivery {
 			return fmt.Errorf("hand is not accepting private delivery shares")
 		}
+		if request.Phase != string(game.StreetPrivateDelivery) {
+			return fmt.Errorf("private delivery phase mismatch")
+		}
 		expectedRecipient := otherSeatIndex(seat.SeatIndex)
 		if request.RecipientSeatIndex == nil || *request.RecipientSeatIndex != expectedRecipient {
 			return fmt.Errorf("private delivery recipient mismatch")
-		}
-		if _, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessagePrivateDelivery, &seat.SeatIndex, string(game.StreetPrivateDelivery), request.RecipientSeatIndex); ok {
-			return fmt.Errorf("private delivery share already recorded for seat %d", seat.SeatIndex)
 		}
 		expectedPositions, err := requiredCardPositionsForPhase(table, game.StreetPrivateDelivery, *request.RecipientSeatIndex)
 		if err != nil {
@@ -2140,8 +2299,8 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 		if table.ActiveHand.State.Phase != game.StreetFlopReveal && table.ActiveHand.State.Phase != game.StreetTurnReveal && table.ActiveHand.State.Phase != game.StreetRiverReveal {
 			return fmt.Errorf("hand is not accepting board shares")
 		}
-		if _, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageBoardShare, &seat.SeatIndex, string(table.ActiveHand.State.Phase), nil); ok {
-			return fmt.Errorf("board share already recorded for seat %d", seat.SeatIndex)
+		if request.Phase != string(table.ActiveHand.State.Phase) {
+			return fmt.Errorf("board share phase mismatch")
 		}
 		expectedPositions, err := requiredCardPositionsForPhase(table, table.ActiveHand.State.Phase, seat.SeatIndex)
 		if err != nil {
@@ -2162,8 +2321,8 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 		if table.ActiveHand.State.Phase != game.StreetFlopReveal && table.ActiveHand.State.Phase != game.StreetTurnReveal && table.ActiveHand.State.Phase != game.StreetRiverReveal {
 			return fmt.Errorf("hand is not accepting board openings")
 		}
-		if transcriptHasBoardOpen(table.ActiveHand, table.ActiveHand.State.Phase) {
-			return fmt.Errorf("board already opened for %s", table.ActiveHand.State.Phase)
+		if request.Phase != string(table.ActiveHand.State.Phase) {
+			return fmt.Errorf("board open phase mismatch")
 		}
 		if err := verifyBoardOpen(table.ActiveHand, string(table.ActiveHand.State.Phase), request.Cards); err != nil {
 			return err
@@ -2172,8 +2331,8 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 		if table.ActiveHand.State.Phase != game.StreetShowdownReveal {
 			return fmt.Errorf("hand is not accepting showdown reveals")
 		}
-		if _, ok := findTranscriptRecord(table.ActiveHand.Cards.Transcript, nativeHandMessageShowdownReveal, &seat.SeatIndex, string(game.StreetShowdownReveal), nil); ok {
-			return fmt.Errorf("showdown reveal already recorded for seat %d", seat.SeatIndex)
+		if request.Phase != string(game.StreetShowdownReveal) {
+			return fmt.Errorf("showdown reveal phase mismatch")
 		}
 		if err := verifyShowdownReveal(table.ActiveHand, seat.SeatIndex, request.Cards); err != nil {
 			return err
@@ -2184,7 +2343,7 @@ func (runtime *meshRuntime) validateHandMessageRequest(table nativeTableState, s
 	return nil
 }
 
-func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageRequest) (updated nativeTableState, err error) {
+func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageRequest) (response nativeHandMessageResponse, err error) {
 	var (
 		replicateView *nativeTableState
 	)
@@ -2213,16 +2372,40 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 		if !ok {
 			return fmt.Errorf("player is not seated")
 		}
-		if err := runtime.validateHandMessageRequest(*table, seat, request); err != nil {
+		record, err := runtime.validateHandMessageRequestIdentity(*table, seat, request)
+		if err != nil {
 			return err
 		}
-		record, err := transcriptRecordFromHandMessage(request)
+		recordKey, err := handMessageRecordKey(request.TableID, request.HandID, request.HandNumber, record)
 		if err != nil {
+			return err
+		}
+		response.RecordKey = recordKey
+		existing, ok, err := findParticipantHandMessageSlotRecord(table.ActiveHand.Cards.Transcript, record)
+		if err != nil {
+			return err
+		}
+		if ok {
+			existingKey, err := handMessageRecordKey(table.Config.TableID, table.ActiveHand.State.HandID, table.ActiveHand.State.HandNumber, existing)
+			if err != nil {
+				return err
+			}
+			response.AcceptedTranscriptRoot = existing.RootHash
+			snapshot := cloneJSON(*table)
+			response.Table = snapshot
+			if existingKey == recordKey {
+				response.Duplicate = true
+				return nil
+			}
+			return fmt.Errorf("hand message replay conflicts with existing transcript slot %s", handMessageSlotLabel(record))
+		}
+		if err := runtime.validateNewHandMessageRequest(*table, seat, request, record); err != nil {
 			return err
 		}
 		if err := runtime.appendHandTranscriptRecord(table, record); err != nil {
 			return err
 		}
+		response.AcceptedTranscriptRoot = handTranscriptRoot(*table)
 		if err := runtime.advanceHandProtocolLocked(table); err != nil {
 			return err
 		}
@@ -2230,7 +2413,7 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 			return err
 		}
 		snapshot := cloneJSON(*table)
-		updated = snapshot
+		response.Table = snapshot
 		replicateView = &snapshot
 		return nil
 	})
@@ -2242,7 +2425,7 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 			}(*replicateView)
 		}
 	}
-	return updated, err
+	return response, err
 }
 
 func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
@@ -2257,6 +2440,7 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 	if err != nil || table == nil || table.ActiveHand == nil {
 		return
 	}
+	runtime.reconcileGuestContribution(tableID, *table)
 	snapshot := snapshotProtocolDrive(*table)
 	if !runtime.isRunning() {
 		return
@@ -2296,22 +2480,21 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 		}
 		return
 	}
-	fingerprint := ""
-	shouldRecordSend := false
-	if guestContributionSupportsDedupe(record.Kind) {
-		fingerprint = localContributionFingerprint(*table, *record)
-		if !runtime.shouldSendGuestContribution(tableID, snapshot, fingerprint) {
-			emitMeshTiming(meshTimingFields{
-				Metric:   "guest_protocol_dedupe_skip",
-				TableID:  tableID,
-				Phase:    record.Phase,
-				Purpose:  record.Kind,
-				PlayerID: runtime.walletID.PlayerID,
-			}, 0, nil)
-			debugMeshf("skip duplicate guest contribution table=%s phase=%s kind=%s self=%s", tableID, record.Phase, record.Kind, runtime.walletID.PlayerID)
-			return
-		}
-		shouldRecordSend = true
+	recordKey, err := handMessageRecordKey(table.Config.TableID, table.ActiveHand.State.HandID, table.ActiveHand.State.HandNumber, *record)
+	if err != nil {
+		debugMeshf("compute hand message record key failed table=%s err=%v", tableID, err)
+		return
+	}
+	if !runtime.shouldSendGuestContribution(tableID, guestContributionSnapshot(*table, *record, recordKey)) {
+		emitMeshTiming(meshTimingFields{
+			Metric:   "guest_protocol_dedupe_skip",
+			TableID:  tableID,
+			Phase:    record.Phase,
+			Purpose:  record.Kind,
+			PlayerID: runtime.walletID.PlayerID,
+		}, 0, nil)
+		debugMeshf("skip acked guest contribution table=%s phase=%s kind=%s self=%s", tableID, record.Phase, record.Kind, runtime.walletID.PlayerID)
+		return
 	}
 	driveTiming := startMeshTiming(meshTimingFields{
 		Metric:   "guest_protocol_drive_total",
@@ -2353,21 +2536,28 @@ func (runtime *meshRuntime) driveLocalHandProtocol(tableID string) {
 		debugMeshf("remote hand message failed table=%s kind=%s err=%v", tableID, record.Kind, err)
 		return
 	}
-	debugMeshf("remote hand message accepted table=%s kind=%s phase=%s self=%s", tableID, record.Kind, table.ActiveHand.State.Phase, runtime.walletID.PlayerID)
+	if updated.RecordKey != recordKey {
+		driveErr = fmt.Errorf("hand message receipt record key mismatch")
+		debugMeshf("remote hand message receipt mismatch table=%s kind=%s want=%s got=%s", tableID, record.Kind, recordKey, updated.RecordKey)
+		return
+	}
+	runtime.markGuestContributionAcked(tableID, updated.RecordKey)
+	debugMeshf("remote hand message accepted table=%s kind=%s phase=%s duplicate=%t self=%s", tableID, record.Kind, table.ActiveHand.State.Phase, updated.Duplicate, runtime.walletID.PlayerID)
 	latest, latestErr = runtime.requireLocalTable(tableID)
 	if latestErr != nil || latest == nil || !sameProtocolDriveSnapshot(*latest, snapshot) {
 		driveErr = latestErr
+		if latest != nil {
+			runtime.reconcileGuestContribution(tableID, *latest)
+		}
 		return
 	}
 	if !runtime.isRunning() {
 		return
 	}
-	if err := runtime.acceptRemoteTable(updated); err != nil {
+	if err := runtime.acceptRemoteTable(updated.Table); err != nil {
 		driveErr = err
 		debugMeshf("accept remote table after hand message failed table=%s err=%v", tableID, err)
 		return
 	}
-	if shouldRecordSend {
-		runtime.recordGuestContributionSend(tableID, snapshot, fingerprint)
-	}
+	runtime.reconcileGuestContribution(tableID, updated.Table)
 }
