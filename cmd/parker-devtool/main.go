@@ -77,6 +77,7 @@ func runSelectTableAction(argv []string) error {
 	alicePlayerID := flags.String("alice", "", "alice player id")
 	bobPlayerID := flags.String("bob", "", "bob player id")
 	avoidShowdown := flags.Bool("avoid-showdown", false, "prefer a fold before showdown")
+	preferEarlySettlement := flags.Bool("prefer-early-settlement", false, "prefer a fold when facing a bet")
 	var players namedPlayersFlag
 	flags.Var(&players, "player", "player mapping in the form profile=playerId")
 	if err := flags.Parse(argv); err != nil {
@@ -145,6 +146,17 @@ func runSelectTableAction(argv []string) error {
 	contribution := state.RoundContributions[actorPlayerID]
 	toCall := maxInt(0, state.CurrentBetSats-contribution)
 
+	if envelope.Data.Local.CanAct {
+		if selected, ok := selectMenuActionLine(envelope.Data.Local.TurnMenu, state.Phase, contribution, toCall, *avoidShowdown, *preferEarlySettlement); ok {
+			_, err = fmt.Fprintf(os.Stdout, "%s %s\n", actor, selected)
+			return err
+		}
+	}
+	if selected, ok := selectMenuActionLine(envelope.Data.PendingTurnMenu, state.Phase, contribution, toCall, *avoidShowdown, *preferEarlySettlement); ok {
+		_, err = fmt.Fprintf(os.Stdout, "%s %s\n", actor, selected)
+		return err
+	}
+
 	action := "check"
 	amount := ""
 	if *avoidShowdown && state.Phase == "river" && toCall == 0 {
@@ -155,6 +167,8 @@ func runSelectTableAction(argv []string) error {
 		amount = strconv.Itoa(maxInt(state.MinRaiseToSats, 800))
 	} else if toCall > 0 {
 		if *avoidShowdown && state.Phase == "river" {
+			action = "fold"
+		} else if *preferEarlySettlement {
 			action = "fold"
 		} else {
 			action = "call"
@@ -212,7 +226,9 @@ type tableEnvelope struct {
 }
 
 type tableEnvelopeData struct {
-	PublicState *tablePublicState `json:"publicState"`
+	Local           tableLocalView    `json:"local"`
+	PendingTurnMenu *tableTurnMenu    `json:"pendingTurnMenu"`
+	PublicState     *tablePublicState `json:"publicState"`
 }
 
 type tablePublicState struct {
@@ -228,6 +244,124 @@ type tablePublicState struct {
 type tableSeat struct {
 	PlayerID  string `json:"playerId"`
 	SeatIndex int    `json:"seatIndex"`
+}
+
+type tableLocalView struct {
+	CanAct   bool           `json:"canAct"`
+	TurnMenu *tableTurnMenu `json:"turnMenu"`
+}
+
+type tableTurnMenu struct {
+	Options []tableMenuOption `json:"options"`
+}
+
+type tableMenuOption struct {
+	Action tableAction `json:"action"`
+}
+
+type tableAction struct {
+	LegacyTotalSats *int   `json:"TotalSats"`
+	LegacyType      string `json:"Type"`
+	TotalSats       *int   `json:"totalSats"`
+	Type            string `json:"type"`
+}
+
+func (action tableAction) normalizedType() string {
+	if strings.TrimSpace(action.Type) != "" {
+		return strings.ToLower(strings.TrimSpace(action.Type))
+	}
+	return strings.ToLower(strings.TrimSpace(action.LegacyType))
+}
+
+func (action tableAction) totalSats() (int, bool) {
+	if action.TotalSats != nil {
+		return *action.TotalSats, true
+	}
+	if action.LegacyTotalSats != nil {
+		return *action.LegacyTotalSats, true
+	}
+	return 0, false
+}
+
+func selectMenuActionLine(menu *tableTurnMenu, phase string, contribution, toCall int, avoidShowdown, preferEarlySettlement bool) (string, bool) {
+	if menu == nil || len(menu.Options) == 0 {
+		return "", false
+	}
+
+	bestAggressiveType := ""
+	bestAggressiveTotal := 0
+	bestAggressiveOK := false
+	haveCheck := false
+	haveCall := false
+	haveFold := false
+
+	for _, option := range menu.Options {
+		actionType := option.Action.normalizedType()
+		switch actionType {
+		case "bet", "raise":
+			total, ok := option.Action.totalSats()
+			if !ok || total <= contribution {
+				continue
+			}
+			if !bestAggressiveOK || total < bestAggressiveTotal || (total == bestAggressiveTotal && actionType < bestAggressiveType) {
+				bestAggressiveType = actionType
+				bestAggressiveTotal = total
+				bestAggressiveOK = true
+			}
+		case "check":
+			haveCheck = true
+		case "call":
+			haveCall = true
+		case "fold":
+			haveFold = true
+		}
+	}
+
+	if avoidShowdown && phase == "river" {
+		if toCall > 0 {
+			if haveFold {
+				return "fold", true
+			}
+			if haveCall {
+				return "call", true
+			}
+		} else if bestAggressiveOK {
+			return fmt.Sprintf("%s %d", bestAggressiveType, bestAggressiveTotal), true
+		}
+	}
+	if preferEarlySettlement && toCall > 0 {
+		if haveFold {
+			return "fold", true
+		}
+		if haveCall {
+			return "call", true
+		}
+	}
+
+	if phase == "preflop" && toCall == 0 && bestAggressiveOK {
+		return fmt.Sprintf("%s %d", bestAggressiveType, bestAggressiveTotal), true
+	}
+	if toCall > 0 {
+		if haveCall {
+			return "call", true
+		}
+		if haveFold {
+			return "fold", true
+		}
+	}
+	if haveCheck {
+		return "check", true
+	}
+	if bestAggressiveOK {
+		return fmt.Sprintf("%s %d", bestAggressiveType, bestAggressiveTotal), true
+	}
+	if haveCall {
+		return "call", true
+	}
+	if haveFold {
+		return "fold", true
+	}
+	return "", false
 }
 
 func decodeInput() (any, error) {

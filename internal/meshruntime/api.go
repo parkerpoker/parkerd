@@ -31,6 +31,8 @@ type Runtime interface {
 	JoinTable(inviteCode string, buyInSats int) (NativeMeshTableView, error)
 	GetTable(tableID string) (NativeMeshTableView, error)
 	SendAction(tableID string, action game.Action) (NativeMeshTableView, error)
+	OpenTurnChallenge(tableID string) (NativeMeshTableView, error)
+	ResolveTurnChallenge(tableID, optionID string) (NativeMeshTableView, error)
 	RotateHost(tableID string) (NativeMeshTableView, error)
 	PublicTables() ([]NativePublicTableView, error)
 	CashOut(tableID string) (map[string]any, error)

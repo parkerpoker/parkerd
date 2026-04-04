@@ -201,6 +201,37 @@ func TestHoldemHandTransitions(t *testing.T) {
 		t.Fatalf("unexpected raise minimum: %#v", legal[2])
 	}
 
+	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionCall})
+	if err != nil {
+		t.Fatalf("complete small blind preflop call: %v", err)
+	}
+	legal = GetLegalActions(state, intPtr(1))
+	if len(legal) != 2 || legal[0].Type != ActionCheck || legal[1].Type != ActionBet {
+		t.Fatalf("unexpected checked-to legal actions: %#v", legal)
+	}
+	if legal[1].MinTotalSats == nil || *legal[1].MinTotalSats != 200 {
+		t.Fatalf("unexpected checked-to bet minimum: %#v", legal[1])
+	}
+
+	state, err = CreateHoldemHand(HoldemHandConfig{
+		HandID:          "770e8400-e29b-41d4-a716-446655440000",
+		HandNumber:      1,
+		DealerSeatIndex: 0,
+		SmallBlindSats:  50,
+		BigBlindSats:    100,
+		Seats: []HoldemSeatConfig{
+			{PlayerID: "alpha", StackSats: 2000},
+			{PlayerID: "beta", StackSats: 2000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("recreate hand: %v", err)
+	}
+	state, err = ActivateHoldemHand(state)
+	if err != nil {
+		t.Fatalf("reactivate hand: %v", err)
+	}
+
 	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionRaise, TotalSats: 250})
 	if err != nil {
 		t.Fatalf("raise: %v", err)

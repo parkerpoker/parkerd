@@ -1,6 +1,6 @@
 # Money Flows Deep Dive
 
-This document describes how money moves in the current Parker implementation in this repository.
+This document describes how money moves in Parker.
 
 For card confidentiality and transcript flow, see [dealerless.md](./dealerless.md). For the wire surface, see [protocol.md](./protocol.md). For trust boundaries, see [trust-model.md](./trust-model.md).
 
@@ -8,7 +8,7 @@ For card confidentiality and transcript flow, see [dealerless.md](./dealerless.m
 
 Parker treats Ark-backed table custody as the monetary source of truth.
 
-The important current-state rules are:
+The key rules are:
 
 - `LatestCustodyState` is the authoritative money checkpoint
 - `LatestSnapshot` and `LatestFullySignedSnapshot` are derived replay/debug projections
@@ -16,14 +16,16 @@ The important current-state rules are:
 - accepted action and funds history replays from canonical signed request objects, not host-authored summaries or `ActionLog`
 - accepted Ark-settled custody history replays from the stored settlement witness bundle in `CustodyProof`, not from live Ark/indexer lookups
 - deterministic contested-pot recovery uses pre-signed CSV recovery bundles over the shared pot exit
-- accepted timeout/showdown history can therefore replay either from `SettlementWitness` or from stored `RecoveryBundles` plus an executed `RecoveryWitness`
-- in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the losing player cannot later cash out or emergency-exit a larger pre-loss claim
-- zero-exposure successors like `check` can still advance custody through a non-settlement transition that reuses the same refs
+- accepted timeout/showdown history can therefore replay either from `SettlementWitness`, from stored `RecoveryBundles` plus an executed `RecoveryWitness`, or from `ChallengeBundle` plus `ChallengeWitness` for the chain-challenge path
+- in the heads-up runtime, once a custody-backed betting or payout step is accepted, the losing player cannot later cash out or emergency-exit a larger pre-loss claim
+- zero-exposure successors like `check` can advance custody through a non-settlement transition that reuses the same refs
 - `meshRenew` is not a money-moving primitive; continuing play means carrying forward the latest stack claims
 - local table-funds state is `arkade-table-funds/v1`, which records custody state hashes, Ark ids, and VTXO refs instead of local-only receipts
 - `walletSummary()` presents Ark wallet funds plus locally recorded custody-backed table-funds buckets as separate totals
+- second-based challenge escapes validate from accepted timestamps, while block-based challenge escapes validate from exact open and escape confirmation heights plus the live chain tip
+- accepted table state does not carry live tip height or transaction confirmation heights for challenge escape replay
 
-In mock-settlement mode the runtime still synthesizes Ark ids for tests, but the runtime model and checkpoints are custody-first either way.
+Mock-settlement mode synthesizes Ark ids for tests, but the runtime model and checkpoints are custody-first either way.
 
 ## Monetary Layers
 
@@ -53,6 +55,8 @@ This is the spendable wallet pool outside a table.
 - `CustodySettlementWitness`
 - `CustodyRecoveryBundle`
 - `CustodyRecoveryWitness`
+- `CustodyChallengeBundle`
+- `CustodyChallengeWitness`
 - `TimeoutResolution`
 
 `CustodyState` binds money to gameplay by hashing:
@@ -81,6 +85,7 @@ The proof surface depends on how the transition finalized:
 - ordinary real Ark completion commits to `CustodyProof.SettlementWitness`
 - deterministic recovery-ready source transitions store `CustodyProof.RecoveryBundles`
 - executed fallback `timeout` or `showdown-payout` transitions commit to `CustodyProof.RecoveryWitness`
+- chain-challenge open, resolution, timeout, and escape transitions commit to `CustodyProof.ChallengeBundle` and `CustodyProof.ChallengeWitness`
 
 ### 3. Derived projections
 
@@ -176,13 +181,13 @@ That witness bundle is authoritative replay proof. The duplicated top-level summ
 
 Not every accepted custody step needs a fresh Ark batch.
 
-For actions like `check`, or for timeout auto-check when no stack or pot claims change, Parker still advances the custody chain without forcing a new Ark batch. In that case the runtime:
+For actions like `check`, or for timeout auto-check when no stack or pot claims change, Parker advances the custody chain without forcing a new Ark batch. In that case the runtime:
 
 1. carries forward the latest accepted custody refs
 2. updates the custody binding fields such as transcript root, decision index, acting player, and legal-actions hash
 3. finalizes a non-settlement custody transition with approvals and replay validation, but without an Ark spend bundle
 
-Current validation scope: `action`, `timeout`, and `blind-post` successors exact-match the locally derived custody bindings, including `ActionDeadlineAt`, `ChallengeAnchor`, and `TranscriptRoot`. That deadline derivation uses the accepted table timing config, not the local daemon's current settlement mode. The same strict binding-field equality is also enforced for `cash-out`, `emergency-exit`, and the other host-derived non-action successors such as `buy-in-lock`, `showdown-payout`, and `carry-forward`.
+Validation scope: `action`, `timeout`, and `blind-post` successors exact-match the locally derived custody bindings, including `ActionDeadlineAt`, `ChallengeAnchor`, and `TranscriptRoot`. That deadline derivation uses the accepted table timing config, not the local daemon's settlement mode. The same strict binding-field equality is also enforced for `cash-out`, `emergency-exit`, and the other host-derived non-action successors such as `buy-in-lock`, `showdown-payout`, and `carry-forward`.
 
 ### Timeout successors
 
@@ -194,23 +199,48 @@ Timeout validation is also local-derivation-first:
 - it derives auto-check vs auto-fold from the accepted timeout policy and the current legal actions
 - it rejects any timeout successor whose supplied resolution disagrees with that local derivation
 
-Current timeout behavior:
+Timeout behavior:
 
 - if `check` is legal, timeout can auto-check
 - otherwise timeout auto-folds
 - reveal/private-delivery/showdown timeout makes the missing player dead for contested pots while refunding unmatched uncontested chips
-- only deterministic money-resolving timeout states get stored recovery bundles; in the current v1 runtime that means action auto-fold, `showdown-reveal` timeout, or settled `showdown-payout`
+- only deterministic money-resolving timeout states get stored recovery bundles; in v1 that means action auto-fold, `showdown-reveal` timeout, or settled `showdown-payout`
 - those bundles become executable only after the unilateral exit delay `U`
 
 Timeout-driven successors may exclude the dead player from the approval set for the successor that resolves the hand.
 
 For deterministic contested pots, the source accepted transition stores the fully signed recovery PSBT before it is considered complete. If later live timeout finalization cannot complete, the host can wait for `U`, execute that stored PSBT over the shared pot CSV exit, and append the same semantic `timeout` transition with `RecoveryWitness` instead of `SettlementWitness`.
 
-That execution still uses the ordinary unilateral-exit broadcaster. In practice the recovering daemon therefore needs the same small on-chain fee-bump reserve that Parker already assumes for unilateral exits; the bundle removes the need for fresh cooperative signatures, not the need to relay the recovery package.
+That execution uses the ordinary unilateral-exit broadcaster. In practice the recovering daemon therefore needs the same small on-chain fee-bump reserve that Parker already assumes for unilateral exits; the bundle removes the need for fresh cooperative signatures, not the need to relay the recovery package.
+
+### Turn challenge fallback
+
+When the table uses `turnTimeoutMode = "chain-challenge"`, the same accepted turn menu also carries a `ChallengeEnvelope`.
+
+That envelope contains four fully signed onchain PSBT families:
+
+- one `turn-challenge-open` bundle that spends every live stack ref and pot ref through the predeclared `D` locktime leaf and reissues the full live bankroll into one `TurnChallengeRef`
+- one option-resolution bundle per finite turn option, each spending `TurnChallengeRef` through its cooperative player-only leaf
+- one timeout-resolution bundle that also spends `TurnChallengeRef` through the cooperative player-only leaf, but with transaction locktime `D + C`
+- one escape bundle that spends `TurnChallengeRef` through its CSV exit leaf
+
+The money model changes shape but not ownership:
+
+- before `turn-challenge-open`, money is distributed across the ordinary stack refs and pot refs
+- after `turn-challenge-open`, the full live bankroll is represented by one `TurnChallengeRef`
+- after an option-resolution, timeout-resolution, or escape spend, money returns to the ordinary stack/pot layout described by the accepted successor transition
+
+Challenge escape maturity depends on the CSV type:
+
+- second-based CSV uses `PendingTurnChallenge.escapeEligibleAt` and replay compares `ChallengeWitness.executedAt` against that accepted timestamp
+- block-based CSV leaves `PendingTurnChallenge.escapeEligibleAt` empty and computes readiness from the accepted open transaction height plus the CSV block delay
+- local escape readiness queries the accepted open txid through the wallet explorer surface, requires that transaction to be confirmed, computes `eligibleHeight = openConfirmedHeight + csvBlocks`, and requires the live chain tip to be at least that height
+- accepted replay queries chain status for both the open txid and the escape txid and requires the escape confirmation height to be at least `eligibleHeight`
+- if Parker cannot verify those heights, local escape resolution and accepted replay both fail closed
 
 ### Settled payouts
 
-`internal/game` is side-pot aware and produces N-player-capable contribution structures even though runtime table creation still rejects `seatCount > 2`.
+`internal/game` is side-pot aware and produces N-player-capable contribution structures even though runtime table creation rejects `seatCount > 2`.
 
 The custody layer carries:
 
@@ -238,7 +268,7 @@ Operationally, that means:
 
 - both flows spend from the acting player's latest accepted stack claim in `LatestCustodyState`, not from a stale pre-hand or pre-bet balance
 - `meshExit` is rejected while a hand is live, so contested pot money cannot be pulled out mid-hand through the unilateral exit path
-- emergency-exit requests must carry the exact current source refs used by the local exit execution proof
+- emergency-exit requests must carry the exact source refs used by the local exit execution proof
 
 Those `arkade-table-funds/v1` operations carry:
 
@@ -277,30 +307,31 @@ There is no separate local renewal receipt that changes monetary truth.
 Interpretation:
 
 - `WalletSpendableSats` is the Ark wallet's spendable balance
-- `TableLockedSats` is value currently recorded in local `arkade-table-funds/v1` entries with `pending-lock` or `locked` status
+- `TableLockedSats` is value recorded in local `arkade-table-funds/v1` entries with `pending-lock` or `locked` status
 - `PendingExitSats` is value recorded in local `arkade-table-funds/v1` entries awaiting exit/cash-out completion
-- `AvailableSats` is spendable wallet balance net of currently table-locked and pending-exit commitments
+- `AvailableSats` is spendable wallet balance net of table-locked and pending-exit commitments
 
 This is presentation over the Ark wallet balance plus the local custody-backed funds ledger, not a security overlay and not a direct scan of `LatestCustodyState`.
 
-## Current Runtime Scope
+## Runtime Scope
 
-The money model is N-player-capable, but table creation still enforces heads-up runtime only:
+The money model is N-player-capable, but table creation enforces heads-up runtime only:
 
-- `seatCount > 2` is rejected in the current dealerless runtime
+- `seatCount > 2` is rejected in the dealerless runtime
 - side-pot and payout code is already generalized
-- a separate multi-player dealing/privacy protocol is still required before multi-seat runtime play is enabled
+- a separate multi-player dealing/privacy protocol is required before multi-seat runtime play is enabled
 
 ## Practical Reading
 
-The safest way to read the implementation today is:
+The safest way to read the implementation is:
 
 - wallet spendable funds live in Ark
 - table money truth lives in `LatestCustodyState`
 - snapshots and public state are derived from accepted custody-backed gameplay
 - every real exposure change is supposed to fail closed if custody cannot be finalized
 - poker-semantic successor validation and Ark/output-shape validation are distinct required checks
-- real-mode approval still uses live Ark/indexer checks when current liveness or spendability matters, but accepted-history replay validates stored settlement witness bundles offline
+- real-mode approval uses live Ark/indexer checks when liveness or spendability matters, but accepted-history replay validates stored settlement witness bundles offline
 - deterministic recovery replay validates stored recovery bundles and executed recovery witnesses offline, with no live Ark/indexer lookup
-- in the current heads-up runtime, once a betting or payout step is accepted into custody history, the other player cannot later cash out or emergency-exit a larger pre-loss claim
+- challenge replay validates stored challenge bundles and executed challenge witnesses offline, with live chain lookups only for the exact block-height checks required by block-based CSV escape
+- in the heads-up runtime, once a betting or payout step is accepted into custody history, the other player cannot later cash out or emergency-exit a larger pre-loss claim
 - operator or indexer outages affect liveness and visibility, not ownership of the latest accepted custody claim

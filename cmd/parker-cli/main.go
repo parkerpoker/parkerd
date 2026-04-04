@@ -116,6 +116,9 @@ func runTableCommand(client *parker.Client, positionals []string, flags parker.F
 		if value, ok := parker.FlagString(flags, "name"); ok {
 			table["name"] = value
 		}
+		if value, ok := parker.FlagString(flags, "turn-timeout-mode"); ok {
+			table["turnTimeoutMode"] = value
+		}
 		visibility, err := resolveTableVisibility(flags)
 		if err != nil {
 			return err
@@ -644,7 +647,7 @@ func printHelp() {
 		"  bootstrap [nickname] [--wallet-nsec <nsec>] --profile <name>",
 		"  wallet [nsec|summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
 		"  network peers|bootstrap add <endpoint> [alias] --profile <name>",
-		"  table create [--name <name>] [--visibility <public|private>] [--public|--private] [--witness-peer-ids <id[,id]>] | created [--cursor <cursor>] [--limit <n>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
+		"  table create [--name <name>] [--visibility <public|private>] [--public|--private] [--witness-peer-ids <id[,id]>] [--turn-timeout-mode <direct|chain-challenge>] | created [--cursor <cursor>] [--limit <n>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
 		"  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
 		"  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
 		"  interactive --profile <name>",

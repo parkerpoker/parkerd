@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,13 +18,22 @@ const (
 
 type ProfileStore struct {
 	profileDir string
+	cache      *profileStoreCache
 }
 
 func NewProfileStore(profileDir string) *ProfileStore {
-	return &ProfileStore{profileDir: profileDir}
+	cleanedDir := filepath.Clean(profileDir)
+	return &ProfileStore{
+		profileDir: cleanedDir,
+		cache:      sharedProfileStoreCache(cleanedDir),
+	}
 }
 
 func (store *ProfileStore) Load(profileName string) (*PlayerProfileState, error) {
+	if cached, ok := store.cache.load(profileName); ok {
+		return cached, nil
+	}
+
 	path := store.pathFor(profileName)
 	for attempt := 0; attempt < profileLoadRetries; attempt++ {
 		data, err := os.ReadFile(path)
@@ -49,6 +59,7 @@ func (store *ProfileStore) Load(profileName string) (*PlayerProfileState, error)
 			}
 			return nil, err
 		}
+		store.cache.save(state)
 		return &state, nil
 	}
 	return nil, nil
@@ -69,6 +80,7 @@ func (store *ProfileStore) Save(state PlayerProfileState) error {
 	if err := writeFileAtomic(path, data, 0o644); err != nil {
 		return err
 	}
+	store.cache.save(state)
 	return nil
 }
 
@@ -123,6 +135,39 @@ func (store *ProfileStore) ListProfiles() ([]LocalProfileSummary, error) {
 
 func (store *ProfileStore) pathFor(profileName string) string {
 	return filepath.Join(store.profileDir, profileName+".json")
+}
+
+type profileStoreCache struct {
+	mu       sync.RWMutex
+	profiles map[string]PlayerProfileState
+}
+
+var sharedProfileStoreCaches sync.Map
+
+func sharedProfileStoreCache(profileDir string) *profileStoreCache {
+	if cache, ok := sharedProfileStoreCaches.Load(profileDir); ok {
+		return cache.(*profileStoreCache)
+	}
+	cache := &profileStoreCache{profiles: map[string]PlayerProfileState{}}
+	actual, _ := sharedProfileStoreCaches.LoadOrStore(profileDir, cache)
+	return actual.(*profileStoreCache)
+}
+
+func (cache *profileStoreCache) load(profileName string) (*PlayerProfileState, bool) {
+	cache.mu.RLock()
+	state, ok := cache.profiles[profileName]
+	cache.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return clonePlayerProfileState(&state), true
+}
+
+func (cache *profileStoreCache) save(state PlayerProfileState) {
+	cloned := clonePlayerProfileState(&state)
+	cache.mu.Lock()
+	cache.profiles[state.ProfileName] = *cloned
+	cache.mu.Unlock()
 }
 
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {

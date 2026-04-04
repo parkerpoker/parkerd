@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -34,6 +35,11 @@ type Runtime struct {
 }
 
 const nigiriFaucetTimeout = 45 * time.Second
+
+var (
+	mockArkForfeitPubkeyHex = mockCustodyPubkeyHex("parker-mock-ark-forfeit")
+	mockArkSignerPubkeyHex  = mockCustodyPubkeyHex("parker-mock-ark-signer")
+)
 
 type RuntimeConfig struct {
 	ArkServerURL      string
@@ -104,7 +110,7 @@ func (runtime *Runtime) GetWallet(profileName string) (WalletSummary, error) {
 			}
 			mock := createMockWallet(identity.PlayerID)
 			state.MockWallet = &mock
-			if err := runtime.store.Save(*state); err != nil {
+			if err := runtime.saveProfileState(*state); err != nil {
 				return WalletSummary{}, err
 			}
 		}
@@ -122,13 +128,21 @@ func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) 
 		return CustodyArkConfig{}, err
 	}
 	if runtime.config.UseMockSettlement {
-		return CustodyArkConfig{
+		if cached, ok := cachedArkConfig(*state); ok {
+			return cached, nil
+		}
+		cached := CustodyArkConfig{
 			ArkServerURL:        runtime.config.ArkServerURL,
 			DustSats:            1,
-			ForfeitPubkeyHex:    mockCustodyPubkeyHex("parker-mock-ark-forfeit"),
-			SignerPubkeyHex:     mockCustodyPubkeyHex("parker-mock-ark-signer"),
+			ForfeitPubkeyHex:    mockArkForfeitPubkeyHex,
+			SignerPubkeyHex:     mockArkSignerPubkeyHex,
 			UnilateralExitDelay: arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512},
-		}, nil
+		}
+		state.CachedArkConfig = &cached
+		if err := runtime.saveProfileState(*state); err != nil {
+			return CustodyArkConfig{}, err
+		}
+		return cached, nil
 	}
 
 	runtime.mu.Lock()
@@ -167,7 +181,7 @@ func (runtime *Runtime) ArkConfig(profileName string) (CustodyArkConfig, error) 
 		UnilateralExitDelay:   config.UnilateralExitDelay,
 	}
 	state.CachedArkConfig = &cached
-	if err := runtime.store.Save(*state); err != nil {
+	if err := runtime.saveProfileState(*state); err != nil {
 		return CustodyArkConfig{}, err
 	}
 	return cached, nil
@@ -198,7 +212,7 @@ func (runtime *Runtime) getWalletLocked(profileName string, state PlayerProfileS
 	}
 	debugWalletf("wallet summary addresses ready profile=%s ark=%s boarding=%s", profileName, arkAddress, boardingAddress)
 	state.CachedOnchainAddresses = append([]string(nil), onchainAddresses...)
-	if err := runtime.store.Save(state); err != nil {
+	if err := runtime.saveProfileState(state); err != nil {
 		return WalletSummary{}, err
 	}
 
@@ -439,7 +453,7 @@ func (runtime *Runtime) SendCustodyOffChain(profileName string, receivers []sdkt
 
 func (runtime *Runtime) SignCustodyTransaction(profileName, tx string) (string, error) {
 	if runtime.config.UseMockSettlement {
-		return "mock-signed-" + tx, nil
+		return tx, nil
 	}
 	state, err := runtime.ensureBootstrap(profileName, "", "")
 	if err != nil {
@@ -494,7 +508,7 @@ func (runtime *Runtime) Faucet(profileName string, amountSats int) error {
 		wallet.AvailableSats += amountSats
 		wallet.TotalSats += amountSats
 		state.MockWallet = &wallet
-		return runtime.store.Save(*state)
+		return runtime.saveProfileState(*state)
 	}
 
 	state, err := runtime.ensureBootstrap(profileName, "", "")
@@ -652,12 +666,13 @@ func (runtime *Runtime) SubmitWithdrawal(profileName string, amountSats int, inv
 }
 
 func (runtime *Runtime) ensureBootstrap(profileName, nickname, walletNsec string) (*PlayerProfileState, error) {
-	existing, err := runtime.store.Load(profileName)
+	existing, err := runtime.loadProfileState(profileName)
 	if err != nil {
 		return nil, err
 	}
 
 	state := &PlayerProfileState{}
+	dirty := existing == nil
 	if existing != nil {
 		*state = *existing
 	}
@@ -675,24 +690,31 @@ func (runtime *Runtime) ensureBootstrap(profileName, nickname, walletNsec string
 
 	if state.HandSeeds == nil {
 		state.HandSeeds = map[string]string{}
+		dirty = true
 	}
 	if state.ProfileName == "" {
 		state.ProfileName = profileName
+		dirty = true
 	}
-	if nickname != "" {
+	if nickname != "" && state.Nickname != nickname {
 		state.Nickname = nickname
+		dirty = true
 	}
 	if state.Nickname == "" {
 		state.Nickname = profileName
+		dirty = true
 	}
 	if state.PrivateKeyHex == "" {
 		state.PrivateKeyHex = seed
+		dirty = true
 	}
 	if state.WalletPrivateKeyHex == "" {
 		state.WalletPrivateKeyHex = state.PrivateKeyHex
+		dirty = true
 	}
 	if state.PrivateKeyHex == "" {
 		state.PrivateKeyHex = state.WalletPrivateKeyHex
+		dirty = true
 	}
 
 	if runtime.config.UseMockSettlement && state.MockWallet == nil {
@@ -702,12 +724,23 @@ func (runtime *Runtime) ensureBootstrap(profileName, nickname, walletNsec string
 		}
 		mock := createMockWallet(identity.PlayerID)
 		state.MockWallet = &mock
+		dirty = true
 	}
 
-	if err := runtime.store.Save(*state); err != nil {
-		return nil, err
+	if dirty {
+		if err := runtime.saveProfileState(*state); err != nil {
+			return nil, err
+		}
 	}
 	return state, nil
+}
+
+func (runtime *Runtime) loadProfileState(profileName string) (*PlayerProfileState, error) {
+	return runtime.store.Load(profileName)
+}
+
+func (runtime *Runtime) saveProfileState(state PlayerProfileState) error {
+	return runtime.store.Save(state)
 }
 
 func (runtime *Runtime) openArkClient(profileName string, state PlayerProfileState) (arksdk.ArkClient, func() error, func(), error) {
@@ -862,6 +895,74 @@ func cachedArkConfig(state PlayerProfileState) (CustodyArkConfig, bool) {
 		return CustodyArkConfig{}, false
 	}
 	return *state.CachedArkConfig, true
+}
+
+func clonePlayerProfileState(state *PlayerProfileState) *PlayerProfileState {
+	if state == nil {
+		return nil
+	}
+
+	cloned := *state
+	if state.CachedArkConfig != nil {
+		cached := *state.CachedArkConfig
+		cloned.CachedArkConfig = &cached
+	}
+	if state.CachedChainTip != nil {
+		cached := *state.CachedChainTip
+		cloned.CachedChainTip = &cached
+	}
+	if len(state.CachedOnchainAddresses) > 0 {
+		cloned.CachedOnchainAddresses = append([]string(nil), state.CachedOnchainAddresses...)
+	}
+	if state.CurrentTable != nil {
+		currentTable := *state.CurrentTable
+		cloned.CurrentTable = &currentTable
+	}
+	if len(state.HandSeeds) > 0 {
+		cloned.HandSeeds = make(map[string]string, len(state.HandSeeds))
+		for key, value := range state.HandSeeds {
+			cloned.HandSeeds[key] = value
+		}
+	}
+	if len(state.KnownPeers) > 0 {
+		cloned.KnownPeers = make([]KnownPeerState, len(state.KnownPeers))
+		for index, peer := range state.KnownPeers {
+			cloned.KnownPeers[index] = cloneKnownPeerState(peer)
+		}
+	}
+	if len(state.MeshTables) > 0 {
+		cloned.MeshTables = make(map[string]MeshTableReferenceState, len(state.MeshTables))
+		for tableID, table := range state.MeshTables {
+			cloned.MeshTables[tableID] = cloneMeshTableReferenceState(table)
+		}
+	}
+	if state.MockWallet != nil {
+		mockWallet := *state.MockWallet
+		cloned.MockWallet = &mockWallet
+	}
+	return &cloned
+}
+
+func cloneKnownPeerState(state KnownPeerState) KnownPeerState {
+	cloned := state
+	if len(state.Capabilities) > 0 {
+		cloned.Capabilities = append([]string(nil), state.Capabilities...)
+	}
+	if len(state.MailboxEndpoints) > 0 {
+		cloned.MailboxEndpoints = append([]string(nil), state.MailboxEndpoints...)
+	}
+	if len(state.Roles) > 0 {
+		cloned.Roles = append([]string(nil), state.Roles...)
+	}
+	return cloned
+}
+
+func cloneMeshTableReferenceState(state MeshTableReferenceState) MeshTableReferenceState {
+	cloned := state
+	if len(state.Config) > 0 {
+		cloned.Config = json.RawMessage(append([]byte(nil), state.Config...))
+	}
+	return cloned
 }
 
 func cachedOnchainAddresses(state PlayerProfileState) []string {

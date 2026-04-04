@@ -601,7 +601,7 @@ func GetLegalActions(state HoldemState, seatIndex *int) []LegalAction {
 	if toCall == 0 {
 		actions := []LegalAction{{Type: ActionCheck}}
 		if player.StackSats > 0 {
-			minTotal := maxInt(state.BigBlindSats, 1)
+			minTotal := player.RoundContributionSats + maxInt(state.BigBlindSats, 1)
 			maxTotal := maxTotalSats
 			actions = append(actions, LegalAction{
 				Type:         ActionBet,

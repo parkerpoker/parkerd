@@ -80,10 +80,7 @@ func expireLocalActionDeadlineForRecoveryTest(t *testing.T, runtime *meshRuntime
 	t.Helper()
 
 	table := mustReadNativeTable(t, runtime, tableID)
-	if table.LatestCustodyState == nil {
-		t.Fatal("expected latest custody state")
-	}
-	table.LatestCustodyState.ActionDeadlineAt = addMillis(nowISO(), -1)
+	expireCurrentTurnActionDeadlineForTest(t, &table)
 	if err := runtime.store.writeTable(&table); err != nil {
 		t.Fatalf("write expired action deadline: %v", err)
 	}
@@ -148,6 +145,80 @@ func TestRecoveryBundlesOnlyAttachOnDeterministicMoneyResolvingStates(t *testing
 	}
 	if len(lastTransition.Proof.RecoveryBundles) != 0 {
 		t.Fatalf("expected auto-check state to skip recovery bundles, got %d", len(lastTransition.Proof.RecoveryBundles))
+	}
+}
+
+func TestDeterministicRecoveryFastPathSkipsSourcesWithoutPotRefs(t *testing.T) {
+	host, _, table, hand, blindTransition := manualBlindTransitionSourceForRecoveryTest(t)
+
+	if deterministicRecoveryImpossibleForSource(table, &blindTransition, &hand) {
+		t.Fatal("expected blind-post source to allow deterministic recovery")
+	}
+
+	noPotTransition := cloneJSON(blindTransition)
+	noPotTransition.NextState.PotSlices = nil
+	noPotTransition.Proof.RecoveryBundles = nil
+	if !deterministicRecoveryImpossibleForSource(table, &noPotTransition, &hand) {
+		t.Fatal("expected missing source pot refs to make deterministic recovery impossible")
+	}
+	if err := host.attachDeterministicRecoveryBundles(table, &noPotTransition, nil, &hand); err != nil {
+		t.Fatalf("attach recovery bundles on no-pot source: %v", err)
+	}
+	if len(noPotTransition.Proof.RecoveryBundles) != 0 {
+		t.Fatalf("expected no recovery bundles for no-pot source, got %d", len(noPotTransition.Proof.RecoveryBundles))
+	}
+}
+
+func TestRecoveryBundleSourceContextReusePreservesBundleContents(t *testing.T) {
+	host, _, table, hand, blindTransition := manualBlindTransitionSourceForRecoveryTest(t)
+
+	targets, err := host.deterministicRecoveryTargetsForTransition(table, blindTransition, &hand)
+	if err != nil {
+		t.Fatalf("derive deterministic recovery targets: %v", err)
+	}
+	if len(targets) == 0 {
+		t.Fatal("expected deterministic recovery targets")
+	}
+
+	var (
+		target  tablecustody.CustodyTransition
+		outputs []custodyBatchOutput
+		found   bool
+	)
+	for _, candidate := range targets {
+		outputs, err = host.recoveryAuthorizedOutputsForTransition(table, &blindTransition.NextState, candidate)
+		if err != nil {
+			t.Fatalf("derive recovery outputs: %v", err)
+		}
+		if len(outputs) == 0 {
+			continue
+		}
+		target = candidate
+		found = true
+		break
+	}
+	if !found {
+		t.Fatal("expected at least one recovery target with authorized outputs")
+	}
+
+	sourceCtx, err := host.prepareRecoverySourceContext(table, blindTransition)
+	if err != nil {
+		t.Fatalf("prepare recovery source context: %v", err)
+	}
+	if sourceCtx == nil {
+		t.Fatal("expected recovery source context")
+	}
+
+	directBundle, err := host.buildRecoveryBundle(table, blindTransition, target, nil, outputs)
+	if err != nil {
+		t.Fatalf("build direct recovery bundle: %v", err)
+	}
+	reusedBundle, err := host.buildRecoveryBundleWithSourceContext(table, blindTransition, target, nil, outputs, sourceCtx)
+	if err != nil {
+		t.Fatalf("build reused recovery bundle: %v", err)
+	}
+	if !reflect.DeepEqual(directBundle, reusedBundle) {
+		t.Fatalf("expected reused recovery bundle to match direct build\n direct=%+v\n reused=%+v", directBundle, reusedBundle)
 	}
 }
 
@@ -298,6 +369,36 @@ func TestActionTimeoutRecoveryMatchesCooperativeSuccessor(t *testing.T) {
 	}
 }
 
+func TestActionTimeoutRecoveryDoesNotRequirePersistedPendingTurnMenu(t *testing.T) {
+	host, _, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
+
+	before = withLatestRecoveryBundlesForTest(t, host, before, before.ActiveHand.State)
+	before.Config.TurnTimeoutMode = turnTimeoutModeDirect
+	lastIndex := len(before.CustodyTransitions) - 1
+	for index := range before.CustodyTransitions[lastIndex].Proof.RecoveryBundles {
+		before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].EarliestExecuteAt = addMillis(nowISO(), -1)
+		before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].BundleHash = tablecustody.HashCustodyRecoveryBundle(before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index])
+	}
+	expireCurrentTurnActionDeadlineForTest(t, &before)
+	before.LatestCustodyState.PublicStateHash = host.publicMoneyStateHash(before, &before.ActiveHand.State)
+	before.PendingTurnMenu = nil
+
+	handled, err := host.handleActionTimeoutLocked(&before)
+	if err != nil {
+		t.Fatalf("handle action timeout without pending menu: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected timeout recovery to finalize without a persisted pending turn menu")
+	}
+	lastTransition := before.CustodyTransitions[len(before.CustodyTransitions)-1]
+	if lastTransition.Kind != tablecustody.TransitionKindTimeout {
+		t.Fatalf("expected latest custody transition %q, got %q", tablecustody.TransitionKindTimeout, lastTransition.Kind)
+	}
+	if lastTransition.Proof.RecoveryWitness == nil {
+		t.Fatal("expected timeout recovery witness on the finalized timeout transition")
+	}
+}
+
 func TestRecoveryFailsClosedWithoutStoredSourceBundle(t *testing.T) {
 	host, _, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
 
@@ -343,6 +444,8 @@ func TestRecoveryFailsClosedWithoutStoredSourceBundle(t *testing.T) {
 }
 
 func TestShowdownRevealRecoveryMatchesCooperativePayoutSuccessor(t *testing.T) {
+	t.Parallel()
+
 	host, guest, tableID := createSyntheticRealStartedTableForRecoveryTest(t)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
@@ -350,11 +453,11 @@ func TestShowdownRevealRecoveryMatchesCooperativePayoutSuccessor(t *testing.T) {
 		t.Fatalf("host send preflop call: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
-	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionBet, TotalSats: 800}); err != nil {
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
 		t.Fatalf("guest send preflop bet: %v", err)
 	}
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
 		t.Fatalf("host send preflop call to showdown line: %v", err)
 	}
 	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {

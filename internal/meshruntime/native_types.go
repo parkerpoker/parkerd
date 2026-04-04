@@ -62,28 +62,35 @@ type NativeMeshRuntimeState struct {
 	Tables        []NativeTableSummary  `json:"tables"`
 }
 
+type ActionMenuPolicy struct {
+	PotFractionBps []int `json:"potFractionBps,omitempty"`
+}
+
 type NativeMeshTableConfig struct {
-	ActionTimeoutMS           int    `json:"actionTimeoutMs,omitempty"`
-	BigBlindSats              int    `json:"bigBlindSats"`
-	BuyInMaxSats              int    `json:"buyInMaxSats"`
-	BuyInMinSats              int    `json:"buyInMinSats"`
-	CreatedAt                 string `json:"createdAt"`
-	DealerMode                string `json:"dealerMode"`
-	HandProtocolTimeoutMS     int    `json:"handProtocolTimeoutMs,omitempty"`
-	HostPeerID                string `json:"hostPeerId"`
-	HostPlaysAllowed          bool   `json:"hostPlaysAllowed"`
-	Name                      string `json:"name"`
-	NetworkID                 string `json:"networkId"`
-	NextHandDelayMS           int    `json:"nextHandDelayMs,omitempty"`
-	OccupiedSeats             int    `json:"occupiedSeats"`
-	ProtocolVersion           string `json:"protocolVersion"`
-	PublicSpectatorDelayHands int    `json:"publicSpectatorDelayHands"`
-	SeatCount                 int    `json:"seatCount"`
-	SmallBlindSats            int    `json:"smallBlindSats"`
-	SpectatorsAllowed         bool   `json:"spectatorsAllowed"`
-	Status                    string `json:"status"`
-	TableID                   string `json:"tableId"`
-	Visibility                string `json:"visibility"`
+	ActionMenuPolicy          ActionMenuPolicy `json:"actionMenuPolicy,omitempty"`
+	ActionTimeoutMS           int              `json:"actionTimeoutMs,omitempty"`
+	BigBlindSats              int              `json:"bigBlindSats"`
+	BuyInMaxSats              int              `json:"buyInMaxSats"`
+	BuyInMinSats              int              `json:"buyInMinSats"`
+	CreatedAt                 string           `json:"createdAt"`
+	DealerMode                string           `json:"dealerMode"`
+	HandProtocolTimeoutMS     int              `json:"handProtocolTimeoutMs,omitempty"`
+	HostPeerID                string           `json:"hostPeerId"`
+	HostPlaysAllowed          bool             `json:"hostPlaysAllowed"`
+	Name                      string           `json:"name"`
+	NetworkID                 string           `json:"networkId"`
+	NextHandDelayMS           int              `json:"nextHandDelayMs,omitempty"`
+	OccupiedSeats             int              `json:"occupiedSeats"`
+	ProtocolVersion           string           `json:"protocolVersion"`
+	PublicSpectatorDelayHands int              `json:"publicSpectatorDelayHands"`
+	SeatCount                 int              `json:"seatCount"`
+	SmallBlindSats            int              `json:"smallBlindSats"`
+	SpectatorsAllowed         bool             `json:"spectatorsAllowed"`
+	Status                    string           `json:"status"`
+	TableID                   string           `json:"tableId"`
+	TurnChallengeWindowMS     int              `json:"turnChallengeWindowMs,omitempty"`
+	TurnTimeoutMode           string           `json:"turnTimeoutMode,omitempty"`
+	Visibility                string           `json:"visibility"`
 }
 
 type NativeSeatedPlayer struct {
@@ -192,11 +199,14 @@ type NativePublicTableView struct {
 }
 
 type NativeTableLocalView struct {
-	CanAct       bool               `json:"canAct"`
-	LegalActions []game.LegalAction `json:"legalActions"`
-	MyHoleCards  any                `json:"myHoleCards"`
-	MyPlayerID   any                `json:"myPlayerId"`
-	MySeatIndex  any                `json:"mySeatIndex"`
+	CanAct             bool                            `json:"canAct"`
+	LegalActions       []game.LegalAction              `json:"legalActions"`
+	MyHoleCards        any                             `json:"myHoleCards"`
+	MyPlayerID         any                             `json:"myPlayerId"`
+	MySeatIndex        any                             `json:"mySeatIndex"`
+	TurnChallenge      *NativePendingTurnChallenge     `json:"turnChallenge,omitempty"`
+	TurnChallengeChain *NativeTurnChallengeChainStatus `json:"turnChallengeChain,omitempty"`
+	TurnMenu           *NativePendingTurnMenu          `json:"turnMenu,omitempty"`
 }
 
 type NativeMeshTableView struct {
@@ -207,6 +217,8 @@ type NativeMeshTableView struct {
 	LatestFullySignedSnapshot *NativeCooperativeTableSnapshot  `json:"latestFullySignedSnapshot"`
 	LatestSnapshot            *NativeCooperativeTableSnapshot  `json:"latestSnapshot"`
 	Local                     NativeTableLocalView             `json:"local"`
+	PendingTurnChallenge      *NativePendingTurnChallenge      `json:"pendingTurnChallenge,omitempty"`
+	PendingTurnMenu           *NativePendingTurnMenu           `json:"pendingTurnMenu,omitempty"`
 	PublicState               *NativePublicTableState          `json:"publicState"`
 }
 
@@ -309,10 +321,87 @@ type nativeTableState struct {
 	LatestSnapshot            *NativeCooperativeTableSnapshot  `json:"latestSnapshot,omitempty"`
 	ActiveHandStartAt         string                           `json:"activeHandStartAt,omitempty"`
 	NextHandAt                string                           `json:"nextHandAt,omitempty"`
+	PendingTurnChallenge      *NativePendingTurnChallenge      `json:"pendingTurnChallenge,omitempty"`
+	PendingTurnMenu           *NativePendingTurnMenu           `json:"pendingTurnMenu,omitempty"`
 	PublicState               *NativePublicTableState          `json:"publicState,omitempty"`
 	Seats                     []nativeSeatRecord               `json:"seats"`
 	Snapshots                 []NativeCooperativeTableSnapshot `json:"snapshots"`
 	Witnesses                 []nativeKnownParticipant         `json:"witnesses,omitempty"`
+}
+
+type NativeChallengeEnvelope struct {
+	OpenBundle              tablecustody.CustodyChallengeBundle   `json:"openBundle"`
+	OpenTransition          tablecustody.CustodyTransition        `json:"openTransition"`
+	OptionResolutionBundles []tablecustody.CustodyChallengeBundle `json:"optionResolutionBundles,omitempty"`
+	EscapeBundle            tablecustody.CustodyChallengeBundle   `json:"escapeBundle"`
+	TimeoutResolutionBundle tablecustody.CustodyChallengeBundle   `json:"timeoutResolutionBundle"`
+}
+
+type NativeTurnChallengeChainStatus struct {
+	ChainTipHeight       int64  `json:"chainTipHeight"`
+	ChainTipObservedAt   string `json:"chainTipObservedAt,omitempty"`
+	EscapeEligibleHeight int64  `json:"escapeEligibleHeight"`
+	EscapeReady          bool   `json:"escapeReady"`
+	OpenConfirmed        bool   `json:"openConfirmed"`
+	OpenConfirmedHeight  int64  `json:"openConfirmedHeight"`
+	OpenTxID             string `json:"openTxid,omitempty"`
+}
+
+type NativePendingTurnChallenge struct {
+	ActingPlayerID    string                          `json:"actingPlayerId,omitempty"`
+	ChallengeRef      tablecustody.VTXORef            `json:"challengeRef"`
+	DecisionIndex     int                             `json:"decisionIndex"`
+	Epoch             int                             `json:"epoch"`
+	EscapeEligibleAt  string                          `json:"escapeEligibleAt,omitempty"`
+	HandID            string                          `json:"handId,omitempty"`
+	OpenBundleHash    string                          `json:"openBundleHash,omitempty"`
+	OpenedAt          string                          `json:"openedAt,omitempty"`
+	OptionIDs         []string                        `json:"optionIds,omitempty"`
+	SourceStateHash   string                          `json:"sourceStateHash,omitempty"`
+	Status            string                          `json:"status,omitempty"`
+	TableID           string                          `json:"tableId"`
+	TimeoutEligibleAt string                          `json:"timeoutEligibleAt,omitempty"`
+	TimeoutResolution *tablecustody.TimeoutResolution `json:"timeoutResolution,omitempty"`
+}
+
+type NativeActionMenuOption struct {
+	Action        game.Action `json:"action"`
+	CandidateHash string      `json:"candidateHash"`
+	OptionID      string      `json:"optionId"`
+}
+
+type NativeTurnCandidateBundle struct {
+	ActionRequest     *nativeActionRequest            `json:"actionRequest,omitempty"`
+	AuthorizedOutputs []custodyBatchOutput            `json:"authorizedOutputs,omitempty"`
+	CandidateHash     string                          `json:"candidateHash"`
+	DerivationPath    string                          `json:"derivationPath,omitempty"`
+	OptionID          string                          `json:"optionId,omitempty"`
+	ProofSignerIDs    []string                        `json:"proofSignerIds,omitempty"`
+	RegisterMessage   string                          `json:"registerMessage,omitempty"`
+	SignedProofPSBT   string                          `json:"signedProofPsbt,omitempty"`
+	SignerPubkeys     map[string]string               `json:"signerPubkeys,omitempty"`
+	TimeoutResolution *tablecustody.TimeoutResolution `json:"timeoutResolution,omitempty"`
+	TurnDeadlineAt    string                          `json:"turnDeadlineAt,omitempty"`
+	Transition        tablecustody.CustodyTransition  `json:"transition"`
+	TreeSignerIDs     []string                        `json:"treeSignerIds,omitempty"`
+	TurnAnchorHash    string                          `json:"turnAnchorHash"`
+}
+
+type NativePendingTurnMenu struct {
+	AcceptedIntentAck     *tablecustody.CandidateIntentAck `json:"acceptedIntentAck,omitempty"`
+	ActionDeadlineAt      string                           `json:"actionDeadlineAt,omitempty"`
+	ActingPlayerID        string                           `json:"actingPlayerId,omitempty"`
+	Candidates            []NativeTurnCandidateBundle      `json:"candidates,omitempty"`
+	ChallengeEnvelope     *NativeChallengeEnvelope         `json:"challengeEnvelope,omitempty"`
+	DecisionIndex         int                              `json:"decisionIndex"`
+	DeliveredAt           string                           `json:"deliveredAt,omitempty"`
+	Epoch                 int                              `json:"epoch"`
+	HandID                string                           `json:"handId,omitempty"`
+	Options               []NativeActionMenuOption         `json:"options,omitempty"`
+	PrevCustodyStateHash  string                           `json:"prevCustodyStateHash,omitempty"`
+	SelectedCandidateHash string                           `json:"selectedCandidateHash,omitempty"`
+	TimeoutCandidate      NativeTurnCandidateBundle        `json:"timeoutCandidate"`
+	TurnAnchorHash        string                           `json:"turnAnchorHash"`
 }
 
 type nativePeerSelf struct {
@@ -347,17 +436,25 @@ type nativeJoinRequest struct {
 
 type nativeActionRequest struct {
 	Action               game.Action `json:"action"`
+	ActionDeadlineAt     string      `json:"actionDeadlineAt,omitempty"`
 	ChallengeAnchor      string      `json:"challengeAnchor,omitempty"`
 	DecisionIndex        int         `json:"decisionIndex"`
 	Epoch                int         `json:"epoch"`
 	HandID               string      `json:"handId"`
+	OptionID             string      `json:"optionId,omitempty"`
 	PlayerID             string      `json:"playerId"`
 	PrevCustodyStateHash string      `json:"prevCustodyStateHash,omitempty"`
 	ProfileName          string      `json:"profileName"`
 	SignatureHex         string      `json:"signatureHex"`
 	SignedAt             string      `json:"signedAt"`
 	TableID              string      `json:"tableId"`
+	TurnAnchorHash       string      `json:"turnAnchorHash,omitempty"`
 	TranscriptRoot       string      `json:"transcriptRoot,omitempty"`
+}
+
+type nativeActionSelectionRequest struct {
+	Candidate NativeTurnCandidateBundle `json:"candidate"`
+	TableID   string                    `json:"tableId"`
 }
 
 type nativeFundsRequest struct {
@@ -392,6 +489,10 @@ type nativeFundsResponse struct {
 	Table      nativeTableState      `json:"table"`
 }
 
+type nativeActionSignRequest struct {
+	Request nativeActionRequest `json:"request"`
+}
+
 type nativeFundsExitExecution struct {
 	BroadcastTxIDs []string               `json:"broadcastTxIds,omitempty"`
 	Pending        bool                   `json:"pending"`
@@ -400,8 +501,10 @@ type nativeFundsExitExecution struct {
 }
 
 type nativeTransitionAuthorizer struct {
-	ActionRequest *nativeActionRequest `json:"actionRequest,omitempty"`
-	FundsRequest  *nativeFundsRequest  `json:"fundsRequest,omitempty"`
+	ActionRequest       *nativeActionRequest                 `json:"actionRequest,omitempty"`
+	ChallengeOpenBundle *tablecustody.CustodyChallengeBundle `json:"challengeOpenBundle,omitempty"`
+	FundsRequest        *nativeFundsRequest                  `json:"fundsRequest,omitempty"`
+	TurnDeadlineAt      string                               `json:"turnDeadlineAt,omitempty"`
 }
 
 type nativeCustodyApprovalRequest struct {
@@ -507,12 +610,20 @@ type nativeHandMessageRequest struct {
 	Phase                 string   `json:"phase"`
 	PlayerID              string   `json:"playerId"`
 	ProfileName           string   `json:"profileName"`
+	ProtocolVersion       string   `json:"protocolVersion,omitempty"`
 	RecipientSeatIndex    *int     `json:"recipientSeatIndex,omitempty"`
 	SeatIndex             int      `json:"seatIndex"`
 	ShuffleSeedHex        string   `json:"shuffleSeedHex,omitempty"`
 	SignatureHex          string   `json:"signatureHex"`
 	SignedAt              string   `json:"signedAt"`
 	TableID               string   `json:"tableId"`
+}
+
+type nativeHandMessageResponse struct {
+	AcceptedTranscriptRoot string           `json:"acceptedTranscriptRoot,omitempty"`
+	Duplicate              bool             `json:"duplicate,omitempty"`
+	RecordKey              string           `json:"recordKey"`
+	Table                  nativeTableState `json:"table"`
 }
 
 type nativeTableFetchRequest struct {

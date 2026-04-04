@@ -11,6 +11,29 @@ func tableHasLiveHand(table nativeTableState) bool {
 	return table.ActiveHand != nil && table.ActiveHand.State.Phase != game.StreetSettled
 }
 
+func (runtime *meshRuntime) settledHandPayoutPending(table nativeTableState) bool {
+	if table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetSettled {
+		return false
+	}
+	if table.LatestCustodyState == nil {
+		return true
+	}
+	return table.LatestCustodyState.HandID != table.ActiveHand.State.HandID ||
+		table.LatestCustodyState.HandNumber != table.ActiveHand.State.HandNumber ||
+		table.LatestCustodyState.PublicStateHash != runtime.publicMoneyStateHash(table, &table.ActiveHand.State)
+}
+
+func (runtime *meshRuntime) fundsSettlementBlockedReason(table nativeTableState) string {
+	switch {
+	case tableHasLiveHand(table):
+		return "funds settlement requires the current hand to be settled first"
+	case runtime.settledHandPayoutPending(table):
+		return "funds settlement requires the settled hand payout to finalize first"
+	default:
+		return ""
+	}
+}
+
 func (runtime *meshRuntime) buildFundsCustodyTransitionForPlayer(table nativeTableState, playerID string, kind tablecustody.TransitionKind, finalStatus string) (tablecustody.CustodyTransition, error) {
 	if table.LatestCustodyState == nil {
 		return tablecustody.CustodyTransition{}, errors.New("latest custody state is unavailable")

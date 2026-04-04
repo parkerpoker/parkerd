@@ -1,12 +1,12 @@
-# Current Protocol Surface
+# Protocol Surface
 
-This document describes the protocol surface implemented today in this repository.
+This document describes the protocol surface in this repository.
 
 For component topology, see [architecture.md](./architecture.md). For dealerless transcript flow, see [dealerless.md](./dealerless.md). For money movement, see [money-flows.md](./money-flows.md). For trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Short Version
 
-The current runtime is `poker/v1`.
+The runtime version is `poker/v1`.
 
 The important protocol properties are:
 
@@ -14,25 +14,25 @@ The important protocol properties are:
 - local funds bookkeeping is `arkade-table-funds/v1`
 - join requests include funded buy-in refs
 - action and funds requests are bound to `prevCustodyStateHash`
-- approval/request hashing strips recovery bundles and recovery witnesses until the final accepted proof is assembled
+- approval/request hashing strips challenge bundles, challenge witnesses, recovery bundles, and recovery witnesses until the final accepted proof is assembled
 - accepted `PlayerAction`, `CashOut`, and `EmergencyExit` events carry the full signed initiator request as the canonical payload
 - host sequencing is proposer-only; action and result events are appended only after custody finalization succeeds
 - deterministic contested-pot recovery uses fully signed CSV recovery bundles over the existing shared pot exit leaf
-- accepted custody history can prove either a live Ark batch path or a stored recovery-bundle path
-- in the current heads-up runtime, accepted betting and payout steps become the new cash-out and exit baseline; later funds requests are evaluated against the latest custody state, not a pre-loss balance
-- the game engine is N-player-capable for money logic, but runtime table creation is still capped at 2 seats
+- accepted custody history proves either a live Ark batch path or a stored recovery-bundle path
+- in the heads-up runtime, accepted betting and payout steps become the cash-out and exit baseline; later funds requests are evaluated against the latest custody state, not a pre-loss balance
+- the game engine is N-player-capable for money logic, but runtime table creation is capped at 2 seats
 
 ## Recovery Semantics
 
 The deterministic recovery path is deliberately narrower than the normal cooperative batch path.
 
-Bundles are only stored when the current accepted transition leaves contested pot refs and the next money result is objective:
+Bundles are stored when the accepted transition leaves contested pot refs and the next money result is objective:
 
 - action timeout that must auto-fold
 - `showdown-reveal` timeout that kills the missing player for the contested pot
 - settled `showdown-payout` timeout
 
-They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result. Earlier protocol-timeout phases such as `private-delivery` still fail closed in v1 unless or until the runtime reaches one of the objectively money-resolving states above.
+They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result. Earlier protocol-timeout phases such as `private-delivery` fail closed in v1 unless or until the runtime reaches one of the objectively money-resolving states above.
 
 Each stored bundle carries:
 
@@ -55,12 +55,14 @@ Only the local daemon RPC and peer transport are required for direct table play.
 
 ## Local Daemon RPC
 
-The daemon still exposes the existing local RPC methods used by the CLI and controller, including:
+The daemon exposes the local RPC methods used by the CLI and controller, including:
 
 - `meshCreateTable`
 - `meshTableJoin`
 - `meshGetTable`
 - `meshSendAction`
+- `meshOpenTurnChallenge`
+- `meshResolveTurnChallenge`
 - `meshRotateHost`
 - `meshCashOut`
 - `meshRenew`
@@ -69,13 +71,13 @@ The daemon still exposes the existing local RPC methods used by the CLI and cont
 - `walletOnboard`
 - `walletOffboard`
 
-The local transport is still newline-delimited JSON request/response/event envelopes over the profile socket.
+The local transport is newline-delimited JSON request/response/event envelopes over the profile socket.
 
-`meshRenew` remains on the control surface for compatibility, but the current runtime implements it as a carry-forward acknowledgment over the latest custody state rather than as a separate money-moving protocol step.
+`meshRenew` stays on the control surface for compatibility and acts as a carry-forward acknowledgment over the latest custody state rather than as a separate money-moving protocol step.
 
 ## Peer Transport
 
-Peer endpoints are still advertised as:
+Peer endpoints are advertised as:
 
 - `parker://<host>:<port>`
 
@@ -87,7 +89,7 @@ Transport envelopes remain:
 
 ## Current Peer Message Types
 
-The runtime currently handles:
+The runtime handles:
 
 - `peer.manifest.get`
 - `peer.manifest`
@@ -116,7 +118,7 @@ The runtime currently handles:
 - `ack`
 - `nack`
 
-The new pieces in the custody generation are the `table.funds.*`, `table.custody.*`, `table.custody.sign*`, and `table.custody.signer.*` routes plus the tighter coupling between table sync, action acceptance, and custody finalization.
+The custody-generation-specific routes are `table.funds.*`, `table.custody.*`, `table.custody.sign*`, and `table.custody.signer.*`, together with the tighter coupling between table sync, action acceptance, and custody finalization.
 
 For user-initiated transitions, `table.custody.request`, `table.custody.sign.request`, and `table.custody.signer.prepare.request` carry a transition authorizer object with the full signed `nativeActionRequest` or `nativeFundsRequest`. Later signer start/nonces/aggregated-nonces steps continue from the already-validated transition hash and stored signer session.
 
@@ -201,7 +203,7 @@ For an accepted action, the host:
 
 `PlayerAction` therefore reflects an already-finalized custody step, and its canonical initiator payload is the full signed `nativeActionRequest`, not a host-authored summary.
 
-This also covers zero-exposure successors such as `check` or timeout auto-check. Those still advance `custodySeq`, but if the successor reuses the same refs and needs no Ark spend inputs, the runtime finalizes a non-settlement custody transition instead of forcing a batch.
+This also covers zero-exposure successors such as `check` or timeout auto-check. Those successors advance `custodySeq`, but if the successor reuses the same refs and needs no Ark spend inputs, the runtime finalizes a non-settlement custody transition instead of forcing a batch.
 
 Custody timing is protocol-configured. Table config carries `actionTimeoutMs`, `handProtocolTimeoutMs`, and `nextHandDelayMs`, and semantic replay uses those accepted table values instead of the local daemon's current mock-vs-real settlement mode.
 
@@ -231,12 +233,13 @@ The custody layer lives in `internal/tablecustody`.
 - stack claims
 - structural side-pot slices
 
-Transition kinds currently used by the runtime include:
+Transition kinds used by the runtime include:
 
 - `buy-in-lock`
 - `blind-post`
 - `action`
 - `timeout`
+- `turn-challenge-open`
 - `showdown-payout`
 - `cash-out`
 - `emergency-exit`
@@ -253,9 +256,9 @@ Semantic successor validation derives the expected next custody step locally fro
 - `cash-out` and `emergency-exit` use the embedded `nativeFundsRequest`
 - `blind-post`, `showdown-payout`, and `carry-forward` are rebuilt locally with no host-authored semantic input
 
-Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers still verify Ark-linked refs, authorized output sets, and proof material even after the semantic successor matches.
+Ark/output-shape validation is a separate mandatory layer. In real-settlement mode, peers verify Ark-linked refs, authorized output sets, and proof material even after the semantic successor matches.
 
-Accepted history can replay two proof surfaces offline.
+Accepted history can replay three proof surfaces offline.
 
 The first is the ordinary real Ark batch path through `CustodyProof.SettlementWitness`. That witness bundle includes:
 
@@ -278,13 +281,88 @@ The second is the deterministic recovery path:
 - replay validates the stored signed PSBT, the exact source pot refs, the CSV leaf/sequence, the authorized outputs, and the recovery transaction metadata
 - replay then derives the winner-owned stack refs from the PSBT itself and exact-matches them against `NextState` and `Proof.VTXORefs`
 
+The third is the deterministic challenge path:
+
+- the accepted source transition stores `CustodyProof.ChallengeBundle`
+- the executed `turn-challenge-open`, challenge-resolved `action`, challenge-resolved `timeout`, or `turn-challenge-escape` transition stores `CustodyProof.ChallengeWitness`
+- replay validates the signed challenge PSBT, the exact source refs, the selected tapscript leaf, the transaction locktime or CSV sequence, and the authorized outputs
+- for block-based challenge escape, replay verifies the accepted open transaction confirmation height live; if the accepted escape transaction is confirmed, its confirmation height must satisfy the CSV delay exactly, otherwise replay requires the escape transaction to be visible and the live chain tip to have reached the CSV maturity height
+
 Hashing and approval semantics follow the same split:
 
-- `HashCustodyRequest` intentionally strips recovery bundles and recovery witnesses
+- `HashCustodyRequest` intentionally strips challenge bundles, challenge witnesses, recovery bundles, and recovery witnesses
 - once the bundle is attached to the accepted source transition, the final transition hash commits to it
 - recovery execution later appends a normal semantic `timeout` or `showdown-payout` transition whose proof commits to the executed `RecoveryWitness`
 
-Live Ark/indexer checks remain in the current protocol only where liveness or spendability matters, such as join funding admission and other interactive safety checks.
+Live Ark/indexer checks remain in the protocol only where liveness or spendability matters, such as join funding admission and other interactive safety checks.
+
+## Turn Challenge Fallback
+
+Tables default `turnTimeoutMode` to `chain-challenge`. Accepted legacy tables that omit the field are interpreted as `direct` timeout tables for backward compatibility.
+
+`PendingTurnMenu` carries two parallel artifacts for the same deterministic finite menu:
+
+- the ordinary prebuilt finite-menu candidate bundles used by the cooperative Ark fast path
+- a deterministic `ChallengeEnvelope` containing:
+  - one fully signed onchain `turn-challenge-open` bundle at locktime `D`
+  - one fully signed option-resolution bundle per menu option
+  - one fully signed timeout-resolution bundle at locktime `D + C`
+  - one fully signed escape bundle spending the `TurnChallengeRef` through its CSV exit path
+
+`turn-challenge-open` always consumes the full live turn bankroll:
+
+- all current stack refs
+- all current pot refs
+
+It reissues the entire live bankroll into one dedicated `TurnChallengeRef`. The challenge path is intentionally a full reissuance path, not a delta path.
+
+While `PendingTurnChallenge` exists:
+
+- the hand decision index, acting player, and legal finite menu stay fixed
+- the logical balances remain the same
+- the custody source for fallback resolution is `PendingTurnChallenge.challengeRef`, not the per-stack or per-pot refs in the pre-open state
+- ordinary `meshSendAction` is disabled for that turn
+
+Resolution then splits:
+
+- `meshResolveTurnChallenge` with an option id executes the matching pre-signed option-resolution bundle and appends the ordinary `PlayerAction` event for that option
+- `meshResolveTurnChallenge` with `optionId="timeout"` executes the pre-signed timeout-resolution bundle once `timeoutEligibleAt` has passed
+- `meshResolveTurnChallenge` with `optionId="escape"` executes the pre-signed escape bundle only after the escape CSV delay has matured
+- host tick also auto-finalizes the timeout-resolution bundle after `D + C` if no option bundle resolved first
+
+Escape maturity depends on the CSV type:
+
+- second-based CSV keeps the accepted-state timestamp surface; `PendingTurnChallenge.escapeEligibleAt` is populated and replay compares `ChallengeWitness.ExecutedAt` against that timestamp
+- block-based CSV does not store an estimated wall-clock maturity in accepted table state; `PendingTurnChallenge.escapeEligibleAt` stays empty
+- local escape readiness for block-based CSV is derived from the accepted `turn-challenge-open` witness txid, that transaction's live confirmation height, and the live chain tip height
+- accepted replay for block-based CSV is derived from the accepted `turn-challenge-open` witness txid plus the accepted escape witness txid, and requires the escape confirmation height to be at least `openConfirmedHeight + csvBlocks`
+- Parker does not persist live tip height or transaction confirmation heights into accepted table state; those observations stay local to the wallet/runtime and are re-queried as needed
+- if Parker cannot verify the required chain heights for a block-based escape, local escape resolution and accepted replay both fail closed
+
+The accepted transition kind after challenge resolution is `action` or `timeout`. What changes is the proof surface:
+
+- `turn-challenge-open`, challenge-resolved `action`, challenge-resolved `timeout`, and `turn-challenge-escape` transitions carry `CustodyProof.ChallengeBundle` plus `CustodyProof.ChallengeWitness`
+- those transitions do not depend on Ark intent registration, `CandidateIntentAck`, or live Ark batch registration
+
+The ordinary cooperative fast path is unchanged. Selected ordinary finite-menu candidates carry `SignedProofPSBT` and `RegisterMessage`, and Parker uses Ark intent registration plus the resulting settlement witness when that fast path finalizes first.
+
+`NativeTableLocalView` also exposes local-only challenge telemetry through `TurnChallengeChain`:
+
+- `chainTipHeight`
+- `chainTipObservedAt`
+- `openTxID`
+- `openConfirmed`
+- `openConfirmedHeight`
+- `escapeEligibleHeight`
+- `escapeReady`
+
+Those fields are runtime observations only. They are not copied into accepted table state or `PendingTurnChallenge`.
+
+The wallet/runtime obtains those observations from the profile's configured explorer:
+
+- `GET {ExplorerURL}/blocks/tip/height` for the live tip height
+- `GET {ExplorerURL}/tx/{txid}/status` for transaction confirmation status, block height, and block time
+- successful tip observations may be reused from a short local cache when a live tip request fails
 
 ## Hand And Money Sequencing
 
@@ -309,7 +387,7 @@ That means:
 
 ## Failover And Continuation
 
-The runtime still uses host heartbeat plus protocol deadlines for liveness:
+The runtime uses host heartbeat plus protocol deadlines for liveness:
 
 - host heartbeat interval: `1000ms`
 - host failure timeout: `3500ms`
@@ -326,7 +404,7 @@ Witness or player failover behavior:
 
 ## Runtime Scope And Limits
 
-The money model and side-pot logic are N-player-capable, but the active dealerless runtime currently enforces:
+The money model and side-pot logic are N-player-capable, but the active dealerless runtime enforces:
 
 - `seatCount <= 2`
 
@@ -334,12 +412,12 @@ Tables above 2 seats are rejected until a separate multi-player dealing/privacy 
 
 ## Practical Reading
 
-The safest way to interpret the current protocol is:
+The safest way to interpret the protocol is:
 
 - transport envelopes authenticate and encrypt peer traffic
 - custody state, not snapshots, is the money-finality object
 - the host proposes transitions and orchestrates replication
 - money-changing steps are accepted only after custody finalization
 - semantic successor validation and Ark/output validation are distinct required checks
-- real-mode peer approvals still use live Ark/indexer checks when current liveness or spendability matters, while accepted-history replay validates stored settlement witness bundles before persistence
+- real-mode peer approvals use live Ark/indexer checks when liveness or spendability matters, while accepted-history replay validates stored settlement witness bundles before persistence
 - non-host peers replay transcript, public state, snapshot history, and custody history before persistence

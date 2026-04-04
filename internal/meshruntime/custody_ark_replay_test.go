@@ -255,6 +255,9 @@ func TestEmergencyExitAcceptedHistoryStillSucceedsWithoutSettlementWitness(t *te
 	if transition.Proof.SettlementWitness != nil {
 		t.Fatal("expected emergency exit to keep the execution-proof path without a settlement witness")
 	}
+	if transition.Proof.ExitWitness == nil {
+		t.Fatal("expected emergency exit to persist an exit witness")
+	}
 	if err := host.validateAcceptedCustodyHistory(nil, table); err != nil {
 		t.Fatalf("expected emergency-exit history to replay without a settlement witness, got %v", err)
 	}

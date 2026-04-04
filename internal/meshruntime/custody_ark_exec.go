@@ -59,6 +59,33 @@ type custodySignerAuthorization struct {
 	TransitionHash          string
 }
 
+func mockCustodyBatchResult(transitionHash string, outputs []custodyBatchOutput) *custodyBatchResult {
+	intentID := "mock-intent-" + transitionHash[:12]
+	arkTxID := transitionHash
+	finalizedAt := nowISO()
+	outputRefs := map[string][]tablecustody.VTXORef{}
+	for index, output := range outputs {
+		ref := tablecustody.VTXORef{
+			AmountSats:    output.AmountSats,
+			ArkIntentID:   intentID,
+			ArkTxID:       arkTxID,
+			ExpiresAt:     addMillis(nowISO(), int((24*time.Hour)/time.Millisecond)),
+			OwnerPlayerID: output.OwnerPlayerID,
+			Script:        output.Script,
+			Tapscripts:    append([]string(nil), output.Tapscripts...),
+			TxID:          arkTxID,
+			VOut:          uint32(index),
+		}
+		outputRefs[output.ClaimKey] = append(outputRefs[output.ClaimKey], ref)
+	}
+	return &custodyBatchResult{
+		ArkTxID:     arkTxID,
+		FinalizedAt: finalizedAt,
+		IntentID:    intentID,
+		OutputRefs:  outputRefs,
+	}
+}
+
 func custodySignerSessionKey(tableID, transitionHash, playerID, derivationPath string) string {
 	return tableID + "|" + transitionHash + "|" + playerID + "|" + derivationPath
 }
@@ -188,6 +215,26 @@ func custodyRegisterMessage(onchainIndexes []int, cosignerPubkeys []string) (str
 		return "", err
 	}
 	return message, nil
+}
+
+func validateCustodyRegisterMessage(message string, onchainIndexes []int, cosignerPubkeys []string) error {
+	if strings.TrimSpace(message) == "" {
+		return errors.New("missing register message")
+	}
+	var decoded arkintent.RegisterMessage
+	if err := decoded.Decode(strings.TrimSpace(message)); err != nil {
+		return err
+	}
+	if decoded.Type != arkintent.IntentMessageTypeRegister {
+		return fmt.Errorf("unexpected register message type %q", decoded.Type)
+	}
+	if !reflect.DeepEqual(decoded.OnchainOutputIndexes, onchainIndexes) {
+		return errors.New("register message onchain outputs mismatch")
+	}
+	if !reflect.DeepEqual(decoded.CosignersPublicKeys, cosignerPubkeys) {
+		return errors.New("register message cosigners mismatch")
+	}
+	return nil
 }
 
 func custodyBuildProofPSBT(message string, inputs []arkintent.Input, outputs []*wire.TxOut, leafProofs []*arklib.TaprootMerkleProof, arkFields [][]*psbt.Unknown, locktime arklib.AbsoluteLocktime) (string, error) {
@@ -813,6 +860,9 @@ func validateCustodyOffchainOutputs(expected, actual []custodyBatchOutput) error
 }
 
 func (runtime *meshRuntime) normalizedCustodySigningTransition(table nativeTableState, transition tablecustody.CustodyTransition) (tablecustody.CustodyTransition, *custodySettlementPlan, error) {
+	if transition.Kind == tablecustody.TransitionKindTurnChallengeOpen || transition.Kind == tablecustody.TransitionKindTurnChallengeEscape {
+		return cloneJSON(transition), nil, nil
+	}
 	plan, err := runtime.buildCustodySettlementPlan(table, transition)
 	if err != nil {
 		return tablecustody.CustodyTransition{}, nil, err
@@ -822,7 +872,39 @@ func (runtime *meshRuntime) normalizedCustodySigningTransition(table nativeTable
 	return normalized, plan, nil
 }
 
+func challengeResolutionApprovalSource(table nativeTableState, transition tablecustody.CustodyTransition) (nativeTableState, tablecustody.CustodyTransition, bool, error) {
+	if transition.Kind != tablecustody.TransitionKindAction && transition.Kind != tablecustody.TransitionKindTimeout {
+		return nativeTableState{}, tablecustody.CustodyTransition{}, false, nil
+	}
+	if transition.Proof.ChallengeBundle == nil && transition.Proof.ChallengeWitness == nil {
+		return nativeTableState{}, tablecustody.CustodyTransition{}, false, nil
+	}
+	openTransition, openPrevious, _, err := acceptedChallengeOpenContextForTransition(table, transition)
+	if err != nil {
+		return nativeTableState{}, tablecustody.CustodyTransition{}, false, err
+	}
+	sourceTable := cloneJSON(table)
+	sourceTable.LatestCustodyState = openPrevious
+	sourceTransition := cloneJSON(transition)
+	sourceTransition.CustodySeq = openTransition.CustodySeq
+	sourceTransition.PrevStateHash = openTransition.PrevStateHash
+	sourceTransition.NextState.CustodySeq = openTransition.NextState.CustodySeq
+	sourceTransition.NextState.PrevStateHash = openTransition.NextState.PrevStateHash
+	return sourceTable, sourceTransition, true, nil
+}
+
 func (runtime *meshRuntime) normalizedCustodyApprovalTransition(table nativeTableState, transition tablecustody.CustodyTransition) (tablecustody.CustodyTransition, *custodySettlementPlan, error) {
+	if transition.Kind == tablecustody.TransitionKindTurnChallengeOpen || transition.Kind == tablecustody.TransitionKindTurnChallengeEscape {
+		normalized := cloneJSON(transition)
+		normalized.Proof.RequestHash = custodyTransitionRequestHash(normalized)
+		return normalized, nil, nil
+	}
+	if sourceTable, sourceTransition, ok, err := challengeResolutionApprovalSource(table, transition); err != nil {
+		return tablecustody.CustodyTransition{}, nil, err
+	} else if ok {
+		table = sourceTable
+		transition = sourceTransition
+	}
 	request := resetCustodyRequestTransition(table, transition)
 	normalized, plan, err := runtime.normalizedCustodySigningTransition(table, request)
 	if err != nil {
@@ -893,7 +975,7 @@ func (runtime *meshRuntime) validatePrebuiltCustodySigningTransition(table nativ
 	if strings.TrimSpace(transitionHash) == "" {
 		return errors.New("custody signing request is missing transition hash")
 	}
-	if err := runtime.validateCustodyTransitionSemantics(table, transition, authorizer); err != nil {
+	if err := runtime.validateCustodyTransitionSemanticsWithOptions(table, transition, authorizer, true); err != nil {
 		return err
 	}
 	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(table, transition)
@@ -905,6 +987,10 @@ func (runtime *meshRuntime) validatePrebuiltCustodySigningTransition(table nativ
 	}
 	if err := tablecustody.ValidateTransition(table.LatestCustodyState, approvalTransition); err != nil {
 		return err
+	}
+	if approvalTransition.Kind == tablecustody.TransitionKindTurnChallengeOpen ||
+		approvalTransition.Kind == tablecustody.TransitionKindTurnChallengeEscape {
+		return nil
 	}
 	if err := validateAcceptedCustodyRefs(table.LatestCustodyState, approvalTransition, false); err != nil {
 		return err
@@ -1090,14 +1176,25 @@ func (runtime *meshRuntime) signCustodyPSBTWithPlayer(table nativeTableState, pl
 	return signedPSBT, nil
 }
 
-func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (string, error) {
-	signed := unsigned
+func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevStateHash, transitionHash, purpose string, signerIDs []string, unsigned string, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, outputs []custodyBatchOutput) (signed string, err error) {
+	timingFields := custodyTimingFields(table, transition, "custody_psbt_fully_sign")
+	timingFields.Purpose = purpose
+	timingFields.OutputCount = len(outputs)
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
+	signed = unsigned
 	for _, playerID := range uniqueSortedPlayerIDs(signerIDs) {
 		nextSigned, err := runtime.signCustodyPSBTWithPlayer(table, playerID, prevStateHash, transitionHash, purpose, signed, transition, authorizer, outputs)
 		if err != nil {
 			return "", fmt.Errorf("custody %s signing via %s: %w", purpose, playerID, err)
 		}
 		signed = nextSigned
+	}
+	signed, err = runtime.maybeSignCustodyPSBTAsOperator(purpose, signed)
+	if err != nil {
+		return "", fmt.Errorf("custody %s operator signing: %w", purpose, err)
 	}
 	return signed, nil
 }
@@ -1180,6 +1277,107 @@ func (runtime *meshRuntime) handleCustodyTxSignFromPeer(request nativeCustodyTxS
 		}
 		if err := validateCustodyRecoveryPSBT(packet, sourceRefs, spendPaths, request.ExpectedOutputs); err != nil {
 			return nativeCustodyTxSignResponse{}, err
+		}
+	case "challenge-open":
+		if err := runtime.validatePrebuiltCustodySigningTransition(*table, request.ExpectedPrevStateHash, request.TransitionHash, request.Transition, request.Authorizer); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		turnDeadlineAt := strings.TrimSpace(request.Transition.NextState.ActionDeadlineAt)
+		if request.Authorizer != nil && strings.TrimSpace(request.Authorizer.TurnDeadlineAt) != "" {
+			turnDeadlineAt = strings.TrimSpace(request.Authorizer.TurnDeadlineAt)
+		}
+		sourceRefs := turnChallengeSourceRefs(table.LatestCustodyState)
+		spendPaths, authorizedPlayers, err := runtime.challengeOpenSpendPaths(*table, sourceRefs, turnDeadlineAt)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if !containsPlayerID(authorizedPlayers, request.PlayerID) {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is not authorized for this player")
+		}
+		spec, err := runtime.challengeRefOutputSpec(*table, sumVTXORefs(sourceRefs))
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		outputs := challengeOutputsFromBatchOutputs([]custodyBatchOutput{custodyBatchOutputFromSpec(spec)})
+		txLocktime, err := challengeOpenBundleLocktime(turnDeadlineAt, spendPaths)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if err := validateCustodyChallengePSBT(packet, sourceRefs, spendPaths, outputs, txLocktime); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+	case "challenge-escape":
+		if err := runtime.validatePrebuiltCustodySigningTransition(*table, request.ExpectedPrevStateHash, request.TransitionHash, request.Transition, request.Authorizer); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if request.Authorizer == nil || request.Authorizer.ChallengeOpenBundle == nil {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge escape signing request is missing its open bundle authorizer")
+		}
+		turnDeadlineAt := strings.TrimSpace(request.Transition.NextState.ActionDeadlineAt)
+		if request.Authorizer != nil && strings.TrimSpace(request.Authorizer.TurnDeadlineAt) != "" {
+			turnDeadlineAt = strings.TrimSpace(request.Authorizer.TurnDeadlineAt)
+		}
+		validationTable := tableWithTurnDeadline(*table, turnDeadlineAt)
+		menu := &NativePendingTurnMenu{ActionDeadlineAt: turnDeadlineAt}
+		challengeRef, err := runtime.validateTurnChallengeOpenBundle(validationTable, menu, *request.Authorizer.ChallengeOpenBundle)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		spendPath, err := runtime.selectTurnChallengeExitSpendPath(validationTable, challengeRef)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if !containsPlayerID(spendPath.PlayerIDs, request.PlayerID) {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge escape signing request is not authorized for this player")
+		}
+		outputs, err := runtime.fullChallengeOutputsForTransition(validationTable, request.Transition)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if err := validateCustodyChallengePSBT(packet, []tablecustody.VTXORef{challengeRef}, []custodySpendPath{spendPath}, outputs, 0); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+	case "challenge-option", "challenge-timeout":
+		if request.Authorizer == nil || request.Authorizer.ChallengeOpenBundle == nil {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is missing its open bundle context")
+		}
+		if request.ExpectedPrevStateHash != "" && latestCustodyStateHash(*table) != request.ExpectedPrevStateHash {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request references stale state")
+		}
+		if request.TransitionHash == "" || challengeBundleRequestHash(request.Transition) != request.TransitionHash {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request transition hash mismatch")
+		}
+		if err := runtime.validateCustodyTransitionSemanticsWithOptions(*table, request.Transition, request.Authorizer, true); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		optionID := ""
+		expectedTransition := request.Transition
+		switch request.Purpose {
+		case "challenge-option":
+			if request.Authorizer.ActionRequest == nil {
+				return nativeCustodyTxSignResponse{}, errors.New("custody challenge option signing request is missing its action authorizer")
+			}
+			optionID = request.Authorizer.ActionRequest.OptionID
+		}
+		menuCtx := &NativePendingTurnMenu{
+			ActionDeadlineAt: strings.TrimSpace(request.Authorizer.TurnDeadlineAt),
+		}
+		if menuCtx.ActionDeadlineAt == "" {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is missing its turn deadline")
+		}
+		if err := runtime.validateTurnChallengeResolutionSigningRequest(*table, menuCtx, *request.Authorizer.ChallengeOpenBundle, expectedTransition, optionID, packet, request.ExpectedOutputs); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		challengeRef, err := runtime.validateTurnChallengeOpenBundle(*table, menuCtx, *request.Authorizer.ChallengeOpenBundle)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		spendPath, err := runtime.selectCustodySpendPath(*table, challengeRef, activeTurnChallengePlayerIDs(*table), false)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if !containsPlayerID(spendPath.PlayerIDs, request.PlayerID) {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is not authorized for this player")
 		}
 	default:
 		return nativeCustodyTxSignResponse{}, fmt.Errorf("unsupported custody signing purpose %q", request.Purpose)
@@ -1439,11 +1637,14 @@ type custodyBatchEventsHandler struct {
 	derivationPath     string
 	signerSessions     map[string]walletpkg.CustodySignerSession
 	signerPubkeys      map[string]string
+	outputCount        int
 	batchSessionID     string
 	batchExpiry        arklib.RelativeLocktime
 	commitmentTx       string
 	finalVtxoTree      *arktree.TxTree
 	finalConnectorTree *arktree.TxTree
+	intentRegisteredAt time.Time
+	treeSigningAt      time.Time
 }
 
 func (handler *custodyBatchEventsHandler) OnBatchStarted(ctx context.Context, event arkclient.BatchStartedEvent) (bool, error) {
@@ -1493,9 +1694,22 @@ func (handler *custodyBatchEventsHandler) OnTreeSigningStarted(ctx context.Conte
 	if found == 0 {
 		return true, nil
 	}
+	if !handler.intentRegisteredAt.IsZero() {
+		emitMeshTiming(meshTimingFields{
+			Metric:         "custody_tree_signing_wait",
+			TableID:        handler.table.Config.TableID,
+			CustodySeq:     handler.transition.CustodySeq,
+			TransitionKind: string(handler.transition.Kind),
+			Phase:          tablePhaseForTiming(handler.table),
+			RequestHash:    handler.requestKey,
+			InputCount:     len(handler.plan.Inputs),
+			OutputCount:    handler.outputCount,
+		}, time.Since(handler.intentRegisteredAt), nil)
+	}
 	if found != len(requiredPubkeys) {
 		return false, errors.New("not all custody signer pubkeys were included in tree signing")
 	}
+	handler.treeSigningAt = time.Now()
 	debugMeshf("custody tree signing started table=%s transition=%s batch=%s expected_signers=%d found_signers=%d", handler.table.Config.TableID, handler.requestKey, event.Id, len(requiredPubkeys), found)
 
 	operatorPubkey, err := compressedPubkeyFromHex(handler.arkConfig.ForfeitPubkeyHex)
@@ -1651,6 +1865,18 @@ func (handler *custodyBatchEventsHandler) OnTreeNoncesAggregated(ctx context.Con
 
 func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Context, event arkclient.BatchFinalizationEvent, vtxoTree, connectorTree *arktree.TxTree) error {
 	handler.commitmentTx = event.Tx
+	if !handler.treeSigningAt.IsZero() {
+		emitMeshTiming(meshTimingFields{
+			Metric:         "custody_tree_nonce_signature_exchange",
+			TableID:        handler.table.Config.TableID,
+			CustodySeq:     handler.transition.CustodySeq,
+			TransitionKind: string(handler.transition.Kind),
+			Phase:          tablePhaseForTiming(handler.table),
+			RequestHash:    handler.requestKey,
+			InputCount:     len(handler.plan.Inputs),
+			OutputCount:    handler.outputCount,
+		}, time.Since(handler.treeSigningAt), nil)
+	}
 	debugMeshf(
 		"custody batch finalization table=%s transition=%s batch=%s input_count=%d has_vtxo_tree=%t has_connector_tree=%t",
 		handler.table.Config.TableID,
@@ -1706,6 +1932,7 @@ func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Contex
 	if err != nil {
 		return err
 	}
+	forfeitSubmitStartedAt := time.Now()
 	signedForfeits := make([]string, 0, len(handler.plan.Inputs))
 	for index, input := range handler.plan.Inputs {
 		debugMeshf(
@@ -1733,7 +1960,18 @@ func (handler *custodyBatchEventsHandler) OnBatchFinalization(ctx context.Contex
 		event.Id,
 		len(signedForfeits),
 	)
-	return handler.transport.SubmitSignedForfeitTxs(ctx, signedForfeits, "")
+	err = handler.transport.SubmitSignedForfeitTxs(ctx, signedForfeits, "")
+	emitMeshTiming(meshTimingFields{
+		Metric:         "custody_connector_forfeit_submit",
+		TableID:        handler.table.Config.TableID,
+		CustodySeq:     handler.transition.CustodySeq,
+		TransitionKind: string(handler.transition.Kind),
+		Phase:          tablePhaseForTiming(handler.table),
+		RequestHash:    handler.requestKey,
+		InputCount:     len(handler.plan.Inputs),
+		OutputCount:    handler.outputCount,
+	}, time.Since(forfeitSubmitStartedAt), err)
+	return err
 }
 
 func (handler *custodyBatchEventsHandler) createSignedForfeit(ctx context.Context, input custodyInputSpec, connectorLeaf *psbt.Packet) (string, error) {
@@ -2042,6 +2280,9 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	if runtime.custodyBatchExecute != nil {
 		return runtime.custodyBatchExecute(table, prevStateHash, transitionHash, inputs, proofSignerIDs, treeSignerIDs, outputs)
 	}
+	if runtime.config.UseMockSettlement {
+		return mockCustodyBatchResult(transitionHash, outputs), nil
+	}
 	if len(inputs) == 0 {
 		return nil, errors.New("custody batch is missing inputs")
 	}
@@ -2067,7 +2308,19 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		return nil, errors.New("custody batch is missing proof signers")
 	}
 
+	prepareStartedAt := time.Now()
 	signerSessions, signerPubkeys, derivationPath, err := runtime.prepareCustodyBatchSigners(table, prevStateHash, transitionHash, transition, authorizer, treeSignerIDs, outputs)
+	emitMeshTiming(meshTimingFields{
+		Metric:         "custody_signer_prepare",
+		TableID:        table.Config.TableID,
+		CustodySeq:     transition.CustodySeq,
+		TransitionKind: string(transition.Kind),
+		Phase:          tablePhaseForTiming(table),
+		RequestHash:    transitionHash,
+		Purpose:        "tree",
+		InputCount:     len(inputs),
+		OutputCount:    len(outputs),
+	}, time.Since(prepareStartedAt), err)
 	if err != nil {
 		return nil, err
 	}
@@ -2093,7 +2346,18 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
+	registerStartedAt := time.Now()
 	intentID, err := transport.RegisterIntent(ctx, signedProof, message)
+	emitMeshTiming(meshTimingFields{
+		Metric:         "custody_intent_register",
+		TableID:        table.Config.TableID,
+		CustodySeq:     transition.CustodySeq,
+		TransitionKind: string(transition.Kind),
+		Phase:          tablePhaseForTiming(table),
+		RequestHash:    transitionHash,
+		InputCount:     len(inputs),
+		OutputCount:    len(outputs),
+	}, time.Since(registerStartedAt), err)
 	if err != nil {
 		return nil, err
 	}
@@ -2109,19 +2373,21 @@ func (runtime *meshRuntime) executeCustodyBatch(table nativeTableState, prevStat
 		return nil, err
 	}
 	handler := &custodyBatchEventsHandler{
-		runtime:        runtime,
-		table:          table,
-		prevStateHash:  prevStateHash,
-		requestKey:     transitionHash,
-		transition:     transition,
-		authorizer:     cloneTransitionAuthorizer(authorizer),
-		plan:           &custodySettlementPlan{Inputs: append([]custodyInputSpec(nil), inputs...)},
-		transport:      transport,
-		arkConfig:      arkConfig,
-		intentID:       intentID,
-		derivationPath: derivationPath,
-		signerSessions: signerSessions,
-		signerPubkeys:  signerPubkeys,
+		runtime:            runtime,
+		table:              table,
+		prevStateHash:      prevStateHash,
+		requestKey:         transitionHash,
+		transition:         transition,
+		authorizer:         cloneTransitionAuthorizer(authorizer),
+		plan:               &custodySettlementPlan{Inputs: append([]custodyInputSpec(nil), inputs...)},
+		transport:          transport,
+		arkConfig:          arkConfig,
+		intentID:           intentID,
+		derivationPath:     derivationPath,
+		signerSessions:     signerSessions,
+		signerPubkeys:      signerPubkeys,
+		outputCount:        len(outputs),
+		intentRegisteredAt: time.Now(),
 	}
 
 	options := []arksdk.BatchSessionOption{}
@@ -2231,14 +2497,23 @@ func (runtime *meshRuntime) finalizeNonSettlementCustodyTransition(table *native
 	return tablecustody.ValidateTransition(table.LatestCustodyState, *transition)
 }
 
-func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableState, transition *tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) error {
+func (runtime *meshRuntime) finalizeRealCustodyTransition(table *nativeTableState, transition *tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer) (err error) {
 	if table == nil || transition == nil {
 		return nil
 	}
+	timingFields := custodyTimingFields(*table, *transition, "custody_finalize_real_total")
+	timing := startMeshTiming(timingFields)
+	defer func() {
+		timing.EndWith(timingFields, err)
+	}()
 	signingTransition, plan, err := runtime.normalizedCustodyApprovalTransition(*table, *transition)
 	if err != nil {
 		return err
 	}
+	timingFields.CustodySeq = transition.CustodySeq
+	timingFields.RequestHash = signingTransition.Proof.RequestHash
+	timingFields.InputCount = len(plan.Inputs)
+	timingFields.OutputCount = len(plan.Outputs)
 	inputRefs := make([]string, 0, len(plan.Inputs))
 	for _, input := range plan.Inputs {
 		inputRefs = append(inputRefs, fundingRefKey(input.Ref))

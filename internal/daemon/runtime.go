@@ -27,6 +27,8 @@ type daemonRuntime interface {
 	JoinTable(inviteCode string, buyInSats int) (any, error)
 	GetTable(tableID string) (any, error)
 	SendAction(tableID string, action game.Action) (any, error)
+	OpenTurnChallenge(tableID string) (any, error)
+	ResolveTurnChallenge(tableID, optionID string) (any, error)
 	RotateHost(tableID string) (any, error)
 	PublicTables() (any, error)
 	CashOut(tableID string) (any, error)
