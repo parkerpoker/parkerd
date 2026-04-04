@@ -266,6 +266,9 @@ func (runtime *meshRuntime) validateTurnCandidateBundle(table nativeTableState, 
 	if strings.TrimSpace(bundle.SignedProofPSBT) == "" || strings.TrimSpace(bundle.RegisterMessage) == "" {
 		return errors.New("turn candidate is missing its signed Ark intent artifacts")
 	}
+	if err := validateCustodyRegisterMessage(bundle.RegisterMessage, custodyOnchainOutputIndexes(plan.AuthorizedOutputs), sortedSignerPubkeys(bundle.SignerPubkeys)); err != nil {
+		return fmt.Errorf("turn candidate register message mismatch: %w", err)
+	}
 	return nil
 }
 

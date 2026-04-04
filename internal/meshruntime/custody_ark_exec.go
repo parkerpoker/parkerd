@@ -217,6 +217,26 @@ func custodyRegisterMessage(onchainIndexes []int, cosignerPubkeys []string) (str
 	return message, nil
 }
 
+func validateCustodyRegisterMessage(message string, onchainIndexes []int, cosignerPubkeys []string) error {
+	if strings.TrimSpace(message) == "" {
+		return errors.New("missing register message")
+	}
+	var decoded arkintent.RegisterMessage
+	if err := decoded.Decode(strings.TrimSpace(message)); err != nil {
+		return err
+	}
+	if decoded.Type != arkintent.IntentMessageTypeRegister {
+		return fmt.Errorf("unexpected register message type %q", decoded.Type)
+	}
+	if !reflect.DeepEqual(decoded.OnchainOutputIndexes, onchainIndexes) {
+		return errors.New("register message onchain outputs mismatch")
+	}
+	if !reflect.DeepEqual(decoded.CosignersPublicKeys, cosignerPubkeys) {
+		return errors.New("register message cosigners mismatch")
+	}
+	return nil
+}
+
 func custodyBuildProofPSBT(message string, inputs []arkintent.Input, outputs []*wire.TxOut, leafProofs []*arklib.TaprootMerkleProof, arkFields [][]*psbt.Unknown, locktime arklib.AbsoluteLocktime) (string, error) {
 	proof, err := arkintent.New(message, inputs, outputs)
 	if err != nil {

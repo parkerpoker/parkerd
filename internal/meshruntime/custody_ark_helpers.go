@@ -594,6 +594,12 @@ func (runtime *meshRuntime) potSpendSignerIDsForTransition(table nativeTableStat
 }
 
 func (runtime *meshRuntime) potSliceRefsReusableForTransition(table nativeTableState, transition tablecustody.CustodyTransition, previous, next tablecustody.PotSlice) bool {
+	// Player-action transitions always mint fresh custody outputs. Historical
+	// replay may happen after cash-out clears the current ActiveHand pointer, so
+	// reuse cannot depend on the live table view.
+	if transition.Kind == tablecustody.TransitionKindAction {
+		return false
+	}
 	if !reflect.DeepEqual(comparablePotSlice(previous), comparablePotSlice(next)) {
 		return false
 	}
@@ -611,6 +617,12 @@ func (runtime *meshRuntime) potSliceRefsReusableForTransition(table nativeTableS
 }
 
 func (runtime *meshRuntime) stackClaimRefsReusableForTransition(table nativeTableState, transition tablecustody.CustodyTransition, previous, next tablecustody.StackClaim) bool {
+	// Player-action transitions always mint fresh custody outputs. Historical
+	// replay may happen after cash-out clears the current ActiveHand pointer, so
+	// reuse cannot depend on the live table view.
+	if transition.Kind == tablecustody.TransitionKindAction {
+		return false
+	}
 	if !reflect.DeepEqual(comparableStackClaim(previous), comparableStackClaim(next)) {
 		return false
 	}
@@ -868,6 +880,9 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			plan.TreeSignerIDs = append(plan.TreeSignerIDs, claim.PlayerID)
 		}
 	}
+	sort.SliceStable(plan.Inputs, func(left, right int) bool {
+		return fundingRefKey(plan.Inputs[left].Ref) < fundingRefKey(plan.Inputs[right].Ref)
+	})
 	plan.TreeSignerIDs = uniqueSortedPlayerIDs(plan.TreeSignerIDs)
 	for playerID := range proofSignerSet {
 		plan.ProofSignerIDs = append(plan.ProofSignerIDs, playerID)

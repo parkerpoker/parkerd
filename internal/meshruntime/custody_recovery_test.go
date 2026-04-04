@@ -369,6 +369,35 @@ func TestActionTimeoutRecoveryMatchesCooperativeSuccessor(t *testing.T) {
 	}
 }
 
+func TestActionTimeoutRecoveryDoesNotRequirePersistedPendingTurnMenu(t *testing.T) {
+	host, _, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
+
+	before = withLatestRecoveryBundlesForTest(t, host, before, before.ActiveHand.State)
+	before.Config.TurnTimeoutMode = turnTimeoutModeDirect
+	lastIndex := len(before.CustodyTransitions) - 1
+	for index := range before.CustodyTransitions[lastIndex].Proof.RecoveryBundles {
+		before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].EarliestExecuteAt = addMillis(nowISO(), -1)
+	}
+	expireCurrentTurnActionDeadlineForTest(t, &before)
+	before.LatestCustodyState.PublicStateHash = host.publicMoneyStateHash(before, &before.ActiveHand.State)
+	before.PendingTurnMenu = nil
+
+	handled, err := host.handleActionTimeoutLocked(&before)
+	if err != nil {
+		t.Fatalf("handle action timeout without pending menu: %v", err)
+	}
+	if !handled {
+		t.Fatal("expected timeout recovery to finalize without a persisted pending turn menu")
+	}
+	lastTransition := before.CustodyTransitions[len(before.CustodyTransitions)-1]
+	if lastTransition.Kind != tablecustody.TransitionKindTimeout {
+		t.Fatalf("expected latest custody transition %q, got %q", tablecustody.TransitionKindTimeout, lastTransition.Kind)
+	}
+	if lastTransition.Proof.RecoveryWitness == nil {
+		t.Fatal("expected timeout recovery witness on the finalized timeout transition")
+	}
+}
+
 func TestRecoveryFailsClosedWithoutStoredSourceBundle(t *testing.T) {
 	host, _, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
 

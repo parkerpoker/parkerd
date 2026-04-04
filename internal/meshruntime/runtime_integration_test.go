@@ -126,7 +126,7 @@ func runRegtestRoundScenario(t *testing.T, scenario string) regtestRoundResult {
 		markers = append(markers,
 			"Forcing deterministic timeout recovery scenario...",
 			"Stopping defaulting player daemon and Ark/indexer services before timeout finalization completes...",
-			"Recovery transition confirmed.",
+			"Timeout completion confirmed.",
 			"Skipping cash out because the recovery scenario intentionally leaves the Ark server offline.",
 		)
 	} else {
@@ -301,13 +301,13 @@ func assertRegtestRoundCustodyArtifacts(t *testing.T, result regtestRoundResult)
 		if request.PrevCustodyStateHash != transition.PrevStateHash {
 			t.Fatalf("player action event %d request prev hash %q does not match transition prev hash %q", index, request.PrevCustodyStateHash, transition.PrevStateHash)
 		}
-			expectedActor := ""
-			if previous != nil {
-				expectedActor = previous.ActingPlayerID
-			}
-			if strings.TrimSpace(expectedActor) != "" && request.PlayerID != expectedActor {
-				t.Fatalf("player action event %d request player %q does not match transition actor %q", index, request.PlayerID, expectedActor)
-			}
+		expectedActor := ""
+		if previous != nil {
+			expectedActor = previous.ActingPlayerID
+		}
+		if strings.TrimSpace(expectedActor) != "" && request.PlayerID != expectedActor {
+			t.Fatalf("player action event %d request player %q does not match transition actor %q", index, request.PlayerID, expectedActor)
+		}
 		if transition.NextState.ChallengeAnchor != request.ChallengeAnchor {
 			t.Fatalf("player action event %d request challenge anchor %q does not match transition binding %q", index, request.ChallengeAnchor, transition.NextState.ChallengeAnchor)
 		}
@@ -384,13 +384,13 @@ func assertRegtestRoundRecoveryArtifacts(t *testing.T, result regtestRoundResult
 	assertRegtestRoundMovedFunds(t, afterHand)
 
 	var recovered tablecustody.CustodyTransition
-	var recoveredPrev *tablecustody.CustodyState
+	var recoveredIndex int
 	foundRecovered := false
 	for index, transition := range afterHand.CustodyTransitions {
 		if transition.Kind != tablecustody.TransitionKindTimeout {
 			continue
 		}
-		if transition.Proof.RecoveryWitness == nil {
+		if transition.Proof.RecoveryWitness == nil && transition.Proof.ChallengeWitness == nil {
 			continue
 		}
 		if transition.Proof.SettlementWitness != nil {
@@ -399,56 +399,85 @@ func assertRegtestRoundRecoveryArtifacts(t *testing.T, result regtestRoundResult
 		if strings.TrimSpace(transition.Proof.ArkIntentID) != "" || strings.TrimSpace(transition.Proof.ArkTxID) != "" {
 			t.Fatalf("recovery timeout transition %d unexpectedly carries live Ark settlement ids", index)
 		}
-		if strings.TrimSpace(transition.Proof.RecoveryWitness.SourceTransitionHash) == "" {
-			t.Fatalf("recovery timeout transition %d is missing its source transition hash", index)
-		}
 		recovered = transition
-		if index > 0 {
-			previous := afterHand.CustodyTransitions[index-1].NextState
-			recoveredPrev = &previous
-		}
+		recoveredIndex = index
 		foundRecovered = true
 	}
 	if !foundRecovered {
-		t.Fatal("expected a timeout transition finalized from a recovery witness")
-	}
-	if recoveredPrev == nil {
-		t.Fatal("expected the recovered timeout transition to have a prior source state")
+		t.Fatal("expected a timeout transition finalized from recovery or challenge proof material")
 	}
 
-	sourceFound := false
-	sourceBundleFound := false
-	for _, transition := range afterHand.CustodyTransitions {
-		if transition.Proof.TransitionHash != recovered.Proof.RecoveryWitness.SourceTransitionHash {
-			continue
+	switch {
+	case recovered.Proof.RecoveryWitness != nil:
+		if strings.TrimSpace(recovered.Proof.RecoveryWitness.SourceTransitionHash) == "" {
+			t.Fatalf("recovery timeout transition %d is missing its source transition hash", recoveredIndex)
 		}
-		sourceFound = true
-		for _, bundle := range transition.Proof.RecoveryBundles {
-			if bundle.BundleHash == recovered.Proof.RecoveryWitness.BundleHash {
-				sourceBundleFound = true
+		sourceFound := false
+		sourceBundleFound := false
+		for _, transition := range afterHand.CustodyTransitions {
+			if transition.Proof.TransitionHash != recovered.Proof.RecoveryWitness.SourceTransitionHash {
+				continue
+			}
+			sourceFound = true
+			for _, bundle := range transition.Proof.RecoveryBundles {
+				if bundle.BundleHash == recovered.Proof.RecoveryWitness.BundleHash {
+					sourceBundleFound = true
+					break
+				}
+			}
+			break
+		}
+		if !sourceFound {
+			t.Fatalf("recovery source transition %s not found in custody history", recovered.Proof.RecoveryWitness.SourceTransitionHash)
+		}
+		if !sourceBundleFound {
+			t.Fatalf("recovery bundle %s not found on its source transition", recovered.Proof.RecoveryWitness.BundleHash)
+		}
+		if strings.TrimSpace(recovered.Proof.RecoveryWitness.RecoveryTxID) == "" {
+			t.Fatal("expected the recovery witness to include a recovery transaction id")
+		}
+		foundRecoveryTxID := false
+		for _, txid := range recovered.Proof.RecoveryWitness.BroadcastTxIDs {
+			if txid == recovered.Proof.RecoveryWitness.RecoveryTxID {
+				foundRecoveryTxID = true
 				break
 			}
 		}
-		break
-	}
-	if !sourceFound {
-		t.Fatalf("recovery source transition %s not found in custody history", recovered.Proof.RecoveryWitness.SourceTransitionHash)
-	}
-	if !sourceBundleFound {
-		t.Fatalf("recovery bundle %s not found on its source transition", recovered.Proof.RecoveryWitness.BundleHash)
-	}
-	if strings.TrimSpace(recovered.Proof.RecoveryWitness.RecoveryTxID) == "" {
-		t.Fatal("expected the recovery witness to include a recovery transaction id")
-	}
-	foundRecoveryTxID := false
-	for _, txid := range recovered.Proof.RecoveryWitness.BroadcastTxIDs {
-		if txid == recovered.Proof.RecoveryWitness.RecoveryTxID {
-			foundRecoveryTxID = true
-			break
+		if !foundRecoveryTxID {
+			t.Fatal("expected the recovery witness broadcast metadata to include the recovery transaction id")
 		}
-	}
-	if !foundRecoveryTxID {
-		t.Fatal("expected the recovery witness broadcast metadata to include the recovery transaction id")
+	case recovered.Proof.ChallengeWitness != nil:
+		if recovered.Proof.ChallengeBundle == nil {
+			t.Fatal("expected the challenge-based timeout completion to carry its bundle")
+		}
+		if recovered.Proof.ChallengeBundle.Kind != tablecustody.TransitionKindTimeout {
+			t.Fatalf("expected challenge-based timeout completion to use bundle kind %q, got %q", tablecustody.TransitionKindTimeout, recovered.Proof.ChallengeBundle.Kind)
+		}
+		if strings.TrimSpace(recovered.Proof.ChallengeWitness.TransactionID) == "" {
+			t.Fatal("expected the challenge witness to include a transaction id")
+		}
+		foundChallengeTxID := false
+		for _, txid := range recovered.Proof.ChallengeWitness.BroadcastTxIDs {
+			if txid == recovered.Proof.ChallengeWitness.TransactionID {
+				foundChallengeTxID = true
+				break
+			}
+		}
+		if !foundChallengeTxID {
+			t.Fatal("expected the challenge witness broadcast metadata to include the timeout transaction id")
+		}
+		if recoveredIndex == 0 {
+			t.Fatal("expected the challenge-based timeout completion to follow a source transition")
+		}
+		openTransition := afterHand.CustodyTransitions[recoveredIndex-1]
+		if openTransition.Kind != tablecustody.TransitionKindTurnChallengeOpen {
+			t.Fatalf("expected the challenge-based timeout completion to follow %q, got %q", tablecustody.TransitionKindTurnChallengeOpen, openTransition.Kind)
+		}
+		if openTransition.Proof.ChallengeWitness == nil {
+			t.Fatal("expected the source turn-challenge-open transition to carry challenge witness metadata")
+		}
+	default:
+		t.Fatal("expected the timeout completion to carry either recovery or challenge witness metadata")
 	}
 
 	latestTransition := afterHand.CustodyTransitions[len(afterHand.CustodyTransitions)-1]

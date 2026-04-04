@@ -871,6 +871,8 @@ select_table_action() {
   )
   if host_player_scenario_enabled; then
     args+=(--avoid-showdown)
+  else
+    args+=(--prefer-early-settlement)
   fi
   pdevtool "${args[@]}"
 }
@@ -1137,6 +1139,45 @@ round_watch_profiles() {
   printf '%s\n' "${profiles[@]}"
 }
 
+turn_menu_action_cooldown_complete() {
+  local state_json="$1"
+
+  STATE_JSON="$state_json" python3 - <<'PY'
+import datetime
+import json
+import os
+import sys
+
+raw = os.environ.get("STATE_JSON", "")
+if not raw:
+    sys.exit(1)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    sys.exit(1)
+
+data = payload.get("data") or {}
+transitions = data.get("custodyTransitions") or []
+if not transitions:
+    sys.exit(0)
+proof = (transitions[-1] or {}).get("proof") or {}
+finalized_at = str(proof.get("finalizedAt") or "").strip()
+if not finalized_at:
+    sys.exit(0)
+if finalized_at.endswith("Z"):
+    finalized_at = finalized_at[:-1] + "+00:00"
+try:
+    finalized = datetime.datetime.fromisoformat(finalized_at)
+except ValueError:
+    sys.exit(0)
+if finalized.tzinfo is None:
+    finalized = finalized.replace(tzinfo=datetime.timezone.utc)
+cooldown_seconds = 2.0
+now = datetime.datetime.now(datetime.timezone.utc)
+sys.exit(0 if (now - finalized).total_seconds() >= cooldown_seconds else 1)
+PY
+}
+
 wait_for_actor_locally_actionable_state() {
   local actor="$1"
   local expected_state_json="$2"
@@ -1207,8 +1248,10 @@ wait_for_actor_locally_actionable_state() {
       return 1
     fi
     if [[ "$can_act" == "true" ]]; then
-      printf '%s\n' "$state_json"
-      return 0
+      if turn_menu_action_cooldown_complete "$state_json"; then
+        printf '%s\n' "$state_json"
+        return 0
+      fi
     fi
     sleep "$sleep_seconds"
   done
@@ -1472,20 +1515,38 @@ wait_for_actionable_table_state() {
   local sleep_seconds="${3:-0.5}"
   local state_json=""
   local phase=""
+  local first_option_type=""
+  local local_can_act=""
+  local local_option_id=""
 
   for ((attempt = 0; attempt < attempts; attempt += 1)); do
     state_json="$(watch_table_state_with_retry "$profile")"
     phase="$(printf '%s' "$state_json" | json_field data.publicState.phase 2>/dev/null || true)"
     if [[ "$phase" == "preflop" || "$phase" == "flop" || "$phase" == "turn" || "$phase" == "river" ]]; then
-      if acting_profile_for_state "$state_json" >/dev/null 2>&1; then
-        printf '%s\n' "$state_json"
-        return 0
+      first_option_type="$(printf '%s' "$state_json" | json_field data.pendingTurnMenu.options.0.action.type 2>/dev/null || true)"
+      if [[ -z "$first_option_type" || "$first_option_type" == "null" ]]; then
+        first_option_type="$(printf '%s' "$state_json" | json_field data.pendingTurnMenu.options.0.action.Type 2>/dev/null || true)"
+      fi
+      if acting_profile_for_state "$state_json" >/dev/null 2>&1 &&
+        [[ -n "$first_option_type" && "$first_option_type" != "null" ]]; then
+        if [[ "$profile" == "host" || "$profile" == "witness" ]]; then
+          printf '%s\n' "$state_json"
+          return 0
+        fi
+        local_can_act="$(printf '%s' "$state_json" | json_field data.local.canAct 2>/dev/null || true)"
+        local_option_id="$(printf '%s' "$state_json" | json_field data.local.turnMenu.options.0.optionId 2>/dev/null || true)"
+        if [[ "$local_can_act" == "true" && -n "$local_option_id" && "$local_option_id" != "null" ]]; then
+          if turn_menu_action_cooldown_complete "$state_json"; then
+            printf '%s\n' "$state_json"
+            return 0
+          fi
+        fi
       fi
     fi
     sleep "$sleep_seconds"
   done
 
-  echo "timed out waiting for an actionable table state" >&2
+  echo "timed out waiting for an actionable table state with a deterministic turn menu" >&2
   return 1
 }
 
@@ -1515,29 +1576,56 @@ forced_aggression_action_for_state() {
   local state_json="$1"
   local actor_profile="$2"
   local actor_player_id=""
-  local current_bet=0
-  local contribution=0
-  local min_raise_to=0
-  local total_sats=800
+  local selected=""
 
-  actor_player_id="$(profile_player_id "$actor_profile")"
+  actor_player_id="$(profile_player_id "$actor_profile" 2>/dev/null || true)"
   [[ -n "$actor_player_id" ]] || return 1
 
-  current_bet="$(printf '%s' "$state_json" | json_field data.publicState.currentBetSats 2>/dev/null || true)"
-  contribution="$(printf '%s' "$state_json" | json_field "data.publicState.roundContributions.${actor_player_id}" 2>/dev/null || true)"
-  min_raise_to="$(printf '%s' "$state_json" | json_field data.publicState.minRaiseToSats 2>/dev/null || true)"
-  [[ "$current_bet" =~ ^[0-9]+$ ]] || current_bet=0
-  [[ "$contribution" =~ ^[0-9]+$ ]] || contribution=0
-  [[ "$min_raise_to" =~ ^[0-9]+$ ]] || min_raise_to=0
-  if (( min_raise_to > total_sats )); then
-    total_sats="$min_raise_to"
-  fi
+  selected="$(STATE_JSON="$state_json" python3 - <<'PY'
+import json
+import os
+import sys
 
-  if (( current_bet - contribution > 0 )); then
-    printf 'raise %s\n' "$total_sats"
-    return 0
-  fi
-  printf 'bet %s\n' "$total_sats"
+raw = os.environ.get("STATE_JSON", "")
+if not raw:
+    sys.exit(1)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError:
+    sys.exit(1)
+
+menu = ((payload.get("data") or {}).get("local") or {}).get("turnMenu") or {}
+if not (menu.get("options") or []):
+    menu = ((payload.get("data") or {}).get("pendingTurnMenu") or {})
+options = menu.get("options") or []
+preferred = {"raise": 0, "bet": 1}
+
+best = None
+for option in options:
+    action = option.get("action") or {}
+    action_type = str(action.get("type") or action.get("Type") or "").strip().lower()
+    if action_type not in preferred:
+        continue
+    rank = preferred[action_type]
+    total = action.get("totalSats")
+    if total is None:
+        total = action.get("TotalSats")
+    if action_type in {"raise", "bet"} and not isinstance(total, int):
+        continue
+    candidate = (rank, action_type, total)
+    if best is None or candidate < best:
+        best = candidate
+
+if best is None:
+    print("no aggressive deterministic menu option is available for the current turn", file=sys.stderr)
+    sys.exit(1)
+
+_, action_type, total = best
+print(f"{action_type} {total}")
+PY
+)" || return 1
+  [[ -n "$selected" ]] || return 1
+  printf '%s\n' "$selected"
 }
 
 clear_profile_daemon_pid() {
@@ -1573,11 +1661,15 @@ wait_for_timeout_recovery_transition() {
   local state_json=""
   local custody_seq=""
   local transition_index=""
+  local previous_transition_hash=""
   local kind=""
   local recovery_bundle_hash=""
   local recovery_source_hash=""
   local recovery_txid=""
   local settlement_witness=""
+  local challenge_bundle_kind=""
+  local challenge_bundle_hash=""
+  local challenge_txid=""
 
   for ((attempt = 0; attempt < attempts; attempt += 1)); do
     state_json="$(watch_table_state_with_retry "$profile")"
@@ -1592,9 +1684,16 @@ wait_for_timeout_recovery_transition() {
       continue
     }
     kind="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.kind" 2>/dev/null || true)"
+    previous_transition_hash=""
+    if [[ "$transition_index" =~ ^[0-9]+$ ]] && (( transition_index > 0 )); then
+      previous_transition_hash="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.$((transition_index - 1)).proof.transitionHash" 2>/dev/null || true)"
+    fi
     recovery_bundle_hash="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryWitness.bundleHash" 2>/dev/null || true)"
     recovery_source_hash="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryWitness.sourceTransitionHash" 2>/dev/null || true)"
     recovery_txid="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.recoveryWitness.recoveryTxid" 2>/dev/null || true)"
+    challenge_bundle_kind="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.challengeBundle.kind" 2>/dev/null || true)"
+    challenge_bundle_hash="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.challengeWitness.bundleHash" 2>/dev/null || true)"
+    challenge_txid="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.challengeWitness.transactionId" 2>/dev/null || true)"
     settlement_witness="$(printf '%s' "$state_json" | json_field "data.custodyTransitions.${transition_index}.proof.settlementWitness" 2>/dev/null || true)"
     if [[ "$kind" == "timeout" &&
       -n "$recovery_bundle_hash" && "$recovery_bundle_hash" != "null" &&
@@ -1604,22 +1703,33 @@ wait_for_timeout_recovery_transition() {
       printf '%s\n' "$state_json"
       return 0
     fi
+    if [[ "$kind" == "timeout" &&
+      "$challenge_bundle_kind" == "timeout" &&
+      -n "$challenge_bundle_hash" && "$challenge_bundle_hash" != "null" &&
+      -n "$challenge_txid" && "$challenge_txid" != "null" &&
+      -z "$settlement_witness" ]]; then
+      printf '%s\n' "$state_json"
+      return 0
+    fi
     sleep "$sleep_seconds"
   done
 
-  echo "timed out waiting for timeout recovery transition from $source_transition_hash" >&2
+  echo "timed out waiting for timeout completion from $source_transition_hash" >&2
   return 1
 }
 
 run_timeout_recovery_scenario() {
   local state_json=""
+  local actor_state_json=""
   local source_transition_state=""
   local initial_seq=0
   local latest_seq=0
   local source_index=""
+  local source_kind=""
   local bundle_index=""
   local source_transition_hash=""
   local defaulting_profile=""
+  local forced_selection=""
   local forced_action=""
   local forced_amount=""
   local earliest_execute_at=""
@@ -1629,27 +1739,38 @@ run_timeout_recovery_scenario() {
   local now_epoch=""
 
   echo "Forcing deterministic timeout recovery scenario..." >&2
-  state_json="$(wait_for_actionable_table_state host)"
-  initial_seq="$(printf '%s' "$state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
-  [[ "$initial_seq" =~ ^[0-9]+$ ]] || initial_seq=0
+  state_json="$(wait_for_actionable_table_state host)" || return 1
 
-  defaulting_profile="$(acting_profile_for_state "$state_json")"
-  read -r forced_action forced_amount <<<"$(forced_aggression_action_for_state "$state_json" "$defaulting_profile")"
+  defaulting_profile="$(acting_profile_for_state "$state_json")" || return 1
+  actor_state_json="$(wait_for_actionable_table_state "$defaulting_profile")" || return 1
+  initial_seq="$(printf '%s' "$actor_state_json" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
+  [[ "$initial_seq" =~ ^[0-9]+$ ]] || initial_seq=0
+  forced_selection="$(forced_aggression_action_for_state "$actor_state_json" "$defaulting_profile")" || return 1
+  read -r forced_action forced_amount <<<"$forced_selection"
+  [[ -n "$forced_action" ]] || return 1
   printf 'Creating contested pot via %s %s %s...\n' "$defaulting_profile" "$forced_action" "$forced_amount" >&2
   send_table_action_with_retry "$defaulting_profile" "$forced_action" "$forced_amount"
 
-  source_transition_state="$(wait_for_latest_custody_seq_gt host "$initial_seq")"
+  source_transition_state="$(wait_for_latest_custody_seq_gt host "$initial_seq")" || return 1
   latest_seq="$(printf '%s' "$source_transition_state" | json_field data.latestCustodyState.custodySeq 2>/dev/null || true)"
-  source_index="$(latest_transition_index_from_state "$source_transition_state")"
+  source_index="$(latest_transition_index_from_state "$source_transition_state")" || return 1
+  source_kind="$(printf '%s' "$source_transition_state" | json_field "data.custodyTransitions.${source_index}.kind" 2>/dev/null || true)"
   source_transition_hash="$(printf '%s' "$source_transition_state" | json_field "data.custodyTransitions.${source_index}.proof.transitionHash" 2>/dev/null || true)"
   bundle_index="$(find_recovery_bundle_index "$source_transition_state" "$source_index" timeout 2>/dev/null || true)"
-  if [[ -z "$bundle_index" ]]; then
-    echo "expected a stored timeout recovery bundle on the latest contested source transition" >&2
+  if [[ -n "$bundle_index" ]]; then
+    earliest_execute_at="$(printf '%s' "$source_transition_state" | json_field "data.custodyTransitions.${source_index}.proof.recoveryBundles.${bundle_index}.earliestExecuteAt" 2>/dev/null || true)"
+  elif [[ "$source_kind" == "turn-challenge-open" ]]; then
+    earliest_execute_at="$(printf '%s' "$source_transition_state" | json_field "data.pendingTurnChallenge.timeoutEligibleAt" 2>/dev/null || true)"
+    if [[ -z "$earliest_execute_at" || "$earliest_execute_at" == "null" ]]; then
+      echo "expected timeout eligibility metadata on the latest turn challenge open transition" >&2
+      return 1
+    fi
+  else
+    echo "expected either a stored timeout recovery bundle or a turn-challenge-open source transition" >&2
     return 1
   fi
-  earliest_execute_at="$(printf '%s' "$source_transition_state" | json_field "data.custodyTransitions.${source_index}.proof.recoveryBundles.${bundle_index}.earliestExecuteAt" 2>/dev/null || true)"
 
-  defaulting_profile="$(acting_profile_for_state "$source_transition_state")"
+  defaulting_profile="$(acting_profile_for_state "$source_transition_state")" || return 1
   if [[ -z "$defaulting_profile" ]]; then
     echo "expected a defaulting player after the forcing action" >&2
     return 1
@@ -1670,14 +1791,14 @@ run_timeout_recovery_scenario() {
     fi
   fi
 
-  echo "Waiting for timeout recovery after U..." >&2
+  echo "Waiting for timeout completion after U..." >&2
   if ! final_table_json="$(wait_for_timeout_recovery_transition host "$source_transition_hash" "$latest_seq" "$recovery_wait_seconds")"; then
     return 1
   fi
   mkdir -p "$BASE/artifacts"
   printf '%s\n' "$final_table_json" >"$BASE/artifacts/table-after-hand.json"
 
-  echo "Recovery transition confirmed." >&2
+  echo "Timeout completion confirmed." >&2
   printf '%s\n' "$final_table_json"
 }
 
@@ -2144,7 +2265,7 @@ if ! host_player_scenario_enabled; then
 fi
 
 echo "Creating table..."
-create_table_args=(table create --name auto-regtest-table --profile host --json)
+create_table_args=(table create --name auto-regtest-table --turn-timeout-mode direct --profile host --json)
 if ! host_player_scenario_enabled; then
   create_table_args+=(--witness-peer-ids "$WITNESS_PEER_ID")
 fi

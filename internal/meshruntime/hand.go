@@ -1658,11 +1658,13 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if turnTimeoutModeForTable(*table) == turnTimeoutModeChainChallenge || table.PendingTurnChallenge != nil {
 		return false, nil
 	}
-	if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
-		return false, nil
-	}
-	if runtime.hasTimelySelectedCandidate(*table) {
-		return false, nil
+	if turnMenuMatchesTable(*table, table.PendingTurnMenu) {
+		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
+			return false, nil
+		}
+		if runtime.hasTimelySelectedCandidate(*table) {
+			return false, nil
+		}
 	}
 	deadline := runtime.currentCustodyActionDeadline(*table)
 	if deadline == "" || elapsedMillis(deadline) < 0 {

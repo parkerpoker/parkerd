@@ -1372,6 +1372,88 @@ func TestBuildCustodySettlementPlanDoesNotDuplicateChangedStackRefs(t *testing.T
 	}
 }
 
+func TestBuildCustodySettlementPlanConsumesAllStackRefsForClosingActionRound(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	runtimes := []*meshRuntime{host, guest}
+
+	table := waitForLocalCanAct(t, runtimes, host, tableID)
+	caller := host
+	bettor := guest
+	if seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex) != host.walletID.PlayerID {
+		table = waitForLocalCanAct(t, runtimes, guest, tableID)
+		caller = guest
+		bettor = host
+	}
+	if _, err := caller.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("caller completes blind: %v", err)
+	}
+
+	table = waitForLocalCanAct(t, runtimes, bettor, tableID)
+	legal := game.GetLegalActions(table.ActiveHand.State, table.ActiveHand.State.ActingSeatIndex)
+	bet := game.Action{}
+	for _, candidate := range legal {
+		if candidate.Type != game.ActionBet && candidate.Type != game.ActionRaise {
+			continue
+		}
+		bet = game.Action{Type: candidate.Type}
+		if candidate.MinTotalSats != nil {
+			bet.TotalSats = *candidate.MinTotalSats
+		}
+		break
+	}
+	if bet.Type == "" || bet.TotalSats == 0 {
+		t.Fatalf("expected a betting action after the blind-completing call, got %#v", legal)
+	}
+	if _, err := bettor.SendAction(tableID, bet); err != nil {
+		t.Fatalf("bettor opens the round: %v", err)
+	}
+
+	table = waitForLocalCanAct(t, runtimes, caller, tableID)
+	call := game.Action{Type: game.ActionCall}
+	nextState, err := game.ApplyHoldemAction(table.ActiveHand.State, *table.ActiveHand.State.ActingSeatIndex, call)
+	if err != nil {
+		t.Fatalf("apply closing call: %v", err)
+	}
+	transition, err := host.buildCustodyTransition(table, tablecustody.TransitionKindAction, &nextState, &call, nil)
+	if err != nil {
+		t.Fatalf("build closing action transition: %v", err)
+	}
+	plan, err := host.buildCustodySettlementPlan(table, transition)
+	if err != nil {
+		t.Fatalf("build closing action settlement plan: %v", err)
+	}
+
+	seenRefs := map[string]int{}
+	orderedRefs := make([]string, 0, len(plan.Inputs))
+	for _, input := range plan.Inputs {
+		key := fundingRefKey(input.Ref)
+		seenRefs[key]++
+		orderedRefs = append(orderedRefs, key)
+	}
+	if !sort.StringsAreSorted(orderedRefs) {
+		t.Fatalf("expected settlement plan inputs to be sorted by funding ref, got %v", orderedRefs)
+	}
+	for _, claim := range table.LatestCustodyState.StackClaims {
+		for _, ref := range claim.VTXORefs {
+			key := fundingRefKey(ref)
+			if seenRefs[key] != 1 {
+				t.Fatalf("expected current stack ref %s to appear exactly once in the settlement plan, got %d", key, seenRefs[key])
+			}
+		}
+	}
+	for _, slice := range table.LatestCustodyState.PotSlices {
+		for _, ref := range slice.VTXORefs {
+			key := fundingRefKey(ref)
+			if seenRefs[key] != 1 {
+				t.Fatalf("expected current pot ref %s to appear exactly once in the settlement plan, got %d", key, seenRefs[key])
+			}
+		}
+	}
+}
+
 func TestRefreshPersistedSettledHandKeepsPreviousSnapshotHash(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -6183,6 +6265,33 @@ func findEventIndexByType(table nativeTableState, eventType string) int {
 		}
 	}
 	return -1
+}
+
+func TestValidateCustodyRegisterMessageIgnoresTimestampVariance(t *testing.T) {
+	onchainIndexes := []int{0, 2}
+	cosignerPubkeys := []string{
+		"021111111111111111111111111111111111111111111111111111111111111111",
+		"032222222222222222222222222222222222222222222222222222222222222222",
+	}
+
+	first, err := custodyRegisterMessage(onchainIndexes, cosignerPubkeys)
+	if err != nil {
+		t.Fatalf("first register message: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	second, err := custodyRegisterMessage(onchainIndexes, cosignerPubkeys)
+	if err != nil {
+		t.Fatalf("second register message: %v", err)
+	}
+	if first == second {
+		t.Fatal("expected register messages built at different times to differ")
+	}
+	if err := validateCustodyRegisterMessage(first, onchainIndexes, cosignerPubkeys); err != nil {
+		t.Fatalf("validate first register message: %v", err)
+	}
+	if err := validateCustodyRegisterMessage(second, onchainIndexes, cosignerPubkeys); err != nil {
+		t.Fatalf("validate second register message: %v", err)
+	}
 }
 
 func recomputeCustodyTransitionHashesForTest(transition *tablecustody.CustodyTransition) {

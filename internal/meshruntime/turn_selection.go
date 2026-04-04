@@ -276,12 +276,16 @@ func (runtime *meshRuntime) executePreSignedCandidateBatch(table nativeTableStat
 	if err != nil {
 		return nil, err
 	}
-	message, err := custodyRegisterMessage(custodyOnchainOutputIndexes(plan.AuthorizedOutputs), sortedSignerPubkeys(signerPubkeys))
+	onchainOutputIndexes := custodyOnchainOutputIndexes(plan.AuthorizedOutputs)
+	cosignerPubkeys := sortedSignerPubkeys(signerPubkeys)
+	if bundle.RegisterMessage != "" {
+		if err := validateCustodyRegisterMessage(bundle.RegisterMessage, onchainOutputIndexes, cosignerPubkeys); err != nil {
+			return nil, err
+		}
+	}
+	message, err := custodyRegisterMessage(onchainOutputIndexes, cosignerPubkeys)
 	if err != nil {
 		return nil, err
-	}
-	if bundle.RegisterMessage != "" && bundle.RegisterMessage != message {
-		return nil, errors.New("candidate register message mismatch")
 	}
 	transport, err := runtime.newArkTransportClient()
 	if err != nil {
