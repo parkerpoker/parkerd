@@ -1,12 +1,12 @@
-# Current Architecture
+# Architecture
 
-This document describes the architecture implemented today in this repository. It is intentionally current-state only.
+This document describes the architecture in this repository.
 
-For protocol details, see [protocol.md](./protocol.md). For the current dealerless hand flow, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
+For protocol details, see [protocol.md](./protocol.md). For the dealerless hand flow, see [dealerless.md](./dealerless.md). For chip and wallet movement, see [money-flows.md](./money-flows.md). For guarantees and trust assumptions, see [trust-model.md](./trust-model.md).
 
 ## Overview
 
-Parker currently runs as a Go-first daemon workspace:
+Parker runs as a Go-first daemon workspace:
 
 - `cmd/parker-daemon` runs the gameplay and settlement daemon
 - `cmd/parker-cli` controls a local daemon over Unix-socket RPC
@@ -15,7 +15,7 @@ Parker currently runs as a Go-first daemon workspace:
 - external browser clients can talk to the localhost controller
 - `scripts/bin/*` wrappers build and run the Go binaries on demand
 
-The peer runtime is coordinator-led and dealerless today:
+The peer runtime is coordinator-led and dealerless:
 
 - each participant runs a local daemon
 - the current host coordinates joins, actions, failover, event append order, and replication
@@ -32,10 +32,11 @@ Daemons advertise direct peer endpoints shaped like `parker://host:port` and exc
 
 Deterministic pot resolution uses pre-signed CSV recovery bundles over the shared pot exit instead of an output-inspecting tapscript branch.
 
-Accepted custody history has two proof surfaces:
+Accepted custody history has three proof surfaces:
 
 - `CustodyProof.SettlementWitness` for ordinary real Ark batch finalization
 - stored `CustodyProof.RecoveryBundles` plus an executed `CustodyProof.RecoveryWitness` for deterministic heads-up contested-pot recovery after the shared pot CSV delay `U`
+- stored `CustodyProof.ChallengeBundle` plus an executed `CustodyProof.ChallengeWitness` for `turn-challenge-open`, challenge-resolved actions, challenge-resolved timeouts, and challenge escapes
 
 The recovery path is intentionally narrow in v1:
 
@@ -45,7 +46,7 @@ The recovery path is intentionally narrow in v1:
 - showdown reveal/showdown timeout that kills the missing player
 - settled `showdown-payout` timeout
 
-Auto-check states still fail closed until a later objective deadline exists. When recovery does apply, it recreates the same ordinary winner-owned stack refs that the cooperative successor would have produced.
+Auto-check states fail closed until a later objective deadline exists. When recovery does apply, it recreates the same ordinary winner-owned stack refs that the cooperative successor would have produced.
 
 ## Practical Repo Mapping
 
@@ -57,15 +58,15 @@ Auto-check states still fail closed until a later objective deadline exists. Whe
 - [internal/settlementcore/core.go](../internal/settlementcore/core.go) implements canonical JSON hashing and signatures
 - [internal/tablecustody](../internal/tablecustody) owns custody state hashing, transition validation, side-pot claims, and exit-proof material
 - [internal/meshruntime/custody_recovery.go](../internal/meshruntime/custody_recovery.go) owns deterministic recovery bundle generation, CSV-leaf selection, fallback execution, and offline witness replay
-- [internal/wallet/runtime.go](../internal/wallet/runtime.go) plus [internal/wallet/custody_exit.go](../internal/wallet/custody_exit.go) own Ark wallet access, signer sessions, and unilateral exit execution
-- [internal/game](../internal/game) contains the current Hold'em rules engine and N-player money evaluation
+- [internal/wallet/runtime.go](../internal/wallet/runtime.go), [internal/wallet/custody_exit.go](../internal/wallet/custody_exit.go), and [internal/wallet/chain_status.go](../internal/wallet/chain_status.go) own Ark wallet access, signer sessions, unilateral exit execution, and explorer-backed chain-status lookups for challenge replay/readiness
+- [internal/game](../internal/game) contains the Hold'em rules engine and N-player money evaluation
 - browser clients are maintained outside this repository
 
 ## Component Roles
 
 ### Daemon process
 
-`cmd/parker-daemon` starts [internal/daemon/service.go](../internal/daemon/service.go), which currently wraps [internal/daemon/proxy_daemon.go](../internal/daemon/proxy_daemon.go), the daemon runtime adapter in [internal/daemon/runtime_adapter.go](../internal/daemon/runtime_adapter.go), and the gameplay/custody runtime in [internal/meshruntime/runtime.go](../internal/meshruntime/runtime.go).
+`cmd/parker-daemon` starts [internal/daemon/service.go](../internal/daemon/service.go), which wraps [internal/daemon/proxy_daemon.go](../internal/daemon/proxy_daemon.go), the daemon runtime adapter in [internal/daemon/runtime_adapter.go](../internal/daemon/runtime_adapter.go), and the gameplay/custody runtime in [internal/meshruntime/runtime.go](../internal/meshruntime/runtime.go).
 
 This process owns:
 
@@ -89,7 +90,7 @@ This is the only component that can:
 
 - `<daemonDir>/<profile>.sock`
 
-The current command groups are:
+The command groups are:
 
 - `bootstrap`
 - `wallet`
@@ -128,7 +129,7 @@ It does not:
 
 The daemon process can be started with a mode label (`player` by default; the CLI and controller can also pass `host`, `witness`, or `indexer`), but live table authority is derived from table state rather than from a separate binary or peer protocol.
 
-Current runtime behavior is:
+Runtime behavior is:
 
 - the current host is the peer recorded in `table.CurrentHost`
 - witness-listed peers are the peers recorded in `table.Witnesses`
@@ -139,7 +140,7 @@ Current runtime behavior is:
 
 If witnesses are configured, only witnesses take over automatically. If no witnesses are configured, the seated player with the lowest peer ID becomes the failover candidate.
 
-The CLI still accepts `--mode indexer` for compatibility, but the actual public read path in this repository is the standalone `cmd/parker-indexer` service.
+The CLI accepts `--mode indexer` for compatibility, but the public read path in this repository is the standalone `cmd/parker-indexer` service.
 
 ### Optional indexer
 
@@ -173,7 +174,7 @@ In controller mode the browser can:
 - submit gameplay actions
 - request carry-forward (`meshRenew`), cash-out, or emergency exit
 
-Even in controller mode, the browser is still outside daemon custody:
+Even in controller mode, the browser stays outside daemon custody:
 
 - it does not hold wallet, protocol, or transport private keys
 - it does not read profile files or Unix sockets
@@ -181,7 +182,7 @@ Even in controller mode, the browser is still outside daemon custody:
 
 ### Arkade and Nigiri dependencies
 
-The current runtime uses Arkade-backed wallet and table-funds operations for:
+The runtime uses Arkade-backed wallet and table-funds operations for:
 
 - faucet/onboarding flows
 - buy-in funding verification and lock
@@ -213,7 +214,7 @@ No remote peer talks to another peer's CLI or controller.
 
 ### Peer replication boundary
 
-The current Go runtime exchanges newline-delimited [TransportEnvelope](../internal/transport_types.go) JSON over direct TCP connections rather than `/native/*` HTTP routes.
+The Go runtime exchanges newline-delimited [TransportEnvelope](../internal/transport_types.go) JSON over direct TCP connections rather than `/native/*` HTTP routes.
 
 Request message types are:
 
@@ -317,7 +318,7 @@ This can function for direct-invite play, but it has weaker recovery and no publ
 
 ### Public table with witnesses and spectators
 
-The current public-facing topology is:
+A public-facing topology is:
 
 - one host daemon
 - one or more player daemons
@@ -330,7 +331,7 @@ This gives a public discovery path while keeping gameplay and funds actions in t
 
 ### Local regtest harnesses
 
-The repository currently exercises these local shapes:
+The repository exercises these local shapes:
 
 - `make local` rebuilds the local binaries, starts Nigiri, the indexer, the localhost controller, and three local daemons: `witness`, `alice`, and `bob`; `HOST_PROFILE` selects which player runs in host mode
 - `make deps`, `make host`, `make witness`, `make alice`, `make bob`, and their matching `-down` targets let you manage the local regtest services individually
@@ -358,6 +359,23 @@ The repository currently exercises these local shapes:
 5. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
 6. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
 
+### Chain-challenge flow
+
+When `turnTimeoutMode = "chain-challenge"`, the gameplay loop also carries a deterministic onchain fallback:
+
+1. The host precomputes a `ChallengeEnvelope` for the active finite turn menu.
+2. The `turn-challenge-open` bundle spends every live stack ref and pot ref through its predeclared `D` locktime leaf and reissues the full live bankroll into one `TurnChallengeRef`.
+3. Option-resolution bundles and the timeout-resolution bundle spend `TurnChallengeRef` through its cooperative player-only leaf.
+4. The escape bundle spends `TurnChallengeRef` through its CSV leaf.
+5. Local escape readiness for block-based CSV comes from the wallet runtime's explorer-backed chain-status surface, which queries the configured explorer for tip height and transaction confirmation heights.
+6. Accepted replay uses those same live chain lookups for exact block-height verification and fails closed when the required heights cannot be verified.
+
+That explorer-backed chain-status surface uses:
+
+- `GET {ExplorerURL}/blocks/tip/height` for local tip height
+- `GET {ExplorerURL}/tx/{txid}/status` for transaction confirmation status and block height
+- a short local tip cache as a fallback when a live tip request fails
+
 ### Public read flow
 
 For public tables, the host daemon can publish:
@@ -376,7 +394,7 @@ If the host stops updating `LastHostHeartbeatAt`:
 
 - witnesses can take over when configured
 - if no witnesses are configured, the seated player with the lowest peer ID is the failover candidate
-- the new host appends `HostRotated`
+- the successor host appends `HostRotated`
 - the next hand starts from the latest accepted custody checkpoint and replay-valid derived state
 
 ### Mid-hand host loss
@@ -395,12 +413,12 @@ If a hand reaches an objectively determined money result but cooperative Ark fin
 - the source accepted transition already carries the fully signed recovery PSBT over the shared pot CSV exit
 - the host keeps retrying the normal path until the bundle's `EarliestExecuteAt`
 - after `U`, the host can execute the stored PSBT through the unilateral-exit broadcaster
-- the accepted successor is still the ordinary semantic `timeout` or `showdown-payout` transition, but it now carries `RecoveryWitness` instead of `SettlementWitness`
+- the accepted successor is the ordinary semantic `timeout` or `showdown-payout` transition, but it carries `RecoveryWitness` instead of `SettlementWitness`
 
-This is an eventual-recovery design, not an instant-at-`D` design. The v1 tradeoff is explicit: deterministic contested pots can recover after `U`, while non-deterministic or auto-check states still fail closed.
+This is an eventual-recovery design, not an instant-at-`D` design. The v1 tradeoff is explicit: deterministic contested pots can recover after `U`, while non-deterministic or auto-check states fail closed.
 
 ## Relationship To Other Docs
 
-- [protocol.md](./protocol.md): current controller routes, local RPC surface, peer transport, signed objects, and public-read protocol
-- [dealerless.md](./dealerless.md): current dealerless transcript flow, private card delivery, board opening, showdown, and failover semantics
+- [protocol.md](./protocol.md): controller routes, local RPC surface, peer transport, signed objects, and public-read protocol
+- [dealerless.md](./dealerless.md): dealerless transcript flow, private card delivery, board opening, showdown, and failover semantics
 - [trust-model.md](./trust-model.md): guarantees, trust assumptions, and operational failure consequences

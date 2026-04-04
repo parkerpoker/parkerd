@@ -1,26 +1,26 @@
 # Trust Model
 
-This document describes the trust model implemented today in this repository.
+This document describes the trust model in this repository.
 
 For the protocol surface, see [protocol.md](./protocol.md). For money movement, see [money-flows.md](./money-flows.md). For architecture, see [architecture.md](./architecture.md).
 
 ## Short Version
 
-The current model is:
+The model is:
 
 - wallet, peer, protocol, and transport private keys stay local to each daemon profile
 - the browser/controller and indexer remain non-custodial
 - monetary truth is the latest accepted `CustodyState`, not replicated UI state
 - the host is a proposer and sequencer, not a unilateral money authority
 - deterministic contested-pot recovery uses pre-signed recovery bundles over the shared pot CSV exit
-- turn timeouts now default to a `chain-challenge` fallback instead of immediate timeout payout on new tables
-- in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty should not be able to claw that accepted result back through a later cash-out or exit
+- turn timeouts default to a `chain-challenge` fallback instead of immediate timeout payout
+- in the heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty does not get a second funds path back to a pre-loss balance
 - operator outage affects liveness and visibility, not ownership of the latest accepted custody claim
-- the accepted v1 liveness tradeoff is eventual deterministic recovery after `U`, not immediate forced recovery at `D`
+- the v1 liveness tradeoff is eventual deterministic recovery after `U`, not immediate forced recovery at `D`
 
 ## Money Authority
 
-The core trust boundary change in the current runtime is:
+The core trust boundary is:
 
 - `LatestCustodyState` is authoritative
 - `LatestSnapshot`, `LatestFullySignedSnapshot`, `PublicState`, and local table-funds state are derived
@@ -33,11 +33,11 @@ That matters because:
 
 If a replica has a prettier UI projection but the wrong custody chain, that replica is wrong.
 
-That accepted chain can prove history through two offline proof surfaces:
+That accepted chain can prove history through three offline proof surfaces:
 
 - `SettlementWitness` for ordinary real Ark batches
 - stored `RecoveryBundles` plus executed `RecoveryWitness` for deterministic recovery transitions
-- stored `ChallengeBundle` plus executed `ChallengeWitness` for `turn-challenge-open` and challenge-resolved turn transitions
+- stored `ChallengeBundle` plus executed `ChallengeWitness` for `turn-challenge-open`, challenge-resolved turn transitions, and `turn-challenge-escape`
 
 ## Keys And Local Secrets
 
@@ -56,11 +56,11 @@ Those secrets do not move to:
 - the indexer
 - witnesses acting only as auditors/replicas
 
-Compromising a player's local wallet key still compromises that player's funds.
+Compromising a player's local wallet key compromises that player's funds.
 
 ## Host Authority
 
-The host still has real responsibility for:
+The host has responsibility for:
 
 - join acceptance
 - action ordering
@@ -76,33 +76,37 @@ For user-initiated transitions, honest replicas do not trust a host-authored sum
 - the latest accepted custody state
 - the signed `nativeActionRequest` or `nativeFundsRequest`
 
-Current runtime guarantee:
+Runtime guarantee:
 
-- `action` successors now exact-match the locally derived next custody state, including `ActionDeadlineAt`, `ChallengeAnchor`, `TranscriptRoot`, and the derived public money state hash, using the latest accepted custody state plus the signed `nativeActionRequest`
+- `action` successors exact-match the locally derived next custody state, including `ActionDeadlineAt`, `ChallengeAnchor`, `TranscriptRoot`, and the derived public money state hash, using the latest accepted custody state plus the signed `nativeActionRequest`
 - `timeout`, `blind-post`, `cash-out`, `emergency-exit`, and the other host-derived non-action successors such as `buy-in-lock`, `showdown-payout`, and `carry-forward` also exact-match those locally derived custody bindings
-- deadline derivation uses the accepted table timing profile (`actionTimeoutMs`, `handProtocolTimeoutMs`, `nextHandDelayMs`) instead of the local daemon's current mock/real mode, so accepted replay stays stable across local settlement-mode changes
+- deadline derivation uses the accepted table timing profile (`actionTimeoutMs`, `handProtocolTimeoutMs`, `nextHandDelayMs`) instead of the local daemon's mock/real settlement mode, so accepted replay stays stable across local settlement-mode changes
 
 In practice, that means the host is a proposer of the next valid state, not the sole owner of monetary truth.
 
 ## Chain-Challenge Timing Model
 
-The new turn-timeout fallback changes the trust story for betting turns.
+The chain-challenge fallback changes the trust story for betting turns.
 
-For new tables:
+By default:
 
-- the ordinary fast path is still the same deterministic finite-menu selection plus cooperative Ark settlement
-- after the ordinary action deadline `D`, the fallback is no longer an immediate timeout payout
+- the ordinary fast path is the same deterministic finite-menu selection plus cooperative Ark settlement
+- after the ordinary action deadline `D`, the fallback is not an immediate timeout payout
 - instead, Parker can open a pre-signed onchain `turn-challenge-open` spend into a dedicated `TurnChallengeRef`
 
-Important current guarantees and non-guarantees:
+Guarantees and non-guarantees:
 
 - `chain-challenge` removes Bob's immediate timeout-payout path at `D`
 - before `D + C`, only the option-resolution bundles are valid
 - at `D + C`, the timeout-resolution bundle also becomes valid without requiring fresh cooperation from the non-acting side
 - after `D + C`, a late option-resolution and the timeout-resolution can both be valid; confirmation order decides if both are published then
-- the current design does not prove from chain data alone that Alice selected her option before `D`
+- the design does not prove from chain data alone that Alice selected her option before `D`
+- second-based challenge escapes validate maturity from accepted timestamps
+- block-based challenge escapes validate maturity from the accepted `turn-challenge-open` transaction height, the live chain tip for local readiness, and the accepted escape transaction height for replay
+- accepted table state does not carry chain tip height or transaction confirmation heights
+- if Parker cannot verify the required block heights for a block-based challenge escape, local resolution and accepted replay fail closed
 
-That last point is intentional in the current `best possible now` version. Candidate intent acks and any operator acceptance receipt still matter for the ordinary cooperative Ark path, but they are no longer the thing suppressing timeout or proving timely turn selection under the challenge fallback. Those fairness properties now come only from the pre-signed `D` and `D + C` chain-challenge envelope.
+Candidate intent acks and operator acceptance receipts support the ordinary cooperative Ark path. Under the challenge fallback, timeout suppression and onchain sequencing come from the pre-signed `D` and `D + C` challenge bundles rather than from a later operator acknowledgment.
 
 ## Cooperative Approval And Dead Players
 
@@ -110,16 +114,16 @@ Only seated players with locked funds participate in custody approval.
 
 Witnesses and the indexer do not authorize spend.
 
-Current runtime behavior:
+Runtime behavior:
 
 - cooperative money changes collect seated-player approvals
 - timeout successors can exclude a dead non-cooperating player when resolving that timeout path
 - reveal/private-delivery/showdown timeout refunds uncontested stack instead of gifting it to the surviving player
 - remote signers validate the prebuilt custody transition semantically before approval, PSBT signing, or signer-session prepare
 - Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
-- deterministic action-timeout and showdown-timeout bundles are pre-signed while the source transition is still cooperative, then executed later only if the live path stalls
+- deterministic action-timeout and showdown-timeout bundles are pre-signed while the source transition is cooperative, then executed later only if the live path stalls
 - challenge-open, option-resolution, and timeout-resolution bundles are fully signed onchain transactions and do not depend on live Ark intent registration
-- second-based challenge escapes are still validated from accepted timestamps, while block-based challenge escapes are validated from live open/escape confirmation heights plus the local chain tip
+- second-based challenge escapes are validated from accepted timestamps, while block-based challenge escapes are validated from live open/escape confirmation heights plus the local chain tip
 - Parker does not treat accepted table state as authoritative for chain-height observations; those tip and confirmation-height checks stay local and must be re-verified when needed
 - if Parker cannot verify the required block heights for a block-based challenge escape, both local resolution and accepted replay fail closed
 
@@ -127,16 +131,16 @@ This keeps liveness from depending on continued cooperation by a player who has 
 
 ## Heads-Up Counterparty Guarantee
 
-In the current `seatCount <= 2` runtime, the practical money guarantee against the other player is:
+In the `seatCount <= 2` runtime, the practical money guarantee against the other player is:
 
 - once a betting or payout step has finalized as an accepted custody transition, later `cash-out` and `emergency-exit` requests are evaluated against that resulting custody state, not against an older pre-loss balance
 - `cash-out` and `emergency-exit` derive from the acting player's latest accepted stack claim, not from snapshots or stale local overlays
-- `emergency-exit` is rejected while a hand is still live, so a player cannot pull contested chips out of an in-progress hand and then claim them unilaterally
+- `emergency-exit` is rejected while a hand is live, so a player cannot pull contested chips out of an in-progress hand and then claim them unilaterally
 
 This is not a blanket "trustless under every failure" claim:
 
-- host, operator, controller, or indexer outages can still stall progress
-- compromising a local wallet or protocol key still compromises that player's own funds
+- host, operator, controller, or indexer outages can stall progress
+- compromising a local wallet or protocol key compromises that player's own funds
 
 ## Derived State And Replay Guarantees
 
@@ -153,14 +157,14 @@ Accepted state is checked against:
 
 In real-settlement mode those checks replay accepted custody transitions from whichever proof surface the history actually used. `SettlementWitness` carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree for the ordinary Ark batch path. `RecoveryWitness` points at a stored signed recovery bundle, source pot refs, and recovery broadcast metadata. If those stored artifacts are intact, accepted history replays without live Ark/indexer availability.
 
-The challenge path now has one extra split:
+The challenge path has one extra split:
 
-- second-based CSV challenge escapes can still replay from the accepted timestamps alone
+- second-based CSV challenge escapes replay from the accepted timestamps alone
 - block-based CSV challenge escapes require live verification of the accepted open tx height and accepted escape tx height, and replay rejects the history if those heights cannot be checked or do not satisfy the CSV delay exactly
 
 `ReplayValidated` remains telemetry/debug metadata only. It is not treated as proof on its own.
 
-This means a malicious or stale proposer can still waste time or withhold progress, but it should not be able to silently rewrite accepted money history without being rejected by honest peers.
+This means a malicious or stale proposer can waste time or withhold progress, but it should not be able to silently rewrite accepted money history without being rejected by honest peers.
 
 ## Non-Custodial Components
 
@@ -203,7 +207,7 @@ If the host disappears between hands:
 
 - witnesses can take over when configured
 - otherwise the eligible seated player fallback can take over
-- the new host resumes from the latest accepted custody checkpoint
+- the successor host resumes from the latest accepted custody checkpoint
 
 ### Host loss mid-hand
 
@@ -218,7 +222,7 @@ If the host disappears mid-hand:
 If the operator, controller, or indexer is down:
 
 - discovery or UI surfaces may degrade
-- new transitions may stall
+- transitions may stall
 - wallet-side cash-out completion may stall
 
 But that is a liveness problem. It does not change who owns the latest accepted custody claim.
@@ -227,40 +231,40 @@ But that is a liveness problem. It does not change who owns the latest accepted 
 
 If Ark-backed services are unavailable:
 
-- new custody transitions may fail closed
+- custody transitions may fail closed
 - onboarding/offboarding may stall
 - exit completion may stall
-- live spendability checks such as join funding admission can still stall
+- live spendability checks such as join funding admission can stall
 
-Accepted historical replay of already-settled Ark custody steps can still succeed from the stored witness material even while Ark services are unavailable. Deterministic contested pots can also recover after `U` if the required recovery bundle was already stored on the source transition. Again, the remaining failures are liveness issues, not ownership changes.
+Accepted historical replay of already-settled Ark custody steps succeeds from the stored witness material even while Ark services are unavailable. Deterministic contested pots also recover after `U` if the required recovery bundle is already stored on the source transition. Again, the remaining failures are liveness issues, not ownership changes.
 
-Remaining v1 stall cases are explicit:
+Explicit v1 stall cases are:
 
 - auto-check states do not get winner-take-all recovery bundles
-- non-deterministic missing-card situations can still fail closed
-- the daemon broadcasting a stored recovery bundle still needs enough ordinary unilateral-exit fee-bump liquidity to relay the recovery package after `U`
-- personal wallet exit/cash-out still depends on the ordinary stack-owned path after the pot has already been resolved
+- non-deterministic missing-card situations fail closed
+- the daemon broadcasting a stored recovery bundle needs enough ordinary unilateral-exit fee-bump liquidity to relay the recovery package after `U`
+- personal wallet exit/cash-out depends on the ordinary stack-owned path after the pot has already been resolved
 
-## Important Current Limits
+## Important Limits
 
-The repo is stronger than the old local-overlay model, but it still has implementation limits:
+Implementation limits are:
 
-- mock settlement mode is still used in tests and can synthesize Ark ids
-- the dealerless runtime still rejects `seatCount > 2`
+- mock settlement mode is used in tests and can synthesize Ark ids
+- the dealerless runtime rejects `seatCount > 2`
 - multi-player money logic exists, but multi-player dealing/privacy runtime does not yet
 
 So the right reading is:
 
-- stronger money authority than before
-- better failover safety than snapshot-led rollback
-- still not a finished multi-player production protocol
+- custody-backed money authority
+- failover safety from replay-valid checkpoints rather than snapshot-led rollback
+- no multi-player production runtime
 
 ## Practical Reading
 
-The safest way to interpret the current system is:
+The safest way to interpret the system is:
 
 - trust each daemon to protect its own secrets
 - trust the host to propose and sequence, not to define money alone
 - trust custody replay more than snapshots or UI projections
-- treat stored settlement witnesses and stored recovery witnesses as the proof for accepted history, and live Ark/indexer checks as a current liveness/spendability safety layer
+- treat stored settlement witnesses and stored recovery witnesses as the proof for accepted history, and live Ark/indexer checks as a liveness/spendability safety layer
 - treat controller and indexer outages as liveness failures, not custody failures
