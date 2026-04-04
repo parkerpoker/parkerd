@@ -195,3 +195,85 @@ func TestSelectCustodySpendPathFallsBackToRefOwnerBeforeSeatReplication(t *testi
 		t.Fatalf("expected fallback player ownership, got %+v", path.PlayerIDs)
 	}
 }
+
+func TestSelectCustodySpendPathReturnsIndependentCachedResults(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	config, err := host.arkCustodyConfig()
+	if err != nil {
+		t.Fatalf("ark custody config: %v", err)
+	}
+	guestOwner, err := compressedPubkeyFromHex(guest.walletID.PublicKeyHex)
+	if err != nil {
+		t.Fatalf("decode guest owner pubkey: %v", err)
+	}
+	operator, err := compressedPubkeyFromHex(config.SignerPubkeyHex)
+	if err != nil {
+		t.Fatalf("decode operator pubkey: %v", err)
+	}
+	script := arkscript.NewDefaultVtxoScript(guestOwner, operator, config.UnilateralExitDelay)
+	tapscripts, err := script.Encode()
+	if err != nil {
+		t.Fatalf("encode tapscripts: %v", err)
+	}
+	tapKey, _, err := script.TapTree()
+	if err != nil {
+		t.Fatalf("build tap tree: %v", err)
+	}
+	pkScript, err := arkscript.P2TRScript(tapKey)
+	if err != nil {
+		t.Fatalf("derive p2tr script: %v", err)
+	}
+
+	ref := tablecustody.VTXORef{
+		AmountSats:    4_000,
+		OwnerPlayerID: guest.walletID.PlayerID,
+		Script:        hex.EncodeToString(pkScript),
+		Tapscripts:    tapscripts,
+		TxID:          strings.Repeat("03", 32),
+		VOut:          0,
+	}
+	first, err := host.selectCustodySpendPath(nativeTableState{}, ref, []string{guest.walletID.PlayerID}, false)
+	if err != nil {
+		t.Fatalf("select initial spend path: %v", err)
+	}
+
+	originalPKScript := hex.EncodeToString(first.PKScript)
+	originalScript := hex.EncodeToString(first.Script)
+	originalControlBlock := hex.EncodeToString(first.LeafProof.ControlBlock)
+	originalLeafScript := hex.EncodeToString(first.LeafProof.Script)
+	originalTapscript := first.Tapscripts[0]
+	originalSigner := first.SignerXOnlyPubkeys[0]
+
+	first.PKScript[0] ^= 0xff
+	first.Script[0] ^= 0xff
+	first.LeafProof.ControlBlock[0] ^= 0xff
+	first.LeafProof.Script[0] ^= 0xff
+	first.Tapscripts[0] = "mutated"
+	first.SignerXOnlyPubkeys[0] = "mutated"
+
+	second, err := host.selectCustodySpendPath(nativeTableState{}, ref, []string{guest.walletID.PlayerID}, false)
+	if err != nil {
+		t.Fatalf("select cached spend path: %v", err)
+	}
+
+	if got := hex.EncodeToString(second.PKScript); got != originalPKScript {
+		t.Fatalf("expected cached pkScript %s, got %s", originalPKScript, got)
+	}
+	if got := hex.EncodeToString(second.Script); got != originalScript {
+		t.Fatalf("expected cached witness script %s, got %s", originalScript, got)
+	}
+	if got := hex.EncodeToString(second.LeafProof.ControlBlock); got != originalControlBlock {
+		t.Fatalf("expected cached control block %s, got %s", originalControlBlock, got)
+	}
+	if got := hex.EncodeToString(second.LeafProof.Script); got != originalLeafScript {
+		t.Fatalf("expected cached leaf script %s, got %s", originalLeafScript, got)
+	}
+	if got := second.Tapscripts[0]; got != originalTapscript {
+		t.Fatalf("expected cached tapscript %q, got %q", originalTapscript, got)
+	}
+	if got := second.SignerXOnlyPubkeys[0]; got != originalSigner {
+		t.Fatalf("expected cached signer %q, got %q", originalSigner, got)
+	}
+}

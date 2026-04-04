@@ -1,6 +1,7 @@
 package meshruntime
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -69,8 +70,24 @@ const (
 
 var (
 	compressedPubkeyCache sync.Map
+	custodyTapscriptCache sync.Map
 	xOnlyPubkeyHexCache   sync.Map
 )
+
+type cachedCustodySpendCandidate struct {
+	Kind               string
+	LeafProof          *arklib.TaprootMerkleProof
+	Locktime           arklib.AbsoluteLocktime
+	Script             []byte
+	SignerXOnlyPubkeys []string
+	UsesCLTVLocktime   bool
+}
+
+type cachedCustodySpendPaths struct {
+	Candidates []cachedCustodySpendCandidate
+	PKScript   []byte
+	Tapscripts []string
+}
 
 func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, error) {
 	config, err := runtime.walletRuntime.ArkConfig(runtime.profileName)
@@ -166,6 +183,107 @@ func xOnlyPubkeyHexFromCompressed(value string) (string, error) {
 	encoded := hex.EncodeToString(schnorr.SerializePubKey(pubkey))
 	actual, _ := xOnlyPubkeyHexCache.LoadOrStore(normalized, encoded)
 	return actual.(string), nil
+}
+
+func custodyTapscriptsCacheKey(tapscripts []string) string {
+	sum := sha256.New()
+	for _, tapscript := range tapscripts {
+		_, _ = sum.Write([]byte(strconv.Itoa(len(tapscript))))
+		_, _ = sum.Write([]byte{':'})
+		_, _ = sum.Write([]byte(tapscript))
+		_, _ = sum.Write([]byte{0})
+	}
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+func cloneTaprootMerkleProof(proof *arklib.TaprootMerkleProof) *arklib.TaprootMerkleProof {
+	if proof == nil {
+		return nil
+	}
+	cloned := *proof
+	cloned.ControlBlock = append([]byte(nil), proof.ControlBlock...)
+	cloned.Script = append([]byte(nil), proof.Script...)
+	return &cloned
+}
+
+func cloneCachedCustodySpendCandidate(candidate cachedCustodySpendCandidate) cachedCustodySpendCandidate {
+	cloned := candidate
+	cloned.LeafProof = cloneTaprootMerkleProof(candidate.LeafProof)
+	cloned.Script = append([]byte(nil), candidate.Script...)
+	cloned.SignerXOnlyPubkeys = append([]string(nil), candidate.SignerXOnlyPubkeys...)
+	return cloned
+}
+
+func cloneCachedCustodySpendPaths(paths *cachedCustodySpendPaths) *cachedCustodySpendPaths {
+	if paths == nil {
+		return nil
+	}
+	cloned := &cachedCustodySpendPaths{
+		Candidates: make([]cachedCustodySpendCandidate, len(paths.Candidates)),
+		PKScript:   append([]byte(nil), paths.PKScript...),
+		Tapscripts: append([]string(nil), paths.Tapscripts...),
+	}
+	for index, candidate := range paths.Candidates {
+		cloned.Candidates[index] = cloneCachedCustodySpendCandidate(candidate)
+	}
+	return cloned
+}
+
+func cachedCustodySpendPathsForTapscripts(tapscripts []string) (*cachedCustodySpendPaths, error) {
+	key := custodyTapscriptsCacheKey(tapscripts)
+	if cached, ok := custodyTapscriptCache.Load(key); ok {
+		return cloneCachedCustodySpendPaths(cached.(*cachedCustodySpendPaths)), nil
+	}
+	vtxoScript, err := arkscript.ParseVtxoScript(tapscripts)
+	if err != nil {
+		return nil, err
+	}
+	tapKey, tapTree, err := vtxoScript.TapTree()
+	if err != nil {
+		return nil, err
+	}
+	pkScript, err := arkscript.P2TRScript(tapKey)
+	if err != nil {
+		return nil, err
+	}
+	paths := &cachedCustodySpendPaths{
+		Candidates: []cachedCustodySpendCandidate{},
+		PKScript:   pkScript,
+		Tapscripts: append([]string(nil), tapscripts...),
+	}
+	for _, closure := range vtxoScript.ForfeitClosures() {
+		candidate := cachedCustodySpendCandidate{
+			SignerXOnlyPubkeys: []string{},
+		}
+		appendPubkeys := func(pubkeys []*btcec.PublicKey) {
+			for _, key := range pubkeys {
+				candidate.SignerXOnlyPubkeys = append(candidate.SignerXOnlyPubkeys, hex.EncodeToString(schnorr.SerializePubKey(key)))
+			}
+		}
+		switch typed := closure.(type) {
+		case *arkscript.MultisigClosure:
+			candidate.Kind = "*arkscript.MultisigClosure"
+			appendPubkeys(typed.PubKeys)
+		case *arkscript.CLTVMultisigClosure:
+			candidate.Kind = "*arkscript.CLTVMultisigClosure"
+			candidate.Locktime = typed.Locktime
+			candidate.UsesCLTVLocktime = true
+			appendPubkeys(typed.PubKeys)
+		default:
+			continue
+		}
+		candidate.Script, err = closure.Script()
+		if err != nil {
+			return nil, err
+		}
+		candidate.LeafProof, err = tapTree.GetTaprootMerkleProof(txscript.NewBaseTapLeaf(candidate.Script).TapHash())
+		if err != nil {
+			return nil, err
+		}
+		paths.Candidates = append(paths.Candidates, candidate)
+	}
+	actual, _ := custodyTapscriptCache.LoadOrStore(key, cloneCachedCustodySpendPaths(paths))
+	return cloneCachedCustodySpendPaths(actual.(*cachedCustodySpendPaths)), nil
 }
 
 func timeoutLocktimeFromISO(value string) (arklib.AbsoluteLocktime, error) {
@@ -510,25 +628,31 @@ func (runtime *meshRuntime) stackClaimRefsReusableForTransition(table nativeTabl
 }
 
 func (runtime *meshRuntime) playerIDByXOnlyPubkey(table nativeTableState, xOnlyHex string) (string, bool, error) {
+	lookup, err := runtime.playerIDsByXOnlyPubkey(table)
+	if err != nil {
+		return "", false, err
+	}
+	playerID, ok := lookup[xOnlyHex]
+	return playerID, ok, nil
+}
+
+func (runtime *meshRuntime) playerIDsByXOnlyPubkey(table nativeTableState) (map[string]string, error) {
+	lookup := map[string]string{}
 	for _, seat := range table.Seats {
 		seatXOnly, err := xOnlyPubkeyHexFromCompressed(seat.WalletPubkeyHex)
 		if err != nil {
-			return "", false, err
+			return nil, err
 		}
-		if seatXOnly == xOnlyHex {
-			return seat.PlayerID, true, nil
-		}
+		lookup[seatXOnly] = seat.PlayerID
 	}
 	if strings.TrimSpace(runtime.walletID.PublicKeyHex) != "" && strings.TrimSpace(runtime.walletID.PlayerID) != "" {
 		localXOnly, err := xOnlyPubkeyHexFromCompressed(runtime.walletID.PublicKeyHex)
 		if err != nil {
-			return "", false, err
+			return nil, err
 		}
-		if localXOnly == xOnlyHex {
-			return runtime.walletID.PlayerID, true, nil
-		}
+		lookup[localXOnly] = runtime.walletID.PlayerID
 	}
-	return "", false, nil
+	return lookup, nil
 }
 
 func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref tablecustody.VTXORef, desiredPlayerIDs []string, preferTimeout bool) (custodySpendPath, error) {
@@ -536,7 +660,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 	if len(tapscripts) == 0 {
 		return custodySpendPath{}, fmt.Errorf("custody ref %s:%d is missing tapscripts", ref.TxID, ref.VOut)
 	}
-	vtxoScript, err := arkscript.ParseVtxoScript(tapscripts)
+	paths, err := cachedCustodySpendPathsForTapscripts(tapscripts)
 	if err != nil {
 		return custodySpendPath{}, err
 	}
@@ -549,107 +673,61 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 		return custodySpendPath{}, err
 	}
 	desired := uniqueSortedPlayerIDs(desiredPlayerIDs)
+	playerIDsByXOnly, err := runtime.playerIDsByXOnlyPubkey(table)
+	if err != nil {
+		return custodySpendPath{}, err
+	}
 
-	bestIndex := -1
-	bestLocktime := arklib.AbsoluteLocktime(0)
-	bestScript := []byte(nil)
+	bestCandidateIndex := -1
 	bestPlayers := []string(nil)
-	bestSignerXOnlyPubkeys := []string(nil)
-	triedClosures := make([]string, 0, len(vtxoScript.ForfeitClosures()))
-	for index, closure := range vtxoScript.ForfeitClosures() {
+	triedClosures := make([]string, 0, len(paths.Candidates))
+	for index, candidate := range paths.Candidates {
 		keys := make([]string, 0)
-		signerXOnlyPubkeys := make([]string, 0)
 		unmappedNonOperatorKeys := 0
-		appendClosureKeys := func(pubkeys []*btcec.PublicKey) error {
-			for _, key := range pubkeys {
-				xOnly := hex.EncodeToString(schnorr.SerializePubKey(key))
-				signerXOnlyPubkeys = append(signerXOnlyPubkeys, xOnly)
-				if xOnly == operatorXOnly {
-					continue
-				}
-				playerID, ok, err := runtime.playerIDByXOnlyPubkey(table, xOnly)
-				if err != nil {
-					return err
-				}
-				if ok {
-					keys = append(keys, playerID)
-					continue
-				}
-				unmappedNonOperatorKeys++
+		for _, xOnly := range candidate.SignerXOnlyPubkeys {
+			if xOnly == operatorXOnly {
+				continue
 			}
-			return nil
-		}
-		switch typed := closure.(type) {
-		case *arkscript.MultisigClosure:
-			if err := appendClosureKeys(typed.PubKeys); err != nil {
-				return custodySpendPath{}, err
+			playerID, ok := playerIDsByXOnly[xOnly]
+			if ok {
+				keys = append(keys, playerID)
+				continue
 			}
-		case *arkscript.CLTVMultisigClosure:
-			if err := appendClosureKeys(typed.PubKeys); err != nil {
-				return custodySpendPath{}, err
-			}
-		default:
-			continue
+			unmappedNonOperatorKeys++
 		}
 		if len(keys) == 0 && unmappedNonOperatorKeys == 1 && strings.TrimSpace(ref.OwnerPlayerID) != "" {
 			keys = append(keys, ref.OwnerPlayerID)
 		}
 		keys = uniqueSortedPlayerIDs(keys)
-		triedClosures = append(triedClosures, fmt.Sprintf("%T:%v:unmapped=%d", closure, keys, unmappedNonOperatorKeys))
+		triedClosures = append(triedClosures, fmt.Sprintf("%s:%v:unmapped=%d", candidate.Kind, keys, unmappedNonOperatorKeys))
 		if !reflect.DeepEqual(keys, desired) {
 			continue
 		}
 		if preferTimeout {
-			if cltv, ok := closure.(*arkscript.CLTVMultisigClosure); ok {
-				bestIndex = index
-				bestLocktime = cltv.Locktime
+			if candidate.UsesCLTVLocktime {
+				bestCandidateIndex = index
 				bestPlayers = keys
-				bestSignerXOnlyPubkeys = uniqueNonEmptyStrings(signerXOnlyPubkeys)
-				bestScript, err = closure.Script()
-				if err != nil {
-					return custodySpendPath{}, err
-				}
 				break
 			}
 			continue
 		}
-		bestIndex = index
-		bestLocktime = 0
-		if cltv, ok := closure.(*arkscript.CLTVMultisigClosure); ok {
-			bestLocktime = cltv.Locktime
-		}
+		bestCandidateIndex = index
 		bestPlayers = keys
-		bestSignerXOnlyPubkeys = uniqueNonEmptyStrings(signerXOnlyPubkeys)
-		bestScript, err = closure.Script()
-		if err != nil {
-			return custodySpendPath{}, err
-		}
 		break
 	}
-	if bestIndex < 0 {
+	if bestCandidateIndex < 0 {
 		return custodySpendPath{}, fmt.Errorf("no custody spend path matches signers %v for %s:%d (owner=%s closures=%v)", desired, ref.TxID, ref.VOut, ref.OwnerPlayerID, triedClosures)
 	}
-	tapKey, tapTree, err := vtxoScript.TapTree()
-	if err != nil {
-		return custodySpendPath{}, err
-	}
-	leafProof, err := tapTree.GetTaprootMerkleProof(txscript.NewBaseTapLeaf(bestScript).TapHash())
-	if err != nil {
-		return custodySpendPath{}, err
-	}
-	pkScript, err := arkscript.P2TRScript(tapKey)
-	if err != nil {
-		return custodySpendPath{}, err
-	}
+	bestCandidate := paths.Candidates[bestCandidateIndex]
 	return custodySpendPath{
-		LeafProof:          leafProof,
-		Locktime:           bestLocktime,
-		PKScript:           pkScript,
+		LeafProof:          cloneTaprootMerkleProof(bestCandidate.LeafProof),
+		Locktime:           bestCandidate.Locktime,
+		PKScript:           append([]byte(nil), paths.PKScript...),
 		PlayerIDs:          bestPlayers,
-		SignerXOnlyPubkeys: bestSignerXOnlyPubkeys,
-		Script:             bestScript,
-		Tapscripts:         tapscripts,
-		UsesCLTVLocktime:   bestLocktime != 0,
+		SignerXOnlyPubkeys: uniqueNonEmptyStrings(bestCandidate.SignerXOnlyPubkeys),
+		Script:             append([]byte(nil), bestCandidate.Script...),
+		Tapscripts:         append([]string(nil), paths.Tapscripts...),
+		UsesCLTVLocktime:   bestCandidate.UsesCLTVLocktime,
 	}, nil
 }
 
