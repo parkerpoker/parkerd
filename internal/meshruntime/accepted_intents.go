@@ -378,8 +378,15 @@ func (runtime *meshRuntime) validateAcceptedInitiatorHistory(table nativeTableSt
 				return fmt.Errorf("event %d funds replay setup failed: %w", index, err)
 			}
 			if expectedKind == tablecustody.TransitionKindEmergencyExit {
-				if err := runtime.validateEmergencyExitExecution(baseTable, *request); err != nil {
+				if err := runtime.validateEmergencyExitExecutionMetadata(baseTable, *request); err != nil {
 					return fmt.Errorf("event %d emergency exit execution is invalid: %w", index, err)
+				}
+				summary, err := runtime.validateAcceptedCustodyExitWitness(baseTable.LatestCustodyState, transition)
+				if err != nil {
+					return fmt.Errorf("event %d emergency exit witness is invalid: %w", index, err)
+				}
+				if !reflect.DeepEqual(fundsExitExecutionTxIDs(request.ExitExecution), fundsExitWitnessTxIDs(summary)) {
+					return fmt.Errorf("event %d emergency exit witness txids mismatch", index)
 				}
 				expectedArkTxID := fundsExitExecutionArkTxID(request.ExitExecution)
 				if transition.ArkTxID != expectedArkTxID {

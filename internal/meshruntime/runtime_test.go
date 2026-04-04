@@ -1,12 +1,14 @@
 package meshruntime
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -2413,14 +2415,27 @@ func TestAcceptRemoteTableRejectsTamperedEmergencyExitExecutionProof(t *testing.
 
 	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
 	enableSyntheticRealMode(host, guest)
-	guest.custodyExitExecute = func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error) {
-		return walletpkg.CustodyExitResult{
-			BroadcastTxIDs: []string{"guest-exit-anchor"},
-			Pending:        false,
-			SourceRefs:     canonicalVTXORefs(refs),
-			SweepTxID:      "guest-exit-sweep",
-		}, nil
+	approveExpectedExitExecution := func(expectedRefs []tablecustody.VTXORef, expectedBroadcast []string, expectedSweep string) func(string, nativeFundsExitExecution) error {
+		return func(profileName string, execution nativeFundsExitExecution) error {
+			if !sameCanonicalVTXORefs(execution.SourceRefs, expectedRefs) {
+				return errors.New("unexpected exit execution refs")
+			}
+			if !reflect.DeepEqual(uniqueNonEmptyStrings(execution.BroadcastTxIDs), uniqueNonEmptyStrings(expectedBroadcast)) {
+				return errors.New("exit execution proof does not spend the claimed custody refs")
+			}
+			if strings.TrimSpace(execution.SweepTxID) != strings.TrimSpace(expectedSweep) {
+				return errors.New("exit execution proof does not spend the claimed custody refs")
+			}
+			return nil
+		}
 	}
+	guestTable := mustReadNativeTable(t, guest, tableID)
+	expectedRefs := canonicalVTXORefs(guest.currentCustodyRefsByPlayer(guestTable)[guest.walletID.PlayerID])
+	exitResult := buildSyntheticExitResultForTest(t, expectedRefs, true)
+	guest.custodyExitExecute = func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error) {
+		return buildSyntheticExitResultForTest(t, refs, true), nil
+	}
+	host.custodyExitVerify = approveExpectedExitExecution(expectedRefs, exitResult.BroadcastTxIDs, exitResult.SweepTxID)
 
 	if _, err := guest.Exit(tableID); err != nil {
 		t.Fatalf("guest emergency exit: %v", err)
@@ -2439,10 +2454,15 @@ func TestAcceptRemoteTableRejectsTamperedEmergencyExitExecutionProof(t *testing.
 		t.Fatal("expected emergency exit execution proof in canonical event")
 	}
 
-	replica := newMeshTestRuntime(t, "guest-replica")
-	replica.walletID = guest.walletID
+	baselineReplica := newMeshTestRuntime(t, "guest-replica")
+	baselineReplica.walletID = guest.walletID
+	if err := baselineReplica.acceptRemoteTable(base); err != nil {
+		t.Fatalf("accept remote table with stored emergency exit witness: %v", err)
+	}
 
 	t.Run("tampered source refs", func(t *testing.T) {
+		replica := newMeshTestRuntime(t, "guest-replica-source")
+		replica.walletID = guest.walletID
 		tampered := cloneJSON(base)
 		forged := cloneJSON(*request)
 		forged.ExitExecution.SourceRefs[0].TxID = "tampered-exit-ref"
@@ -2456,6 +2476,8 @@ func TestAcceptRemoteTableRejectsTamperedEmergencyExitExecutionProof(t *testing.
 	})
 
 	t.Run("tampered sweep txid", func(t *testing.T) {
+		replica := newMeshTestRuntime(t, "guest-replica-sweep")
+		replica.walletID = guest.walletID
 		tampered := cloneJSON(base)
 		forged := cloneJSON(*request)
 		forged.ExitExecution.SweepTxID = "tampered-sweep"
@@ -2463,8 +2485,23 @@ func TestAcceptRemoteTableRejectsTamperedEmergencyExitExecutionProof(t *testing.
 		tampered.Events[eventIndex].Body["fundsRequest"] = rawJSONMap(forged)
 		resignAcceptedTableEventsForTest(t, host, &tampered)
 
-		if err := replica.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "emergency exit txid mismatch") {
+		if err := replica.acceptRemoteTable(tampered); err == nil || (!strings.Contains(err.Error(), "emergency exit execution is invalid") && !strings.Contains(err.Error(), "emergency exit witness txids mismatch")) {
 			t.Fatalf("expected tampered emergency exit txid to be rejected, got %v", err)
+		}
+	})
+
+	t.Run("tampered broadcast txids", func(t *testing.T) {
+		replica := newMeshTestRuntime(t, "guest-replica-broadcast")
+		replica.walletID = guest.walletID
+		tampered := cloneJSON(base)
+		forged := cloneJSON(*request)
+		forged.ExitExecution.BroadcastTxIDs = []string{"forged-exit-anchor"}
+		resignFundsRequestForTest(t, guest, &forged)
+		tampered.Events[eventIndex].Body["fundsRequest"] = rawJSONMap(forged)
+		resignAcceptedTableEventsForTest(t, host, &tampered)
+
+		if err := replica.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "emergency exit witness txids mismatch") {
+			t.Fatalf("expected unrelated emergency exit txids to be rejected, got %v", err)
 		}
 	})
 }
@@ -3512,6 +3549,20 @@ func TestSyntheticRealModeGuestEmergencyExitUsesLocalExecutionProof(t *testing.T
 	if len(expectedRefs) == 0 {
 		t.Fatal("expected guest custody refs before emergency exit")
 	}
+	exitResult := buildSyntheticExitResultForTest(t, expectedRefs, true)
+	approveExpectedExitExecution := func(profileName string, execution nativeFundsExitExecution) error {
+		if !sameCanonicalVTXORefs(execution.SourceRefs, expectedRefs) {
+			return errors.New("unexpected exit execution refs")
+		}
+		if !reflect.DeepEqual(uniqueNonEmptyStrings(execution.BroadcastTxIDs), uniqueNonEmptyStrings(exitResult.BroadcastTxIDs)) {
+			return errors.New("unexpected exit execution broadcast txids")
+		}
+		if execution.SweepTxID != exitResult.SweepTxID {
+			return errors.New("unexpected exit execution sweep txid")
+		}
+		return nil
+	}
+	host.custodyExitVerify = approveExpectedExitExecution
 
 	exitCalls := 0
 	guest.custodyExitExecute = func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error) {
@@ -3522,12 +3573,7 @@ func TestSyntheticRealModeGuestEmergencyExitUsesLocalExecutionProof(t *testing.T
 		if !sameCanonicalVTXORefs(refs, expectedRefs) {
 			t.Fatalf("expected local exit refs %+v, got %+v", expectedRefs, refs)
 		}
-		return walletpkg.CustodyExitResult{
-			BroadcastTxIDs: []string{"guest-exit-anchor"},
-			Pending:        false,
-			SourceRefs:     canonicalVTXORefs(refs),
-			SweepTxID:      "guest-exit-sweep",
-		}, nil
+		return buildSyntheticExitResultForTest(t, refs, true), nil
 	}
 
 	result, err := guest.Exit(tableID)
@@ -3562,7 +3608,7 @@ func TestSyntheticRealModeGuestEmergencyExitUsesLocalExecutionProof(t *testing.T
 	if !sameCanonicalVTXORefs(request.ExitExecution.SourceRefs, expectedRefs) {
 		t.Fatalf("expected event execution refs %+v, got %+v", expectedRefs, request.ExitExecution.SourceRefs)
 	}
-	if request.ExitExecution.SweepTxID != "guest-exit-sweep" {
+	if request.ExitExecution.SweepTxID != exitResult.SweepTxID {
 		t.Fatalf("expected sweep tx id to be preserved, got %q", request.ExitExecution.SweepTxID)
 	}
 	if request.ExitExecution.Pending {
@@ -3583,6 +3629,9 @@ func TestSyntheticRealModeGuestEmergencyExitUsesLocalExecutionProof(t *testing.T
 	if want := emergencyExitProofRef(*previousState, guest.walletID.PlayerID, request.ExitExecution); transition.Proof.ExitProofRef != want {
 		t.Fatalf("expected exit proof ref %q, got %q", want, transition.Proof.ExitProofRef)
 	}
+	if transition.Proof.ExitWitness == nil {
+		t.Fatal("expected emergency exit to persist an exit witness")
+	}
 }
 
 func TestSyntheticRealModeGuestEmergencyExitRetriesAfterFailoverWithoutRerunningExit(t *testing.T) {
@@ -3599,16 +3648,26 @@ func TestSyntheticRealModeGuestEmergencyExitRetriesAfterFailoverWithoutRerunning
 	if len(expectedRefs) == 0 {
 		t.Fatal("expected guest custody refs before emergency exit")
 	}
+	exitResult := buildSyntheticExitResultForTest(t, expectedRefs, true)
+	approveExpectedExitExecution := func(profileName string, execution nativeFundsExitExecution) error {
+		if !sameCanonicalVTXORefs(execution.SourceRefs, expectedRefs) {
+			return errors.New("unexpected exit execution refs")
+		}
+		if !reflect.DeepEqual(uniqueNonEmptyStrings(execution.BroadcastTxIDs), uniqueNonEmptyStrings(exitResult.BroadcastTxIDs)) {
+			return errors.New("unexpected exit execution broadcast txids")
+		}
+		if execution.SweepTxID != exitResult.SweepTxID {
+			return errors.New("unexpected exit execution sweep txid")
+		}
+		return nil
+	}
+	host.custodyExitVerify = approveExpectedExitExecution
+	guest.custodyExitVerify = approveExpectedExitExecution
 
 	exitCalls := 0
 	guest.custodyExitExecute = func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error) {
 		exitCalls++
-		return walletpkg.CustodyExitResult{
-			BroadcastTxIDs: []string{"guest-exit-anchor"},
-			Pending:        false,
-			SourceRefs:     canonicalVTXORefs(refs),
-			SweepTxID:      "guest-exit-sweep",
-		}, nil
+		return buildSyntheticExitResultForTest(t, refs, true), nil
 	}
 
 	firstSubmission := true
@@ -3807,6 +3866,72 @@ func TestSyntheticRealModeGuestCashOutAfterSettledHand(t *testing.T) {
 	}
 	if latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID) != 0 {
 		t.Fatalf("expected guest stack to be zero after settled-hand cash-out, got %d", latestStackAmount(hostTable.LatestCustodyState, guest.walletID.PlayerID))
+	}
+}
+
+func TestFundsRequestRejectedWhileSettledHandPayoutIsDeferred(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
+		t.Fatalf("host send preflop call to showdown line: %v", err)
+	}
+	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send showdown-line check %d: %v", index, err)
+		}
+	}
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	settled := mustReadNativeTable(t, host, tableID)
+	if len(settled.CustodyTransitions) < 2 {
+		t.Fatalf("expected settled hand custody history, got %d transitions", len(settled.CustodyTransitions))
+	}
+	if settled.CustodyTransitions[len(settled.CustodyTransitions)-1].Kind != tablecustody.TransitionKindShowdownPayout {
+		t.Fatalf("expected showdown payout transition, got %s", settled.CustodyTransitions[len(settled.CustodyTransitions)-1].Kind)
+	}
+	stale := cloneJSON(settled)
+	previousState := cloneJSON(settled.CustodyTransitions[len(settled.CustodyTransitions)-2].NextState)
+	stale.LatestCustodyState = &previousState
+
+	wallet, err := guest.walletSummary()
+	if err != nil {
+		t.Fatalf("guest wallet summary: %v", err)
+	}
+	request := nativeFundsRequest{
+		ArkAddress:           wallet.ArkAddress,
+		Epoch:                stale.CurrentEpoch,
+		Kind:                 "cashout",
+		PlayerID:             guest.walletID.PlayerID,
+		PrevCustodyStateHash: latestCustodyStateHash(stale),
+		ProfileName:          guest.profileName,
+		ProtocolVersion:      nativeProtocolVersion,
+		SignedAt:             nowISO(),
+		TableID:              stale.Config.TableID,
+	}
+	resignFundsRequestForTest(t, guest, &request)
+	if _, err := guest.buildSignedFundsRequest(stale, "cashout"); err == nil || !strings.Contains(err.Error(), "settled hand payout") {
+		t.Fatalf("expected deferred settled-hand payout to block local funds request creation, got %v", err)
+	}
+	staleApply := cloneJSON(stale)
+	if _, err := host.applyFundsRequestLocked(&staleApply, request); err == nil || !strings.Contains(err.Error(), "settled hand payout") {
+		t.Fatalf("expected deferred settled-hand payout to block funds application, got %v", err)
 	}
 }
 
@@ -5272,6 +5397,74 @@ func enableSyntheticRealMode(runtimes ...*meshRuntime) {
 		runtime.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
 			return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
 		}
+	}
+}
+
+func encodeSyntheticExitTxHexForTest(t *testing.T, tx *wire.MsgTx) string {
+	t.Helper()
+	var encoded bytes.Buffer
+	if err := tx.Serialize(&encoded); err != nil {
+		t.Fatalf("serialize synthetic exit tx: %v", err)
+	}
+	return hex.EncodeToString(encoded.Bytes())
+}
+
+func buildSyntheticExitWitnessForTest(t *testing.T, refs []tablecustody.VTXORef, includeSweep bool) *tablecustody.CustodyExitWitness {
+	t.Helper()
+	if len(refs) == 0 {
+		t.Fatal("expected source refs for synthetic exit witness")
+	}
+	anchorTx := wire.NewMsgTx(2)
+	for _, ref := range refs {
+		hash, err := chainhash.NewHashFromStr(strings.TrimSpace(ref.TxID))
+		if err != nil {
+			t.Fatalf("parse synthetic exit source ref %s:%d: %v", ref.TxID, ref.VOut, err)
+		}
+		anchorTx.AddTxIn(&wire.TxIn{
+			PreviousOutPoint: wire.OutPoint{
+				Hash:  *hash,
+				Index: ref.VOut,
+			},
+		})
+	}
+	anchorTx.AddTxOut(&wire.TxOut{Value: 1, PkScript: []byte{txscript.OP_TRUE}})
+	witness := &tablecustody.CustodyExitWitness{
+		BroadcastTransactions: []tablecustody.CustodyExitTransaction{{
+			TransactionHex: encodeSyntheticExitTxHexForTest(t, anchorTx),
+			TransactionID:  anchorTx.TxHash().String(),
+		}},
+	}
+	if !includeSweep {
+		return witness
+	}
+	sweepTx := wire.NewMsgTx(2)
+	sweepTx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{
+			Hash:  anchorTx.TxHash(),
+			Index: 0,
+		},
+	})
+	sweepTx.AddTxOut(&wire.TxOut{Value: 1, PkScript: []byte{txscript.OP_TRUE}})
+	witness.SweepTransaction = &tablecustody.CustodyExitTransaction{
+		TransactionHex: encodeSyntheticExitTxHexForTest(t, sweepTx),
+		TransactionID:  sweepTx.TxHash().String(),
+	}
+	return witness
+}
+
+func buildSyntheticExitResultForTest(t *testing.T, refs []tablecustody.VTXORef, includeSweep bool) walletpkg.CustodyExitResult {
+	t.Helper()
+	canonicalRefs := canonicalVTXORefs(refs)
+	witness := buildSyntheticExitWitnessForTest(t, canonicalRefs, includeSweep)
+	summary, err := walletpkg.VerifyUnilateralExitWitness(canonicalRefs, *witness)
+	if err != nil {
+		t.Fatalf("verify synthetic exit witness: %v", err)
+	}
+	return walletpkg.CustodyExitResult{
+		BroadcastTxIDs: append([]string(nil), summary.BroadcastTxIDs...),
+		Pending:        !includeSweep,
+		SourceRefs:     canonicalRefs,
+		SweepTxID:      summary.SweepTxID,
 	}
 }
 

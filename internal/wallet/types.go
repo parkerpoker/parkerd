@@ -143,6 +143,11 @@ type CustodyExitResult struct {
 	SweepTxID      string                 `json:"sweepTxId,omitempty"`
 }
 
+type CustodyExitWitnessSummary struct {
+	BroadcastTxIDs []string `json:"broadcastTxIds,omitempty"`
+	SweepTxID      string   `json:"sweepTxId,omitempty"`
+}
+
 type CustodyRecoveryResult struct {
 	BroadcastTxIDs []string `json:"broadcastTxIds,omitempty"`
 	RecoveryTxID   string   `json:"recoveryTxid,omitempty"`

@@ -270,6 +270,44 @@ func sameRecoveryAuthorizedOutputs(left []custodyBatchOutput, right []custodyBat
 	return reflect.DeepEqual(canonicalRecoveryAuthorizedOutputs(left), canonicalRecoveryAuthorizedOutputs(right))
 }
 
+func sameRecoverySettlementSemantics(left []custodyBatchOutput, right []custodyBatchOutput) bool {
+	type settlementDelta struct {
+		AmountSats    int
+		OwnerPlayerID string
+	}
+	leftSemantics := make([]settlementDelta, 0, len(left))
+	for _, output := range left {
+		leftSemantics = append(leftSemantics, settlementDelta{
+			AmountSats:    output.AmountSats,
+			OwnerPlayerID: output.OwnerPlayerID,
+		})
+	}
+	rightSemantics := make([]settlementDelta, 0, len(right))
+	for _, output := range right {
+		rightSemantics = append(rightSemantics, settlementDelta{
+			AmountSats:    output.AmountSats,
+			OwnerPlayerID: output.OwnerPlayerID,
+		})
+	}
+	sort.SliceStable(leftSemantics, func(leftIndex, rightIndex int) bool {
+		switch {
+		case leftSemantics[leftIndex].OwnerPlayerID != leftSemantics[rightIndex].OwnerPlayerID:
+			return leftSemantics[leftIndex].OwnerPlayerID < leftSemantics[rightIndex].OwnerPlayerID
+		default:
+			return leftSemantics[leftIndex].AmountSats < leftSemantics[rightIndex].AmountSats
+		}
+	})
+	sort.SliceStable(rightSemantics, func(leftIndex, rightIndex int) bool {
+		switch {
+		case rightSemantics[leftIndex].OwnerPlayerID != rightSemantics[rightIndex].OwnerPlayerID:
+			return rightSemantics[leftIndex].OwnerPlayerID < rightSemantics[rightIndex].OwnerPlayerID
+		default:
+			return rightSemantics[leftIndex].AmountSats < rightSemantics[rightIndex].AmountSats
+		}
+	})
+	return reflect.DeepEqual(leftSemantics, rightSemantics)
+}
+
 func (runtime *meshRuntime) selectPotCSVExitSpendPath(table nativeTableState, ref tablecustody.VTXORef) (custodySpendPath, error) {
 	if len(ref.Tapscripts) == 0 {
 		return custodySpendPath{}, fmt.Errorf("custody ref %s:%d is missing tapscripts", ref.TxID, ref.VOut)
@@ -888,7 +926,9 @@ func (runtime *meshRuntime) matchingStoredRecoveryBundle(table nativeTableState,
 		if !sameCanonicalVTXORefs(bundle.SourcePotRefs, sourceRefs) {
 			continue
 		}
-		if !sameRecoveryAuthorizedOutputs(recoveryOutputsFromBundle(bundle), outputs) {
+		recoveryOutputs := recoveryOutputsFromBundle(bundle)
+		if !sameRecoveryAuthorizedOutputs(recoveryOutputs, outputs) &&
+			!sameRecoverySettlementSemantics(recoveryOutputs, outputs) {
 			continue
 		}
 		candidate := bundle
@@ -963,6 +1003,7 @@ func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTable
 	if runtime.config.UseMockSettlement || table == nil || transition == nil {
 		return false, nil
 	}
+	_ = authorizer
 	timingFields := custodyTimingFields(*table, *transition, "recovery_finalize")
 	timing := startMeshTiming(timingFields)
 	defer func() {
@@ -988,10 +1029,6 @@ func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTable
 	if err != nil {
 		return false, err
 	}
-	approvals, err := runtime.collectCustodyApprovals(*table, approvalTransition, authorizer, runtime.requiredCustodySigners(*table, approvalTransition))
-	if err != nil {
-		return false, err
-	}
 
 	outputRefs, recoveryTxID, err := recoveryOutputRefsFromBundle(*bundle)
 	if err != nil {
@@ -1008,7 +1045,7 @@ func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTable
 	applyRecoveryBundleToTransition(table.LatestCustodyState, transition, outputRefs)
 	finalizedAt := nowISO()
 	broadcastTxIDs := uniqueNonEmptyStrings(append(append([]string(nil), execution.BroadcastTxIDs...), recoveryTxID))
-	transition.Approvals = append([]tablecustody.CustodySignature(nil), approvals...)
+	transition.Approvals = nil
 	transition.Proof = tablecustody.CustodyProof{
 		FinalizedAt:     finalizedAt,
 		RequestHash:     approvalTransition.Proof.RequestHash,
@@ -1020,7 +1057,7 @@ func (runtime *meshRuntime) finalizeCustodyRecoveryTransition(table *nativeTable
 			RecoveryTxID:         recoveryTxID,
 			SourceTransitionHash: sourceTransitionHash,
 		},
-		Signatures: append([]tablecustody.CustodySignature(nil), approvals...),
+		Signatures: nil,
 		StateHash:  transition.NextStateHash,
 		VTXORefs:   stackProofRefs(transition.NextState),
 	}

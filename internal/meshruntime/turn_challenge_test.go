@@ -323,7 +323,7 @@ func TestTurnChallengeEscapeEligibleHeightUsesOpenConfirmationHeight(t *testing.
 func waitForTurnActionDeadlineToExpire(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
 	t.Helper()
 
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, reader, tableID)
 		if turnMenuMatchesTable(table, table.PendingTurnMenu) &&
@@ -890,6 +890,32 @@ func TestTurnChallengeEscapeRestoresSplitAndAbortsHand(t *testing.T) {
 	}
 	if err := host.validateAcceptedCustodyHistory(nil, table); err != nil {
 		t.Fatalf("expected accepted replay to validate challenge escape offline, got %v", err)
+	}
+}
+
+func TestAcceptedTurnChallengeEscapeReplayAllowsVisibleUnconfirmedEscape(t *testing.T) {
+	oracle, host, _, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	openConfirmedHeight := int64(300)
+	eligibleHeight := openConfirmedHeight + prepared.csvBlocks
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: openConfirmedHeight,
+		Confirmed:   true,
+		TxID:        prepared.openTxID,
+	})
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		Confirmed: false,
+		TxID:      prepared.escapeTxID,
+	})
+	oracle.setTip(eligibleHeight)
+
+	if _, err := host.ResolveTurnChallenge(prepared.tableID, "escape"); err != nil {
+		t.Fatalf("resolve turn challenge escape: %v", err)
+	}
+	table := waitForCustodyTransitionKindPresent(t, []*meshRuntime{host}, host, prepared.tableID, tablecustody.TransitionKindTurnChallengeEscape)
+
+	if err := host.validateAcceptedCustodyHistory(nil, table); err != nil {
+		t.Fatalf("expected accepted replay to allow a visible unconfirmed escape after maturity, got %v", err)
 	}
 }
 

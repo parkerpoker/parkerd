@@ -377,6 +377,7 @@ func TestActionTimeoutRecoveryDoesNotRequirePersistedPendingTurnMenu(t *testing.
 	lastIndex := len(before.CustodyTransitions) - 1
 	for index := range before.CustodyTransitions[lastIndex].Proof.RecoveryBundles {
 		before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].EarliestExecuteAt = addMillis(nowISO(), -1)
+		before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].BundleHash = tablecustody.HashCustodyRecoveryBundle(before.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index])
 	}
 	expireCurrentTurnActionDeadlineForTest(t, &before)
 	before.LatestCustodyState.PublicStateHash = host.publicMoneyStateHash(before, &before.ActiveHand.State)

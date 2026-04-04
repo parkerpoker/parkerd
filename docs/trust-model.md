@@ -102,7 +102,7 @@ Guarantees and non-guarantees:
 - after `D + C`, a late option-resolution and the timeout-resolution can both be valid; confirmation order decides if both are published then
 - the design does not prove from chain data alone that Alice selected her option before `D`
 - second-based challenge escapes validate maturity from accepted timestamps
-- block-based challenge escapes validate maturity from the accepted `turn-challenge-open` transaction height, the live chain tip for local readiness, and the accepted escape transaction height for replay
+- block-based challenge escapes validate maturity from the accepted `turn-challenge-open` transaction height, the live chain tip for local readiness, and either the accepted escape transaction confirmation height or, while that escape remains unconfirmed, the live chain tip plus a visible escape transaction
 - accepted table state does not carry chain tip height or transaction confirmation heights
 - if Parker cannot verify the required block heights for a block-based challenge escape, local resolution and accepted replay fail closed
 
@@ -123,7 +123,7 @@ Runtime behavior:
 - Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
 - deterministic action-timeout and showdown-timeout bundles are pre-signed while the source transition is cooperative, then executed later only if the live path stalls
 - challenge-open, option-resolution, and timeout-resolution bundles are fully signed onchain transactions and do not depend on live Ark intent registration
-- second-based challenge escapes are validated from accepted timestamps, while block-based challenge escapes are validated from live open/escape confirmation heights plus the local chain tip
+- second-based challenge escapes are validated from accepted timestamps, while block-based challenge escapes are validated from the live open confirmation height plus either the escape confirmation height or a visible unconfirmed escape together with the local chain tip
 - Parker does not treat accepted table state as authoritative for chain-height observations; those tip and confirmation-height checks stay local and must be re-verified when needed
 - if Parker cannot verify the required block heights for a block-based challenge escape, both local resolution and accepted replay fail closed
 

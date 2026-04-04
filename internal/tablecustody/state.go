@@ -220,6 +220,9 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 	if transition.Proof.ChallengeWitness != nil {
 		witnessKinds++
 	}
+	if transition.Proof.ExitWitness != nil {
+		witnessKinds++
+	}
 	if witnessKinds > 1 {
 		return fmt.Errorf("custody proof cannot carry multiple witness types")
 	}
@@ -322,6 +325,38 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 		}
 		if transition.Proof.ChallengeBundle.BundleHash != "" && transition.Proof.ChallengeBundle.BundleHash != witness.BundleHash {
 			return fmt.Errorf("custody challenge witness bundle hash mismatch")
+		}
+	}
+	if witness := transition.Proof.ExitWitness; witness != nil {
+		if transition.Kind != TransitionKindEmergencyExit {
+			return fmt.Errorf("custody exit witness is only valid for emergency-exit transitions")
+		}
+		if len(witness.BroadcastTransactions) == 0 {
+			return fmt.Errorf("custody exit witness is missing broadcast transactions")
+		}
+		seenBroadcast := map[string]struct{}{}
+		for index, tx := range witness.BroadcastTransactions {
+			if tx.TransactionID == "" {
+				return fmt.Errorf("custody exit witness broadcast transaction %d is missing a txid", index)
+			}
+			if tx.TransactionHex == "" {
+				return fmt.Errorf("custody exit witness broadcast transaction %d is missing tx hex", index)
+			}
+			if _, ok := seenBroadcast[tx.TransactionID]; ok {
+				return fmt.Errorf("custody exit witness broadcast transaction %d is duplicated", index)
+			}
+			seenBroadcast[tx.TransactionID] = struct{}{}
+		}
+		if witness.SweepTransaction != nil {
+			if witness.SweepTransaction.TransactionID == "" {
+				return fmt.Errorf("custody exit witness sweep transaction is missing a txid")
+			}
+			if witness.SweepTransaction.TransactionHex == "" {
+				return fmt.Errorf("custody exit witness sweep transaction is missing tx hex")
+			}
+			if _, ok := seenBroadcast[witness.SweepTransaction.TransactionID]; ok {
+				return fmt.Errorf("custody exit witness sweep transaction duplicates a broadcast txid")
+			}
 		}
 	}
 	expectedHash := HashCustodyTransition(transition)

@@ -255,14 +255,19 @@ func TestVerifyCandidateIntentAckRejectsTampering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build candidate intent ack: %v", err)
 	}
-	ack.OperatorPubkeyHex = host.protocolIdentity.PublicKeyHex
-	signatureHex, err := settlementcore.SignStructuredData(host.protocolIdentity.PrivateKeyHex, candidateIntentAckPayload(*ack))
+	if err := host.verifyCandidateIntentAck(table, bundle, *ack); err != nil {
+		t.Fatalf("expected untampered ack to verify, got %v", err)
+	}
+
+	unexpectedKey := cloneJSON(*ack)
+	unexpectedKey.OperatorPubkeyHex = host.protocolIdentity.PublicKeyHex
+	signatureHex, err := settlementcore.SignStructuredData(host.protocolIdentity.PrivateKeyHex, candidateIntentAckPayload(unexpectedKey))
 	if err != nil {
 		t.Fatalf("sign candidate intent ack: %v", err)
 	}
-	ack.OperatorSignatureHex = signatureHex
-	if err := host.verifyCandidateIntentAck(table, bundle, *ack); err != nil {
-		t.Fatalf("expected untampered ack to verify, got %v", err)
+	unexpectedKey.OperatorSignatureHex = signatureHex
+	if err := host.verifyCandidateIntentAck(table, bundle, unexpectedKey); err == nil || !strings.Contains(err.Error(), "operator key mismatch") {
+		t.Fatalf("expected non-signer operator key to fail verification, got %v", err)
 	}
 
 	cases := []struct {

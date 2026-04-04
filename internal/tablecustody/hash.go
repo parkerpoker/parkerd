@@ -57,6 +57,7 @@ func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned.Proof.ArkIntentID = ""
 	unsigned.Proof.ArkTxID = ""
 	unsigned.Proof.ExitProofRef = ""
+	unsigned.Proof.ExitWitness = nil
 	unsigned.Proof.FinalizedAt = ""
 	unsigned.Proof.RequestHash = ""
 	unsigned.Proof.RecoveryBundles = nil
@@ -153,6 +154,10 @@ func canonicalTransition(transition CustodyTransition) CustodyTransition {
 		canonicalWitness := canonicalChallengeWitness(*transition.Proof.ChallengeWitness)
 		transition.Proof.ChallengeWitness = &canonicalWitness
 	}
+	if transition.Proof.ExitWitness != nil {
+		canonicalWitness := canonicalExitWitness(*transition.Proof.ExitWitness)
+		transition.Proof.ExitWitness = &canonicalWitness
+	}
 	transition.Proof.VTXORefs = append([]VTXORef(nil), transition.Proof.VTXORefs...)
 	sort.SliceStable(transition.Proof.VTXORefs, func(left, right int) bool {
 		return compareVTXORefs(transition.Proof.VTXORefs[left], transition.Proof.VTXORefs[right]) < 0
@@ -235,6 +240,15 @@ func canonicalChallengeBundle(bundle CustodyChallengeBundle) CustodyChallengeBun
 func canonicalChallengeWitness(witness CustodyChallengeWitness) CustodyChallengeWitness {
 	witness.BroadcastTxIDs = append([]string(nil), witness.BroadcastTxIDs...)
 	sort.Strings(witness.BroadcastTxIDs)
+	return witness
+}
+
+func canonicalExitWitness(witness CustodyExitWitness) CustodyExitWitness {
+	witness.BroadcastTransactions = append([]CustodyExitTransaction(nil), witness.BroadcastTransactions...)
+	if witness.SweepTransaction != nil {
+		sweep := *witness.SweepTransaction
+		witness.SweepTransaction = &sweep
+	}
 	return witness
 }
 

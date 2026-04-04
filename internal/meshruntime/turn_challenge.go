@@ -2126,11 +2126,18 @@ func (runtime *meshRuntime) validateAcceptedCustodyChallengeWitness(table native
 			if err != nil {
 				return fmt.Errorf("unable to verify turn challenge escape tx status: %w", err)
 			}
-			if !escapeStatus.Confirmed {
-				return errors.New("turn challenge escape tx is unconfirmed")
+			if escapeStatus.Confirmed {
+				if escapeStatus.BlockHeight < eligibleHeight {
+					return errors.New("custody challenge escape witness confirmed before the CSV block delay matured")
+				}
+				break
 			}
-			if escapeStatus.BlockHeight < eligibleHeight {
-				return errors.New("custody challenge escape witness confirmed before the CSV block delay matured")
+			tip, err := runtime.currentChainTip()
+			if err != nil {
+				return fmt.Errorf("unable to verify chain tip height for turn challenge escape: %w", err)
+			}
+			if tip.Height < eligibleHeight {
+				return errors.New("turn challenge escape tx is unconfirmed before the CSV block delay matured")
 			}
 		}
 		applyChallengeOutputRefsToTransition(&expected, outputRefs)

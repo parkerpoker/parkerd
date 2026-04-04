@@ -286,7 +286,7 @@ The third is the deterministic challenge path:
 - the accepted source transition stores `CustodyProof.ChallengeBundle`
 - the executed `turn-challenge-open`, challenge-resolved `action`, challenge-resolved `timeout`, or `turn-challenge-escape` transition stores `CustodyProof.ChallengeWitness`
 - replay validates the signed challenge PSBT, the exact source refs, the selected tapscript leaf, the transaction locktime or CSV sequence, and the authorized outputs
-- for block-based challenge escape, replay also verifies the accepted open and escape transaction confirmation heights live and requires the escape confirmation height to satisfy the CSV delay exactly
+- for block-based challenge escape, replay verifies the accepted open transaction confirmation height live; if the accepted escape transaction is confirmed, its confirmation height must satisfy the CSV delay exactly, otherwise replay requires the escape transaction to be visible and the live chain tip to have reached the CSV maturity height
 
 Hashing and approval semantics follow the same split:
 

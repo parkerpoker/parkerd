@@ -178,6 +178,13 @@ func (runtime *meshRuntime) verifyCandidateIntentAck(table nativeTableState, bun
 	if strings.TrimSpace(ack.OperatorSignatureHex) == "" || strings.TrimSpace(ack.OperatorPubkeyHex) == "" {
 		return errors.New("candidate intent ack signature is missing")
 	}
+	config, err := runtime.arkCustodyConfig()
+	if err != nil {
+		return err
+	}
+	if ack.OperatorPubkeyHex != config.SignerPubkeyHex {
+		return errors.New("candidate intent ack operator key mismatch")
+	}
 	ok, err := settlementcore.VerifyStructuredData(ack.OperatorPubkeyHex, candidateIntentAckPayload(ack), ack.OperatorSignatureHex)
 	if err != nil {
 		return err

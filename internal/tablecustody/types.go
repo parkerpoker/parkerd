@@ -131,6 +131,16 @@ type CustodyRecoveryWitness struct {
 	SourceTransitionHash string   `json:"sourceTransitionHash,omitempty"`
 }
 
+type CustodyExitTransaction struct {
+	TransactionHex string `json:"transactionHex,omitempty"`
+	TransactionID  string `json:"transactionId,omitempty"`
+}
+
+type CustodyExitWitness struct {
+	BroadcastTransactions []CustodyExitTransaction `json:"broadcastTransactions,omitempty"`
+	SweepTransaction      *CustodyExitTransaction  `json:"sweepTransaction,omitempty"`
+}
+
 type CustodyChallengeOutput struct {
 	AmountSats    int      `json:"amountSats"`
 	ClaimKey      string   `json:"claimKey,omitempty"`
@@ -164,6 +174,7 @@ type CustodyProof struct {
 	ChallengeBundle    *CustodyChallengeBundle   `json:"challengeBundle,omitempty"`
 	ChallengeWitness   *CustodyChallengeWitness  `json:"challengeWitness,omitempty"`
 	ExitProofRef       string                    `json:"exitProofRef,omitempty"`
+	ExitWitness        *CustodyExitWitness       `json:"exitWitness,omitempty"`
 	FinalizedAt        string                    `json:"finalizedAt,omitempty"`
 	RequestHash        string                    `json:"requestHash,omitempty"`
 	RecoveryBundles    []CustodyRecoveryBundle   `json:"recoveryBundles,omitempty"`

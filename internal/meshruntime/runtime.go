@@ -38,6 +38,7 @@ type meshRuntime struct {
 	custodyArkVerify       func(refs []tablecustody.VTXORef, requireSpendable bool) error
 	custodyBatchExecute    func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
 	custodyExitExecute     func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
+	custodyExitVerify      func(profileName string, execution nativeFundsExitExecution) error
 	custodyPSBTSign        func(profileName, tx string) (string, error)
 	custodyRecoveryExecute func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
 	custodySignerAuth      map[string]custodySignerAuthorization
@@ -1687,8 +1688,8 @@ func (runtime *meshRuntime) completeEmergencyExit(tableID, finalStatus string) (
 
 	request := pendingRequest
 	if request == nil {
-		if tableHasLiveHand(*table) {
-			return nil, errors.New("funds settlement requires the current hand to be settled first")
+		if reason := runtime.fundsSettlementBlockedReason(*table); reason != "" {
+			return nil, errors.New(reason)
 		}
 		transition, err := runtime.buildFundsCustodyTransitionForPlayer(*table, runtime.walletID.PlayerID, tablecustody.TransitionKindEmergencyExit, finalStatus)
 		if err != nil {
@@ -1969,6 +1970,9 @@ func (runtime *meshRuntime) buildSignedFundsRequest(table nativeTableState, kind
 	if table.LatestCustodyState == nil {
 		return nativeFundsRequest{}, errors.New("latest custody state is unavailable")
 	}
+	if reason := runtime.fundsSettlementBlockedReason(table); reason != "" {
+		return nativeFundsRequest{}, errors.New(reason)
+	}
 	transitionKind, _, err := fundsTransitionKindAndStatus(kind)
 	if err != nil {
 		return nativeFundsRequest{}, err
@@ -2083,7 +2087,34 @@ func emergencyExitProofRef(state tablecustody.CustodyState, playerID string, exe
 	return tablecustody.BuildExitProofRef(state, playerID, canonicalVTXORefs(execution.SourceRefs), fundsExitExecutionTxIDs(execution))
 }
 
-func (runtime *meshRuntime) validateEmergencyExitExecution(table nativeTableState, request nativeFundsRequest) error {
+func (runtime *meshRuntime) verifyEmergencyExitExecution(execution *nativeFundsExitExecution) error {
+	if execution == nil {
+		return errors.New("funds request is missing emergency exit execution proof")
+	}
+	if runtime.custodyExitVerify != nil {
+		return runtime.custodyExitVerify(runtime.profileName, cloneJSON(*execution))
+	}
+	return runtime.walletRuntime.VerifyUnilateralExitExecution(
+		runtime.profileName,
+		execution.SourceRefs,
+		execution.BroadcastTxIDs,
+		execution.SweepTxID,
+	)
+}
+
+func (runtime *meshRuntime) buildEmergencyExitWitness(execution *nativeFundsExitExecution) (*tablecustody.CustodyExitWitness, error) {
+	if execution == nil {
+		return nil, errors.New("funds request is missing emergency exit execution proof")
+	}
+	return runtime.walletRuntime.BuildUnilateralExitWitness(
+		runtime.profileName,
+		execution.SourceRefs,
+		execution.BroadcastTxIDs,
+		execution.SweepTxID,
+	)
+}
+
+func (runtime *meshRuntime) validateEmergencyExitExecutionMetadata(table nativeTableState, request nativeFundsRequest) error {
 	if request.Kind != string(tablecustody.TransitionKindEmergencyExit) {
 		return nil
 	}
@@ -2101,6 +2132,13 @@ func (runtime *meshRuntime) validateEmergencyExitExecution(table nativeTableStat
 		return errors.New("funds request emergency exit proof is missing txids")
 	}
 	return nil
+}
+
+func (runtime *meshRuntime) validateEmergencyExitExecution(table nativeTableState, request nativeFundsRequest) error {
+	if err := runtime.validateEmergencyExitExecutionMetadata(table, request); err != nil {
+		return err
+	}
+	return runtime.verifyEmergencyExitExecution(request.ExitExecution)
 }
 
 func (runtime *meshRuntime) acceptedEmergencyExitSettlement(table nativeTableState, playerID string) (*nativeFundsSettlement, *nativeFundsRequest, bool, error) {
@@ -2213,8 +2251,8 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 	if table.LatestCustodyState == nil {
 		return nativeFundsSettlement{}, errors.New("latest custody state is unavailable")
 	}
-	if tableHasLiveHand(*table) {
-		return nativeFundsSettlement{}, errors.New("funds settlement requires the current hand to be settled first")
+	if reason := runtime.fundsSettlementBlockedReason(*table); reason != "" {
+		return nativeFundsSettlement{}, errors.New(reason)
 	}
 	transitionKind, finalStatus, err := fundsTransitionKindAndStatus(request.Kind)
 	if err != nil {
@@ -2293,6 +2331,10 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 		if execution.Pending {
 			receiptStatus = "pending-exit"
 		}
+		exitWitness, err := runtime.buildEmergencyExitWitness(execution)
+		if err != nil {
+			return nativeFundsSettlement{}, err
+		}
 		receiptRefs = append(receiptRefs, canonicalVTXORefs(execution.SourceRefs)...)
 		receiptArkTxID = fundsExitExecutionArkTxID(execution)
 		exitProofRef = emergencyExitProofRef(*table.LatestCustodyState, request.PlayerID, execution)
@@ -2301,6 +2343,7 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 		transition.Proof = tablecustody.CustodyProof{
 			ArkTxID:         receiptArkTxID,
 			ExitProofRef:    exitProofRef,
+			ExitWitness:     exitWitness,
 			FinalizedAt:     nowISO(),
 			RequestHash:     approvalTransition.Proof.RequestHash,
 			ReplayValidated: true,
@@ -3770,6 +3813,81 @@ func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTable
 	return nil
 }
 
+func custodyStateRefsForPlayer(state *tablecustody.CustodyState, playerID string) []tablecustody.VTXORef {
+	if state == nil {
+		return nil
+	}
+	for _, claim := range state.StackClaims {
+		if claim.PlayerID == playerID {
+			return canonicalVTXORefs(claim.VTXORefs)
+		}
+	}
+	return nil
+}
+
+func fundsExitWitnessTxIDs(summary walletpkg.CustodyExitWitnessSummary) []string {
+	txIDs := append([]string(nil), summary.BroadcastTxIDs...)
+	if strings.TrimSpace(summary.SweepTxID) != "" {
+		txIDs = append(txIDs, summary.SweepTxID)
+	}
+	return txIDs
+}
+
+func fundsExitWitnessArkTxID(summary walletpkg.CustodyExitWitnessSummary) string {
+	if strings.TrimSpace(summary.SweepTxID) != "" {
+		return summary.SweepTxID
+	}
+	if len(summary.BroadcastTxIDs) == 0 {
+		return ""
+	}
+	return summary.BroadcastTxIDs[0]
+}
+
+func (runtime *meshRuntime) validateAcceptedCustodyExitWitness(previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) (walletpkg.CustodyExitWitnessSummary, error) {
+	summary := walletpkg.CustodyExitWitnessSummary{}
+	expectedSourceRefs := custodyStateRefsForPlayer(previous, transition.ActingPlayerID)
+	if len(expectedSourceRefs) == 0 {
+		return summary, errors.New("custody exit is missing source refs from the previous custody state")
+	}
+	if transition.Proof.ExitWitness == nil {
+		if runtime.config.UseMockSettlement {
+			return summary, nil
+		}
+		return summary, errors.New("custody exit witness is missing")
+	}
+	verified, err := walletpkg.VerifyUnilateralExitWitness(expectedSourceRefs, *transition.Proof.ExitWitness)
+	if err != nil {
+		return summary, err
+	}
+	expectedProofRef := tablecustody.BuildExitProofRef(*previous, transition.ActingPlayerID, expectedSourceRefs, fundsExitWitnessTxIDs(verified))
+	if transition.Proof.ExitProofRef != expectedProofRef {
+		return summary, errors.New("custody exit proof ref mismatch")
+	}
+	finalTxID := fundsExitWitnessArkTxID(verified)
+	if finalTxID == "" {
+		return summary, errors.New("custody exit witness is missing a final txid")
+	}
+	if transition.ArkTxID != "" && transition.ArkTxID != finalTxID {
+		return summary, errors.New("custody exit witness txid mismatch")
+	}
+	if transition.Proof.ArkTxID != "" && transition.Proof.ArkTxID != finalTxID {
+		return summary, errors.New("custody proof witness txid mismatch")
+	}
+	for _, ref := range expectedSourceRefs {
+		found := false
+		for _, proofRef := range transition.Proof.VTXORefs {
+			if reflect.DeepEqual(proofRef, ref) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return summary, fmt.Errorf("custody proof is missing exit source ref %s", fundingRefKey(ref))
+		}
+	}
+	return verified, nil
+}
+
 func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableState, previous *tablecustody.CustodyState, transition tablecustody.CustodyTransition) error {
 	requireArkSettlement := !runtime.config.UseMockSettlement &&
 		custodyTransitionRequiresArkSettlement(previous, transition) &&
@@ -3820,7 +3938,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		}
 	}
 	required := runtime.requiredCustodySigners(table, transition)
-	if !(hasChallengeWitness && transition.Kind == tablecustody.TransitionKindTurnChallengeEscape) {
+	if !(hasChallengeWitness && transition.Kind == tablecustody.TransitionKindTurnChallengeEscape) && !hasRecoveryWitness {
 		if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
 			return err
 		}
@@ -3836,7 +3954,11 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if hasRecoveryWitness {
 		return runtime.validateAcceptedCustodyRecoveryWitness(table, previous, transition)
 	}
-	if !requireArkSettlement || transition.Kind == tablecustody.TransitionKindEmergencyExit {
+	if transition.Kind == tablecustody.TransitionKindEmergencyExit {
+		_, err := runtime.validateAcceptedCustodyExitWitness(previous, transition)
+		return err
+	}
+	if !requireArkSettlement {
 		return nil
 	}
 	return runtime.validateAcceptedCustodySettlementWitness(table, previous, transition)

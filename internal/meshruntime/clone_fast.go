@@ -502,6 +502,7 @@ func cloneCustodyProofFast(value tablecustody.CustodyProof) tablecustody.Custody
 	cloned.CandidateIntentAck = cloneCandidateIntentAckPtrFast(value.CandidateIntentAck)
 	cloned.ChallengeBundle = cloneCustodyChallengeBundlePtrFast(value.ChallengeBundle)
 	cloned.ChallengeWitness = cloneCustodyChallengeWitnessPtrFast(value.ChallengeWitness)
+	cloned.ExitWitness = cloneCustodyExitWitnessPtrFast(value.ExitWitness)
 	cloned.RecoveryBundles = cloneCustodyRecoveryBundlesFast(value.RecoveryBundles)
 	cloned.RecoveryWitness = cloneCustodyRecoveryWitnessPtrFast(value.RecoveryWitness)
 	cloned.SettlementWitness = cloneCustodySettlementWitnessPtrFast(value.SettlementWitness)
@@ -564,6 +565,33 @@ func cloneCustodyChallengeWitnessPtrFast(value *tablecustody.CustodyChallengeWit
 	cloned := *value
 	cloned.BroadcastTxIDs = cloneOptionalStringSliceFast(value.BroadcastTxIDs)
 	return &cloned
+}
+
+func cloneCustodyExitWitnessPtrFast(value *tablecustody.CustodyExitWitness) *tablecustody.CustodyExitWitness {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	cloned.BroadcastTransactions = cloneCustodyExitTransactionsFast(value.BroadcastTransactions)
+	cloned.SweepTransaction = cloneCustodyExitTransactionPtrFast(value.SweepTransaction)
+	return &cloned
+}
+
+func cloneCustodyExitTransactionPtrFast(value *tablecustody.CustodyExitTransaction) *tablecustody.CustodyExitTransaction {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneCustodyExitTransactionsFast(values []tablecustody.CustodyExitTransaction) []tablecustody.CustodyExitTransaction {
+	if len(values) == 0 {
+		return nil
+	}
+	cloned := make([]tablecustody.CustodyExitTransaction, len(values))
+	copy(cloned, values)
+	return cloned
 }
 
 func cloneCustodyRecoveryBundlesFast(values []tablecustody.CustodyRecoveryBundle) []tablecustody.CustodyRecoveryBundle {
