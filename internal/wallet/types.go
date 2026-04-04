@@ -25,6 +25,19 @@ type TableSessionState struct {
 	TableID    string `json:"tableId"`
 }
 
+type ChainTipStatus struct {
+	Height     int64  `json:"height"`
+	ObservedAt string `json:"observedAt"`
+}
+
+type ChainTransactionStatus struct {
+	BlockHeight int64  `json:"blockHeight"`
+	BlockTime   int64  `json:"blockTime"`
+	Confirmed   bool   `json:"confirmed"`
+	ObservedAt  string `json:"observedAt"`
+	TxID        string `json:"txid"`
+}
+
 type KnownPeerState struct {
 	Alias             string   `json:"alias,omitempty"`
 	Capabilities      []string `json:"capabilities,omitempty"`
@@ -56,6 +69,7 @@ type MeshTableReferenceState struct {
 
 type PlayerProfileState struct {
 	CachedArkConfig        *CustodyArkConfig                  `json:"cachedArkConfig,omitempty"`
+	CachedChainTip         *ChainTipStatus                    `json:"cachedChainTip,omitempty"`
 	CachedOnchainAddresses []string                           `json:"cachedOnchainAddresses,omitempty"`
 	CurrentTable           *TableSessionState                 `json:"currentTable,omitempty"`
 	CurrentMeshTableID     string                             `json:"currentMeshTableId,omitempty"`

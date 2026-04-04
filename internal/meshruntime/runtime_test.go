@@ -36,6 +36,30 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 	return fn(request)
 }
 
+type meshTestRuntimeConfig struct {
+	chainTipStatus func(profileName string) (walletpkg.ChainTipStatus, error)
+	chainTxStatus  func(profileName, txid string) (walletpkg.ChainTransactionStatus, error)
+}
+
+type meshTestRuntimeOption func(*meshTestRuntimeConfig)
+
+const (
+	syntheticRealTestActionTimeoutMS   = 4000
+	syntheticRealTestProtocolTimeoutMS = 5000
+)
+
+func withMeshTestChainTipStatus(fn func(profileName string) (walletpkg.ChainTipStatus, error)) meshTestRuntimeOption {
+	return func(config *meshTestRuntimeConfig) {
+		config.chainTipStatus = fn
+	}
+}
+
+func withMeshTestChainTxStatus(fn func(profileName, txid string) (walletpkg.ChainTransactionStatus, error)) meshTestRuntimeOption {
+	return func(config *meshTestRuntimeConfig) {
+		config.chainTxStatus = fn
+	}
+}
+
 func TestTableTrafficKeepsHoleCardsOwnerLocalAndPushesTranscriptUpdates(t *testing.T) {
 	t.Parallel()
 
@@ -802,6 +826,7 @@ func TestHandleHandMessageAcceptsExactDuplicateReplays(t *testing.T) {
 		{name: "showdown reveal", prepare: prepareGuestShowdownRevealRequest},
 	}
 	for _, tc := range cases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			host, _, tableID, request := tc.prepare(t)
 			first, err := host.handleHandMessageFromPeer(request)
@@ -852,6 +877,7 @@ func TestHandleHandMessageRejectsConflictingReplays(t *testing.T) {
 		{name: "showdown reveal", prepare: prepareGuestShowdownRevealRequest},
 	}
 	for _, tc := range cases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			host, guest, _, request := tc.prepare(t)
 			first, err := host.handleHandMessageFromPeer(request)
@@ -1011,6 +1037,8 @@ func TestRefreshLocalTableIgnoresStaleHostPoll(t *testing.T) {
 }
 
 func TestFailoverKeepsActiveTranscriptDrivenHandRunning(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	player := newMeshTestRuntime(t, "player")
 	witness := newMeshTestRuntime(t, "witness")
@@ -1108,6 +1136,8 @@ func TestMissingRevealTimeoutAwardsPotAndAppendsAbort(t *testing.T) {
 }
 
 func TestSyntheticRealModeMissingShowdownRevealTimeoutSettles(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -1468,6 +1498,8 @@ func TestFirstActionApprovalUsesPreActionCustodyDeadline(t *testing.T) {
 }
 
 func TestShowdownPayoutPlanConsumesRemovedPotRefs(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -1967,7 +1999,7 @@ func TestAcceptRemoteTableRejectsRewrittenHistoricalLedger(t *testing.T) {
 			t.Fatalf("expected table announce payload, got %#v", tampered.Events[0].Body["table"])
 		}
 		tableBody["name"] = "forged historical name"
-		tampered.Events, tampered.LastEventHash = resignHistoricalEventsForTest(t, host, tampered.Events)
+		tampered.Events, tampered.LastEventHash = resignHistoricalEventsForTest(t, tampered.Events, host, guest)
 		if tampered.PublicState != nil {
 			tampered.PublicState.LatestEventHash = tampered.LastEventHash
 		}
@@ -3385,6 +3417,8 @@ func TestEmergencyExitAppendsCustodyTransition(t *testing.T) {
 }
 
 func TestSyntheticRealModeGuestEmergencyExitUsesLocalExecutionProof(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3470,6 +3504,8 @@ func TestSyntheticRealModeGuestEmergencyExitUsesLocalExecutionProof(t *testing.T
 }
 
 func TestSyntheticRealModeGuestEmergencyExitRetriesAfterFailoverWithoutRerunningExit(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3585,6 +3621,8 @@ func TestSyntheticRealModeGuestEmergencyExitRetriesAfterFailoverWithoutRerunning
 }
 
 func TestGuestCashOutCancelsPendingNextHandStart(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3623,6 +3661,8 @@ func TestGuestCashOutCancelsPendingNextHandStart(t *testing.T) {
 }
 
 func TestSyntheticRealModeGuestCashOutUsesHostAuthority(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3646,6 +3686,8 @@ func TestSyntheticRealModeGuestCashOutUsesHostAuthority(t *testing.T) {
 }
 
 func TestSyntheticRealModeGuestCashOutAfterSettledHand(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3687,6 +3729,8 @@ func TestSyntheticRealModeGuestCashOutAfterSettledHand(t *testing.T) {
 }
 
 func TestGuestCashOutRefreshesRemoteCustodyAfterPeerCashOut(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3787,6 +3831,8 @@ func TestHostCashOutAfterPeerSettledHandCashOutAcceptsRemoteHistory(t *testing.T
 }
 
 func TestCashOutRetriesRemoteCustodyMismatchAfterAuthoritativeRefresh(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3845,6 +3891,8 @@ func TestCashOutRetriesRemoteCustodyMismatchAfterAuthoritativeRefresh(t *testing
 }
 
 func TestSyntheticRealModeSettledHandCashOutProofRefsCoverRemainingClaims(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -3909,6 +3957,8 @@ func TestSyntheticRealModeSettledHandCashOutProofRefsCoverRemainingClaims(t *tes
 }
 
 func TestSettledHandCashOutSignerPrepareAcceptsNormalizedTransition(t *testing.T) {
+	t.Parallel()
+
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 
@@ -5077,8 +5127,15 @@ func TestRealSettlementUsesExtendedTimingWindows(t *testing.T) {
 	}
 }
 
-func newMeshTestRuntime(t *testing.T, profileName string) *meshRuntime {
+func newMeshTestRuntime(t *testing.T, profileName string, options ...meshTestRuntimeOption) *meshRuntime {
 	t.Helper()
+
+	config := meshTestRuntimeConfig{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
 
 	rootDir := t.TempDir()
 	runtimeConfig, err := cfg.ResolveRuntimeConfig(map[string]string{
@@ -5104,6 +5161,8 @@ func newMeshTestRuntime(t *testing.T, profileName string) *meshRuntime {
 	t.Cleanup(func() {
 		_ = runtime.Close()
 	})
+	runtime.chainTipStatus = config.chainTipStatus
+	runtime.chainTxStatus = config.chainTxStatus
 
 	if _, err := runtime.Bootstrap(profileName, ""); err != nil {
 		t.Fatalf("bootstrap mesh runtime %s: %v", profileName, err)
@@ -5117,6 +5176,8 @@ func enableSyntheticRealMode(runtimes ...*meshRuntime) {
 			continue
 		}
 		runtime.config.UseMockSettlement = false
+		runtime.testActionTimeoutMS = syntheticRealTestActionTimeoutMS
+		runtime.testHandProtocolMS = syntheticRealTestProtocolTimeoutMS
 		runtime.custodyArkVerify = func(refs []tablecustody.VTXORef, requireSpendable bool) error {
 			return nil
 		}
@@ -6034,14 +6095,25 @@ func runtimeForPeerID(t *testing.T, peerID string, runtimes ...*meshRuntime) *me
 	return nil
 }
 
-func resignHistoricalEventsForTest(t *testing.T, runtime *meshRuntime, events []NativeSignedTableEvent) ([]NativeSignedTableEvent, string) {
+func resignHistoricalEventsForTest(t *testing.T, events []NativeSignedTableEvent, runtimes ...*meshRuntime) ([]NativeSignedTableEvent, string) {
 	t.Helper()
+
+	signers := map[string]*meshRuntime{}
+	for _, runtime := range runtimes {
+		if runtime == nil {
+			continue
+		}
+		key := runtime.selfPeerID() + "|" + runtime.protocolIdentity.PublicKeyHex
+		signers[key] = runtime
+	}
 
 	resigned := cloneJSON(events)
 	prevHash := ""
 	for index := range resigned {
-		if resigned[index].SenderPeerID != runtime.selfPeerID() || resigned[index].SenderProtocolPubkeyHex != runtime.protocolIdentity.PublicKeyHex {
-			t.Fatalf("expected historical event %d to belong to %s, got peer=%s pubkey=%s", index, runtime.selfPeerID(), resigned[index].SenderPeerID, resigned[index].SenderProtocolPubkeyHex)
+		key := resigned[index].SenderPeerID + "|" + resigned[index].SenderProtocolPubkeyHex
+		runtime, ok := signers[key]
+		if !ok {
+			t.Fatalf("missing signer for historical event %d peer=%s pubkey=%s", index, resigned[index].SenderPeerID, resigned[index].SenderProtocolPubkeyHex)
 		}
 		if prevHash == "" {
 			resigned[index].PrevEventHash = nil
@@ -6070,7 +6142,7 @@ func resignAcceptedTableEventsForTest(t *testing.T, runtime *meshRuntime, table 
 	if table == nil {
 		t.Fatal("expected table to re-sign")
 	}
-	table.Events, table.LastEventHash = resignHistoricalEventsForTest(t, runtime, table.Events)
+	table.Events, table.LastEventHash = resignHistoricalEventsForTest(t, table.Events, runtime)
 	if table.PublicState != nil {
 		table.PublicState.LatestEventHash = table.LastEventHash
 	}

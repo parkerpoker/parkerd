@@ -87,7 +87,7 @@ func (runtime *Runtime) liveOrCachedArkConfig(ctx context.Context, profileName s
 			UnilateralExitDelay:   config.UnilateralExitDelay,
 		}
 		state.CachedArkConfig = &cached
-		if saveErr := runtime.store.Save(state); saveErr != nil {
+		if saveErr := runtime.saveProfileState(state); saveErr != nil {
 			return nil, saveErr
 		}
 		return &cached, nil

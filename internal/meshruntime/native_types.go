@@ -199,13 +199,14 @@ type NativePublicTableView struct {
 }
 
 type NativeTableLocalView struct {
-	CanAct        bool                        `json:"canAct"`
-	LegalActions  []game.LegalAction          `json:"legalActions"`
-	MyHoleCards   any                         `json:"myHoleCards"`
-	MyPlayerID    any                         `json:"myPlayerId"`
-	MySeatIndex   any                         `json:"mySeatIndex"`
-	TurnChallenge *NativePendingTurnChallenge `json:"turnChallenge,omitempty"`
-	TurnMenu      *NativePendingTurnMenu      `json:"turnMenu,omitempty"`
+	CanAct             bool                            `json:"canAct"`
+	LegalActions       []game.LegalAction              `json:"legalActions"`
+	MyHoleCards        any                             `json:"myHoleCards"`
+	MyPlayerID         any                             `json:"myPlayerId"`
+	MySeatIndex        any                             `json:"mySeatIndex"`
+	TurnChallenge      *NativePendingTurnChallenge     `json:"turnChallenge,omitempty"`
+	TurnChallengeChain *NativeTurnChallengeChainStatus `json:"turnChallengeChain,omitempty"`
+	TurnMenu           *NativePendingTurnMenu          `json:"turnMenu,omitempty"`
 }
 
 type NativeMeshTableView struct {
@@ -334,6 +335,16 @@ type NativeChallengeEnvelope struct {
 	OptionResolutionBundles []tablecustody.CustodyChallengeBundle `json:"optionResolutionBundles,omitempty"`
 	EscapeBundle            tablecustody.CustodyChallengeBundle   `json:"escapeBundle"`
 	TimeoutResolutionBundle tablecustody.CustodyChallengeBundle   `json:"timeoutResolutionBundle"`
+}
+
+type NativeTurnChallengeChainStatus struct {
+	ChainTipHeight       int64  `json:"chainTipHeight"`
+	ChainTipObservedAt   string `json:"chainTipObservedAt,omitempty"`
+	EscapeEligibleHeight int64  `json:"escapeEligibleHeight"`
+	EscapeReady          bool   `json:"escapeReady"`
+	OpenConfirmed        bool   `json:"openConfirmed"`
+	OpenConfirmedHeight  int64  `json:"openConfirmedHeight"`
+	OpenTxID             string `json:"openTxid,omitempty"`
 }
 
 type NativePendingTurnChallenge struct {

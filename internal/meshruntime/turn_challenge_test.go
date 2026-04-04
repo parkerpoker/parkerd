@@ -2,8 +2,10 @@ package meshruntime
 
 import (
 	"encoding/hex"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +15,82 @@ import (
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
+
+type turnChallengeChainOracle struct {
+	mu     sync.Mutex
+	tip    walletpkg.ChainTipStatus
+	tipErr error
+	tx     map[string]walletpkg.ChainTransactionStatus
+	txErr  map[string]error
+}
+
+func newTurnChallengeChainOracle() *turnChallengeChainOracle {
+	return &turnChallengeChainOracle{
+		tip: walletpkg.ChainTipStatus{
+			ObservedAt: nowISO(),
+		},
+		tx:    map[string]walletpkg.ChainTransactionStatus{},
+		txErr: map[string]error{},
+	}
+}
+
+func (oracle *turnChallengeChainOracle) chainTip(profileName string) (walletpkg.ChainTipStatus, error) {
+	oracle.mu.Lock()
+	defer oracle.mu.Unlock()
+	if oracle.tipErr != nil {
+		return walletpkg.ChainTipStatus{}, oracle.tipErr
+	}
+	return oracle.tip, nil
+}
+
+func (oracle *turnChallengeChainOracle) chainTx(profileName, txid string) (walletpkg.ChainTransactionStatus, error) {
+	oracle.mu.Lock()
+	defer oracle.mu.Unlock()
+	if err, ok := oracle.txErr[txid]; ok && err != nil {
+		return walletpkg.ChainTransactionStatus{}, err
+	}
+	status, ok := oracle.tx[txid]
+	if !ok {
+		return walletpkg.ChainTransactionStatus{}, fmt.Errorf("missing tx status for %s", txid)
+	}
+	return status, nil
+}
+
+func (oracle *turnChallengeChainOracle) setTip(height int64) {
+	oracle.mu.Lock()
+	defer oracle.mu.Unlock()
+	oracle.tip = walletpkg.ChainTipStatus{
+		Height:     height,
+		ObservedAt: nowISO(),
+	}
+	oracle.tipErr = nil
+}
+
+func (oracle *turnChallengeChainOracle) setTipError(err error) {
+	oracle.mu.Lock()
+	defer oracle.mu.Unlock()
+	oracle.tipErr = err
+}
+
+func (oracle *turnChallengeChainOracle) setTxStatus(status walletpkg.ChainTransactionStatus) {
+	oracle.mu.Lock()
+	defer oracle.mu.Unlock()
+	if oracle.tx == nil {
+		oracle.tx = map[string]walletpkg.ChainTransactionStatus{}
+	}
+	status.ObservedAt = nowISO()
+	oracle.tx[status.TxID] = status
+	delete(oracle.txErr, status.TxID)
+}
+
+func (oracle *turnChallengeChainOracle) setTxError(txid string, err error) {
+	oracle.mu.Lock()
+	defer oracle.mu.Unlock()
+	if oracle.txErr == nil {
+		oracle.txErr = map[string]error{}
+	}
+	oracle.txErr[txid] = err
+}
 
 func installDirectTableSync(t *testing.T, runtimes ...*meshRuntime) {
 	t.Helper()
@@ -129,7 +207,91 @@ func challengeBundleUsesSignerXOnly(t *testing.T, bundle tablecustody.CustodyCha
 	return false
 }
 
-func TestTurnChallengeEscapeEligibleAtUsesCSVDelayEstimate(t *testing.T) {
+type preparedTurnChallengeEscape struct {
+	csvBlocks   int64
+	escapeTxID  string
+	openTxID    string
+	sourceState tablecustody.CustodyState
+	table       nativeTableState
+	tableID     string
+}
+
+func prepareBlockBasedTurnChallengeEscape(t *testing.T) (*turnChallengeChainOracle, *meshRuntime, *meshRuntime, preparedTurnChallengeEscape) {
+	t.Helper()
+
+	oracle := newTurnChallengeChainOracle()
+	host := newMeshTestRuntime(
+		t,
+		"host",
+		withMeshTestChainTipStatus(oracle.chainTip),
+		withMeshTestChainTxStatus(oracle.chainTx),
+	)
+	guest := newMeshTestRuntime(
+		t,
+		"guest",
+		withMeshTestChainTipStatus(oracle.chainTip),
+		withMeshTestChainTxStatus(oracle.chainTx),
+	)
+	host.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	guest.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	sourceState := cloneJSON(*table.LatestCustodyState)
+
+	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.OpenTurnChallenge(tableID); err != nil {
+		t.Fatalf("open turn challenge: %v", err)
+	}
+	table = waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, host, tableID)
+	if table.PendingTurnChallenge == nil {
+		t.Fatal("expected pending turn challenge after open")
+	}
+	if strings.TrimSpace(table.PendingTurnChallenge.EscapeEligibleAt) != "" {
+		t.Fatalf("expected block-based escape eligibility timestamp to stay empty, got %+v", table.PendingTurnChallenge)
+	}
+	if table.PendingTurnMenu == nil || table.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected pending challenge envelope after open")
+	}
+	openTransition := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	if openTransition.Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		t.Fatalf("expected latest custody transition %q, got %q", tablecustody.TransitionKindTurnChallengeOpen, openTransition.Kind)
+	}
+	openTxID := openTransition.Proof.ChallengeWitness.TransactionID
+	if strings.TrimSpace(openTxID) == "" {
+		t.Fatal("expected turn challenge open txid")
+	}
+	_, escapeTxID, err := challengeOutputRefsFromBundle(table.PendingTurnMenu.ChallengeEnvelope.EscapeBundle)
+	if err != nil {
+		t.Fatalf("derive turn challenge escape txid: %v", err)
+	}
+	openTable := cloneJSON(table)
+	openState := cloneJSON(openTransition.NextState)
+	openTable.LatestCustodyState = &openState
+	spendPath, err := host.selectTurnChallengeExitSpendPath(openTable, table.PendingTurnChallenge.ChallengeRef)
+	if err != nil {
+		t.Fatalf("select turn challenge escape spend path: %v", err)
+	}
+	if spendPath.CSVLocktime.Type != arklib.LocktimeTypeBlock {
+		t.Fatalf("expected block-based turn challenge escape locktime, got %+v", spendPath.CSVLocktime)
+	}
+
+	return oracle, host, guest, preparedTurnChallengeEscape{
+		csvBlocks:   int64(spendPath.CSVLocktime.Value),
+		escapeTxID:  escapeTxID,
+		openTxID:    openTxID,
+		sourceState: sourceState,
+		table:       table,
+		tableID:     tableID,
+	}
+}
+
+func TestTurnChallengeEscapeEligibleAtOnlyUsesSecondBasedCSV(t *testing.T) {
 	openedAt := "2026-04-03T12:00:00Z"
 	spendPath := custodySpendPath{
 		UsesCSVLocktime: true,
@@ -139,8 +301,22 @@ func TestTurnChallengeEscapeEligibleAtUsesCSVDelayEstimate(t *testing.T) {
 		t.Fatalf("expected second-based challenge escape eligibility %q, got %q", want, got)
 	}
 	spendPath.CSVLocktime = arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 30}
-	if got, want := turnChallengeEscapeEligibleAt(openedAt, spendPath), addMillis(openedAt, 30*10*60*1000); got != want {
-		t.Fatalf("expected block-based challenge escape eligibility estimate %q, got %q", want, got)
+	if got := turnChallengeEscapeEligibleAt(openedAt, spendPath); got != "" {
+		t.Fatalf("expected block-based challenge escape eligibility timestamp to stay empty, got %q", got)
+	}
+}
+
+func TestTurnChallengeEscapeEligibleHeightUsesOpenConfirmationHeight(t *testing.T) {
+	spendPath := custodySpendPath{
+		UsesCSVLocktime: true,
+		CSVLocktime:     arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 144},
+	}
+	height, ok := turnChallengeEscapeEligibleHeight(700_000, spendPath)
+	if !ok {
+		t.Fatal("expected block-based CSV locktime to produce an eligible height")
+	}
+	if height != 700_144 {
+		t.Fatalf("expected eligible height 700144, got %d", height)
 	}
 }
 
@@ -416,6 +592,9 @@ func TestTurnChallengeOpenBlocksOrdinarySendAction(t *testing.T) {
 	if table.PendingTurnChallenge.OpenedAt == "" || table.PendingTurnChallenge.TimeoutEligibleAt == "" {
 		t.Fatalf("expected pending turn challenge timestamps, got %+v", table.PendingTurnChallenge)
 	}
+	if strings.TrimSpace(table.PendingTurnChallenge.EscapeEligibleAt) != "" {
+		t.Fatalf("expected block-based pending turn challenge escape eligibility timestamp to stay empty, got %+v", table.PendingTurnChallenge)
+	}
 	if table.PendingTurnChallenge.DecisionIndex != originalMenu.DecisionIndex || table.PendingTurnChallenge.ActingPlayerID != originalMenu.ActingPlayerID {
 		t.Fatalf("expected turn challenge to preserve turn identity, got %+v want decision=%d acting=%s", table.PendingTurnChallenge, originalMenu.DecisionIndex, originalMenu.ActingPlayerID)
 	}
@@ -585,112 +764,85 @@ func TestTurnChallengeTimeoutResolutionExecutesAfterWindow(t *testing.T) {
 	}
 }
 
+func TestTurnChallengeEscapeRejectsUnconfirmedOpenTx(t *testing.T) {
+	oracle, host, _, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		Confirmed: false,
+		TxID:      prepared.openTxID,
+	})
+	oracle.setTip(prepared.csvBlocks + 100)
+
+	if _, err := host.ResolveTurnChallenge(prepared.tableID, "escape"); err == nil || !strings.Contains(err.Error(), "open tx is unconfirmed") {
+		t.Fatalf("expected escape to reject an unconfirmed open tx, got %v", err)
+	}
+}
+
+func TestTurnChallengeEscapeRejectsTipBelowEligibleHeight(t *testing.T) {
+	oracle, host, _, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	openConfirmedHeight := int64(250)
+	eligibleHeight := openConfirmedHeight + prepared.csvBlocks
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: openConfirmedHeight,
+		Confirmed:   true,
+		TxID:        prepared.openTxID,
+	})
+	oracle.setTip(eligibleHeight - 1)
+
+	if _, err := host.ResolveTurnChallenge(prepared.tableID, "escape"); err == nil || !strings.Contains(err.Error(), "not yet eligible") {
+		t.Fatalf("expected escape to reject a chain tip below the eligible height, got %v", err)
+	}
+}
+
 func TestTurnChallengeEscapeRestoresSplitAndAbortsHand(t *testing.T) {
-	host := newMeshTestRuntime(t, "host")
-	guest := newMeshTestRuntime(t, "guest")
-	host.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
-		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
-	}
-	guest.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
-		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
-	}
-	bridgeHostToGuestSync(host, guest)
+	oracle, host, guest, prepared := prepareBlockBasedTurnChallengeEscape(t)
 
-	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
-	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	sourceState := cloneJSON(*table.LatestCustodyState)
-	if table.PendingTurnMenu == nil || table.PendingTurnMenu.ChallengeEnvelope == nil {
-		t.Fatal("expected pending turn menu challenge envelope before opening the challenge")
-	}
-	if table.PendingTurnMenu.ChallengeEnvelope.EscapeBundle.Kind != tablecustody.TransitionKindTurnChallengeEscape {
-		t.Fatalf("expected escape bundle kind %q, got %q", tablecustody.TransitionKindTurnChallengeEscape, table.PendingTurnMenu.ChallengeEnvelope.EscapeBundle.Kind)
-	}
+	openConfirmedHeight := int64(100)
+	eligibleHeight := openConfirmedHeight + prepared.csvBlocks
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: openConfirmedHeight,
+		Confirmed:   true,
+		TxID:        prepared.openTxID,
+	})
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: eligibleHeight,
+		Confirmed:   true,
+		TxID:        prepared.escapeTxID,
+	})
+	oracle.setTip(eligibleHeight)
 
-	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
-	if _, err := host.OpenTurnChallenge(tableID); err != nil {
-		t.Fatalf("open turn challenge: %v", err)
+	view := host.localTableView(prepared.table)
+	if view.Local.TurnChallengeChain == nil {
+		t.Fatal("expected local view to expose turn challenge chain status")
 	}
-	table = waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, host, tableID)
-	if table.PendingTurnChallenge == nil || strings.TrimSpace(table.PendingTurnChallenge.EscapeEligibleAt) == "" {
-		t.Fatalf("expected pending turn challenge to carry escape eligibility, got %+v", table.PendingTurnChallenge)
+	if view.Local.TurnChallengeChain.OpenTxID != prepared.openTxID {
+		t.Fatalf("expected open txid %q, got %+v", prepared.openTxID, view.Local.TurnChallengeChain)
 	}
-	if _, err := host.ResolveTurnChallenge(tableID, "escape"); err == nil || !strings.Contains(err.Error(), "not yet eligible") {
-		t.Fatalf("expected default turn challenge escape to reject before block-delay estimate maturity, got %v", err)
+	if view.Local.TurnChallengeChain.OpenConfirmedHeight != openConfirmedHeight {
+		t.Fatalf("expected open confirmed height %d, got %+v", openConfirmedHeight, view.Local.TurnChallengeChain)
 	}
-
-	if err := host.store.withTableLock(tableID, func() error {
-		locked, err := host.store.readTable(tableID)
-		if err != nil || locked == nil {
-			return err
-		}
-		if locked.PendingTurnChallenge == nil {
-			t.Fatal("expected pending turn challenge before forcing escape eligibility")
-		}
-		challenge := cloneJSON(*locked.PendingTurnChallenge)
-		challenge.EscapeEligibleAt = addMillis(nowISO(), 60_000)
-		locked.PendingTurnChallenge = &challenge
-		return host.persistLocalTable(locked, false)
-	}); err != nil {
-		t.Fatalf("force escape ineligible state: %v", err)
+	if view.Local.TurnChallengeChain.EscapeEligibleHeight != eligibleHeight {
+		t.Fatalf("expected escape eligible height %d, got %+v", eligibleHeight, view.Local.TurnChallengeChain)
 	}
-	if _, err := host.ResolveTurnChallenge(tableID, "escape"); err == nil || !strings.Contains(err.Error(), "not yet eligible") {
-		t.Fatalf("expected turn challenge escape to reject before eligibility, got %v", err)
+	if view.Local.TurnChallengeChain.ChainTipHeight != eligibleHeight {
+		t.Fatalf("expected chain tip height %d, got %+v", eligibleHeight, view.Local.TurnChallengeChain)
 	}
-	if err := host.store.withTableLock(tableID, func() error {
-		locked, err := host.store.readTable(tableID)
-		if err != nil || locked == nil {
-			return err
-		}
-		if locked.PendingTurnChallenge == nil {
-			t.Fatal("expected pending turn challenge before forcing escape eligibility")
-		}
-		challenge := cloneJSON(*locked.PendingTurnChallenge)
-		openIndex := -1
-		for index := len(locked.CustodyTransitions) - 1; index >= 0; index-- {
-			if locked.CustodyTransitions[index].Kind == tablecustody.TransitionKindTurnChallengeOpen {
-				openIndex = index
-				break
-			}
-		}
-		if openIndex < 0 {
-			t.Fatal("expected turn-challenge-open transition before forcing escape eligibility")
-		}
-		openTransition := cloneJSON(locked.CustodyTransitions[openIndex])
-		openTable := cloneJSON(*locked)
-		openState := cloneJSON(openTransition.NextState)
-		openTable.LatestCustodyState = &openState
-		spendPath, err := host.selectTurnChallengeExitSpendPath(openTable, challenge.ChallengeRef)
-		if err != nil {
-			return err
-		}
-		openedAt := addMillis(nowISO(), -(int((time.Duration(spendPath.CSVLocktime.Value)*estimatedBitcoinBlockInterval)/time.Millisecond) + 1000))
-		challenge.OpenedAt = openedAt
-		challenge.EscapeEligibleAt = turnChallengeEscapeEligibleAt(openedAt, spendPath)
-		locked.PendingTurnChallenge = &challenge
-		openTransition.Proof.FinalizedAt = openedAt
-		if openTransition.Proof.ChallengeWitness != nil {
-			witness := cloneJSON(*openTransition.Proof.ChallengeWitness)
-			witness.ExecutedAt = openedAt
-			openTransition.Proof.ChallengeWitness = &witness
-		}
-		openTransition.Proof.TransitionHash = tablecustody.HashCustodyTransition(openTransition)
-		locked.CustodyTransitions[openIndex] = openTransition
-		return host.persistLocalTable(locked, false)
-	}); err != nil {
-		t.Fatalf("force escape eligibility: %v", err)
+	if !view.Local.TurnChallengeChain.EscapeReady {
+		t.Fatalf("expected local turn challenge chain status to report readiness, got %+v", view.Local.TurnChallengeChain)
 	}
 
-	if _, err := host.ResolveTurnChallenge(tableID, "escape"); err != nil {
+	if _, err := host.ResolveTurnChallenge(prepared.tableID, "escape"); err != nil {
 		t.Fatalf("resolve turn challenge escape: %v", err)
 	}
-	table = mustReadNativeTable(t, host, tableID)
+	table := mustReadNativeTable(t, host, prepared.tableID)
 	if len(table.CustodyTransitions) == 0 {
 		t.Fatal("expected challenge escape to append a custody transition")
 	}
 	if table.CustodyTransitions[len(table.CustodyTransitions)-1].Kind != tablecustody.TransitionKindTurnChallengeEscape {
 		t.Fatalf("expected immediate local latest transition %q, got %+v", tablecustody.TransitionKindTurnChallengeEscape, table.CustodyTransitions[len(table.CustodyTransitions)-1])
 	}
-	table = waitForCustodyTransitionKindPresent(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindTurnChallengeEscape)
+	table = waitForCustodyTransitionKindPresent(t, []*meshRuntime{host, guest}, host, prepared.tableID, tablecustody.TransitionKindTurnChallengeEscape)
 	var last tablecustody.CustodyTransition
 	foundEscape := false
 	for _, transition := range table.CustodyTransitions {
@@ -712,11 +864,11 @@ func TestTurnChallengeEscapeRestoresSplitAndAbortsHand(t *testing.T) {
 	if len(last.Approvals) != 0 {
 		t.Fatalf("expected challenge escape to avoid custody approvals, got %+v", last.Approvals)
 	}
-	if !reflect.DeepEqual(semanticComparableCustodyStacks(&last.NextState), semanticComparableCustodyStacks(&sourceState)) {
-		t.Fatalf("expected challenge escape to restore the pre-open stack split, got %+v want %+v", last.NextState.StackClaims, sourceState.StackClaims)
+	if !reflect.DeepEqual(semanticComparableCustodyStacks(&last.NextState), semanticComparableCustodyStacks(&prepared.sourceState)) {
+		t.Fatalf("expected challenge escape to restore the pre-open stack split, got %+v want %+v", last.NextState.StackClaims, prepared.sourceState.StackClaims)
 	}
-	if !reflect.DeepEqual(semanticComparableCustodyPots(&last.NextState), semanticComparableCustodyPots(&sourceState)) {
-		t.Fatalf("expected challenge escape to restore the pre-open pot split, got %+v want %+v", last.NextState.PotSlices, sourceState.PotSlices)
+	if !reflect.DeepEqual(semanticComparableCustodyPots(&last.NextState), semanticComparableCustodyPots(&prepared.sourceState)) {
+		t.Fatalf("expected challenge escape to restore the pre-open pot split, got %+v want %+v", last.NextState.PotSlices, prepared.sourceState.PotSlices)
 	}
 	if !sameCanonicalVTXORefs(stackProofRefs(last.NextState), last.Proof.VTXORefs) {
 		t.Fatalf("expected challenge escape proof refs to match restored stack refs")
@@ -738,6 +890,66 @@ func TestTurnChallengeEscapeRestoresSplitAndAbortsHand(t *testing.T) {
 	}
 	if err := host.validateAcceptedCustodyHistory(nil, table); err != nil {
 		t.Fatalf("expected accepted replay to validate challenge escape offline, got %v", err)
+	}
+}
+
+func TestAcceptedTurnChallengeEscapeReplayRejectsEscapeConfirmedBelowEligibleHeight(t *testing.T) {
+	oracle, host, _, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	openConfirmedHeight := int64(400)
+	eligibleHeight := openConfirmedHeight + prepared.csvBlocks
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: openConfirmedHeight,
+		Confirmed:   true,
+		TxID:        prepared.openTxID,
+	})
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: eligibleHeight,
+		Confirmed:   true,
+		TxID:        prepared.escapeTxID,
+	})
+	oracle.setTip(eligibleHeight)
+
+	if _, err := host.ResolveTurnChallenge(prepared.tableID, "escape"); err != nil {
+		t.Fatalf("resolve turn challenge escape: %v", err)
+	}
+	table := waitForCustodyTransitionKindPresent(t, []*meshRuntime{host}, host, prepared.tableID, tablecustody.TransitionKindTurnChallengeEscape)
+
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: eligibleHeight - 1,
+		Confirmed:   true,
+		TxID:        prepared.escapeTxID,
+	})
+	if err := host.validateAcceptedCustodyHistory(nil, table); err == nil || !strings.Contains(err.Error(), "confirmed before the CSV block delay matured") {
+		t.Fatalf("expected accepted replay to reject an early escape confirmation, got %v", err)
+	}
+}
+
+func TestAcceptedTurnChallengeEscapeReplayRejectsMissingChainStatus(t *testing.T) {
+	oracle, host, _, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	openConfirmedHeight := int64(500)
+	eligibleHeight := openConfirmedHeight + prepared.csvBlocks
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: openConfirmedHeight,
+		Confirmed:   true,
+		TxID:        prepared.openTxID,
+	})
+	oracle.setTxStatus(walletpkg.ChainTransactionStatus{
+		BlockHeight: eligibleHeight,
+		Confirmed:   true,
+		TxID:        prepared.escapeTxID,
+	})
+	oracle.setTip(eligibleHeight)
+
+	if _, err := host.ResolveTurnChallenge(prepared.tableID, "escape"); err != nil {
+		t.Fatalf("resolve turn challenge escape: %v", err)
+	}
+	table := waitForCustodyTransitionKindPresent(t, []*meshRuntime{host}, host, prepared.tableID, tablecustody.TransitionKindTurnChallengeEscape)
+
+	oracle.setTxError(prepared.escapeTxID, fmt.Errorf("missing chain status"))
+	if err := host.validateAcceptedCustodyHistory(nil, table); err == nil || !strings.Contains(err.Error(), "unable to verify turn challenge escape tx status") {
+		t.Fatalf("expected accepted replay to fail closed when chain status is unavailable, got %v", err)
 	}
 }
 

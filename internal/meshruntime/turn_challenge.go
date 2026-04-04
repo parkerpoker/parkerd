@@ -25,10 +25,6 @@ import (
 const (
 	turnChallengeClaimKey   = "turn-challenge-ref"
 	turnChallengeStatusOpen = "open"
-	// Parker does not yet track chain height locally, so block-based CSV
-	// escape leaves use a conservative wall-clock estimate rather than
-	// defaulting to immediate local/replay eligibility.
-	estimatedBitcoinBlockInterval = 10 * time.Minute
 )
 
 func turnChallengeSourceRefs(state *tablecustody.CustodyState) []tablecustody.VTXORef {
@@ -198,24 +194,25 @@ func turnChallengeEscapeEligibleAt(openedAt string, spendPath custodySpendPath) 
 	if strings.TrimSpace(openedAt) == "" || !spendPath.UsesCSVLocktime {
 		return ""
 	}
-	delayMS := 0
 	switch spendPath.CSVLocktime.Type {
 	case arklib.LocktimeTypeSecond:
 		delaySeconds := spendPath.CSVLocktime.Seconds()
-		if delaySeconds > 0 {
-			delayMS = int(delaySeconds * 1000)
+		if delaySeconds <= 0 {
+			return openedAt
 		}
+		return addMillis(openedAt, int(delaySeconds*1000))
 	case arklib.LocktimeTypeBlock:
-		if spendPath.CSVLocktime.Value > 0 {
-			delayMS = int((time.Duration(spendPath.CSVLocktime.Value) * estimatedBitcoinBlockInterval) / time.Millisecond)
-		}
+		return ""
 	default:
 		return ""
 	}
-	if delayMS <= 0 {
-		return openedAt
+}
+
+func turnChallengeEscapeEligibleHeight(openConfirmedHeight int64, spendPath custodySpendPath) (int64, bool) {
+	if !spendPath.UsesCSVLocktime || spendPath.CSVLocktime.Type != arklib.LocktimeTypeBlock {
+		return 0, false
 	}
-	return addMillis(openedAt, delayMS)
+	return openConfirmedHeight + int64(spendPath.CSVLocktime.Value), true
 }
 
 func turnChallengeEscapeReady(challenge *NativePendingTurnChallenge) bool {
@@ -223,6 +220,100 @@ func turnChallengeEscapeReady(challenge *NativePendingTurnChallenge) bool {
 		return true
 	}
 	return elapsedMillis(challenge.EscapeEligibleAt) >= 0
+}
+
+func (runtime *meshRuntime) pendingTurnChallengeOpenContext(table nativeTableState) (*tablecustody.CustodyTransition, nativeTableState, custodySpendPath, error) {
+	if !turnChallengeMatchesTable(table, table.PendingTurnChallenge) || table.PendingTurnChallenge == nil {
+		return nil, nativeTableState{}, custodySpendPath{}, errors.New("turn challenge is not open for the current table state")
+	}
+	if len(table.CustodyTransitions) == 0 || table.CustodyTransitions[len(table.CustodyTransitions)-1].Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		return nil, nativeTableState{}, custodySpendPath{}, errors.New("turn challenge is missing its accepted open transition")
+	}
+	openTransition := cloneJSON(table.CustodyTransitions[len(table.CustodyTransitions)-1])
+	if openTransition.Proof.ChallengeWitness == nil {
+		return nil, nativeTableState{}, custodySpendPath{}, errors.New("turn challenge open transition is missing its witness")
+	}
+	openTable := cloneJSON(table)
+	openState := cloneJSON(openTransition.NextState)
+	openTable.LatestCustodyState = &openState
+	spendPath, err := runtime.selectTurnChallengeExitSpendPath(openTable, table.PendingTurnChallenge.ChallengeRef)
+	if err != nil {
+		return nil, nativeTableState{}, custodySpendPath{}, err
+	}
+	return &openTransition, openTable, spendPath, nil
+}
+
+func (runtime *meshRuntime) turnChallengeChainStatus(table nativeTableState) (*NativeTurnChallengeChainStatus, error) {
+	openTransition, _, spendPath, err := runtime.pendingTurnChallengeOpenContext(table)
+	if err != nil {
+		return nil, err
+	}
+	if spendPath.CSVLocktime.Type != arklib.LocktimeTypeBlock {
+		return nil, nil
+	}
+	openTxID := strings.TrimSpace(openTransition.Proof.ChallengeWitness.TransactionID)
+	if openTxID == "" {
+		return nil, errors.New("turn challenge open transition is missing its transaction id")
+	}
+	openStatus, err := runtime.transactionChainStatus(openTxID)
+	if err != nil {
+		return nil, fmt.Errorf("unable to verify turn challenge open tx status: %w", err)
+	}
+	status := &NativeTurnChallengeChainStatus{
+		OpenConfirmed:       openStatus.Confirmed,
+		OpenConfirmedHeight: openStatus.BlockHeight,
+		OpenTxID:            openTxID,
+	}
+	if !openStatus.Confirmed {
+		return status, nil
+	}
+	eligibleHeight, ok := turnChallengeEscapeEligibleHeight(openStatus.BlockHeight, spendPath)
+	if !ok {
+		return nil, nil
+	}
+	status.EscapeEligibleHeight = eligibleHeight
+	tip, err := runtime.currentChainTip()
+	if err != nil {
+		return nil, fmt.Errorf("unable to verify chain tip height: %w", err)
+	}
+	status.ChainTipHeight = tip.Height
+	status.ChainTipObservedAt = tip.ObservedAt
+	status.EscapeReady = tip.Height >= eligibleHeight
+	return status, nil
+}
+
+func (runtime *meshRuntime) validateTurnChallengeEscapeReadiness(table nativeTableState) error {
+	_, _, spendPath, err := runtime.pendingTurnChallengeOpenContext(table)
+	if err != nil {
+		return err
+	}
+	switch spendPath.CSVLocktime.Type {
+	case arklib.LocktimeTypeSecond:
+		if table.PendingTurnChallenge == nil || strings.TrimSpace(table.PendingTurnChallenge.EscapeEligibleAt) == "" {
+			return errors.New("turn challenge escape is missing its eligibility timestamp")
+		}
+		if !turnChallengeEscapeReady(table.PendingTurnChallenge) {
+			return errors.New("turn challenge escape is not yet eligible")
+		}
+		return nil
+	case arklib.LocktimeTypeBlock:
+		status, err := runtime.turnChallengeChainStatus(table)
+		if err != nil {
+			return err
+		}
+		if status == nil {
+			return errors.New("turn challenge escape is missing chain status")
+		}
+		if !status.OpenConfirmed {
+			return errors.New("turn challenge escape is not yet eligible: open tx is unconfirmed")
+		}
+		if !status.EscapeReady {
+			return fmt.Errorf("turn challenge escape is not yet eligible: chain tip height %d is below required height %d", status.ChainTipHeight, status.EscapeEligibleHeight)
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 func clearTurnChallengeRefs(transition *tablecustody.CustodyTransition) {
@@ -1748,6 +1839,9 @@ func acceptedChallengeOpenContextForTransition(table nativeTableState, transitio
 		if candidate.Proof.ChallengeBundle == nil {
 			return nil, nil, nil, errors.New("turn challenge source transition is missing its challenge bundle")
 		}
+		if candidate.Proof.ChallengeWitness == nil {
+			return nil, nil, nil, errors.New("turn challenge source transition is missing its challenge witness")
+		}
 		var previous *tablecustody.CustodyState
 		if index > 0 {
 			state := cloneJSON(table.CustodyTransitions[index-1].NextState)
@@ -1976,19 +2070,9 @@ func (runtime *meshRuntime) validateAcceptedCustodyChallengeWitness(table native
 		if err != nil {
 			return err
 		}
-		eligibleAt := turnChallengeEscapeEligibleAt(firstNonEmptyString(openTransition.Proof.ChallengeWitness.ExecutedAt, openTransition.Proof.FinalizedAt), spendPath)
-		if strings.TrimSpace(eligibleAt) != "" {
-			eligibleTime, err := parseISOTimestamp(eligibleAt)
-			if err != nil {
-				return err
-			}
-			executedAt, err := parseISOTimestamp(firstNonEmptyString(witness.ExecutedAt, transition.Proof.FinalizedAt))
-			if err != nil {
-				return err
-			}
-			if executedAt.Before(eligibleTime) {
-				return errors.New("custody challenge escape witness executed before the CSV delay matured")
-			}
+		openTxID := strings.TrimSpace(openTransition.Proof.ChallengeWitness.TransactionID)
+		if openTxID == "" {
+			return errors.New("turn challenge open witness txid is missing")
 		}
 		expected := cloneJSON(transition)
 		clearTurnChallengeRefs(&expected)
@@ -2008,6 +2092,46 @@ func (runtime *meshRuntime) validateAcceptedCustodyChallengeWitness(table native
 		}
 		if !containsString(witness.BroadcastTxIDs, txid) {
 			return errors.New("custody challenge witness broadcast metadata is missing the challenge transaction")
+		}
+		switch spendPath.CSVLocktime.Type {
+		case arklib.LocktimeTypeSecond:
+			eligibleAt := turnChallengeEscapeEligibleAt(firstNonEmptyString(openTransition.Proof.ChallengeWitness.ExecutedAt, openTransition.Proof.FinalizedAt), spendPath)
+			if strings.TrimSpace(eligibleAt) == "" {
+				return errors.New("turn challenge escape eligibility timestamp is unavailable")
+			}
+			eligibleTime, err := parseISOTimestamp(eligibleAt)
+			if err != nil {
+				return err
+			}
+			executedAt, err := parseISOTimestamp(firstNonEmptyString(witness.ExecutedAt, transition.Proof.FinalizedAt))
+			if err != nil {
+				return err
+			}
+			if executedAt.Before(eligibleTime) {
+				return errors.New("custody challenge escape witness executed before the CSV delay matured")
+			}
+		case arklib.LocktimeTypeBlock:
+			openStatus, err := runtime.transactionChainStatus(openTxID)
+			if err != nil {
+				return fmt.Errorf("unable to verify turn challenge open tx status: %w", err)
+			}
+			if !openStatus.Confirmed {
+				return errors.New("turn challenge open tx is unconfirmed")
+			}
+			eligibleHeight, ok := turnChallengeEscapeEligibleHeight(openStatus.BlockHeight, spendPath)
+			if !ok {
+				return errors.New("turn challenge escape eligible height is unavailable")
+			}
+			escapeStatus, err := runtime.transactionChainStatus(txid)
+			if err != nil {
+				return fmt.Errorf("unable to verify turn challenge escape tx status: %w", err)
+			}
+			if !escapeStatus.Confirmed {
+				return errors.New("turn challenge escape tx is unconfirmed")
+			}
+			if escapeStatus.BlockHeight < eligibleHeight {
+				return errors.New("custody challenge escape witness confirmed before the CSV block delay matured")
+			}
 		}
 		applyChallengeOutputRefsToTransition(&expected, outputRefs)
 		if !reflect.DeepEqual(canonicalCustodyMoneyStacks(&expected.NextState), canonicalCustodyMoneyStacks(&transition.NextState)) {

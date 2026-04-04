@@ -300,6 +300,7 @@ New tables now default `turnTimeoutMode` to `chain-challenge`. Older accepted ta
   - one fully signed onchain `turn-challenge-open` bundle at locktime `D`
   - one fully signed option-resolution bundle per menu option
   - one fully signed timeout-resolution bundle at locktime `D + C`
+  - one fully signed escape bundle spending the `TurnChallengeRef` through its CSV exit path
 
 `turn-challenge-open` always consumes the full live turn bankroll:
 
@@ -319,7 +320,17 @@ Resolution then splits:
 
 - `meshResolveTurnChallenge` with an option id executes the matching pre-signed option-resolution bundle and appends the ordinary `PlayerAction` event for that option
 - `meshResolveTurnChallenge` with `optionId="timeout"` executes the pre-signed timeout-resolution bundle once `timeoutEligibleAt` has passed
+- `meshResolveTurnChallenge` with `optionId="escape"` executes the pre-signed escape bundle only after the escape CSV delay has matured
 - host tick also auto-finalizes the timeout-resolution bundle after `D + C` if no option bundle resolved first
+
+Escape maturity now depends on the CSV type:
+
+- second-based CSV keeps the accepted-state timestamp surface; `PendingTurnChallenge.escapeEligibleAt` is populated and replay compares `ChallengeWitness.ExecutedAt` against that timestamp
+- block-based CSV no longer stores an estimated wall-clock maturity in accepted table state; `PendingTurnChallenge.escapeEligibleAt` stays empty
+- local escape readiness for block-based CSV is derived from the accepted `turn-challenge-open` witness txid, that transaction's live confirmation height, and the live chain tip height
+- accepted replay for block-based CSV is derived from the accepted `turn-challenge-open` witness txid plus the accepted escape witness txid, and requires the escape confirmation height to be at least `openConfirmedHeight + csvBlocks`
+- Parker does not persist live tip height or transaction confirmation heights into accepted table state; those observations stay local to the wallet/runtime and are re-queried as needed
+- if Parker cannot verify the required chain heights for a block-based escape, local escape resolution and accepted replay both fail closed
 
 The accepted transition kind after challenge resolution is still `action` or `timeout`. What changes is the proof surface:
 

@@ -2426,6 +2426,7 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 			if err != nil {
 				return err
 			}
+			runtime.markHostActiveLocked(table)
 			response.AcceptedTranscriptRoot = existing.RootHash
 			snapshot := cloneJSON(*table)
 			response.Table = snapshot
@@ -2445,6 +2446,7 @@ func (runtime *meshRuntime) handleHandMessageFromPeer(request nativeHandMessageR
 		if err := runtime.advanceHandProtocolLocked(table); err != nil {
 			return err
 		}
+		runtime.markHostActiveLocked(table)
 		if err := runtime.persistLocalTable(table, true); err != nil {
 			return err
 		}

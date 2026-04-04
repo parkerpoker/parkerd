@@ -414,6 +414,8 @@ func TestRecoveryFailsClosedWithoutStoredSourceBundle(t *testing.T) {
 }
 
 func TestShowdownRevealRecoveryMatchesCooperativePayoutSuccessor(t *testing.T) {
+	t.Parallel()
+
 	host, guest, tableID := createSyntheticRealStartedTableForRecoveryTest(t)
 
 	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)

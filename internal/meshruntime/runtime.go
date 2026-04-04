@@ -29,6 +29,8 @@ import (
 type meshRuntime struct {
 	backgroundTasks        int
 	candidateIntentAckHook func(table nativeTableState, bundle NativeTurnCandidateBundle) (*tablecustody.CandidateIntentAck, error)
+	chainTipStatus         func(profileName string) (walletpkg.ChainTipStatus, error)
+	chainTxStatus          func(profileName, txid string) (walletpkg.ChainTransactionStatus, error)
 	config                 cfg.RuntimeConfig
 	arkTransportFactory    func() (arkclient.TransportClient, error)
 	clearPeerURL           string
@@ -43,6 +45,7 @@ type meshRuntime struct {
 	handMessageSenderHook  func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error)
 	httpClient             *http.Client
 	lastSyncAt             map[string]time.Time
+	lastChainTipRefreshAt  time.Time
 	lastGuestContribution  map[string]guestContributionSendSnapshot
 	listener               net.Listener
 	mode                   string
@@ -58,6 +61,8 @@ type meshRuntime struct {
 	server                 *http.Server
 	fundsSenderHook        func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
 	tableSyncSender        func(peerURL string, input nativeTableSyncRequest) error
+	testActionTimeoutMS    int
+	testHandProtocolMS     int
 	started                bool
 	store                  *meshStore
 	taskCond               *sync.Cond
@@ -75,6 +80,7 @@ const (
 	nativeTableAuthSignatureHeader = "X-Parker-Signature"
 	nativeTableFetchAuthMaxAge     = 15 * time.Second
 	nativeTableSyncAuthMaxAge      = 15 * time.Second
+	chainTipPollInterval           = 15 * time.Second
 	defaultCreatedTablesLimit      = 10
 	maxCreatedTablesLimit          = 100
 )
@@ -231,6 +237,9 @@ func (runtime *meshRuntime) hostFailureTimeoutMS() int {
 }
 
 func (runtime *meshRuntime) handProtocolTimeoutMS() int {
+	if runtime != nil && runtime.testHandProtocolMS > 0 {
+		return runtime.testHandProtocolMS
+	}
 	if runtime != nil && !runtime.config.UseMockSettlement {
 		// Real Ark custody rounds add network and signer coordination latency to
 		// every protocol phase transition, so keep more budget than synthetic mode.
@@ -240,6 +249,9 @@ func (runtime *meshRuntime) handProtocolTimeoutMS() int {
 }
 
 func (runtime *meshRuntime) actionTimeoutMS() int {
+	if runtime != nil && runtime.testActionTimeoutMS > 0 {
+		return runtime.testActionTimeoutMS
+	}
 	if runtime != nil && !runtime.config.UseMockSettlement {
 		return 16_000
 	}
@@ -251,6 +263,15 @@ func (runtime *meshRuntime) actionTimeoutMSForTable(table nativeTableState) int 
 		return table.Config.ActionTimeoutMS
 	}
 	return runtime.actionTimeoutMS()
+}
+
+func (runtime *meshRuntime) markHostActiveLocked(table *nativeTableState) {
+	if table == nil {
+		return
+	}
+	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
+		table.LastHostHeartbeatAt = nowISO()
+	}
 }
 
 func (runtime *meshRuntime) handProtocolTimeoutMSForTable(table nativeTableState) int {
@@ -306,6 +327,18 @@ func (runtime *meshRuntime) Bootstrap(nickname, walletNsec string) (map[string]a
 
 func (runtime *meshRuntime) Tick() {
 	_ = runtime.Start()
+
+	refreshChainTip := false
+	now := time.Now()
+	runtime.mu.Lock()
+	if runtime.lastChainTipRefreshAt.IsZero() || now.Sub(runtime.lastChainTipRefreshAt) >= chainTipPollInterval {
+		runtime.lastChainTipRefreshAt = now
+		refreshChainTip = true
+	}
+	runtime.mu.Unlock()
+	if refreshChainTip {
+		_, _ = runtime.currentChainTip()
+	}
 
 	tableIDs, err := runtime.store.listTableIDs()
 	if err != nil {
@@ -1378,8 +1411,8 @@ func (runtime *meshRuntime) ResolveTurnChallenge(tableID, optionID string) (resu
 			if escapeBundle == nil {
 				return errors.New("turn challenge escape resolution is unavailable")
 			}
-			if !turnChallengeEscapeReady(table.PendingTurnChallenge) {
-				return errors.New("turn challenge escape is not yet eligible")
+			if err := runtime.validateTurnChallengeEscapeReadiness(*table); err != nil {
+				return err
 			}
 			resolved, err := runtime.finalizeTurnChallengeEscapeLocked(table, *escapeBundle)
 			if err != nil {
@@ -2029,6 +2062,20 @@ func (runtime *meshRuntime) executeLocalCustodyRecovery(signedPSBT string) (wall
 	return runtime.walletRuntime.ExecuteCustodyRecoveryTransaction(runtime.profileName, signedPSBT)
 }
 
+func (runtime *meshRuntime) currentChainTip() (walletpkg.ChainTipStatus, error) {
+	if runtime.chainTipStatus != nil {
+		return runtime.chainTipStatus(runtime.profileName)
+	}
+	return runtime.walletRuntime.ChainTip(runtime.profileName)
+}
+
+func (runtime *meshRuntime) transactionChainStatus(txid string) (walletpkg.ChainTransactionStatus, error) {
+	if runtime.chainTxStatus != nil {
+		return runtime.chainTxStatus(runtime.profileName, txid)
+	}
+	return runtime.walletRuntime.TransactionChainStatus(runtime.profileName, txid)
+}
+
 func emergencyExitProofRef(state tablecustody.CustodyState, playerID string, execution *nativeFundsExitExecution) string {
 	if execution == nil {
 		return ""
@@ -2317,6 +2364,7 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 	if err := runtime.appendEvent(table, body); err != nil {
 		return nativeFundsSettlement{}, err
 	}
+	runtime.markHostActiveLocked(table)
 	if err := runtime.persistAndReplicate(table, true); err != nil {
 		return nativeFundsSettlement{}, err
 	}
@@ -2612,6 +2660,7 @@ func (runtime *meshRuntime) handleJoinFromPeer(join nativeJoinRequest) (nativeTa
 		} else {
 			table.Config.Status = "seating"
 		}
+		runtime.markHostActiveLocked(table)
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
 		}
@@ -2692,6 +2741,7 @@ func (runtime *meshRuntime) handleActionFromPeer(request nativeActionRequest) (u
 		if err := runtime.advanceHandProtocolLocked(table); err != nil {
 			return err
 		}
+		runtime.markHostActiveLocked(table)
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
 		}
@@ -4135,6 +4185,7 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 	legalActions := []game.LegalAction{}
 	var turnMenu *NativePendingTurnMenu
 	var turnChallenge *NativePendingTurnChallenge
+	var turnChallengeChain *NativeTurnChallengeChainStatus
 	if runtime.walletID.PlayerID != "" {
 		myPlayerID = runtime.walletID.PlayerID
 	}
@@ -4179,6 +4230,12 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 		}
 	}
 
+	if turnChallengeMatchesTable(table, table.PendingTurnChallenge) {
+		if status, err := runtime.turnChallengeChainStatus(table); err == nil {
+			turnChallengeChain = status
+		}
+	}
+
 	return NativeMeshTableView{
 		Config:                    table.Config,
 		CustodyTransitions:        cloneJSON(table.CustodyTransitions),
@@ -4187,13 +4244,14 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 		LatestFullySignedSnapshot: cloneSnapshot(table.LatestFullySignedSnapshot),
 		LatestSnapshot:            cloneSnapshot(table.LatestSnapshot),
 		Local: NativeTableLocalView{
-			CanAct:        canAct,
-			LegalActions:  legalActions,
-			MyHoleCards:   myHoleCards,
-			MyPlayerID:    myPlayerID,
-			MySeatIndex:   mySeatIndex,
-			TurnChallenge: turnChallenge,
-			TurnMenu:      turnMenu,
+			CanAct:             canAct,
+			LegalActions:       legalActions,
+			MyHoleCards:        myHoleCards,
+			MyPlayerID:         myPlayerID,
+			MySeatIndex:        mySeatIndex,
+			TurnChallenge:      turnChallenge,
+			TurnChallengeChain: turnChallengeChain,
+			TurnMenu:           turnMenu,
 		},
 		PendingTurnChallenge: cloneJSON(table.PendingTurnChallenge),
 		PendingTurnMenu:      cloneJSON(table.PendingTurnMenu),

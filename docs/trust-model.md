@@ -119,6 +119,9 @@ Current runtime behavior:
 - Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
 - deterministic action-timeout and showdown-timeout bundles are pre-signed while the source transition is still cooperative, then executed later only if the live path stalls
 - challenge-open, option-resolution, and timeout-resolution bundles are fully signed onchain transactions and do not depend on live Ark intent registration
+- second-based challenge escapes are still validated from accepted timestamps, while block-based challenge escapes are validated from live open/escape confirmation heights plus the local chain tip
+- Parker does not treat accepted table state as authoritative for chain-height observations; those tip and confirmation-height checks stay local and must be re-verified when needed
+- if Parker cannot verify the required block heights for a block-based challenge escape, both local resolution and accepted replay fail closed
 
 This keeps liveness from depending on continued cooperation by a player who has already lost eligibility in the contested portion of the hand.
 
@@ -149,6 +152,11 @@ Accepted state is checked against:
 - historical custody continuity
 
 In real-settlement mode those checks replay accepted custody transitions from whichever proof surface the history actually used. `SettlementWitness` carries the proof PSBT, finalized commitment transaction, batch expiry, and finalized VTXO tree for the ordinary Ark batch path. `RecoveryWitness` points at a stored signed recovery bundle, source pot refs, and recovery broadcast metadata. If those stored artifacts are intact, accepted history replays without live Ark/indexer availability.
+
+The challenge path now has one extra split:
+
+- second-based CSV challenge escapes can still replay from the accepted timestamps alone
+- block-based CSV challenge escapes require live verification of the accepted open tx height and accepted escape tx height, and replay rejects the history if those heights cannot be checked or do not satisfy the CSV delay exactly
 
 `ReplayValidated` remains telemetry/debug metadata only. It is not treated as proof on its own.
 
