@@ -3337,7 +3337,7 @@ func comparableDealerCommitment(commitment *NativeDealerCommitment) *NativeDeale
 	if commitment == nil {
 		return nil
 	}
-	comparable := cloneJSON(*commitment)
+	comparable := *commitment
 	comparable.CommittedAt = ""
 	if strings.TrimSpace(comparable.RootHash) == "" {
 		return nil
@@ -3705,7 +3705,7 @@ func transcriptExtends(prefix, full game.HandTranscript) bool {
 		return false
 	}
 	for index := range prefix.Records {
-		if !reflect.DeepEqual(cloneJSON(prefix.Records[index]), cloneJSON(full.Records[index])) {
+		if !reflect.DeepEqual(cloneTranscriptRecordFast(prefix.Records[index]), cloneTranscriptRecordFast(full.Records[index])) {
 			return false
 		}
 	}
@@ -3753,7 +3753,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTable
 	if incoming.LatestCustodyState == nil {
 		return errors.New("latest custody state is missing from accepted custody history")
 	}
-	if previous != nil && !reflect.DeepEqual(cloneCustodyState(incoming.LatestCustodyState), cloneCustodyState(previous)) {
+	if previous != nil && !reflect.DeepEqual(cloneCustodyStateFast(*incoming.LatestCustodyState), cloneCustodyStateFast(*previous)) {
 		return errors.New("latest custody state does not match accepted custody history")
 	}
 	if existing == nil {
@@ -3763,7 +3763,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTable
 		return errors.New("accepted history would roll back custody transitions")
 	}
 	for index := range existing.CustodyTransitions {
-		if !reflect.DeepEqual(cloneJSON(existing.CustodyTransitions[index]), cloneJSON(incoming.CustodyTransitions[index])) {
+		if !reflect.DeepEqual(cloneCustodyTransitionFast(existing.CustodyTransitions[index]), cloneCustodyTransitionFast(incoming.CustodyTransitions[index])) {
 			return fmt.Errorf("historical custody transition %d was rewritten", index)
 		}
 	}
@@ -4083,7 +4083,7 @@ func (runtime *meshRuntime) validateAcceptedPublicReplay(table nativeTableState)
 	if err != nil {
 		return fmt.Errorf("active hand replay validation failed: %w", err)
 	}
-	if !reflect.DeepEqual(cloneJSON(table.ActiveHand.State), cloneJSON(replayedState)) {
+	if !reflect.DeepEqual(cloneHoldemStateFast(table.ActiveHand.State), cloneHoldemStateFast(replayedState)) {
 		return fmt.Errorf("active hand state does not match transcript replay: phase=%s expectedBoard=%v gotBoard=%v expectedWinners=%+v gotWinners=%+v expectedPlayers=%+v gotPlayers=%+v", replayedState.Phase, replayedState.Board, table.ActiveHand.State.Board, replayedState.Winners, table.ActiveHand.State.Winners, replayedState.Players, table.ActiveHand.State.Players)
 	}
 	if table.PublicState == nil {

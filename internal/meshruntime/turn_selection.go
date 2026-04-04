@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	arksdk "github.com/arkade-os/go-sdk"
@@ -16,6 +17,13 @@ import (
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
 )
+
+type mockOperatorKeyPair struct {
+	PrivateKeyHex string
+	PublicKeyHex  string
+}
+
+var mockOperatorKeyCache sync.Map
 
 func candidateIntentAckPayload(ack tablecustody.CandidateIntentAck) map[string]any {
 	return map[string]any{
@@ -33,9 +41,19 @@ func candidateIntentAckPayload(ack tablecustody.CandidateIntentAck) map[string]a
 }
 
 func mockOperatorSigningKeyHex(label string) (string, string) {
+	if cached, ok := mockOperatorKeyCache.Load(label); ok {
+		pair := cached.(mockOperatorKeyPair)
+		return pair.PrivateKeyHex, pair.PublicKeyHex
+	}
 	sum := sha256.Sum256([]byte(label))
 	privateKey, publicKey := btcec.PrivKeyFromBytes(sum[:])
-	return hex.EncodeToString(privateKey.Serialize()), hex.EncodeToString(publicKey.SerializeCompressed())
+	pair := mockOperatorKeyPair{
+		PrivateKeyHex: hex.EncodeToString(privateKey.Serialize()),
+		PublicKeyHex:  hex.EncodeToString(publicKey.SerializeCompressed()),
+	}
+	actual, _ := mockOperatorKeyCache.LoadOrStore(label, pair)
+	pair = actual.(mockOperatorKeyPair)
+	return pair.PrivateKeyHex, pair.PublicKeyHex
 }
 
 func (runtime *meshRuntime) candidateIntentAckSigningKeyHex(operatorPubkeyHex string) string {

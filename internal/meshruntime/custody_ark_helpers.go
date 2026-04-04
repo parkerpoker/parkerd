@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
@@ -64,6 +65,11 @@ const (
 	// clock. Encode timeout leaves slightly before the visible protocol deadline
 	// so the timeout path is mature once the runtime decides the deadline elapsed.
 	custodyTimeoutLocktimeSlack = 2 * time.Minute
+)
+
+var (
+	compressedPubkeyCache sync.Map
+	xOnlyPubkeyHexCache   sync.Map
 )
 
 func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, error) {
@@ -132,19 +138,34 @@ func (runtime *meshRuntime) requiredJoinFundingSats(buyInSats int) (int, error) 
 }
 
 func compressedPubkeyFromHex(value string) (*btcec.PublicKey, error) {
-	raw, err := hex.DecodeString(strings.TrimSpace(value))
+	normalized := strings.TrimSpace(value)
+	if cached, ok := compressedPubkeyCache.Load(normalized); ok {
+		return cached.(*btcec.PublicKey), nil
+	}
+	raw, err := hex.DecodeString(normalized)
 	if err != nil {
 		return nil, err
 	}
-	return btcec.ParsePubKey(raw)
+	pubkey, err := btcec.ParsePubKey(raw)
+	if err != nil {
+		return nil, err
+	}
+	actual, _ := compressedPubkeyCache.LoadOrStore(normalized, pubkey)
+	return actual.(*btcec.PublicKey), nil
 }
 
 func xOnlyPubkeyHexFromCompressed(value string) (string, error) {
-	pubkey, err := compressedPubkeyFromHex(value)
+	normalized := strings.TrimSpace(value)
+	if cached, ok := xOnlyPubkeyHexCache.Load(normalized); ok {
+		return cached.(string), nil
+	}
+	pubkey, err := compressedPubkeyFromHex(normalized)
 	if err != nil {
 		return "", err
 	}
-	return hex.EncodeToString(schnorr.SerializePubKey(pubkey)), nil
+	encoded := hex.EncodeToString(schnorr.SerializePubKey(pubkey))
+	actual, _ := xOnlyPubkeyHexCache.LoadOrStore(normalized, encoded)
+	return actual.(string), nil
 }
 
 func timeoutLocktimeFromISO(value string) (arklib.AbsoluteLocktime, error) {

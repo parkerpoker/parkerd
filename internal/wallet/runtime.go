@@ -29,11 +29,9 @@ import (
 )
 
 type Runtime struct {
-	config       RuntimeConfig
-	mu           sync.Mutex
-	store        *ProfileStore
-	cacheMu      sync.RWMutex
-	profileCache map[string]cachedProfileState
+	config RuntimeConfig
+	mu     sync.Mutex
+	store  *ProfileStore
 }
 
 const nigiriFaucetTimeout = 45 * time.Second
@@ -42,13 +40,6 @@ var (
 	mockArkForfeitPubkeyHex = mockCustodyPubkeyHex("parker-mock-ark-forfeit")
 	mockArkSignerPubkeyHex  = mockCustodyPubkeyHex("parker-mock-ark-signer")
 )
-
-type cachedProfileState struct {
-	exists  bool
-	modTime time.Time
-	size    int64
-	state   PlayerProfileState
-}
 
 type RuntimeConfig struct {
 	ArkServerURL      string
@@ -61,9 +52,8 @@ type RuntimeConfig struct {
 
 func NewRuntime(config RuntimeConfig) *Runtime {
 	return &Runtime{
-		config:       config,
-		store:        NewProfileStore(config.ProfileDir),
-		profileCache: map[string]cachedProfileState{},
+		config: config,
+		store:  NewProfileStore(config.ProfileDir),
 	}
 }
 
@@ -746,83 +736,11 @@ func (runtime *Runtime) ensureBootstrap(profileName, nickname, walletNsec string
 }
 
 func (runtime *Runtime) loadProfileState(profileName string) (*PlayerProfileState, error) {
-	modTime, size, exists, err := runtime.currentProfileStamp(profileName)
-	if err != nil {
-		return nil, err
-	}
-
-	runtime.cacheMu.RLock()
-	cached, ok := runtime.profileCache[profileName]
-	runtime.cacheMu.RUnlock()
-	if ok && cached.exists == exists {
-		if !exists {
-			return nil, nil
-		}
-		if cached.modTime.Equal(modTime) && cached.size == size {
-			return clonePlayerProfileState(&cached.state), nil
-		}
-	}
-	if !exists {
-		runtime.cacheMu.Lock()
-		runtime.profileCache[profileName] = cachedProfileState{}
-		runtime.cacheMu.Unlock()
-		return nil, nil
-	}
-
-	state, err := runtime.store.Load(profileName)
-	if err != nil || state == nil {
-		return state, err
-	}
-
-	cloned := clonePlayerProfileState(state)
-	modTime, size, exists, err = runtime.currentProfileStamp(profileName)
-	if err != nil {
-		return nil, err
-	}
-	runtime.cacheMu.Lock()
-	runtime.profileCache[profileName] = cachedProfileState{
-		exists:  exists,
-		modTime: modTime,
-		size:    size,
-		state:   *cloned,
-	}
-	runtime.cacheMu.Unlock()
-	return clonePlayerProfileState(cloned), nil
+	return runtime.store.Load(profileName)
 }
 
 func (runtime *Runtime) saveProfileState(state PlayerProfileState) error {
-	if err := runtime.store.Save(state); err != nil {
-		return err
-	}
-	modTime, size, exists, err := runtime.currentProfileStamp(state.ProfileName)
-	if err != nil {
-		return err
-	}
-	cloned := clonePlayerProfileState(&state)
-	runtime.cacheMu.Lock()
-	if exists {
-		runtime.profileCache[state.ProfileName] = cachedProfileState{
-			exists:  true,
-			modTime: modTime,
-			size:    size,
-			state:   *cloned,
-		}
-	} else {
-		delete(runtime.profileCache, state.ProfileName)
-	}
-	runtime.cacheMu.Unlock()
-	return nil
-}
-
-func (runtime *Runtime) currentProfileStamp(profileName string) (time.Time, int64, bool, error) {
-	info, err := os.Stat(runtime.store.pathFor(profileName))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return time.Time{}, 0, false, nil
-		}
-		return time.Time{}, 0, false, err
-	}
-	return info.ModTime(), info.Size(), true, nil
+	return runtime.store.Save(state)
 }
 
 func (runtime *Runtime) openArkClient(profileName string, state PlayerProfileState) (arksdk.ArkClient, func() error, func(), error) {
