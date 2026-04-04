@@ -2950,6 +2950,123 @@ func TestTwoPlayerFailoverUsesLowestNonHostSeat(t *testing.T) {
 	}
 }
 
+func TestReachableWitnessKeepsSeatOutOfFailover(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := guest.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+
+	table := nativeTableState{
+		CurrentHost: nativeKnownParticipant{
+			ProfileName: host.profileName,
+			Peer:        host.self.Peer,
+		},
+		Seats: []nativeSeatRecord{
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Host",
+					PeerID:    host.self.Peer.PeerID,
+					PlayerID:  host.walletID.PlayerID,
+					SeatIndex: 0,
+					Status:    "active",
+				},
+				PeerURL:     host.self.Peer.PeerURL,
+				ProfileName: host.profileName,
+			},
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Guest",
+					PeerID:    guest.self.Peer.PeerID,
+					PlayerID:  guest.walletID.PlayerID,
+					SeatIndex: 1,
+					Status:    "active",
+				},
+				PeerURL:     guest.self.Peer.PeerURL,
+				ProfileName: guest.profileName,
+			},
+		},
+		Witnesses: []nativeKnownParticipant{{
+			ProfileName: witness.profileName,
+			Peer:        witness.self.Peer,
+		}},
+	}
+
+	if guest.shouldHandleFailover(table) {
+		t.Fatal("expected reachable witness to keep the seat out of failover")
+	}
+	if !witness.shouldHandleFailover(table) {
+		t.Fatal("expected configured witness to handle failover")
+	}
+}
+
+func TestOfflineWitnessFallsBackToLowestNonHostSeat(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := guest.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	staleWitness := cloneJSON(witness.self.Peer)
+	staleWitness.LastSeenAt = addMillis(nowISO(), -(nativeHostFailureMS + 100))
+	if err := guest.saveKnownPeer(staleWitness); err != nil {
+		t.Fatalf("age witness liveness: %v", err)
+	}
+	guest.peerInfoCache = map[string]nativeCachedPeerInfo{}
+	if err := witness.Close(); err != nil {
+		t.Fatalf("close witness runtime: %v", err)
+	}
+
+	table := nativeTableState{
+		CurrentHost: nativeKnownParticipant{
+			ProfileName: host.profileName,
+			Peer:        host.self.Peer,
+		},
+		Seats: []nativeSeatRecord{
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Host",
+					PeerID:    host.self.Peer.PeerID,
+					PlayerID:  host.walletID.PlayerID,
+					SeatIndex: 0,
+					Status:    "active",
+				},
+				PeerURL:     host.self.Peer.PeerURL,
+				ProfileName: host.profileName,
+			},
+			{
+				NativeSeatedPlayer: NativeSeatedPlayer{
+					Nickname:  "Guest",
+					PeerID:    guest.self.Peer.PeerID,
+					PlayerID:  guest.walletID.PlayerID,
+					SeatIndex: 1,
+					Status:    "active",
+				},
+				PeerURL:     guest.self.Peer.PeerURL,
+				ProfileName: guest.profileName,
+			},
+		},
+		Witnesses: []nativeKnownParticipant{{
+			ProfileName: witness.profileName,
+			Peer:        staleWitness,
+		}},
+	}
+
+	if !guest.shouldHandleFailover(table) {
+		t.Fatal("expected lowest non-host seat to handle failover when configured witnesses are unavailable")
+	}
+	authorized, ok := guest.authorizedRemoteHostPeer(&table, guest.selfPeerID())
+	if !ok {
+		t.Fatal("expected seat fallback host to remain authorized for accepted remote tables")
+	}
+	if authorized.PeerID != guest.selfPeerID() {
+		t.Fatalf("expected authorized seat fallback host %q, got %q", guest.selfPeerID(), authorized.PeerID)
+	}
+}
+
 func TestCompletedSeatDoesNotReclaimFailoverHost(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")

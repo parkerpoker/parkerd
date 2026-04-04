@@ -4775,7 +4775,7 @@ func (runtime *meshRuntime) shouldHandleFailover(table nativeTableState) bool {
 			return true
 		}
 	}
-	if len(table.Witnesses) > 0 {
+	if runtime.hasAvailableFailoverWitness(table) {
 		return false
 	}
 	if runtime.seatIndexForPlayer(table) < 0 {
@@ -4783,6 +4783,59 @@ func (runtime *meshRuntime) shouldHandleFailover(table nativeTableState) bool {
 	}
 	candidate, ok := lowestEligibleFailoverSeat(table)
 	return ok && candidate.PeerID == runtime.selfPeerID()
+}
+
+func (runtime *meshRuntime) hasAvailableFailoverWitness(table nativeTableState) bool {
+	for _, witness := range table.Witnesses {
+		if runtime.failoverWitnessAvailable(witness) {
+			return true
+		}
+	}
+	return false
+}
+
+func (runtime *meshRuntime) failoverWitnessAvailable(witness nativeKnownParticipant) bool {
+	if witness.Peer.PeerID == "" {
+		return false
+	}
+	if witness.Peer.PeerID == runtime.selfPeerID() {
+		return true
+	}
+	if runtime.knownPeerSeenWithin(witness.Peer.PeerID, time.Duration(runtime.hostFailureTimeoutMS())*time.Millisecond) {
+		return true
+	}
+	peerURL := firstNonEmptyString(witness.Peer.PeerURL, runtime.knownPeerURL(witness.Peer.PeerID))
+	if strings.TrimSpace(peerURL) == "" {
+		return false
+	}
+	peerSelf, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return false
+	}
+	if peerSelf.Peer.PeerID != witness.Peer.PeerID {
+		return false
+	}
+	peer := peerSelf.Peer
+	peer.LastSeenAt = nowISO()
+	_ = runtime.saveKnownPeer(peer)
+	return true
+}
+
+func (runtime *meshRuntime) knownPeerSeenWithin(peerID string, maxAge time.Duration) bool {
+	if strings.TrimSpace(peerID) == "" {
+		return false
+	}
+	peers, err := runtime.knownPeers()
+	if err != nil {
+		return false
+	}
+	for _, peer := range peers {
+		if peer.PeerID != peerID {
+			continue
+		}
+		return timestampWithinWindow(peer.LastSeenAt, maxAge)
+	}
+	return false
 }
 
 func (runtime *meshRuntime) knownPeerURL(peerID string) string {
@@ -5353,9 +5406,8 @@ func (runtime *meshRuntime) authorizedRemoteHostPeer(table *nativeTableState, ca
 			return cloneJSON(witness.Peer), true
 		}
 	}
-	if len(table.Witnesses) > 0 {
-		return NativePeerAddress{}, false
-	}
+	// Accepted histories still need to sync if witnesses were configured but
+	// unreachable when the deterministic seat fallback rotated the host.
 	lowestSeat, ok := lowestEligibleFailoverSeat(*table)
 	if !ok || candidatePeerID != lowestSeat.PeerID {
 		return NativePeerAddress{}, false
