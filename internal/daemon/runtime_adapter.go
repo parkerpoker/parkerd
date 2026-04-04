@@ -213,6 +213,14 @@ func (runtime *daemonRuntimeAdapter) SendAction(tableID string, action game.Acti
 	return runtime.inner.SendAction(tableID, action)
 }
 
+func (runtime *daemonRuntimeAdapter) OpenTurnChallenge(tableID string) (any, error) {
+	return runtime.inner.OpenTurnChallenge(tableID)
+}
+
+func (runtime *daemonRuntimeAdapter) ResolveTurnChallenge(tableID, optionID string) (any, error) {
+	return runtime.inner.ResolveTurnChallenge(tableID, optionID)
+}
+
 func (runtime *daemonRuntimeAdapter) RotateHost(tableID string) (any, error) {
 	return runtime.inner.RotateHost(tableID)
 }

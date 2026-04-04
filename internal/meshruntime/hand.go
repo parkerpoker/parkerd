@@ -1655,6 +1655,9 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if !game.PhaseAllowsActions(table.ActiveHand.State.Phase) || table.ActiveHand.State.ActingSeatIndex == nil {
 		return false, nil
 	}
+	if turnTimeoutModeForTable(*table) == turnTimeoutModeChainChallenge || table.PendingTurnChallenge != nil {
+		return false, nil
+	}
 	if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
 		return false, nil
 	}
@@ -1771,6 +1774,7 @@ func (runtime *meshRuntime) abortActiveHandLocked(table *nativeTableState, reaso
 		return nil
 	}
 	restored := runtime.publicStateFromSnapshot(*table, *table.LatestFullySignedSnapshot)
+	restored.LatestEventHash = table.LastEventHash
 	table.PublicState = &restored
 	table.ActiveHand = nil
 	table.ActiveHandStartAt = ""
@@ -1942,11 +1946,19 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 	}
 	for iteration := 0; iteration < 8; iteration++ {
 		changed := false
-		if tableHasActionableTurn(*table) && !turnMenuMatchesTable(*table, table.PendingTurnMenu) {
+		if tableHasActionableTurn(*table) &&
+			table.CurrentHost.Peer.PeerID == runtime.selfPeerID() &&
+			!turnMenuMatchesTable(*table, table.PendingTurnMenu) {
 			if err := runtime.ensurePendingTurnMenuLocked(table); err != nil {
 				return err
 			}
 			changed = true
+		}
+		if handled, err := runtime.handlePendingTurnChallengeLocked(table); err != nil {
+			return err
+		} else if handled {
+			changed = true
+			continue
 		}
 		if completed, err := runtime.finalizeSelectedTurnCandidateLocked(table); err != nil {
 			return err
@@ -1957,6 +1969,12 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 		if shouldTrackProtocolDeadline(table.ActiveHand.State.Phase) && table.ActiveHand.Cards.PhaseDeadlineAt == "" {
 			runtime.setProtocolDeadline(table)
 			changed = true
+		}
+		if opened, err := runtime.openTurnChallengeLocked(table); err != nil {
+			return err
+		} else if opened {
+			changed = true
+			continue
 		}
 		if handled, err := runtime.handleActionTimeoutLocked(table); err != nil {
 			return err

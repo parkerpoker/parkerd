@@ -1,0 +1,761 @@
+package meshruntime
+
+import (
+	"encoding/hex"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
+	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/parkerpoker/parkerd/internal/game"
+	"github.com/parkerpoker/parkerd/internal/tablecustody"
+	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
+)
+
+func installDirectTableSync(t *testing.T, runtimes ...*meshRuntime) {
+	t.Helper()
+
+	byURL := map[string]*meshRuntime{}
+	for _, runtime := range runtimes {
+		if runtime == nil {
+			continue
+		}
+		byURL[runtime.selfPeerURL()] = runtime
+	}
+	for _, runtime := range runtimes {
+		if runtime == nil {
+			continue
+		}
+		runtime.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+			target := byURL[peerURL]
+			if target == nil {
+				return nil
+			}
+			err := target.acceptTableSync(input)
+			if err != nil {
+				t.Errorf("table sync %s -> %s failed: %v", input.SenderPeerID, peerURL, err)
+			}
+			return err
+		}
+	}
+}
+
+func bridgeHostToGuestSync(host, guest *meshRuntime) {
+	if host == nil || guest == nil {
+		return
+	}
+	host.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+		if peerURL == guest.selfPeerURL() {
+			return guest.acceptTableSync(input)
+		}
+		return nil
+	}
+}
+
+func waitForPendingTurnChallenge(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if turnChallengeMatchesTable(table, table.PendingTurnChallenge) {
+			return table
+		}
+		for _, runtime := range runtimes {
+			if runtime != nil {
+				runtime.Tick()
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_ = mustReadNativeTable(t, reader, tableID)
+	t.Fatalf("timed out waiting for pending turn challenge on table %s", tableID)
+	return nativeTableState{}
+}
+
+func waitForPendingTurnMenuWithChallengeEnvelope(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if turnMenuMatchesTable(table, table.PendingTurnMenu) && table.PendingTurnMenu.ChallengeEnvelope != nil {
+			return table
+		}
+		for _, runtime := range runtimes {
+			if runtime != nil {
+				runtime.Tick()
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_ = mustReadNativeTable(t, reader, tableID)
+	t.Fatalf("timed out waiting for pending turn menu challenge envelope on table %s", tableID)
+	return nativeTableState{}
+}
+
+func preferredChallengeResolutionOption(menu *NativePendingTurnMenu) NativeActionMenuOption {
+	if menu == nil || len(menu.Options) == 0 {
+		return NativeActionMenuOption{}
+	}
+	for _, option := range menu.Options {
+		if option.Action.Type == game.ActionCheck || option.Action.Type == game.ActionCall {
+			return option
+		}
+	}
+	for _, option := range menu.Options {
+		if option.Action.Type != game.ActionFold {
+			return option
+		}
+	}
+	return menu.Options[0]
+}
+
+func challengeBundleUsesSignerXOnly(t *testing.T, bundle tablecustody.CustodyChallengeBundle, xOnlyHex string) bool {
+	t.Helper()
+	packet, err := psbt.NewFromRawBytes(strings.NewReader(bundle.SignedPSBT), true)
+	if err != nil {
+		t.Fatalf("parse challenge bundle psbt: %v", err)
+	}
+	for _, input := range packet.Inputs {
+		for _, signature := range input.TaprootScriptSpendSig {
+			if signature != nil && strings.EqualFold(hex.EncodeToString(signature.XOnlyPubKey), xOnlyHex) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestTurnChallengeEscapeEligibleAtUsesCSVDelayEstimate(t *testing.T) {
+	openedAt := "2026-04-03T12:00:00Z"
+	spendPath := custodySpendPath{
+		UsesCSVLocktime: true,
+		CSVLocktime:     arklib.RelativeLocktime{Type: arklib.LocktimeTypeSecond, Value: 30},
+	}
+	if got, want := turnChallengeEscapeEligibleAt(openedAt, spendPath), addMillis(openedAt, 30_000); got != want {
+		t.Fatalf("expected second-based challenge escape eligibility %q, got %q", want, got)
+	}
+	spendPath.CSVLocktime = arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 30}
+	if got, want := turnChallengeEscapeEligibleAt(openedAt, spendPath), addMillis(openedAt, 30*10*60*1000); got != want {
+		t.Fatalf("expected block-based challenge escape eligibility estimate %q, got %q", want, got)
+	}
+}
+
+func waitForTurnActionDeadlineToExpire(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
+	t.Helper()
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if turnMenuMatchesTable(table, table.PendingTurnMenu) &&
+			table.PendingTurnChallenge == nil &&
+			elapsedMillis(table.PendingTurnMenu.ActionDeadlineAt) >= 0 &&
+			turnChallengeOpenReady(table.PendingTurnMenu) {
+			return table
+		}
+		for _, runtime := range runtimes {
+			if runtime != nil {
+				runtime.Tick()
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_ = mustReadNativeTable(t, reader, tableID)
+	t.Fatalf("timed out waiting for turn action deadline to expire on table %s", tableID)
+	return nativeTableState{}
+}
+
+func waitForLatestCustodyTransitionKind(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string, kind tablecustody.TransitionKind) nativeTableState {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		if len(table.CustodyTransitions) > 0 && table.CustodyTransitions[len(table.CustodyTransitions)-1].Kind == kind {
+			return table
+		}
+		for _, runtime := range runtimes {
+			if runtime != nil {
+				runtime.Tick()
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_ = mustReadNativeTable(t, reader, tableID)
+	t.Fatalf("timed out waiting for latest custody transition %s on table %s", kind, tableID)
+	return nativeTableState{}
+}
+
+func waitForCustodyTransitionKindPresent(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string, kind tablecustody.TransitionKind) nativeTableState {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, reader, tableID)
+		for _, transition := range table.CustodyTransitions {
+			if transition.Kind == kind {
+				return table
+			}
+		}
+		for _, runtime := range runtimes {
+			if runtime != nil {
+				runtime.Tick()
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	_ = mustReadNativeTable(t, reader, tableID)
+	t.Fatalf("timed out waiting for custody transition %s on table %s", kind, tableID)
+	return nativeTableState{}
+}
+
+func TestTurnChallengeTimeoutModeDefaults(t *testing.T) {
+	if got := turnTimeoutModeFromCreateInput(map[string]any{}); got != turnTimeoutModeChainChallenge {
+		t.Fatalf("expected new tables to default to %q, got %q", turnTimeoutModeChainChallenge, got)
+	}
+	if got := turnTimeoutModeFromCreateInput(map[string]any{"turnTimeoutMode": "invalid"}); got != turnTimeoutModeChainChallenge {
+		t.Fatalf("expected invalid create input timeout mode to default to %q, got %q", turnTimeoutModeChainChallenge, got)
+	}
+	if got := turnTimeoutModeForTable(nativeTableState{}); got != turnTimeoutModeDirect {
+		t.Fatalf("expected legacy tables without timeout mode to be treated as %q, got %q", turnTimeoutModeDirect, got)
+	}
+	if got := turnChallengeWindowMSForTable(nativeTableState{}); got != defaultTurnChallengeWindowMS {
+		t.Fatalf("expected default challenge window %dms, got %d", defaultTurnChallengeWindowMS, got)
+	}
+}
+
+func TestPendingTurnMenuCarriesDeterministicChallengeEnvelope(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	hostTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	guestTable := waitForPendingTurnMenuWithChallengeEnvelope(t, []*meshRuntime{host, guest}, guest, tableID)
+
+	if turnTimeoutModeForTable(hostTable) != turnTimeoutModeChainChallenge {
+		t.Fatalf("expected started tables to default to %q", turnTimeoutModeChainChallenge)
+	}
+	if !turnMenuMatchesTable(hostTable, hostTable.PendingTurnMenu) || hostTable.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected host pending turn menu to carry a challenge envelope")
+	}
+	if !turnMenuMatchesTable(guestTable, guestTable.PendingTurnMenu) || guestTable.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected guest pending turn menu to carry a challenge envelope")
+	}
+
+	hostEnvelope := hostTable.PendingTurnMenu.ChallengeEnvelope
+	guestEnvelope := guestTable.PendingTurnMenu.ChallengeEnvelope
+	if !reflect.DeepEqual(*hostEnvelope, *guestEnvelope) {
+		t.Fatalf("expected peers to converge on the same challenge envelope, host=%+v guest=%+v", *hostEnvelope, *guestEnvelope)
+	}
+	if hostEnvelope.OpenBundle.Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		t.Fatalf("expected open bundle kind %q, got %q", tablecustody.TransitionKindTurnChallengeOpen, hostEnvelope.OpenBundle.Kind)
+	}
+	if len(hostEnvelope.OpenBundle.SourceRefs) == 0 {
+		t.Fatal("expected open bundle to consume the live turn bankroll refs")
+	}
+	if len(hostEnvelope.OptionResolutionBundles) != len(hostTable.PendingTurnMenu.Candidates) {
+		t.Fatalf("expected %d option bundles, got %d", len(hostTable.PendingTurnMenu.Candidates), len(hostEnvelope.OptionResolutionBundles))
+	}
+	if hostEnvelope.TimeoutResolutionBundle.Kind != tablecustody.TransitionKindTimeout {
+		t.Fatalf("expected timeout resolution bundle kind %q, got %q", tablecustody.TransitionKindTimeout, hostEnvelope.TimeoutResolutionBundle.Kind)
+	}
+	if hostEnvelope.TimeoutResolutionBundle.TxLocktime <= hostEnvelope.OpenBundle.TxLocktime {
+		t.Fatalf("expected timeout resolution locktime %d to trail open locktime %d", hostEnvelope.TimeoutResolutionBundle.TxLocktime, hostEnvelope.OpenBundle.TxLocktime)
+	}
+	if hostEnvelope.EscapeBundle.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected escape bundle kind %q, got %q", tablecustody.TransitionKindTurnChallengeEscape, hostEnvelope.EscapeBundle.Kind)
+	}
+	if len(hostEnvelope.EscapeBundle.SourceRefs) != 1 {
+		t.Fatalf("expected escape bundle to spend the single challenge ref, got %+v", hostEnvelope.EscapeBundle.SourceRefs)
+	}
+}
+
+func TestTurnChallengeBundlesStayPlayerOnlyWhileOrdinaryPotPathKeepsOperator(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected actionable turn menu with challenge envelope")
+	}
+	config, err := host.arkCustodyConfig()
+	if err != nil {
+		t.Fatalf("ark custody config: %v", err)
+	}
+	operatorXOnly, err := xOnlyPubkeyHexFromCompressed(config.SignerPubkeyHex)
+	if err != nil {
+		t.Fatalf("operator xonly: %v", err)
+	}
+	envelope := table.PendingTurnMenu.ChallengeEnvelope
+	if challengeBundleUsesSignerXOnly(t, envelope.OpenBundle, operatorXOnly) {
+		t.Fatal("expected challenge-open bundle to avoid operator signatures")
+	}
+	for index, bundle := range envelope.OptionResolutionBundles {
+		if challengeBundleUsesSignerXOnly(t, bundle, operatorXOnly) {
+			t.Fatalf("expected challenge option bundle %d to avoid operator signatures", index)
+		}
+	}
+	if challengeBundleUsesSignerXOnly(t, envelope.TimeoutResolutionBundle, operatorXOnly) {
+		t.Fatal("expected challenge-timeout bundle to avoid operator signatures")
+	}
+	if challengeBundleUsesSignerXOnly(t, envelope.EscapeBundle, operatorXOnly) {
+		t.Fatal("expected challenge-escape bundle to avoid operator signatures")
+	}
+
+	var potRef tablecustody.VTXORef
+	foundPotRef := false
+	for _, slice := range table.LatestCustodyState.PotSlices {
+		if len(slice.VTXORefs) == 0 {
+			continue
+		}
+		potRef = slice.VTXORefs[0]
+		foundPotRef = true
+		break
+	}
+	if !foundPotRef {
+		t.Fatal("expected actionable turn state to carry a pot ref")
+	}
+	challengePath, err := host.selectTurnChallengeOpenSpendPath(table, potRef, table.PendingTurnMenu.ActionDeadlineAt)
+	if err != nil {
+		t.Fatalf("select turn challenge open spend path: %v", err)
+	}
+	if containsString(challengePath.SignerXOnlyPubkeys, operatorXOnly) {
+		t.Fatalf("expected challenge-open spend path to exclude operator signer, got %+v", challengePath.SignerXOnlyPubkeys)
+	}
+	ordinaryPath, err := host.selectCustodySpendPath(table, potRef, activeTurnChallengePlayerIDs(table), false)
+	if err != nil {
+		t.Fatalf("select ordinary custody spend path: %v", err)
+	}
+	if !containsString(ordinaryPath.SignerXOnlyPubkeys, operatorXOnly) {
+		t.Fatalf("expected ordinary pot spend path to keep operator signer, got %+v", ordinaryPath.SignerXOnlyPubkeys)
+	}
+}
+
+func TestAcceptRemoteTableRejectsTamperedChallengeEnvelope(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected actionable turn menu with challenge envelope")
+	}
+
+	tampered := cloneJSON(table)
+	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.AuthorizedOutputs[0].AmountSats++
+	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.BundleHash = tablecustody.HashCustodyChallengeBundle(tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
+
+	if err := guest.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "challenge") {
+		t.Fatalf("expected tampered challenge envelope to be rejected, got %v", err)
+	}
+}
+
+func TestAcceptRemoteTableRejectsTamperedChallengeBundleKind(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected actionable turn menu with challenge envelope")
+	}
+
+	tampered := cloneJSON(table)
+	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.Kind = tablecustody.TransitionKindAction
+	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.BundleHash = tablecustody.HashCustodyChallengeBundle(tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
+
+	if err := guest.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "kind") {
+		t.Fatalf("expected tampered challenge bundle kind to be rejected, got %v", err)
+	}
+}
+
+func TestTurnChallengeOpenBlocksOrdinarySendAction(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	host.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	guest.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	originalMenu := cloneJSON(*table.PendingTurnMenu)
+	bridgeHostToGuestSync(host, guest)
+
+	if _, err := host.OpenTurnChallenge(tableID); err == nil || !strings.Contains(err.Error(), "cannot be opened") {
+		t.Fatalf("expected challenge-open to reject before D, got %v", err)
+	}
+
+	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.OpenTurnChallenge(tableID); err != nil {
+		t.Fatalf("open turn challenge: %v", err)
+	}
+	table = waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, host, tableID)
+	if len(table.CustodyTransitions) == 0 || table.CustodyTransitions[len(table.CustodyTransitions)-1].Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		t.Fatalf("expected latest custody transition to be %q, got %+v", tablecustody.TransitionKindTurnChallengeOpen, table.CustodyTransitions)
+	}
+	if table.CurrentHost.Peer.PeerID != host.selfPeerID() {
+		t.Fatalf("expected current host to remain %s, got %s", host.selfPeerID(), table.CurrentHost.Peer.PeerID)
+	}
+	if table.PendingTurnChallenge == nil || table.PendingTurnChallenge.Status != turnChallengeStatusOpen {
+		t.Fatalf("expected open pending turn challenge, got %+v", table.PendingTurnChallenge)
+	}
+	if table.PendingTurnChallenge.OpenedAt == "" || table.PendingTurnChallenge.TimeoutEligibleAt == "" {
+		t.Fatalf("expected pending turn challenge timestamps, got %+v", table.PendingTurnChallenge)
+	}
+	if table.PendingTurnChallenge.DecisionIndex != originalMenu.DecisionIndex || table.PendingTurnChallenge.ActingPlayerID != originalMenu.ActingPlayerID {
+		t.Fatalf("expected turn challenge to preserve turn identity, got %+v want decision=%d acting=%s", table.PendingTurnChallenge, originalMenu.DecisionIndex, originalMenu.ActingPlayerID)
+	}
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		t.Fatal("expected pending turn menu to remain attached while challenge is open")
+	}
+	if !reflect.DeepEqual(table.PendingTurnMenu.Options, originalMenu.Options) {
+		t.Fatalf("expected challenge-open to preserve the legal finite menu, got %+v want %+v", table.PendingTurnMenu.Options, originalMenu.Options)
+	}
+	if err := host.validateAcceptedPendingTurnChallenge(table, table.PendingTurnChallenge); err != nil {
+		t.Fatalf("expected accepted pending turn challenge to validate, got %v", err)
+	}
+	if _, err := host.SendAction(tableID, originalMenu.Options[0].Action); err == nil || !strings.Contains(err.Error(), "ordinary SendAction is disabled") {
+		t.Fatalf("expected ordinary SendAction to be disabled during an open challenge, got %v", err)
+	}
+}
+
+func TestTurnChallengeOptionResolutionExecutesFromParticipant(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	host.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	guest.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	originalMenu := cloneJSON(*table.PendingTurnMenu)
+	optionID := preferredChallengeResolutionOption(table.PendingTurnMenu).OptionID
+	expectedBundle, ok := findTurnCandidateByOption(&originalMenu, optionID)
+	if !ok {
+		t.Fatalf("expected option bundle %s", optionID)
+	}
+	bridgeHostToGuestSync(host, guest)
+
+	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.OpenTurnChallenge(tableID); err != nil {
+		t.Fatalf("open turn challenge: %v", err)
+	}
+	waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, host, tableID)
+
+	if _, err := host.ResolveTurnChallenge(tableID, optionID); err != nil {
+		t.Fatalf("resolve turn challenge option: %v", err)
+	}
+
+	table = waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindAction)
+	last := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	if last.Proof.ChallengeBundle == nil || last.Proof.ChallengeWitness == nil {
+		t.Fatalf("expected option resolution to carry challenge proof material, got %+v", last.Proof)
+	}
+	if last.Proof.SettlementWitness != nil {
+		t.Fatalf("expected challenge option resolution to avoid settlement witness, got %+v", last.Proof.SettlementWitness)
+	}
+	if last.Proof.RequestHash != expectedBundle.Transition.Proof.RequestHash {
+		t.Fatalf("expected challenge option request hash %q, got %q", expectedBundle.Transition.Proof.RequestHash, last.Proof.RequestHash)
+	}
+	if !reflect.DeepEqual(last.Approvals, expectedBundle.Transition.Approvals) {
+		t.Fatalf("expected challenge option approvals to reuse the prebuilt candidate approvals")
+	}
+	if table.PendingTurnChallenge != nil {
+		t.Fatalf("expected pending turn challenge to clear after option resolution, got %+v", table.PendingTurnChallenge)
+	}
+	guestTable := waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, guest, tableID, tablecustody.TransitionKindAction)
+	guestLast := guestTable.CustodyTransitions[len(guestTable.CustodyTransitions)-1]
+	if !reflect.DeepEqual(guestLast.Approvals, expectedBundle.Transition.Approvals) {
+		t.Fatalf("expected guest to accept the reused challenge option approvals")
+	}
+}
+
+func TestTurnChallengeOptionResolutionExecutesInSyntheticRealMode(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	enableSyntheticRealMode(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	bridgeHostToGuestSync(host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected actionable turn menu with challenge envelope")
+	}
+	option := preferredChallengeResolutionOption(table.PendingTurnMenu)
+
+	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.OpenTurnChallenge(tableID); err != nil {
+		t.Fatalf("open turn challenge: %v", err)
+	}
+	waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, guest, tableID)
+
+	if _, err := guest.ResolveTurnChallenge(tableID, option.OptionID); err != nil {
+		t.Fatalf("resolve turn challenge option in synthetic-real mode: %v", err)
+	}
+	table = waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindAction)
+	last := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	if last.Proof.ChallengeBundle == nil || last.Proof.ChallengeWitness == nil {
+		t.Fatalf("expected synthetic-real challenge resolution to carry challenge proof material, got %+v", last.Proof)
+	}
+}
+
+func TestTurnChallengeTimeoutResolutionExecutesAfterWindow(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	host.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	guest.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	originalMenu := cloneJSON(*table.PendingTurnMenu)
+	bridgeHostToGuestSync(host, guest)
+
+	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.OpenTurnChallenge(tableID); err != nil {
+		t.Fatalf("open turn challenge: %v", err)
+	}
+
+	waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, host, tableID)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		locked, err := host.store.readTable(tableID)
+		if err != nil || locked == nil {
+			return err
+		}
+		if locked.PendingTurnChallenge == nil {
+			t.Fatal("expected pending turn challenge before forcing timeout eligibility")
+		}
+		challenge := cloneJSON(*locked.PendingTurnChallenge)
+		challenge.TimeoutEligibleAt = addMillis(nowISO(), -1)
+		locked.PendingTurnChallenge = &challenge
+		return host.persistLocalTable(locked, false)
+	}); err != nil {
+		t.Fatalf("force timeout eligibility: %v", err)
+	}
+
+	if _, err := host.ResolveTurnChallenge(tableID, "timeout"); err != nil {
+		t.Fatalf("resolve turn challenge timeout: %v", err)
+	}
+
+	table = waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindTimeout)
+	last := table.CustodyTransitions[len(table.CustodyTransitions)-1]
+	if last.Proof.ChallengeBundle == nil || last.Proof.ChallengeWitness == nil {
+		t.Fatalf("expected timeout resolution to carry challenge proof material, got %+v", last.Proof)
+	}
+	if last.Proof.SettlementWitness != nil {
+		t.Fatalf("expected timeout challenge resolution to avoid settlement witness, got %+v", last.Proof.SettlementWitness)
+	}
+	if last.Proof.RequestHash != originalMenu.TimeoutCandidate.Transition.Proof.RequestHash {
+		t.Fatalf("expected challenge timeout request hash %q, got %q", originalMenu.TimeoutCandidate.Transition.Proof.RequestHash, last.Proof.RequestHash)
+	}
+	if !reflect.DeepEqual(last.Approvals, originalMenu.TimeoutCandidate.Transition.Approvals) {
+		t.Fatalf("expected challenge timeout approvals to reuse the prebuilt candidate approvals")
+	}
+	if table.PendingTurnChallenge != nil {
+		t.Fatalf("expected pending turn challenge to clear after timeout resolution, got %+v", table.PendingTurnChallenge)
+	}
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		t.Fatalf("expected pending turn menu to clear after timeout resolution, got %+v", table.PendingTurnMenu)
+	}
+	guestTable := waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, guest, tableID, tablecustody.TransitionKindTimeout)
+	guestLast := guestTable.CustodyTransitions[len(guestTable.CustodyTransitions)-1]
+	if !reflect.DeepEqual(guestLast.Approvals, originalMenu.TimeoutCandidate.Transition.Approvals) {
+		t.Fatalf("expected guest to accept the reused challenge timeout approvals")
+	}
+}
+
+func TestTurnChallengeEscapeRestoresSplitAndAbortsHand(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	host.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	guest.custodyRecoveryExecute = func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error) {
+		return syntheticExecuteCustodyRecoveryForTest(signedPSBT)
+	}
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	sourceState := cloneJSON(*table.LatestCustodyState)
+	if table.PendingTurnMenu == nil || table.PendingTurnMenu.ChallengeEnvelope == nil {
+		t.Fatal("expected pending turn menu challenge envelope before opening the challenge")
+	}
+	if table.PendingTurnMenu.ChallengeEnvelope.EscapeBundle.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected escape bundle kind %q, got %q", tablecustody.TransitionKindTurnChallengeEscape, table.PendingTurnMenu.ChallengeEnvelope.EscapeBundle.Kind)
+	}
+
+	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.OpenTurnChallenge(tableID); err != nil {
+		t.Fatalf("open turn challenge: %v", err)
+	}
+	table = waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, host, tableID)
+	if table.PendingTurnChallenge == nil || strings.TrimSpace(table.PendingTurnChallenge.EscapeEligibleAt) == "" {
+		t.Fatalf("expected pending turn challenge to carry escape eligibility, got %+v", table.PendingTurnChallenge)
+	}
+	if _, err := host.ResolveTurnChallenge(tableID, "escape"); err == nil || !strings.Contains(err.Error(), "not yet eligible") {
+		t.Fatalf("expected default turn challenge escape to reject before block-delay estimate maturity, got %v", err)
+	}
+
+	if err := host.store.withTableLock(tableID, func() error {
+		locked, err := host.store.readTable(tableID)
+		if err != nil || locked == nil {
+			return err
+		}
+		if locked.PendingTurnChallenge == nil {
+			t.Fatal("expected pending turn challenge before forcing escape eligibility")
+		}
+		challenge := cloneJSON(*locked.PendingTurnChallenge)
+		challenge.EscapeEligibleAt = addMillis(nowISO(), 60_000)
+		locked.PendingTurnChallenge = &challenge
+		return host.persistLocalTable(locked, false)
+	}); err != nil {
+		t.Fatalf("force escape ineligible state: %v", err)
+	}
+	if _, err := host.ResolveTurnChallenge(tableID, "escape"); err == nil || !strings.Contains(err.Error(), "not yet eligible") {
+		t.Fatalf("expected turn challenge escape to reject before eligibility, got %v", err)
+	}
+	if err := host.store.withTableLock(tableID, func() error {
+		locked, err := host.store.readTable(tableID)
+		if err != nil || locked == nil {
+			return err
+		}
+		if locked.PendingTurnChallenge == nil {
+			t.Fatal("expected pending turn challenge before forcing escape eligibility")
+		}
+		challenge := cloneJSON(*locked.PendingTurnChallenge)
+		openIndex := -1
+		for index := len(locked.CustodyTransitions) - 1; index >= 0; index-- {
+			if locked.CustodyTransitions[index].Kind == tablecustody.TransitionKindTurnChallengeOpen {
+				openIndex = index
+				break
+			}
+		}
+		if openIndex < 0 {
+			t.Fatal("expected turn-challenge-open transition before forcing escape eligibility")
+		}
+		openTransition := cloneJSON(locked.CustodyTransitions[openIndex])
+		openTable := cloneJSON(*locked)
+		openState := cloneJSON(openTransition.NextState)
+		openTable.LatestCustodyState = &openState
+		spendPath, err := host.selectTurnChallengeExitSpendPath(openTable, challenge.ChallengeRef)
+		if err != nil {
+			return err
+		}
+		openedAt := addMillis(nowISO(), -(int((time.Duration(spendPath.CSVLocktime.Value)*estimatedBitcoinBlockInterval)/time.Millisecond) + 1000))
+		challenge.OpenedAt = openedAt
+		challenge.EscapeEligibleAt = turnChallengeEscapeEligibleAt(openedAt, spendPath)
+		locked.PendingTurnChallenge = &challenge
+		openTransition.Proof.FinalizedAt = openedAt
+		if openTransition.Proof.ChallengeWitness != nil {
+			witness := cloneJSON(*openTransition.Proof.ChallengeWitness)
+			witness.ExecutedAt = openedAt
+			openTransition.Proof.ChallengeWitness = &witness
+		}
+		openTransition.Proof.TransitionHash = tablecustody.HashCustodyTransition(openTransition)
+		locked.CustodyTransitions[openIndex] = openTransition
+		return host.persistLocalTable(locked, false)
+	}); err != nil {
+		t.Fatalf("force escape eligibility: %v", err)
+	}
+
+	if _, err := host.ResolveTurnChallenge(tableID, "escape"); err != nil {
+		t.Fatalf("resolve turn challenge escape: %v", err)
+	}
+	table = mustReadNativeTable(t, host, tableID)
+	if len(table.CustodyTransitions) == 0 {
+		t.Fatal("expected challenge escape to append a custody transition")
+	}
+	if table.CustodyTransitions[len(table.CustodyTransitions)-1].Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected immediate local latest transition %q, got %+v", tablecustody.TransitionKindTurnChallengeEscape, table.CustodyTransitions[len(table.CustodyTransitions)-1])
+	}
+	table = waitForCustodyTransitionKindPresent(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindTurnChallengeEscape)
+	var last tablecustody.CustodyTransition
+	foundEscape := false
+	for _, transition := range table.CustodyTransitions {
+		if transition.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+			continue
+		}
+		last = transition
+		foundEscape = true
+	}
+	if !foundEscape {
+		t.Fatal("expected accepted custody history to contain a turn-challenge-escape transition")
+	}
+	if last.Proof.ChallengeBundle == nil || last.Proof.ChallengeWitness == nil {
+		t.Fatalf("expected challenge escape to carry challenge proof material, got %+v", last.Proof)
+	}
+	if last.Proof.ChallengeBundle.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected stored challenge escape bundle kind %q, got %q", tablecustody.TransitionKindTurnChallengeEscape, last.Proof.ChallengeBundle.Kind)
+	}
+	if len(last.Approvals) != 0 {
+		t.Fatalf("expected challenge escape to avoid custody approvals, got %+v", last.Approvals)
+	}
+	if !reflect.DeepEqual(semanticComparableCustodyStacks(&last.NextState), semanticComparableCustodyStacks(&sourceState)) {
+		t.Fatalf("expected challenge escape to restore the pre-open stack split, got %+v want %+v", last.NextState.StackClaims, sourceState.StackClaims)
+	}
+	if !reflect.DeepEqual(semanticComparableCustodyPots(&last.NextState), semanticComparableCustodyPots(&sourceState)) {
+		t.Fatalf("expected challenge escape to restore the pre-open pot split, got %+v want %+v", last.NextState.PotSlices, sourceState.PotSlices)
+	}
+	if !sameCanonicalVTXORefs(stackProofRefs(last.NextState), last.Proof.VTXORefs) {
+		t.Fatalf("expected challenge escape proof refs to match restored stack refs")
+	}
+	if table.PendingTurnChallenge != nil {
+		t.Fatalf("expected pending turn challenge to clear after escape, got %+v", table.PendingTurnChallenge)
+	}
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		t.Fatalf("expected pending turn menu to clear after escape, got %+v", table.PendingTurnMenu)
+	}
+	if table.ActiveHand != nil {
+		t.Fatalf("expected challenge escape to abort the active hand, got %+v", table.ActiveHand)
+	}
+	if table.Config.Status != "ready" {
+		t.Fatalf("expected challenge escape to return the table to ready status, got %q", table.Config.Status)
+	}
+	if got := stringValue(table.Events[len(table.Events)-1].Body["type"]); got != "HandAbort" && got != "HostRotated" {
+		t.Fatalf("expected challenge escape to preserve a HandAbort tail or a later failover marker, got %q", got)
+	}
+	if err := host.validateAcceptedCustodyHistory(nil, table); err != nil {
+		t.Fatalf("expected accepted replay to validate challenge escape offline, got %v", err)
+	}
+}
+
+func TestTurnChallengeOpenBundleBecomesStaleAfterOrdinaryCandidateFinalizesFirst(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	bridgeHostToGuestSync(host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	originalMenu := cloneJSON(*table.PendingTurnMenu)
+
+	if _, err := host.SendAction(tableID, originalMenu.Options[0].Action); err != nil {
+		t.Fatalf("send ordinary action: %v", err)
+	}
+
+	table = waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindAction)
+	if _, err := host.validateTurnChallengeOpenBundle(table, &originalMenu, originalMenu.ChallengeEnvelope.OpenBundle); err == nil {
+		t.Fatal("expected original challenge-open bundle to go stale once the ordinary candidate settled first")
+	}
+}

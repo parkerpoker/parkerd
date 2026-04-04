@@ -98,7 +98,7 @@ func (runtime *meshRuntime) recoveryAuthorizedOutputsForTransition(table nativeT
 		if delta <= 0 {
 			continue
 		}
-		spec, err := runtime.stackOutputSpec(table, claim.PlayerID, delta)
+		spec, err := runtime.stackOutputSpecForTransition(table, &target, claim.PlayerID, delta)
 		if err != nil {
 			return nil, err
 		}

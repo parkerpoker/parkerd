@@ -308,6 +308,13 @@ func (d *ProxyDaemon) handleRuntimeRequest(method string, params map[string]any)
 			return nil, err
 		}
 		return d.runtime.SendAction(tableID, action)
+	case "meshOpenTurnChallenge":
+		return d.runtime.OpenTurnChallenge(stringFromMap(params, "tableId", d.runtime.currentTableID()))
+	case "meshResolveTurnChallenge":
+		return d.runtime.ResolveTurnChallenge(
+			stringFromMap(params, "tableId", d.runtime.currentTableID()),
+			stringFromMap(params, "optionId", ""),
+		)
 	case "meshRotateHost":
 		return d.runtime.RotateHost(stringFromMap(params, "tableId", d.runtime.currentTableID()))
 	case "meshPublicTables":

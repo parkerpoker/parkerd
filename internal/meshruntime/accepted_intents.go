@@ -285,19 +285,30 @@ func (runtime *meshRuntime) validateAcceptedInitiatorHistory(table nativeTableSt
 				if previousState == nil {
 					return fmt.Errorf("event %d action request is missing its previous custody state", index)
 				}
-				if request.PrevCustodyStateHash != transition.PrevStateHash {
+				requestValidationState := previousState
+				if transition.Proof.ChallengeWitness != nil {
+					_, openPrevious, _, err := acceptedChallengeOpenContextForTransition(table, transition)
+					if err != nil {
+						return fmt.Errorf("event %d challenge action request is missing its source turn context: %w", index, err)
+					}
+					if openPrevious == nil {
+						return fmt.Errorf("event %d challenge action request is missing its source custody state", index)
+					}
+					requestValidationState = openPrevious
+				}
+				if request.PrevCustodyStateHash != requestValidationState.StateHash {
 					return fmt.Errorf("event %d action request prev custody hash mismatch", index)
 				}
 				if request.Epoch != transition.NextState.Epoch {
 					return fmt.Errorf("event %d action request epoch mismatch", index)
 				}
-				if request.DecisionIndex != previousState.DecisionIndex {
+				if request.DecisionIndex != requestValidationState.DecisionIndex {
 					return fmt.Errorf("event %d action request decision index mismatch", index)
 				}
-				if request.HandID != previousState.HandID {
+				if request.HandID != requestValidationState.HandID {
 					return fmt.Errorf("event %d action request hand mismatch", index)
 				}
-				if expectedActor := strings.TrimSpace(previousState.ActingPlayerID); expectedActor != "" && request.PlayerID != expectedActor {
+				if expectedActor := strings.TrimSpace(requestValidationState.ActingPlayerID); expectedActor != "" && request.PlayerID != expectedActor {
 					return fmt.Errorf("event %d action request player mismatch", index)
 				}
 				if transition.Action == nil {
@@ -417,6 +428,7 @@ func (runtime *meshRuntime) applyAcceptedReplayActionEvent(table nativeTableStat
 	if previousState == nil {
 		return game.HoldemState{}, nil, errors.New("player action event is missing its previous custody state")
 	}
+	replayPreviousState := previousState
 	baseTable := cloneJSON(table)
 	challengeAnchor := previousState.ChallengeAnchor
 	transcriptRoot := previousState.TranscriptRoot
@@ -439,6 +451,20 @@ func (runtime *meshRuntime) applyAcceptedReplayActionEvent(table nativeTableStat
 	if err != nil {
 		return game.HoldemState{}, nil, err
 	}
+	if hasRequest && transition.Proof.ChallengeWitness != nil {
+		_, openPrevious, _, err := acceptedChallengeOpenContextForTransition(table, transition)
+		if err != nil {
+			return game.HoldemState{}, nil, err
+		}
+		if openPrevious == nil {
+			return game.HoldemState{}, nil, errors.New("challenge action replay is missing its source custody state")
+		}
+		previousState = openPrevious
+		challengeAnchor = openPrevious.ChallengeAnchor
+		transcriptRoot = openPrevious.TranscriptRoot
+		baseTable.ActiveHand.Cards.PhaseDeadlineAt = openPrevious.ActionDeadlineAt
+		baseTable.LatestCustodyState = openPrevious
+	}
 	if hasRequest {
 		challengeAnchor = request.ChallengeAnchor
 		transcriptRoot = request.TranscriptRoot
@@ -448,11 +474,29 @@ func (runtime *meshRuntime) applyAcceptedReplayActionEvent(table nativeTableStat
 	baseTable.LatestCustodyState = previousState
 	if hasRequest {
 		authorizer := authorizerForActionRequest(*request)
-		if err := runtime.validateCustodyTransitionSemantics(baseTable, transition, authorizer); err != nil {
-			return game.HoldemState{}, nil, err
-		}
 		nextState, err := game.ApplyHoldemAction(hand, seatIndexForPlayerID(table, request.PlayerID), request.Action)
 		if err != nil {
+			return game.HoldemState{}, nil, err
+		}
+		if transition.Proof.ChallengeWitness != nil {
+			seat, ok := seatRecordForPlayer(baseTable, request.PlayerID)
+			if !ok {
+				return game.HoldemState{}, nil, fmt.Errorf("missing seat for challenge action player %s", request.PlayerID)
+			}
+			validationTable := actionRequestValidationTable(baseTable, *request)
+			if err := runtime.validateActionRequest(validationTable, seat, *request); err != nil {
+				return game.HoldemState{}, nil, err
+			}
+			expected, err := runtime.buildCustodyTransitionWithOverrides(validationTable, tablecustody.TransitionKindAction, &nextState, &request.Action, nil, actionRequestBindingOverrides(*request))
+			if err != nil {
+				return game.HoldemState{}, nil, err
+			}
+			currentTable := cloneJSON(validationTable)
+			currentTable.LatestCustodyState = replayPreviousState
+			if err := runtime.validateChallengeResolutionSemanticMatch(currentTable, validationTable, transition, expected); err != nil {
+				return game.HoldemState{}, nil, err
+			}
+		} else if err := runtime.validateCustodyTransitionSemantics(baseTable, transition, authorizer); err != nil {
 			return game.HoldemState{}, nil, err
 		}
 		return nextState, &transition.NextState, nil

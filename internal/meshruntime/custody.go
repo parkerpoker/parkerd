@@ -81,6 +81,9 @@ func (runtime *meshRuntime) custodyActionDeadline(table nativeTableState, kind t
 			baseDeadline = strings.TrimSpace(table.LatestCustodyState.ActionDeadlineAt)
 		}
 	}
+	if kind == tablecustody.TransitionKindTurnChallengeOpen {
+		return baseDeadline
+	}
 	if game.PhaseAllowsActions(hand.Phase) {
 		if baseDeadline != "" {
 			return addMillis(baseDeadline, runtime.actionTimeoutMSForTable(table))
@@ -593,6 +596,18 @@ func (runtime *meshRuntime) validateCustodyTransitionSemanticsWithOptions(table 
 			validationTable = tableWithTurnDeadline(table, table.PendingTurnMenu.ActionDeadlineAt)
 		}
 		expected, err = runtime.deriveTimeoutCustodyTransitionWithOptions(validationTable, !allowFutureTimeout, requireCompleteMenu)
+	case tablecustody.TransitionKindTurnChallengeOpen:
+		if authorizer == nil || strings.TrimSpace(authorizer.TurnDeadlineAt) == "" {
+			return errors.New("turn-challenge-open transition is missing its turn deadline authorizer")
+		}
+		validationTable := tableWithTurnDeadline(table, authorizer.TurnDeadlineAt)
+		expected, err = runtime.buildTurnChallengeOpenTransition(validationTable, validationTable.PendingTurnMenu)
+	case tablecustody.TransitionKindTurnChallengeEscape:
+		turnDeadlineAt := transition.NextState.ActionDeadlineAt
+		if authorizer != nil && strings.TrimSpace(authorizer.TurnDeadlineAt) != "" {
+			turnDeadlineAt = authorizer.TurnDeadlineAt
+		}
+		expected, err = runtime.buildTurnChallengeEscapeTransition(tableWithTurnDeadline(table, turnDeadlineAt), turnDeadlineAt)
 	case tablecustody.TransitionKindCashOut, tablecustody.TransitionKindEmergencyExit:
 		if authorizer == nil || authorizer.FundsRequest == nil {
 			return errors.New("funds transition is missing its signed funds request")
@@ -867,7 +882,7 @@ func (runtime *meshRuntime) finalizeCustodyTransition(table *nativeTableState, t
 			transition.NextState.StackClaims[index].VTXORefs = nil
 			continue
 		}
-		spec, err := runtime.stackOutputSpec(*table, transition.NextState.StackClaims[index].PlayerID, backedAmount)
+		spec, err := runtime.stackOutputSpecForTransition(*table, transition, transition.NextState.StackClaims[index].PlayerID, backedAmount)
 		if err != nil {
 			return err
 		}
@@ -927,6 +942,10 @@ func (runtime *meshRuntime) applyCustodyTransition(table *nativeTableState, tran
 	table.CustodyTransitions = append(table.CustodyTransitions, transition)
 	state := transition.NextState
 	table.LatestCustodyState = &state
+	if transition.Kind == tablecustody.TransitionKindTurnChallengeOpen {
+		return
+	}
+	table.PendingTurnChallenge = nil
 	table.PendingTurnMenu = nil
 }
 

@@ -840,6 +840,9 @@ func validateCustodyOffchainOutputs(expected, actual []custodyBatchOutput) error
 }
 
 func (runtime *meshRuntime) normalizedCustodySigningTransition(table nativeTableState, transition tablecustody.CustodyTransition) (tablecustody.CustodyTransition, *custodySettlementPlan, error) {
+	if transition.Kind == tablecustody.TransitionKindTurnChallengeOpen || transition.Kind == tablecustody.TransitionKindTurnChallengeEscape {
+		return cloneJSON(transition), nil, nil
+	}
 	plan, err := runtime.buildCustodySettlementPlan(table, transition)
 	if err != nil {
 		return tablecustody.CustodyTransition{}, nil, err
@@ -849,7 +852,39 @@ func (runtime *meshRuntime) normalizedCustodySigningTransition(table nativeTable
 	return normalized, plan, nil
 }
 
+func challengeResolutionApprovalSource(table nativeTableState, transition tablecustody.CustodyTransition) (nativeTableState, tablecustody.CustodyTransition, bool, error) {
+	if transition.Kind != tablecustody.TransitionKindAction && transition.Kind != tablecustody.TransitionKindTimeout {
+		return nativeTableState{}, tablecustody.CustodyTransition{}, false, nil
+	}
+	if transition.Proof.ChallengeBundle == nil && transition.Proof.ChallengeWitness == nil {
+		return nativeTableState{}, tablecustody.CustodyTransition{}, false, nil
+	}
+	openTransition, openPrevious, _, err := acceptedChallengeOpenContextForTransition(table, transition)
+	if err != nil {
+		return nativeTableState{}, tablecustody.CustodyTransition{}, false, err
+	}
+	sourceTable := cloneJSON(table)
+	sourceTable.LatestCustodyState = openPrevious
+	sourceTransition := cloneJSON(transition)
+	sourceTransition.CustodySeq = openTransition.CustodySeq
+	sourceTransition.PrevStateHash = openTransition.PrevStateHash
+	sourceTransition.NextState.CustodySeq = openTransition.NextState.CustodySeq
+	sourceTransition.NextState.PrevStateHash = openTransition.NextState.PrevStateHash
+	return sourceTable, sourceTransition, true, nil
+}
+
 func (runtime *meshRuntime) normalizedCustodyApprovalTransition(table nativeTableState, transition tablecustody.CustodyTransition) (tablecustody.CustodyTransition, *custodySettlementPlan, error) {
+	if transition.Kind == tablecustody.TransitionKindTurnChallengeOpen || transition.Kind == tablecustody.TransitionKindTurnChallengeEscape {
+		normalized := cloneJSON(transition)
+		normalized.Proof.RequestHash = custodyTransitionRequestHash(normalized)
+		return normalized, nil, nil
+	}
+	if sourceTable, sourceTransition, ok, err := challengeResolutionApprovalSource(table, transition); err != nil {
+		return tablecustody.CustodyTransition{}, nil, err
+	} else if ok {
+		table = sourceTable
+		transition = sourceTransition
+	}
 	request := resetCustodyRequestTransition(table, transition)
 	normalized, plan, err := runtime.normalizedCustodySigningTransition(table, request)
 	if err != nil {
@@ -932,6 +967,10 @@ func (runtime *meshRuntime) validatePrebuiltCustodySigningTransition(table nativ
 	}
 	if err := tablecustody.ValidateTransition(table.LatestCustodyState, approvalTransition); err != nil {
 		return err
+	}
+	if approvalTransition.Kind == tablecustody.TransitionKindTurnChallengeOpen ||
+		approvalTransition.Kind == tablecustody.TransitionKindTurnChallengeEscape {
+		return nil
 	}
 	if err := validateAcceptedCustodyRefs(table.LatestCustodyState, approvalTransition, false); err != nil {
 		return err
@@ -1133,6 +1172,10 @@ func (runtime *meshRuntime) fullySignCustodyPSBT(table nativeTableState, prevSta
 		}
 		signed = nextSigned
 	}
+	signed, err = runtime.maybeSignCustodyPSBTAsOperator(purpose, signed)
+	if err != nil {
+		return "", fmt.Errorf("custody %s operator signing: %w", purpose, err)
+	}
 	return signed, nil
 }
 
@@ -1214,6 +1257,107 @@ func (runtime *meshRuntime) handleCustodyTxSignFromPeer(request nativeCustodyTxS
 		}
 		if err := validateCustodyRecoveryPSBT(packet, sourceRefs, spendPaths, request.ExpectedOutputs); err != nil {
 			return nativeCustodyTxSignResponse{}, err
+		}
+	case "challenge-open":
+		if err := runtime.validatePrebuiltCustodySigningTransition(*table, request.ExpectedPrevStateHash, request.TransitionHash, request.Transition, request.Authorizer); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		turnDeadlineAt := strings.TrimSpace(request.Transition.NextState.ActionDeadlineAt)
+		if request.Authorizer != nil && strings.TrimSpace(request.Authorizer.TurnDeadlineAt) != "" {
+			turnDeadlineAt = strings.TrimSpace(request.Authorizer.TurnDeadlineAt)
+		}
+		sourceRefs := turnChallengeSourceRefs(table.LatestCustodyState)
+		spendPaths, authorizedPlayers, err := runtime.challengeOpenSpendPaths(*table, sourceRefs, turnDeadlineAt)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if !containsPlayerID(authorizedPlayers, request.PlayerID) {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is not authorized for this player")
+		}
+		spec, err := runtime.challengeRefOutputSpec(*table, sumVTXORefs(sourceRefs))
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		outputs := challengeOutputsFromBatchOutputs([]custodyBatchOutput{custodyBatchOutputFromSpec(spec)})
+		txLocktime, err := challengeOpenBundleLocktime(turnDeadlineAt, spendPaths)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if err := validateCustodyChallengePSBT(packet, sourceRefs, spendPaths, outputs, txLocktime); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+	case "challenge-escape":
+		if err := runtime.validatePrebuiltCustodySigningTransition(*table, request.ExpectedPrevStateHash, request.TransitionHash, request.Transition, request.Authorizer); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if request.Authorizer == nil || request.Authorizer.ChallengeOpenBundle == nil {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge escape signing request is missing its open bundle authorizer")
+		}
+		turnDeadlineAt := strings.TrimSpace(request.Transition.NextState.ActionDeadlineAt)
+		if request.Authorizer != nil && strings.TrimSpace(request.Authorizer.TurnDeadlineAt) != "" {
+			turnDeadlineAt = strings.TrimSpace(request.Authorizer.TurnDeadlineAt)
+		}
+		validationTable := tableWithTurnDeadline(*table, turnDeadlineAt)
+		menu := &NativePendingTurnMenu{ActionDeadlineAt: turnDeadlineAt}
+		challengeRef, err := runtime.validateTurnChallengeOpenBundle(validationTable, menu, *request.Authorizer.ChallengeOpenBundle)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		spendPath, err := runtime.selectTurnChallengeExitSpendPath(validationTable, challengeRef)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if !containsPlayerID(spendPath.PlayerIDs, request.PlayerID) {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge escape signing request is not authorized for this player")
+		}
+		outputs, err := runtime.fullChallengeOutputsForTransition(validationTable, request.Transition)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if err := validateCustodyChallengePSBT(packet, []tablecustody.VTXORef{challengeRef}, []custodySpendPath{spendPath}, outputs, 0); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+	case "challenge-option", "challenge-timeout":
+		if request.Authorizer == nil || request.Authorizer.ChallengeOpenBundle == nil {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is missing its open bundle context")
+		}
+		if request.ExpectedPrevStateHash != "" && latestCustodyStateHash(*table) != request.ExpectedPrevStateHash {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request references stale state")
+		}
+		if request.TransitionHash == "" || challengeBundleRequestHash(request.Transition) != request.TransitionHash {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request transition hash mismatch")
+		}
+		if err := runtime.validateCustodyTransitionSemanticsWithOptions(*table, request.Transition, request.Authorizer, true); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		optionID := ""
+		expectedTransition := request.Transition
+		switch request.Purpose {
+		case "challenge-option":
+			if request.Authorizer.ActionRequest == nil {
+				return nativeCustodyTxSignResponse{}, errors.New("custody challenge option signing request is missing its action authorizer")
+			}
+			optionID = request.Authorizer.ActionRequest.OptionID
+		}
+		menuCtx := &NativePendingTurnMenu{
+			ActionDeadlineAt: strings.TrimSpace(request.Authorizer.TurnDeadlineAt),
+		}
+		if menuCtx.ActionDeadlineAt == "" {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is missing its turn deadline")
+		}
+		if err := runtime.validateTurnChallengeResolutionSigningRequest(*table, menuCtx, *request.Authorizer.ChallengeOpenBundle, expectedTransition, optionID, packet, request.ExpectedOutputs); err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		challengeRef, err := runtime.validateTurnChallengeOpenBundle(*table, menuCtx, *request.Authorizer.ChallengeOpenBundle)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		spendPath, err := runtime.selectCustodySpendPath(*table, challengeRef, activeTurnChallengePlayerIDs(*table), false)
+		if err != nil {
+			return nativeCustodyTxSignResponse{}, err
+		}
+		if !containsPlayerID(spendPath.PlayerIDs, request.PlayerID) {
+			return nativeCustodyTxSignResponse{}, errors.New("custody challenge signing request is not authorized for this player")
 		}
 	default:
 		return nativeCustodyTxSignResponse{}, fmt.Errorf("unsupported custody signing purpose %q", request.Purpose)

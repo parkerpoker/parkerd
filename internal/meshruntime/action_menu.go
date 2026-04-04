@@ -12,6 +12,9 @@ import (
 const (
 	actionMenuDefaultHalfPotBps = 5000
 	actionMenuDefaultPotBps     = 10000
+	defaultTurnChallengeWindowMS = 120000
+	turnTimeoutModeDirect        = "direct"
+	turnTimeoutModeChainChallenge = "chain-challenge"
 )
 
 func defaultActionMenuPolicy() ActionMenuPolicy {
@@ -57,6 +60,38 @@ func actionMenuPolicyFromCreateInput(input map[string]any) ActionMenuPolicy {
 		return defaultActionMenuPolicy()
 	}
 	return normalizeActionMenuPolicy(policy)
+}
+
+func normalizeTurnTimeoutMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case turnTimeoutModeChainChallenge:
+		return turnTimeoutModeChainChallenge
+	case turnTimeoutModeDirect:
+		return turnTimeoutModeDirect
+	default:
+		return turnTimeoutModeDirect
+	}
+}
+
+func turnTimeoutModeFromCreateInput(input map[string]any) string {
+	mode := strings.TrimSpace(stringFromMap(input, "turnTimeoutMode", turnTimeoutModeChainChallenge))
+	switch mode {
+	case turnTimeoutModeDirect, turnTimeoutModeChainChallenge:
+		return mode
+	default:
+		return turnTimeoutModeChainChallenge
+	}
+}
+
+func turnTimeoutModeForTable(table nativeTableState) string {
+	return normalizeTurnTimeoutMode(table.Config.TurnTimeoutMode)
+}
+
+func turnChallengeWindowMSForTable(table nativeTableState) int {
+	if table.Config.TurnChallengeWindowMS > 0 {
+		return table.Config.TurnChallengeWindowMS
+	}
+	return defaultTurnChallengeWindowMS
 }
 
 func exactMenuLegalActions(menu *NativePendingTurnMenu) []game.LegalAction {
@@ -185,7 +220,7 @@ func turnAnchorPayload(table nativeTableState) map[string]any {
 		"epoch":                table.CurrentEpoch,
 		"handId":               "",
 		"legalActionsHash":     "",
-		"prevCustodyStateHash": latestCustodyStateHash(table),
+		"prevCustodyStateHash": turnMenuSourceStateHash(table),
 		"tableId":              table.Config.TableID,
 	}
 	if table.ActiveHand != nil {

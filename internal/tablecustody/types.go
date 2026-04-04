@@ -12,14 +12,16 @@ const (
 type TransitionKind string
 
 const (
-	TransitionKindBuyInLock      TransitionKind = "buy-in-lock"
-	TransitionKindBlindPost      TransitionKind = "blind-post"
-	TransitionKindAction         TransitionKind = "action"
-	TransitionKindTimeout        TransitionKind = "timeout"
-	TransitionKindShowdownPayout TransitionKind = "showdown-payout"
-	TransitionKindCashOut        TransitionKind = "cash-out"
-	TransitionKindEmergencyExit  TransitionKind = "emergency-exit"
-	TransitionKindCarryForward   TransitionKind = "carry-forward"
+	TransitionKindBuyInLock           TransitionKind = "buy-in-lock"
+	TransitionKindBlindPost           TransitionKind = "blind-post"
+	TransitionKindAction              TransitionKind = "action"
+	TransitionKindTimeout             TransitionKind = "timeout"
+	TransitionKindTurnChallengeOpen   TransitionKind = "turn-challenge-open"
+	TransitionKindTurnChallengeEscape TransitionKind = "turn-challenge-escape"
+	TransitionKindShowdownPayout      TransitionKind = "showdown-payout"
+	TransitionKindCashOut             TransitionKind = "cash-out"
+	TransitionKindEmergencyExit       TransitionKind = "emergency-exit"
+	TransitionKindCarryForward        TransitionKind = "carry-forward"
 )
 
 type VTXORef struct {
@@ -129,10 +131,38 @@ type CustodyRecoveryWitness struct {
 	SourceTransitionHash string   `json:"sourceTransitionHash,omitempty"`
 }
 
+type CustodyChallengeOutput struct {
+	AmountSats    int      `json:"amountSats"`
+	ClaimKey      string   `json:"claimKey,omitempty"`
+	OwnerPlayerID string   `json:"ownerPlayerId,omitempty"`
+	Script        string   `json:"script,omitempty"`
+	Tapscripts    []string `json:"tapscripts,omitempty"`
+}
+
+type CustodyChallengeBundle struct {
+	AuthorizedOutputs []CustodyChallengeOutput `json:"authorizedOutputs,omitempty"`
+	BundleHash        string                   `json:"bundleHash,omitempty"`
+	Kind              TransitionKind           `json:"kind"`
+	OptionID          string                   `json:"optionId,omitempty"`
+	SignedPSBT        string                   `json:"signedPsbt,omitempty"`
+	SourceRefs        []VTXORef                `json:"sourceRefs,omitempty"`
+	TimeoutResolution *TimeoutResolution       `json:"timeoutResolution,omitempty"`
+	TxLocktime        uint32                   `json:"txLocktime,omitempty"`
+}
+
+type CustodyChallengeWitness struct {
+	BroadcastTxIDs []string `json:"broadcastTxIds,omitempty"`
+	BundleHash     string   `json:"bundleHash,omitempty"`
+	ExecutedAt     string   `json:"executedAt,omitempty"`
+	TransactionID  string   `json:"transactionId,omitempty"`
+}
+
 type CustodyProof struct {
 	ArkIntentID        string                    `json:"arkIntentId,omitempty"`
 	ArkTxID            string                    `json:"arkTxid,omitempty"`
 	CandidateIntentAck *CandidateIntentAck       `json:"candidateIntentAck,omitempty"`
+	ChallengeBundle    *CustodyChallengeBundle   `json:"challengeBundle,omitempty"`
+	ChallengeWitness   *CustodyChallengeWitness  `json:"challengeWitness,omitempty"`
 	ExitProofRef       string                    `json:"exitProofRef,omitempty"`
 	FinalizedAt        string                    `json:"finalizedAt,omitempty"`
 	RequestHash        string                    `json:"requestHash,omitempty"`

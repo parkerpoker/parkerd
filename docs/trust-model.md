@@ -13,6 +13,7 @@ The current model is:
 - monetary truth is the latest accepted `CustodyState`, not replicated UI state
 - the host is a proposer and sequencer, not a unilateral money authority
 - deterministic contested-pot recovery uses pre-signed recovery bundles over the shared pot CSV exit
+- turn timeouts now default to a `chain-challenge` fallback instead of immediate timeout payout on new tables
 - in the current heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty should not be able to claw that accepted result back through a later cash-out or exit
 - operator outage affects liveness and visibility, not ownership of the latest accepted custody claim
 - the accepted v1 liveness tradeoff is eventual deterministic recovery after `U`, not immediate forced recovery at `D`
@@ -36,6 +37,7 @@ That accepted chain can prove history through two offline proof surfaces:
 
 - `SettlementWitness` for ordinary real Ark batches
 - stored `RecoveryBundles` plus executed `RecoveryWitness` for deterministic recovery transitions
+- stored `ChallengeBundle` plus executed `ChallengeWitness` for `turn-challenge-open` and challenge-resolved turn transitions
 
 ## Keys And Local Secrets
 
@@ -82,6 +84,26 @@ Current runtime guarantee:
 
 In practice, that means the host is a proposer of the next valid state, not the sole owner of monetary truth.
 
+## Chain-Challenge Timing Model
+
+The new turn-timeout fallback changes the trust story for betting turns.
+
+For new tables:
+
+- the ordinary fast path is still the same deterministic finite-menu selection plus cooperative Ark settlement
+- after the ordinary action deadline `D`, the fallback is no longer an immediate timeout payout
+- instead, Parker can open a pre-signed onchain `turn-challenge-open` spend into a dedicated `TurnChallengeRef`
+
+Important current guarantees and non-guarantees:
+
+- `chain-challenge` removes Bob's immediate timeout-payout path at `D`
+- before `D + C`, only the option-resolution bundles are valid
+- at `D + C`, the timeout-resolution bundle also becomes valid without requiring fresh cooperation from the non-acting side
+- after `D + C`, a late option-resolution and the timeout-resolution can both be valid; confirmation order decides if both are published then
+- the current design does not prove from chain data alone that Alice selected her option before `D`
+
+That last point is intentional in the current `best possible now` version. Candidate intent acks and any operator acceptance receipt still matter for the ordinary cooperative Ark path, but they are no longer the thing suppressing timeout or proving timely turn selection under the challenge fallback. Those fairness properties now come only from the pre-signed `D` and `D + C` chain-challenge envelope.
+
 ## Cooperative Approval And Dead Players
 
 Only seated players with locked funds participate in custody approval.
@@ -96,6 +118,7 @@ Current runtime behavior:
 - remote signers validate the prebuilt custody transition semantically before approval, PSBT signing, or signer-session prepare
 - Ark/output authorization and Ark-proof validation remain a separate mandatory layer after semantic validation
 - deterministic action-timeout and showdown-timeout bundles are pre-signed while the source transition is still cooperative, then executed later only if the live path stalls
+- challenge-open, option-resolution, and timeout-resolution bundles are fully signed onchain transactions and do not depend on live Ark intent registration
 
 This keeps liveness from depending on continued cooperation by a player who has already lost eligibility in the contested portion of the hand.
 

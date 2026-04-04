@@ -29,29 +29,25 @@ import (
 
 const unilateralExitSweepTimeout = 90 * time.Second
 
-func finalizedCustodyRecoveryTx(packet *psbt.Packet) (*wire.MsgTx, error) {
+func finalizedSignedCustodyTxFromPacket(packet *psbt.Packet) (*wire.MsgTx, error) {
 	if packet == nil {
-		return nil, errors.New("custody recovery psbt is missing")
+		return nil, errors.New("custody signed psbt is missing")
 	}
-	recoveryTx := packet.UnsignedTx.Copy()
+	finalTx := packet.UnsignedTx.Copy()
 	for inputIndex, input := range packet.Inputs {
 		if len(input.TaprootLeafScript) != 1 {
-			return nil, fmt.Errorf("custody recovery psbt input %d is missing its csv leaf proof", inputIndex)
+			return nil, fmt.Errorf("custody signed psbt input %d is missing its authorized leaf proof", inputIndex)
 		}
 		leafScript := input.TaprootLeafScript[0]
 		closure, err := arkscript.DecodeClosure(leafScript.Script)
 		if err != nil {
 			return nil, err
 		}
-		csvClosure, ok := closure.(*arkscript.CSVMultisigClosure)
-		if !ok {
-			return nil, fmt.Errorf("custody recovery psbt input %d does not use a csv multisig leaf", inputIndex)
-		}
 		leafHash := txscript.NewTapLeaf(leafScript.LeafVersion, leafScript.Script).TapHash()
 		signatures := make(map[string][]byte, len(input.TaprootScriptSpendSig))
 		for _, signature := range input.TaprootScriptSpendSig {
 			if signature == nil || !bytes.Equal(signature.LeafHash, leafHash[:]) {
-				return nil, fmt.Errorf("custody recovery psbt input %d contains a signature for the wrong leaf", inputIndex)
+				return nil, fmt.Errorf("custody signed psbt input %d contains a signature for the wrong leaf", inputIndex)
 			}
 			rawSignature := append([]byte(nil), signature.Signature...)
 			if signature.SigHash != txscript.SigHashDefault {
@@ -59,13 +55,13 @@ func finalizedCustodyRecoveryTx(packet *psbt.Packet) (*wire.MsgTx, error) {
 			}
 			signatures[hex.EncodeToString(signature.XOnlyPubKey)] = rawSignature
 		}
-		witness, err := csvClosure.Witness(leafScript.ControlBlock, signatures)
+		witness, err := closure.Witness(leafScript.ControlBlock, signatures)
 		if err != nil {
 			return nil, err
 		}
-		recoveryTx.TxIn[inputIndex].Witness = witness
+		finalTx.TxIn[inputIndex].Witness = witness
 	}
-	return recoveryTx, nil
+	return finalTx, nil
 }
 
 func (runtime *Runtime) liveOrCachedArkConfig(ctx context.Context, profileName string, state PlayerProfileState, client arksdk.ArkClient) (*CustodyArkConfig, error) {
@@ -264,7 +260,7 @@ func (runtime *Runtime) ExecuteCustodyRecoveryTransaction(profileName, signedPSB
 	if err != nil {
 		return CustodyRecoveryResult{}, err
 	}
-	parentTx, err := finalizedCustodyRecoveryTx(packet)
+	parentTx, err := finalizedSignedCustodyTxFromPacket(packet)
 	if err != nil {
 		return CustodyRecoveryResult{}, err
 	}

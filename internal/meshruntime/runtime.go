@@ -930,6 +930,8 @@ func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, e
 		SpectatorsAllowed:         boolFromMapDefault(input, "spectatorsAllowed", true),
 		Status:                    "announced",
 		TableID:                   tableID,
+		TurnChallengeWindowMS:     intFromMap(input, "turnChallengeWindowMs", defaultTurnChallengeWindowMS),
+		TurnTimeoutMode:           turnTimeoutModeFromCreateInput(input),
 		Visibility:                visibility,
 	}
 	if err := validateDealerlessBlindPot(config.SmallBlindSats, config.BigBlindSats, minOffchainSats); err != nil {
@@ -1322,6 +1324,110 @@ func (runtime *meshRuntime) SendAction(tableID string, action game.Action) (resu
 		return runtime.localTableView(*accepted), nil
 	}
 	return NativeMeshTableView{}, errors.New("action submission exhausted retries")
+}
+
+func (runtime *meshRuntime) OpenTurnChallenge(tableID string) (result NativeMeshTableView, err error) {
+	if err := runtime.Start(); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	if _, err := runtime.refreshLocalTable(tableID); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	err = runtime.store.withTableLock(tableID, func() error {
+		table, err := runtime.store.readTable(tableID)
+		if err != nil || table == nil {
+			return fmt.Errorf("table %s not found", tableID)
+		}
+		opened, err := runtime.openTurnChallengeLocked(table)
+		if err != nil {
+			return err
+		}
+		if !opened {
+			return errors.New("turn challenge cannot be opened for the current table state")
+		}
+		return runtime.persistAndReplicate(table, true)
+	})
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	accepted, err := runtime.requireLocalTable(tableID)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	return runtime.localTableView(*accepted), nil
+}
+
+func (runtime *meshRuntime) ResolveTurnChallenge(tableID, optionID string) (result NativeMeshTableView, err error) {
+	if err := runtime.Start(); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	if _, err := runtime.refreshLocalTable(tableID); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	optionID = strings.TrimSpace(optionID)
+	err = runtime.store.withTableLock(tableID, func() error {
+		table, err := runtime.store.readTable(tableID)
+		if err != nil || table == nil {
+			return fmt.Errorf("table %s not found", tableID)
+		}
+		if !turnChallengeMatchesTable(*table, table.PendingTurnChallenge) || !turnMenuMatchesTable(*table, table.PendingTurnMenu) {
+			return errors.New("turn challenge is not open for the current table state")
+		}
+		if optionID == "escape" {
+			escapeBundle := challengeEscapeBundle(table.PendingTurnMenu.ChallengeEnvelope)
+			if escapeBundle == nil {
+				return errors.New("turn challenge escape resolution is unavailable")
+			}
+			if !turnChallengeEscapeReady(table.PendingTurnChallenge) {
+				return errors.New("turn challenge escape is not yet eligible")
+			}
+			resolved, err := runtime.finalizeTurnChallengeEscapeLocked(table, *escapeBundle)
+			if err != nil {
+				return err
+			}
+			if !resolved {
+				return errors.New("turn challenge escape did not resolve")
+			}
+			return runtime.persistAndReplicate(table, true)
+		}
+		if optionID == "" || optionID == "timeout" {
+			timeoutBundle := challengeTimeoutBundle(table.PendingTurnMenu.ChallengeEnvelope)
+			if timeoutBundle == nil {
+				return errors.New("turn challenge timeout resolution is unavailable")
+			}
+			if table.PendingTurnChallenge == nil || strings.TrimSpace(table.PendingTurnChallenge.TimeoutEligibleAt) == "" || elapsedMillis(table.PendingTurnChallenge.TimeoutEligibleAt) < 0 {
+				return errors.New("turn challenge timeout is not yet eligible")
+			}
+			resolved, err := runtime.finalizeTurnChallengeResolutionLocked(table, table.PendingTurnMenu.TimeoutCandidate, *timeoutBundle)
+			if err != nil {
+				return err
+			}
+			if !resolved {
+				return errors.New("turn challenge timeout did not resolve")
+			}
+			return runtime.persistAndReplicate(table, true)
+		}
+		candidate, bundle, ok := runtime.challengeBundleForOptionID(*table, optionID)
+		if !ok {
+			return fmt.Errorf("turn challenge option %s is unavailable", optionID)
+		}
+		resolved, err := runtime.finalizeTurnChallengeResolutionLocked(table, *candidate, bundle)
+		if err != nil {
+			return err
+		}
+		if !resolved {
+			return fmt.Errorf("turn challenge option %s did not resolve", optionID)
+		}
+		return runtime.persistAndReplicate(table, true)
+	})
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	accepted, err := runtime.requireLocalTable(tableID)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	return runtime.localTableView(*accepted), nil
 }
 
 func (runtime *meshRuntime) RotateHost(tableID string) (NativeMeshTableView, error) {
@@ -1909,6 +2015,9 @@ func (runtime *meshRuntime) executeLocalCustodyExit(sourceRefs []tablecustody.VT
 func (runtime *meshRuntime) signLocalCustodyPSBT(current string) (string, error) {
 	if runtime.custodyPSBTSign != nil {
 		return runtime.custodyPSBTSign(runtime.profileName, current)
+	}
+	if runtime.config.UseMockSettlement {
+		return signCustodyPSBTWithKey(current, runtime.walletID.PrivateKeyHex, runtime.walletID.PublicKeyHex)
 	}
 	return runtime.walletRuntime.SignCustodyTransaction(runtime.profileName, current)
 }
@@ -3628,6 +3737,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		return errors.New("custody proof must mark replay validation")
 	}
 	hasRecoveryWitness := transition.Proof.RecoveryWitness != nil
+	hasChallengeWitness := transition.Proof.ChallengeWitness != nil
 	if transition.ArkIntentID != "" && transition.Proof.ArkIntentID != "" && transition.Proof.ArkIntentID != transition.ArkIntentID {
 		return errors.New("custody proof intent id mismatch")
 	}
@@ -3636,6 +3746,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	}
 	if requireArkSettlement &&
 		!hasRecoveryWitness &&
+		!hasChallengeWitness &&
 		transition.Kind != tablecustody.TransitionKindEmergencyExit &&
 		(strings.TrimSpace(transition.ArkIntentID) == "" || strings.TrimSpace(transition.ArkTxID) == "") {
 		return errors.New("custody proof is missing Ark settlement ids")
@@ -3646,7 +3757,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if err != nil {
 		return err
 	}
-	if transition.Proof.RequestHash != approvalTransition.Proof.RequestHash {
+	if !hasChallengeWitness && transition.Proof.RequestHash != approvalTransition.Proof.RequestHash {
 		return errors.New("custody proof request hash mismatch")
 	}
 	expectedRecoverySourceRefs := sourcePotRecoveryRefs(&transition.NextState)
@@ -3659,11 +3770,18 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		}
 	}
 	required := runtime.requiredCustodySigners(table, transition)
-	if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
-		return err
+	if !(hasChallengeWitness && transition.Kind == tablecustody.TransitionKindTurnChallengeEscape) {
+		if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
+			return err
+		}
 	}
-	if err := validateAcceptedCustodyRefs(previous, transition, requireArkSettlement && !hasRecoveryWitness); err != nil {
-		return err
+	if !hasChallengeWitness {
+		if err := validateAcceptedCustodyRefs(previous, transition, requireArkSettlement && !hasRecoveryWitness); err != nil {
+			return err
+		}
+	}
+	if hasChallengeWitness {
+		return runtime.validateAcceptedCustodyChallengeWitness(table, previous, transition)
 	}
 	if hasRecoveryWitness {
 		return runtime.validateAcceptedCustodyRecoveryWitness(table, previous, transition)
@@ -3675,7 +3793,15 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 }
 
 func (runtime *meshRuntime) validateCustodyApprovals(table nativeTableState, transition tablecustody.CustodyTransition, required []string) error {
-	requestHash := strings.TrimSpace(transition.Proof.RequestHash)
+	approvalTransition := cloneJSON(transition)
+	if sourceTable, sourceTransition, ok, err := challengeResolutionApprovalSource(table, transition); err != nil {
+		return err
+	} else if ok {
+		table = sourceTable
+		approvalTransition = sourceTransition
+		approvalTransition.Proof.RequestHash = strings.TrimSpace(transition.Proof.RequestHash)
+	}
+	requestHash := strings.TrimSpace(approvalTransition.Proof.RequestHash)
 	if requestHash == "" {
 		return errors.New("custody proof request hash is missing")
 	}
@@ -3700,7 +3826,7 @@ func (runtime *meshRuntime) validateCustodyApprovals(table nativeTableState, tra
 		if approval.WalletPubkeyHex != "" && approval.WalletPubkeyHex != seat.WalletPubkeyHex {
 			return fmt.Errorf("custody approval pubkey mismatch for %s", approval.PlayerID)
 		}
-		if err := verifyCustodyApproval(seat, transition, approval); err != nil {
+		if err := verifyCustodyApproval(seat, approvalTransition, approval); err != nil {
 			return fmt.Errorf("custody approval verification failed for %s: %w", approval.PlayerID, err)
 		}
 		approvalByPlayer[approval.PlayerID] = approval
@@ -4008,6 +4134,7 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 	canAct := false
 	legalActions := []game.LegalAction{}
 	var turnMenu *NativePendingTurnMenu
+	var turnChallenge *NativePendingTurnChallenge
 	if runtime.walletID.PlayerID != "" {
 		myPlayerID = runtime.walletID.PlayerID
 	}
@@ -4025,12 +4152,19 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 				seatIndex := seat.SeatIndex
 				canAct = table.ActiveHand.State.ActingSeatIndex != nil && *table.ActiveHand.State.ActingSeatIndex == seat.SeatIndex
 				if canAct {
+					if turnChallengeMatchesTable(table, table.PendingTurnChallenge) {
+						turnChallenge = cloneJSON(table.PendingTurnChallenge)
+						canAct = false
+						legalActions = nil
+					}
 					if turnMenuMatchesTable(table, table.PendingTurnMenu) &&
 						table.PendingTurnMenu.ActingPlayerID == seat.PlayerID &&
 						runtime.validatePendingTurnMenu(table, table.PendingTurnMenu) == nil {
 						turnMenu = cloneJSON(table.PendingTurnMenu)
-						legalActions = exactMenuLegalActions(turnMenu)
-						if strings.TrimSpace(turnMenu.SelectedCandidateHash) != "" {
+						if !turnChallengeMatchesTable(table, table.PendingTurnChallenge) {
+							legalActions = exactMenuLegalActions(turnMenu)
+						}
+						if turnChallengeMatchesTable(table, table.PendingTurnChallenge) || strings.TrimSpace(turnMenu.SelectedCandidateHash) != "" {
 							canAct = false
 						}
 					} else if game.PhaseAllowsActions(table.ActiveHand.State.Phase) {
@@ -4053,15 +4187,17 @@ func (runtime *meshRuntime) localTableView(table nativeTableState) NativeMeshTab
 		LatestFullySignedSnapshot: cloneSnapshot(table.LatestFullySignedSnapshot),
 		LatestSnapshot:            cloneSnapshot(table.LatestSnapshot),
 		Local: NativeTableLocalView{
-			CanAct:       canAct,
-			LegalActions: legalActions,
-			MyHoleCards:  myHoleCards,
-			MyPlayerID:   myPlayerID,
-			MySeatIndex:  mySeatIndex,
-			TurnMenu:     turnMenu,
+			CanAct:        canAct,
+			LegalActions:  legalActions,
+			MyHoleCards:   myHoleCards,
+			MyPlayerID:    myPlayerID,
+			MySeatIndex:   mySeatIndex,
+			TurnChallenge: turnChallenge,
+			TurnMenu:      turnMenu,
 		},
-		PendingTurnMenu: cloneJSON(table.PendingTurnMenu),
-		PublicState:     clonePublicState(table.PublicState),
+		PendingTurnChallenge: cloneJSON(table.PendingTurnChallenge),
+		PendingTurnMenu:      cloneJSON(table.PendingTurnMenu),
+		PublicState:          clonePublicState(table.PublicState),
 	}
 }
 
@@ -4716,12 +4852,6 @@ func (runtime *meshRuntime) validateTableSyncRequest(request nativeTableSyncRequ
 	if !timestampWithinWindow(request.SentAt, nativeTableSyncAuthMaxAge) {
 		return errors.New("sync request is stale")
 	}
-	if request.SenderPeerID != request.Table.CurrentHost.Peer.PeerID {
-		return errors.New("sync request sender does not match table host")
-	}
-	if request.SenderProtocolPubkeyHex != request.Table.CurrentHost.Peer.ProtocolPubkeyHex {
-		return errors.New("sync request protocol key does not match table host")
-	}
 	tableHash, err := settlementcore.HashStructuredDataHex(request.Table)
 	if err != nil {
 		return err
@@ -4736,6 +4866,22 @@ func (runtime *meshRuntime) validateTableSyncRequest(request nativeTableSyncRequ
 	existing, err := runtime.store.readTable(request.Table.Config.TableID)
 	if err != nil {
 		return err
+	}
+	allowNonHostChallengeSync := runtime.allowNonHostChallengeSync(existing, request.Table, request.SenderPeerID)
+	expectedProtocolPubkey := strings.TrimSpace(request.Table.CurrentHost.Peer.ProtocolPubkeyHex)
+	if !allowNonHostChallengeSync {
+		if request.SenderPeerID != request.Table.CurrentHost.Peer.PeerID {
+			return errors.New("sync request sender does not match table host")
+		}
+	} else if existing != nil {
+		protocolPubkeyHex, ok := participantProtocolPubkeyForPeer(*existing, request.SenderPeerID)
+		if !ok {
+			return errors.New("sync request sender is not an authorized seated peer")
+		}
+		expectedProtocolPubkey = strings.TrimSpace(protocolPubkeyHex)
+	}
+	if request.SenderProtocolPubkeyHex != expectedProtocolPubkey {
+		return errors.New("sync request protocol key does not match the authorized sender")
 	}
 	return runtime.validateSyncTransition(existing, request.Table, request.SenderPeerID)
 }
@@ -4889,13 +5035,17 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 		return err
 	}
 	if existing == nil {
-		return runtime.validateAcceptedPendingTurnMenu(normalized, normalized.PendingTurnMenu)
+		if err := runtime.validateAcceptedPendingTurnMenu(normalized, normalized.PendingTurnMenu); err != nil {
+			return err
+		}
+		return runtime.validateAcceptedPendingTurnChallenge(normalized, normalized.PendingTurnChallenge)
 	}
 	if incoming.CurrentEpoch < existing.CurrentEpoch {
 		return errors.New("sync request would roll back table epoch")
 	}
+	allowNonHostChallengeSync := runtime.allowNonHostChallengeSync(existing, incoming, senderPeerID)
 	if incoming.CurrentEpoch == existing.CurrentEpoch {
-		if senderPeerID != existing.CurrentHost.Peer.PeerID {
+		if senderPeerID != existing.CurrentHost.Peer.PeerID && !allowNonHostChallengeSync {
 			return errors.New("sync request sender does not match the current host")
 		}
 		if len(incoming.Events) < len(existing.Events) {
@@ -4908,7 +5058,10 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 	if err := runtime.validateAcceptedHostTransition(existing, incoming, "sync request"); err != nil {
 		return err
 	}
-	return runtime.validateAcceptedPendingTurnMenu(normalized, normalized.PendingTurnMenu)
+	if err := runtime.validateAcceptedPendingTurnMenu(normalized, normalized.PendingTurnMenu); err != nil {
+		return err
+	}
+	return runtime.validateAcceptedPendingTurnChallenge(normalized, normalized.PendingTurnChallenge)
 }
 
 func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
@@ -4928,7 +5081,10 @@ func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableSta
 		return err
 	}
 	if existing == nil {
-		return runtime.validateAcceptedPendingTurnMenu(incoming, incoming.PendingTurnMenu)
+		if err := runtime.validateAcceptedPendingTurnMenu(incoming, incoming.PendingTurnMenu); err != nil {
+			return err
+		}
+		return runtime.validateAcceptedPendingTurnChallenge(incoming, incoming.PendingTurnChallenge)
 	}
 	if incoming.CurrentEpoch < existing.CurrentEpoch {
 		return errors.New("remote table would roll back table epoch")
@@ -4944,7 +5100,10 @@ func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableSta
 	if err := runtime.validateAcceptedHostTransition(existing, incoming, "remote table"); err != nil {
 		return err
 	}
-	return runtime.validateAcceptedPendingTurnMenu(incoming, incoming.PendingTurnMenu)
+	if err := runtime.validateAcceptedPendingTurnMenu(incoming, incoming.PendingTurnMenu); err != nil {
+		return err
+	}
+	return runtime.validateAcceptedPendingTurnChallenge(incoming, incoming.PendingTurnChallenge)
 }
 
 func (runtime *meshRuntime) validateAcceptedHostTransition(existing *nativeTableState, incoming nativeTableState, source string) error {

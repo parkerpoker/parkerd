@@ -210,8 +210,18 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 	if transition.Proof.ArkTxID != "" && transition.ArkTxID != "" && transition.Proof.ArkTxID != transition.ArkTxID {
 		return fmt.Errorf("custody proof txid mismatch")
 	}
-	if transition.Proof.RecoveryWitness != nil && transition.Proof.SettlementWitness != nil {
-		return fmt.Errorf("custody proof cannot carry both settlement and recovery witnesses")
+	witnessKinds := 0
+	if transition.Proof.SettlementWitness != nil {
+		witnessKinds++
+	}
+	if transition.Proof.RecoveryWitness != nil {
+		witnessKinds++
+	}
+	if transition.Proof.ChallengeWitness != nil {
+		witnessKinds++
+	}
+	if witnessKinds > 1 {
+		return fmt.Errorf("custody proof cannot carry multiple witness types")
 	}
 	if transition.Proof.SettlementWitness != nil {
 		witness := transition.Proof.SettlementWitness
@@ -266,6 +276,52 @@ func ValidateTransition(previous *CustodyState, transition CustodyTransition) er
 		}
 		if transition.ArkIntentID != "" || transition.ArkTxID != "" || transition.Proof.ArkIntentID != "" || transition.Proof.ArkTxID != "" {
 			return fmt.Errorf("custody recovery witness cannot coexist with Ark settlement ids")
+		}
+	}
+	if bundle := transition.Proof.ChallengeBundle; bundle != nil {
+		if bundle.Kind == "" {
+			return fmt.Errorf("custody challenge bundle is missing a kind")
+		}
+		if len(bundle.SourceRefs) == 0 {
+			return fmt.Errorf("custody challenge bundle is missing source refs")
+		}
+		if len(bundle.AuthorizedOutputs) == 0 {
+			return fmt.Errorf("custody challenge bundle is missing authorized outputs")
+		}
+		if bundle.SignedPSBT == "" {
+			return fmt.Errorf("custody challenge bundle is missing signed psbt")
+		}
+		if expected := HashCustodyChallengeBundle(*bundle); bundle.BundleHash != "" && bundle.BundleHash != expected {
+			return fmt.Errorf("custody challenge bundle hash mismatch")
+		}
+	}
+	if witness := transition.Proof.ChallengeWitness; witness != nil {
+		if transition.Kind != TransitionKindAction &&
+			transition.Kind != TransitionKindTimeout &&
+			transition.Kind != TransitionKindTurnChallengeOpen &&
+			transition.Kind != TransitionKindTurnChallengeEscape {
+			return fmt.Errorf("custody challenge witness is only valid for action, timeout, turn-challenge-open, or turn-challenge-escape transitions")
+		}
+		if witness.BundleHash == "" {
+			return fmt.Errorf("custody challenge witness is missing bundle hash")
+		}
+		if witness.TransactionID == "" {
+			return fmt.Errorf("custody challenge witness is missing transaction id")
+		}
+		if len(witness.BroadcastTxIDs) == 0 {
+			return fmt.Errorf("custody challenge witness is missing broadcast txids")
+		}
+		if transition.Proof.FinalizedAt != "" && witness.ExecutedAt != "" && witness.ExecutedAt != transition.Proof.FinalizedAt {
+			return fmt.Errorf("custody challenge witness finalized timestamp mismatch")
+		}
+		if transition.ArkIntentID != "" || transition.ArkTxID != "" || transition.Proof.ArkIntentID != "" || transition.Proof.ArkTxID != "" {
+			return fmt.Errorf("custody challenge witness cannot coexist with Ark settlement ids")
+		}
+		if transition.Proof.ChallengeBundle == nil {
+			return fmt.Errorf("custody challenge witness is missing its bundle")
+		}
+		if transition.Proof.ChallengeBundle.BundleHash != "" && transition.Proof.ChallengeBundle.BundleHash != witness.BundleHash {
+			return fmt.Errorf("custody challenge witness bundle hash mismatch")
 		}
 	}
 	expectedHash := HashCustodyTransition(transition)

@@ -61,6 +61,8 @@ The daemon still exposes the existing local RPC methods used by the CLI and cont
 - `meshTableJoin`
 - `meshGetTable`
 - `meshSendAction`
+- `meshOpenTurnChallenge`
+- `meshResolveTurnChallenge`
 - `meshRotateHost`
 - `meshCashOut`
 - `meshRenew`
@@ -237,6 +239,7 @@ Transition kinds currently used by the runtime include:
 - `blind-post`
 - `action`
 - `timeout`
+- `turn-challenge-open`
 - `showdown-payout`
 - `cash-out`
 - `emergency-exit`
@@ -285,6 +288,45 @@ Hashing and approval semantics follow the same split:
 - recovery execution later appends a normal semantic `timeout` or `showdown-payout` transition whose proof commits to the executed `RecoveryWitness`
 
 Live Ark/indexer checks remain in the current protocol only where liveness or spendability matters, such as join funding admission and other interactive safety checks.
+
+## Turn Challenge Fallback
+
+New tables now default `turnTimeoutMode` to `chain-challenge`. Older accepted tables that omit the field are still interpreted as legacy `direct` timeout tables for backward compatibility.
+
+`PendingTurnMenu` now carries two parallel artifacts for the same deterministic finite menu:
+
+- the ordinary prebuilt finite-menu candidate bundles used by the cooperative Ark fast path
+- a deterministic `ChallengeEnvelope` containing:
+  - one fully signed onchain `turn-challenge-open` bundle at locktime `D`
+  - one fully signed option-resolution bundle per menu option
+  - one fully signed timeout-resolution bundle at locktime `D + C`
+
+`turn-challenge-open` always consumes the full live turn bankroll:
+
+- all current stack refs
+- all current pot refs
+
+It reissues the entire live bankroll into one dedicated `TurnChallengeRef`. The challenge path is intentionally a full reissuance path, not a delta path.
+
+While `PendingTurnChallenge` exists:
+
+- the hand decision index, acting player, and legal finite menu stay fixed
+- the logical balances remain the same
+- the custody source for fallback resolution is `PendingTurnChallenge.challengeRef`, not the per-stack or per-pot refs in the pre-open state
+- ordinary `meshSendAction` is disabled for that turn
+
+Resolution then splits:
+
+- `meshResolveTurnChallenge` with an option id executes the matching pre-signed option-resolution bundle and appends the ordinary `PlayerAction` event for that option
+- `meshResolveTurnChallenge` with `optionId="timeout"` executes the pre-signed timeout-resolution bundle once `timeoutEligibleAt` has passed
+- host tick also auto-finalizes the timeout-resolution bundle after `D + C` if no option bundle resolved first
+
+The accepted transition kind after challenge resolution is still `action` or `timeout`. What changes is the proof surface:
+
+- `turn-challenge-open`, challenge-resolved `action`, and challenge-resolved `timeout` transitions carry `CustodyProof.ChallengeBundle` plus `CustodyProof.ChallengeWitness`
+- those transitions do not depend on Ark intent registration, `CandidateIntentAck`, or live Ark batch registration
+
+The ordinary cooperative fast path is unchanged. Selected ordinary finite-menu candidates still carry `SignedProofPSBT` and `RegisterMessage`, and Parker still uses Ark intent registration plus the resulting settlement witness when that fast path actually finalizes first.
 
 ## Hand And Money Sequencing
 

@@ -80,6 +80,12 @@ func (runtime *meshRuntime) arkCustodyConfig() (walletpkg.CustodyArkConfig, erro
 	if config.UnilateralExitDelay.Value == 0 {
 		config.UnilateralExitDelay = arklib.RelativeLocktime{Type: arklib.LocktimeTypeBlock, Value: 512}
 	}
+	if !runtime.config.UseMockSettlement &&
+		runtime.custodyBatchExecute != nil &&
+		strings.TrimSpace(runtime.candidateIntentAckSigningKeyHex(config.SignerPubkeyHex)) == "" {
+		_, mockSignerPubkeyHex := mockOperatorSigningKeyHex("parker-mock-ark-signer")
+		config.SignerPubkeyHex = mockSignerPubkeyHex
+	}
 	return config, nil
 }
 
@@ -192,6 +198,10 @@ func (runtime *meshRuntime) walletPubkeyHexForPlayer(table nativeTableState, pla
 }
 
 func (runtime *meshRuntime) stackOutputSpec(table nativeTableState, playerID string, amountSats int) (custodyOutputSpec, error) {
+	return runtime.stackOutputSpecForTransition(table, nil, playerID, amountSats)
+}
+
+func (runtime *meshRuntime) stackOutputSpecForTransition(table nativeTableState, transition *tablecustody.CustodyTransition, playerID string, amountSats int) (custodyOutputSpec, error) {
 	config, err := runtime.arkCustodyConfig()
 	if err != nil {
 		return custodyOutputSpec{}, err
@@ -208,7 +218,33 @@ func (runtime *meshRuntime) stackOutputSpec(table nativeTableState, playerID str
 	if err != nil {
 		return custodyOutputSpec{}, err
 	}
-	vtxoScript := arkscript.NewDefaultVtxoScript(ownerPubkey, signerPubkey, config.UnilateralExitDelay)
+	var vtxoScript *arkscript.TapscriptsVtxoScript
+	challengeOpenLeaf := arkscript.Closure(nil)
+	if transition != nil {
+		leaf, _, err := runtime.turnChallengeOpenLeaf(table, &transition.NextState)
+		if err != nil {
+			return custodyOutputSpec{}, err
+		}
+		if leaf != nil {
+			challengeOpenLeaf = leaf
+		}
+	}
+	if challengeOpenLeaf == nil {
+		vtxoScript = arkscript.NewDefaultVtxoScript(ownerPubkey, signerPubkey, config.UnilateralExitDelay)
+	} else {
+		vtxoScript = &arkscript.TapscriptsVtxoScript{
+			Closures: []arkscript.Closure{
+				&arkscript.MultisigClosure{PubKeys: []*btcec.PublicKey{ownerPubkey, signerPubkey}},
+				challengeOpenLeaf,
+				&arkscript.CSVMultisigClosure{
+					Locktime: config.UnilateralExitDelay,
+					MultisigClosure: arkscript.MultisigClosure{
+						PubKeys: []*btcec.PublicKey{ownerPubkey},
+					},
+				},
+			},
+		}
+	}
 	tapscripts, err := vtxoScript.Encode()
 	if err != nil {
 		return custodyOutputSpec{}, err
@@ -315,6 +351,11 @@ func (runtime *meshRuntime) potOutputSpec(table nativeTableState, transition tab
 	collaborativeKeys := append([]*btcec.PublicKey{}, playerPubkeys...)
 	collaborativeKeys = append(collaborativeKeys, operatorPubkey)
 	closures = append(closures, &arkscript.MultisigClosure{PubKeys: collaborativeKeys})
+	if challengeOpenLeaf, _, err := runtime.turnChallengeOpenLeaf(table, &transition.NextState); err != nil {
+		return custodyOutputSpec{}, err
+	} else if challengeOpenLeaf != nil {
+		closures = append(closures, challengeOpenLeaf)
+	}
 
 	if transition.NextState.ActionDeadlineAt != "" {
 		locktime, err := timeoutLocktimeFromISO(transition.NextState.ActionDeadlineAt)
@@ -430,6 +471,23 @@ func (runtime *meshRuntime) potSliceRefsReusableForTransition(table nativeTableS
 		sameCanonicalStrings(ref.Tapscripts, spec.Tapscripts)
 }
 
+func (runtime *meshRuntime) stackClaimRefsReusableForTransition(table nativeTableState, transition tablecustody.CustodyTransition, previous, next tablecustody.StackClaim) bool {
+	if !reflect.DeepEqual(comparableStackClaim(previous), comparableStackClaim(next)) {
+		return false
+	}
+	if len(previous.VTXORefs) != 1 {
+		return false
+	}
+	spec, err := runtime.stackOutputSpecForTransition(table, &transition, next.PlayerID, stackClaimRefAmount(next))
+	if err != nil {
+		return false
+	}
+	ref := previous.VTXORefs[0]
+	return ref.AmountSats == spec.AmountSats &&
+		ref.Script == spec.Script &&
+		sameCanonicalStrings(ref.Tapscripts, spec.Tapscripts)
+}
+
 func (runtime *meshRuntime) playerIDByXOnlyPubkey(table nativeTableState, xOnlyHex string) (string, bool, error) {
 	for _, seat := range table.Seats {
 		seatXOnly, err := xOnlyPubkeyHexFromCompressed(seat.WalletPubkeyHex)
@@ -475,13 +533,16 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 	bestLocktime := arklib.AbsoluteLocktime(0)
 	bestScript := []byte(nil)
 	bestPlayers := []string(nil)
+	bestSignerXOnlyPubkeys := []string(nil)
 	triedClosures := make([]string, 0, len(vtxoScript.ForfeitClosures()))
 	for index, closure := range vtxoScript.ForfeitClosures() {
 		keys := make([]string, 0)
+		signerXOnlyPubkeys := make([]string, 0)
 		unmappedNonOperatorKeys := 0
 		appendClosureKeys := func(pubkeys []*btcec.PublicKey) error {
 			for _, key := range pubkeys {
 				xOnly := hex.EncodeToString(schnorr.SerializePubKey(key))
+				signerXOnlyPubkeys = append(signerXOnlyPubkeys, xOnly)
 				if xOnly == operatorXOnly {
 					continue
 				}
@@ -522,6 +583,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 				bestIndex = index
 				bestLocktime = cltv.Locktime
 				bestPlayers = keys
+				bestSignerXOnlyPubkeys = uniqueNonEmptyStrings(signerXOnlyPubkeys)
 				bestScript, err = closure.Script()
 				if err != nil {
 					return custodySpendPath{}, err
@@ -536,6 +598,7 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 			bestLocktime = cltv.Locktime
 		}
 		bestPlayers = keys
+		bestSignerXOnlyPubkeys = uniqueNonEmptyStrings(signerXOnlyPubkeys)
 		bestScript, err = closure.Script()
 		if err != nil {
 			return custodySpendPath{}, err
@@ -558,13 +621,14 @@ func (runtime *meshRuntime) selectCustodySpendPath(table nativeTableState, ref t
 		return custodySpendPath{}, err
 	}
 	return custodySpendPath{
-		LeafProof:        leafProof,
-		Locktime:         bestLocktime,
-		PKScript:         pkScript,
-		PlayerIDs:        bestPlayers,
-		Script:           bestScript,
-		Tapscripts:       tapscripts,
-		UsesCLTVLocktime: bestLocktime != 0,
+		LeafProof:          leafProof,
+		Locktime:           bestLocktime,
+		PKScript:           pkScript,
+		PlayerIDs:          bestPlayers,
+		SignerXOnlyPubkeys: bestSignerXOnlyPubkeys,
+		Script:             bestScript,
+		Tapscripts:         tapscripts,
+		UsesCLTVLocktime:   bestLocktime != 0,
 	}, nil
 }
 
@@ -595,7 +659,7 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 	for index := range transition.NextState.StackClaims {
 		nextClaim := transition.NextState.StackClaims[index]
 		prevClaim, hadPrev := prevStacks[nextClaim.PlayerID]
-		if hadPrev && reflect.DeepEqual(comparableStackClaim(prevClaim), comparableStackClaim(nextClaim)) {
+		if hadPrev && runtime.stackClaimRefsReusableForTransition(table, transition, prevClaim, nextClaim) {
 			transition.NextState.StackClaims[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
 			continue
 		}
@@ -628,13 +692,13 @@ func (runtime *meshRuntime) buildCustodySettlementPlan(table nativeTableState, t
 			}
 		}
 		if nextClaim.AmountSats > 0 {
-			output, err := runtime.stackOutputSpec(table, nextClaim.PlayerID, stackClaimRefAmount(nextClaim))
+			output, err := runtime.stackOutputSpecForTransition(table, &transition, nextClaim.PlayerID, stackClaimRefAmount(nextClaim))
 			if err != nil {
 				return nil, err
 			}
 			plan.Outputs = append(plan.Outputs, output)
 		} else if nextClaim.ReservedFeeSats > 0 {
-			output, err := runtime.stackOutputSpec(table, nextClaim.PlayerID, stackClaimRefAmount(nextClaim))
+			output, err := runtime.stackOutputSpecForTransition(table, &transition, nextClaim.PlayerID, stackClaimRefAmount(nextClaim))
 			if err != nil {
 				return nil, err
 			}

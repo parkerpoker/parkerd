@@ -48,7 +48,7 @@ func (runtime *meshRuntime) candidateIntentAckSigningKeyHex(operatorPubkeyHex st
 	if runtime.walletID.PublicKeyHex == operatorPubkeyHex {
 		return runtime.walletID.PrivateKeyHex
 	}
-	if runtime.config.UseMockSettlement {
+	if runtime.config.UseMockSettlement || runtime.custodyBatchExecute != nil {
 		privateKeyHex, publicKeyHex := mockOperatorSigningKeyHex("parker-mock-ark-signer")
 		if publicKeyHex == operatorPubkeyHex {
 			return privateKeyHex
@@ -440,6 +440,9 @@ func (runtime *meshRuntime) finalizeSelectedTurnCandidateLocked(table *nativeTab
 }
 
 func (runtime *meshRuntime) buildActionSelectionRequest(table nativeTableState, action game.Action) (nativeActionSelectionRequest, error) {
+	if turnChallengeMatchesTable(table, table.PendingTurnChallenge) {
+		return nativeActionSelectionRequest{}, errors.New("turn challenge is open for this turn; ordinary SendAction is disabled")
+	}
 	if err := runtime.validatePendingTurnMenu(table, table.PendingTurnMenu); err != nil {
 		return nativeActionSelectionRequest{}, errors.New("turn menu is not available for the current action")
 	}
@@ -483,6 +486,9 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionSe
 		}
 		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
 			return errors.New("action selection must be sent to the current host")
+		}
+		if turnChallengeMatchesTable(*table, table.PendingTurnChallenge) {
+			return errors.New("turn challenge is open for this turn")
 		}
 		if err := runtime.ensurePendingTurnMenuLocked(table); err != nil {
 			return err
@@ -534,6 +540,9 @@ func (runtime *meshRuntime) persistDirectActionSelection(tableID string, selecti
 		table, err := runtime.store.readTable(tableID)
 		if err != nil || table == nil {
 			return fmt.Errorf("table %s not found", tableID)
+		}
+		if turnChallengeMatchesTable(*table, table.PendingTurnChallenge) {
+			return errors.New("turn challenge is open for this turn")
 		}
 		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
 			return errors.New("turn menu is unavailable for direct action fallback")

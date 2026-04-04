@@ -40,12 +40,20 @@ func HashCustodyRecoveryBundle(bundle CustodyRecoveryBundle) string {
 	return HashValue(canonical)
 }
 
+func HashCustodyChallengeBundle(bundle CustodyChallengeBundle) string {
+	canonical := canonicalChallengeBundle(bundle)
+	canonical.BundleHash = ""
+	return HashValue(canonical)
+}
+
 func HashCustodyRequest(transition CustodyTransition) string {
 	unsigned := canonicalTransition(transition)
 	unsigned.Approvals = nil
 	unsigned.ArkIntentID = ""
 	unsigned.ArkTxID = ""
 	unsigned.Proof.CandidateIntentAck = nil
+	unsigned.Proof.ChallengeBundle = nil
+	unsigned.Proof.ChallengeWitness = nil
 	unsigned.Proof.ArkIntentID = ""
 	unsigned.Proof.ArkTxID = ""
 	unsigned.Proof.ExitProofRef = ""
@@ -137,6 +145,14 @@ func canonicalTransition(transition CustodyTransition) CustodyTransition {
 		canonicalAck := canonicalCandidateIntentAck(*transition.Proof.CandidateIntentAck)
 		transition.Proof.CandidateIntentAck = &canonicalAck
 	}
+	if transition.Proof.ChallengeBundle != nil {
+		canonicalBundle := canonicalChallengeBundle(*transition.Proof.ChallengeBundle)
+		transition.Proof.ChallengeBundle = &canonicalBundle
+	}
+	if transition.Proof.ChallengeWitness != nil {
+		canonicalWitness := canonicalChallengeWitness(*transition.Proof.ChallengeWitness)
+		transition.Proof.ChallengeWitness = &canonicalWitness
+	}
 	transition.Proof.VTXORefs = append([]VTXORef(nil), transition.Proof.VTXORefs...)
 	sort.SliceStable(transition.Proof.VTXORefs, func(left, right int) bool {
 		return compareVTXORefs(transition.Proof.VTXORefs[left], transition.Proof.VTXORefs[right]) < 0
@@ -180,6 +196,43 @@ func canonicalRecoveryBundle(bundle CustodyRecoveryBundle) CustodyRecoveryBundle
 }
 
 func canonicalRecoveryWitness(witness CustodyRecoveryWitness) CustodyRecoveryWitness {
+	witness.BroadcastTxIDs = append([]string(nil), witness.BroadcastTxIDs...)
+	sort.Strings(witness.BroadcastTxIDs)
+	return witness
+}
+
+func canonicalChallengeBundle(bundle CustodyChallengeBundle) CustodyChallengeBundle {
+	bundle.AuthorizedOutputs = append([]CustodyChallengeOutput(nil), bundle.AuthorizedOutputs...)
+	for index := range bundle.AuthorizedOutputs {
+		bundle.AuthorizedOutputs[index].Tapscripts = append([]string(nil), bundle.AuthorizedOutputs[index].Tapscripts...)
+		sort.Strings(bundle.AuthorizedOutputs[index].Tapscripts)
+	}
+	sort.SliceStable(bundle.AuthorizedOutputs, func(left, right int) bool {
+		leftOutput := bundle.AuthorizedOutputs[left]
+		rightOutput := bundle.AuthorizedOutputs[right]
+		switch {
+		case leftOutput.ClaimKey != rightOutput.ClaimKey:
+			return leftOutput.ClaimKey < rightOutput.ClaimKey
+		case leftOutput.OwnerPlayerID != rightOutput.OwnerPlayerID:
+			return leftOutput.OwnerPlayerID < rightOutput.OwnerPlayerID
+		case leftOutput.AmountSats != rightOutput.AmountSats:
+			return leftOutput.AmountSats < rightOutput.AmountSats
+		default:
+			return leftOutput.Script < rightOutput.Script
+		}
+	})
+	bundle.SourceRefs = append([]VTXORef(nil), bundle.SourceRefs...)
+	sort.SliceStable(bundle.SourceRefs, func(left, right int) bool {
+		return compareVTXORefs(bundle.SourceRefs[left], bundle.SourceRefs[right]) < 0
+	})
+	if bundle.TimeoutResolution != nil {
+		canonicalResolution := canonicalTimeoutResolution(*bundle.TimeoutResolution)
+		bundle.TimeoutResolution = &canonicalResolution
+	}
+	return bundle
+}
+
+func canonicalChallengeWitness(witness CustodyChallengeWitness) CustodyChallengeWitness {
 	witness.BroadcastTxIDs = append([]string(nil), witness.BroadcastTxIDs...)
 	sort.Strings(witness.BroadcastTxIDs)
 	return witness

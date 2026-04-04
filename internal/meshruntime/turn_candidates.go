@@ -25,12 +25,36 @@ func tableHasActionableTurn(table nativeTableState) bool {
 		table.LatestCustodyState != nil
 }
 
+func turnMenuSourceStateHash(table nativeTableState) string {
+	if turnChallengeMatchesTable(table, table.PendingTurnChallenge) && table.PendingTurnChallenge != nil && strings.TrimSpace(table.PendingTurnChallenge.SourceStateHash) != "" {
+		return table.PendingTurnChallenge.SourceStateHash
+	}
+	return latestCustodyStateHash(table)
+}
+
+func turnMenuValidationTable(table nativeTableState) nativeTableState {
+	if !turnChallengeMatchesTable(table, table.PendingTurnChallenge) || len(table.CustodyTransitions) == 0 {
+		return table
+	}
+	lastIndex := len(table.CustodyTransitions) - 1
+	if table.CustodyTransitions[lastIndex].Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		return table
+	}
+	previous := previousCustodyStateForTransition(table, lastIndex)
+	if previous == nil {
+		return table
+	}
+	validation := cloneJSON(table)
+	validation.LatestCustodyState = cloneCustodyState(previous)
+	return validation
+}
+
 func turnMenuMatchesTable(table nativeTableState, menu *NativePendingTurnMenu) bool {
 	if menu == nil || !tableHasActionableTurn(table) {
 		return false
 	}
 	return menu.TurnAnchorHash == turnAnchorHash(table) &&
-		menu.PrevCustodyStateHash == latestCustodyStateHash(table) &&
+		menu.PrevCustodyStateHash == turnMenuSourceStateHash(table) &&
 		menu.HandID == table.ActiveHand.State.HandID &&
 		menu.DecisionIndex == custodyDecisionIndex(&table.ActiveHand.State) &&
 		menu.ActingPlayerID == seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex)
@@ -142,6 +166,13 @@ func (runtime *meshRuntime) buildPendingTurnMenuForDelivery(table nativeTableSta
 		return NativePendingTurnMenu{}, err
 	}
 	menu.TimeoutCandidate = timeoutCandidate
+	if turnTimeoutModeForTable(table) == turnTimeoutModeChainChallenge {
+		envelope, err := runtime.buildChallengeEnvelope(buildTable, &menu)
+		if err != nil {
+			return NativePendingTurnMenu{}, err
+		}
+		menu.ChallengeEnvelope = envelope
+	}
 	if err := runtime.validatePendingTurnMenu(buildTable, &menu); err != nil {
 		return NativePendingTurnMenu{}, err
 	}
@@ -251,7 +282,8 @@ func (runtime *meshRuntime) validatePendingTurnMenu(table nativeTableState, menu
 	if !turnMenuMatchesTable(table, menu) {
 		return errors.New("pending turn menu does not match the current turn")
 	}
-	expectedOptions, err := deriveFiniteMenuOptions(table.ActiveHand.State, table)
+	validationTable := turnMenuValidationTable(table)
+	expectedOptions, err := deriveFiniteMenuOptions(validationTable.ActiveHand.State, validationTable)
 	if err != nil {
 		return err
 	}
@@ -275,12 +307,15 @@ func (runtime *meshRuntime) validatePendingTurnMenu(table nativeTableState, menu
 		if menu.Options[index].CandidateHash != candidate.CandidateHash {
 			return fmt.Errorf("pending turn menu candidate hash mismatch for %s", expectedOptions[index].OptionID)
 		}
-		if err := runtime.validateTurnCandidateBundle(table, menu, candidate, &expectedOptions[index]); err != nil {
+		if err := runtime.validateTurnCandidateBundle(validationTable, menu, candidate, &expectedOptions[index]); err != nil {
 			return fmt.Errorf("pending turn candidate %s is invalid: %w", expectedOptions[index].OptionID, err)
 		}
 	}
-	if err := runtime.validateTurnCandidateBundle(table, menu, menu.TimeoutCandidate, nil); err != nil {
+	if err := runtime.validateTurnCandidateBundle(validationTable, menu, menu.TimeoutCandidate, nil); err != nil {
 		return fmt.Errorf("pending timeout candidate is invalid: %w", err)
+	}
+	if err := runtime.validateChallengeEnvelope(validationTable, menu); err != nil {
+		return err
 	}
 	if strings.TrimSpace(menu.SelectedCandidateHash) == "" {
 		if menu.AcceptedIntentAck != nil {
@@ -295,7 +330,7 @@ func (runtime *meshRuntime) validatePendingTurnMenu(table nativeTableState, menu
 	if menu.AcceptedIntentAck == nil {
 		return nil
 	}
-	if err := runtime.verifyCandidateIntentAck(table, selected, *menu.AcceptedIntentAck); err != nil {
+	if err := runtime.verifyCandidateIntentAck(validationTable, selected, *menu.AcceptedIntentAck); err != nil {
 		return err
 	}
 	return nil
