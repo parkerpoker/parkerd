@@ -54,10 +54,9 @@ func (sm *SessionManager) Request(peerURL string, peerStaticPub []byte, request 
 
 	resp, err := sess.RoundTrip(request, sm.config.RequestTimeout)
 	if err != nil {
-		// Tear down only on broken connections. Requests are multiplexed on the
-		// session, so a single timed-out RPC must not reset unrelated in-flight
-		// requests or force an unnecessary reconnect for later work.
-		if isConnBroken(err) {
+		// Timeouts indicate the session can no longer be trusted for future work:
+		// remove it so the next request reconnects instead of reusing a dead path.
+		if IsTransportTimeout(err) || isConnBroken(err) {
 			sm.removeSession(peerURL)
 		}
 		return TransportEnvelope{}, err
@@ -355,6 +354,7 @@ func (s *OutboundSession) RoundTrip(request TransportEnvelope, timeout time.Dura
 		}
 		return resp, nil
 	case <-timer.C:
+		s.Close()
 		return TransportEnvelope{}, &TransportError{Kind: ErrKindRequestTimeout, PeerURL: s.peerURL, Detail: fmt.Sprintf("timeout after %s", timeout)}
 	case <-s.closeCh:
 		return TransportEnvelope{}, &TransportError{Kind: ErrKindSessionClosed, PeerURL: s.peerURL}

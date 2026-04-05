@@ -1,12 +1,15 @@
 package meshruntime
 
 import (
+	"bufio"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +50,20 @@ func backgroundTaskCountForTest(runtime *meshRuntime) int {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	return runtime.backgroundTasks
+}
+
+type closeNotifyConn struct {
+	net.Conn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (conn *closeNotifyConn) Close() error {
+	err := conn.Conn.Close()
+	conn.once.Do(func() {
+		close(conn.closed)
+	})
+	return err
 }
 
 func TestExchangePeerTransportV3UsesVersion3EndToEnd(t *testing.T) {
@@ -184,6 +201,222 @@ func TestExchangePeerTransportV3RejectsWireDowngrade(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("downgrade test server: %v", err)
+	}
+}
+
+func TestExchangePeerTransportAutoRejectsDowngradeWhenRefreshStillAdvertisesV3(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	peerURL := "parker://" + listener.Addr().String()
+	advertisedPeer := host.self
+	advertisedPeer.Peer.PeerURL = peerURL
+
+	staticPrivBytes, err := hex.DecodeString(host.transportPrivate)
+	if err != nil {
+		t.Fatalf("decode host transport private key: %v", err)
+	}
+	staticPubBytes, err := hex.DecodeString(host.transportPublic)
+	if err != nil {
+		t.Fatalf("decode host transport public key: %v", err)
+	}
+
+	var manifestRequests atomic.Int32
+	var fallbackV2Requests atomic.Int32
+	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			if err := func() error {
+				defer conn.Close()
+
+				preface := make([]byte, transportpkg.V3PrefaceLen())
+				n, readErr := io.ReadFull(conn, preface)
+				if readErr == nil && n == transportpkg.V3PrefaceLen() && transportpkg.IsV3Preface(preface) {
+					noise, err := transportpkg.AcceptV3Session(conn, staticPrivBytes, staticPubBytes, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					request, err := transportpkg.ReadV3Request(conn, noise, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					response, err := host.buildEnvelope(request.MessageType+".response", request.Channel, request.TableID, "", []byte(`{}`), nil, request.MessageID)
+					if err != nil {
+						return err
+					}
+					response, err = host.signEnvelopeForWireVersion(response, 2)
+					if err != nil {
+						return err
+					}
+					if err := transportpkg.WriteV3Response(conn, noise, response, 5*time.Second); err != nil {
+						return err
+					}
+					return nil
+				}
+
+				reader := bufio.NewReader(io.MultiReader(strings.NewReader(string(preface[:n])), conn))
+				line, err := readTrimmedLine(reader)
+				if err != nil {
+					return err
+				}
+				var request transportpkg.TransportEnvelope
+				if err := json.Unmarshal([]byte(line), &request); err != nil {
+					return err
+				}
+				if request.MessageType == nativeTransportMessagePeerProbe {
+					manifestRequests.Add(1)
+					body, err := json.Marshal(advertisedPeer)
+					if err != nil {
+						return err
+					}
+					response, err := host.buildEnvelope(nativeTransportMessagePeerManifest, nativeTransportChannelDiscovery, "", "", body, nil, request.MessageID)
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(response)
+					if err != nil {
+						return err
+					}
+					if _, err := conn.Write(append(data, '\n')); err != nil {
+						return err
+					}
+					return nil
+				}
+
+				fallbackV2Requests.Add(1)
+				body := []byte(`{}`)
+				response, err := host.buildEnvelope(request.MessageType+".response", request.Channel, request.TableID, "", body, nil, request.MessageID)
+				if err != nil {
+					return err
+				}
+				data, err := json.Marshal(response)
+				if err != nil {
+					return err
+				}
+				if _, err := conn.Write(append(data, '\n')); err != nil {
+					return err
+				}
+				return nil
+			}(); err != nil {
+				select {
+				case serverErr <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	_, _, err = guest.exchangePeerTransportAuto(peerURL, func(peerInfo nativePeerSelf) (transportpkg.TransportEnvelope, string, error) {
+		return guest.newOutboundEnvelope("test.rpc", nativeTransportChannelTable, "table-1", peerInfo.Peer.PeerID, map[string]any{"ok": true}, "")
+	})
+	if err == nil {
+		t.Fatal("expected wire downgrade error")
+	}
+	if !transportpkg.IsWireDowngrade(err) {
+		t.Fatalf("expected wire downgrade error, got %v", err)
+	}
+
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	<-serverDone
+	select {
+	case err := <-serverErr:
+		t.Fatalf("downgrade auto server: %v", err)
+	default:
+	}
+	if manifestRequests.Load() != 2 {
+		t.Fatalf("expected initial and refreshed manifest fetches, got %d", manifestRequests.Load())
+	}
+	if fallbackV2Requests.Load() != 0 {
+		t.Fatalf("expected downgrade to stop before v2 fallback, got %d unexpected v2 retries", fallbackV2Requests.Load())
+	}
+}
+
+func TestHandleV3PeerTransportConnectionClosesConnOnLocalKeyDecodeFailure(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	closeSessionManagersForTest(t, host)
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+
+	wrapped := &closeNotifyConn{Conn: serverConn, closed: make(chan struct{})}
+	host.transportPrivate = "not-hex"
+
+	done := make(chan struct{})
+	go func() {
+		host.handleV3PeerTransportConnection(wrapped)
+		close(done)
+	}()
+
+	select {
+	case <-wrapped.closed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected connection to close on local key decode failure")
+	}
+
+	<-done
+}
+
+func TestHandleV3PeerTransportConnectionClosesConnOnHandshakeFailure(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	closeSessionManagersForTest(t, host)
+
+	serverConn, clientConn := net.Pipe()
+	wrapped := &closeNotifyConn{Conn: serverConn, closed: make(chan struct{})}
+
+	done := make(chan struct{})
+	go func() {
+		host.handleV3PeerTransportConnection(wrapped)
+		close(done)
+	}()
+
+	if err := clientConn.Close(); err != nil {
+		t.Fatalf("close client side: %v", err)
+	}
+
+	select {
+	case <-wrapped.closed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected connection to close on handshake failure")
+	}
+
+	<-done
+}
+
+func TestAcquireV3HandlerSlotUnblocksOnShutdown(t *testing.T) {
+	handlerSlots := make(chan struct{}, 1)
+	handlerSlots <- struct{}{}
+	shutdownCh := make(chan struct{})
+
+	result := make(chan bool, 1)
+	go func() {
+		result <- acquireV3HandlerSlot(handlerSlots, shutdownCh)
+	}()
+
+	close(shutdownCh)
+
+	select {
+	case ok := <-result:
+		if ok {
+			t.Fatal("expected shutdown to abort handler slot acquisition")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected shutdown to unblock handler slot acquisition")
 	}
 }
 
@@ -356,7 +589,7 @@ func TestCachePeerInfoInvalidatesCanonicalSessionOnAliasKeyRotation(t *testing.T
 	}
 }
 
-func TestExchangePeerTransportAutoRefreshesManifestOnFallbackKeyRotation(t *testing.T) {
+func TestExchangePeerTransportAutoRefreshesManifestAndRetriesV3AfterKeyRotation(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 	closeSessionManagersForTest(t, host, guest)
@@ -390,12 +623,17 @@ func TestExchangePeerTransportAutoRefreshesManifestOnFallbackKeyRotation(t *test
 		t.Fatalf("expected refreshed transport key %s, got %s", rotatedPub, cached.TransportPubkeyHex)
 	}
 
+	sm := guest.ensureSessionManager()
+	if !sm.HasSession(hostURL) {
+		t.Fatalf("expected refreshed v3 request to establish a session for %s", hostURL)
+	}
+
 	metrics := guest.SessionMetricsSnapshot()
 	if metrics == nil {
-		t.Fatal("expected session metrics after v3 fallback")
+		t.Fatal("expected session metrics after v3 retry")
 	}
-	if metrics.FallbackToV2Count != 1 {
-		t.Fatalf("expected one v3-to-v2 fallback after key rotation, got %d", metrics.FallbackToV2Count)
+	if metrics.FallbackToV2Count != 0 {
+		t.Fatalf("expected key rotation retry to stay on v3, got %d v2 fallbacks", metrics.FallbackToV2Count)
 	}
 }
 

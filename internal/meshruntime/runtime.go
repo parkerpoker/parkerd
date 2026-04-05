@@ -68,6 +68,7 @@ type meshRuntime struct {
 	testHandProtocolMS     int
 	started                bool
 	store                  *meshStore
+	stopCh                 chan struct{}
 	taskCond               *sync.Cond
 	torService             *runtimeHiddenService
 	transportKeyID         string
@@ -111,6 +112,7 @@ func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (
 		profileName:           profileName,
 		protocolDrives:        map[string]struct{}{},
 		profileStore:          walletpkg.NewProfileStore(config.ProfileDir),
+		stopCh:                make(chan struct{}),
 		store:                 store,
 		walletRuntime: walletpkg.NewRuntime(walletpkg.RuntimeConfig{
 			ArkServerURL:      config.ArkServerURL,
@@ -132,6 +134,7 @@ func (runtime *meshRuntime) Start() error {
 	if runtime.started {
 		return nil
 	}
+	runtime.stopCh = make(chan struct{})
 	if err := runtime.ensureBootstrapLocked("", ""); err != nil {
 		return err
 	}
@@ -154,9 +157,14 @@ func (runtime *meshRuntime) Close() error {
 	runtime.clearPeerURL = ""
 	runtime.self.Peer.PeerURL = ""
 	runtime.started = false
+	stopCh := runtime.stopCh
+	runtime.stopCh = nil
 	runtime.mu.Unlock()
 
 	var joined error
+	if stopCh != nil {
+		close(stopCh)
+	}
 	if torService != nil {
 		joined = errors.Join(joined, runtime.unregisterTorHiddenService(torService))
 	}
@@ -234,6 +242,12 @@ func (runtime *meshRuntime) waitForBackgroundTasks() {
 	for runtime.backgroundTasks > 0 {
 		runtime.taskCond.Wait()
 	}
+}
+
+func (runtime *meshRuntime) shutdownSignal() <-chan struct{} {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.stopCh
 }
 
 func (runtime *meshRuntime) trackPeerTransportConnection(conn net.Conn) bool {
@@ -2599,7 +2613,7 @@ func (runtime *meshRuntime) ensureBootstrapLocked(nickname, walletNsec string) e
 		ProfileName:          runtime.profileName,
 		ProtocolID:           protocolIdentity.ID,
 		TransportPubkeyHex:   transportPublic,
-		TransportWireVersion: 3,
+		TransportWireVersion: TransportWireVersion,
 		WalletPlayerID:       walletID.PlayerID,
 	}
 	return nil

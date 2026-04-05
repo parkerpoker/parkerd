@@ -259,12 +259,12 @@ func TestSessionTimeout(t *testing.T) {
 	if !IsTransportTimeout(err) {
 		t.Fatalf("expected transport timeout error, got: %v", err)
 	}
-	if !sm.HasSession("parker://slow-peer:1234") {
-		t.Fatal("session should remain available after one request times out")
+	if sm.HasSession("parker://slow-peer:1234") {
+		t.Fatal("session should be invalidated after a request timeout")
 	}
 }
 
-func TestSessionTimeoutDoesNotCloseConcurrentSession(t *testing.T) {
+func TestSessionTimeoutReconnectsFutureRequests(t *testing.T) {
 	serverPriv, serverPub := testKeypair(t)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -365,8 +365,8 @@ func TestSessionTimeoutDoesNotCloseConcurrentSession(t *testing.T) {
 	if err := <-slowDone; !IsTransportTimeout(err) {
 		t.Fatalf("expected slow request timeout error, got: %v", err)
 	}
-	if !sm.HasSession(peerURL) {
-		t.Fatal("session should remain active after one request times out")
+	if sm.HasSession(peerURL) {
+		t.Fatal("session should be invalidated after a request timeout")
 	}
 
 	time.Sleep(800 * time.Millisecond)
@@ -379,8 +379,8 @@ func TestSessionTimeoutDoesNotCloseConcurrentSession(t *testing.T) {
 	if resp.RetryOf != req3.MessageID {
 		t.Fatalf("post-timeout response RetryOf=%q, want %q", resp.RetryOf, req3.MessageID)
 	}
-	if got := connectionCount.Load(); got != 1 {
-		t.Fatalf("expected requests to stay on one session connection, got %d accepted connections", got)
+	if got := connectionCount.Load(); got != 2 {
+		t.Fatalf("expected request after timeout to reconnect, got %d accepted connections", got)
 	}
 }
 

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	TransportWireVersion = 2
+	TransportWireVersion = transportpkg.WireVersion
 
 	nativeTransportChannelDiscovery = "discovery"
 	nativeTransportChannelTable     = "table"
@@ -816,9 +816,7 @@ func (runtime *meshRuntime) signEnvelope(envelope transportpkg.TransportEnvelope
 }
 
 func (runtime *meshRuntime) signEnvelopeForWireVersion(envelope transportpkg.TransportEnvelope, wireVersion int) (transportpkg.TransportEnvelope, error) {
-	switch wireVersion {
-	case TransportWireVersion, transportpkg.WireVersion:
-	default:
+	if wireVersion != TransportWireVersion && wireVersion != transportpkg.WireVersion {
 		return transportpkg.TransportEnvelope{}, fmt.Errorf("unsupported transport wire version %d", wireVersion)
 	}
 	envelope.TransportWireVersion = wireVersion

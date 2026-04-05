@@ -84,8 +84,9 @@ func (runtime *meshRuntime) exchangePeerTransportV3(peerURL string, peerInfo nat
 }
 
 // exchangePeerTransportAuto attempts v3 if the peer supports it, otherwise uses v2.
-// On fallback-worthy session errors it forces a fresh discovery fetch and rebuilds
-// the request so any rotated transport key is picked up before sending the v2 retry.
+// On retry-worthy v3 errors it refreshes discovery, rebuilds the request, and
+// retries v3 first when the peer still advertises v3 support. Only peers that no
+// longer advertise v3 are downgraded to the v2 one-shot path.
 func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildRequest peerTransportRequestBuilder) (transportpkg.TransportEnvelope, string, error) {
 	peerInfo, err := runtime.fetchPeerInfo(peerURL)
 	if err != nil {
@@ -100,25 +101,38 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildReque
 		if err == nil {
 			return resp, requestKey, nil
 		}
-		// On handshake, wire downgrade, session reset, or session closed error, fall back to v2.
-		if transportpkg.IsSessionReset(err) || transportpkg.IsWireDowngrade(err) || isHandshakeErr(err) || transportpkg.IsSessionClosed(err) {
-			debugMeshf("v3 session failed for %s, falling back to v2: %v", peerURL, err)
-			if runtime.sessionMetrics != nil {
-				runtime.sessionMetrics.FallbackToV2Count.Add(1)
-			}
+		if shouldRefreshV3Exchange(err) {
 			refreshedPeerInfo, refreshErr := runtime.fetchPeerInfoFresh(peerURL)
 			if refreshErr != nil {
 				return transportpkg.TransportEnvelope{}, "", errors.Join(err, fmt.Errorf("refresh peer manifest: %w", refreshErr))
 			}
-			fallbackRequest, fallbackKey, buildErr := buildRequest(refreshedPeerInfo)
+			retryRequest, retryKey, buildErr := buildRequest(refreshedPeerInfo)
 			if buildErr != nil {
-				return transportpkg.TransportEnvelope{}, "", errors.Join(err, fmt.Errorf("rebuild fallback request: %w", buildErr))
+				return transportpkg.TransportEnvelope{}, "", errors.Join(err, fmt.Errorf("rebuild refreshed request: %w", buildErr))
 			}
-			resp, fallbackErr := runtime.exchangePeerTransport(peerURL, fallbackRequest)
+			if peerSupportsV3(refreshedPeerInfo) {
+				if transportpkg.IsWireDowngrade(err) {
+					return transportpkg.TransportEnvelope{}, "", err
+				}
+				debugMeshf("v3 session failed for %s, retrying with refreshed v3 manifest: %v", peerURL, err)
+				resp, retryErr := runtime.exchangePeerTransportV3(peerURL, refreshedPeerInfo, retryRequest)
+				if retryErr == nil {
+					return resp, retryKey, nil
+				}
+				if transportpkg.IsWireDowngrade(retryErr) || !isRetryableV3SessionErr(retryErr) {
+					return transportpkg.TransportEnvelope{}, "", retryErr
+				}
+				err = retryErr
+			}
+			debugMeshf("v3 session failed for %s, falling back to v2: %v", peerURL, err)
+			if runtime.sessionMetrics != nil {
+				runtime.sessionMetrics.FallbackToV2Count.Add(1)
+			}
+			resp, fallbackErr := runtime.exchangePeerTransport(peerURL, retryRequest)
 			if fallbackErr != nil {
 				return transportpkg.TransportEnvelope{}, "", fallbackErr
 			}
-			return resp, fallbackKey, nil
+			return resp, retryKey, nil
 		}
 		return transportpkg.TransportEnvelope{}, "", err
 	}
@@ -132,6 +146,14 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildReque
 func isHandshakeErr(err error) bool {
 	var te *transportpkg.TransportError
 	return errors.As(err, &te) && te.Kind == transportpkg.ErrKindHandshakeFailed
+}
+
+func isRetryableV3SessionErr(err error) bool {
+	return transportpkg.IsSessionReset(err) || transportpkg.IsTransportTimeout(err) || isHandshakeErr(err) || transportpkg.IsSessionClosed(err)
+}
+
+func shouldRefreshV3Exchange(err error) bool {
+	return isRetryableV3SessionErr(err) || transportpkg.IsWireDowngrade(err)
 }
 
 // closeSessionManager tears down the session manager if active.
@@ -158,6 +180,13 @@ func (runtime *meshRuntime) invalidateSessionForPeer(peerURL string) {
 // handleV3PeerTransportConnection handles an inbound v3 session connection.
 // The v3 preface has already been consumed by the listener dispatch.
 func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
+	shutdownCh := runtime.shutdownSignal()
+	var wg sync.WaitGroup
+	defer func() {
+		_ = conn.Close()
+		wg.Wait()
+	}()
+
 	staticPrivBytes, err := hex.DecodeString(runtime.transportPrivate)
 	if err != nil {
 		return
@@ -184,11 +213,6 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 	handlerSlots := make(chan struct{}, maxV3SessionConcurrentHandlers)
 
 	var writeMu sync.Mutex // serializes noise.Encrypt + conn.Write
-	var wg sync.WaitGroup
-	defer func() {
-		_ = conn.Close()
-		wg.Wait()
-	}()
 
 	writeResponse := func(resp transportpkg.TransportEnvelope) error {
 		writeMu.Lock()
@@ -231,7 +255,9 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 			}
 			continue
 		}
-		handlerSlots <- struct{}{}
+		if !acquireV3HandlerSlot(handlerSlots, shutdownCh) {
+			return
+		}
 		if !runtime.beginBackgroundTask() {
 			<-handlerSlots
 			return
@@ -254,6 +280,15 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 				debugMeshf("v3 write error: %v", err)
 			}
 		}(request)
+	}
+}
+
+func acquireV3HandlerSlot(handlerSlots chan struct{}, shutdownCh <-chan struct{}) bool {
+	select {
+	case handlerSlots <- struct{}{}:
+		return true
+	case <-shutdownCh:
+		return false
 	}
 }
 
