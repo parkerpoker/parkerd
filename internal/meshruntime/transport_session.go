@@ -19,6 +19,10 @@ import (
 // (peer.manifest.get) stays on the v2 one-shot path. All other RPCs attempt
 // v3 when the peer advertises session-transport-v3, falling back to v2.
 
+const maxV3SessionConcurrentHandlers = 8
+
+type peerTransportRequestBuilder func(peerInfo nativePeerSelf) (transportpkg.TransportEnvelope, string, error)
+
 // ensureSessionManager lazily creates the outbound session manager.
 func (runtime *meshRuntime) ensureSessionManager() *transportpkg.SessionManager {
 	runtime.mu.Lock()
@@ -80,11 +84,21 @@ func (runtime *meshRuntime) exchangePeerTransportV3(peerURL string, peerInfo nat
 }
 
 // exchangePeerTransportAuto attempts v3 if the peer supports it, otherwise uses v2.
-func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, peerInfo nativePeerSelf, request transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+// On fallback-worthy session errors it forces a fresh discovery fetch and rebuilds
+// the request so any rotated transport key is picked up before sending the v2 retry.
+func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildRequest peerTransportRequestBuilder) (transportpkg.TransportEnvelope, string, error) {
+	peerInfo, err := runtime.fetchPeerInfo(peerURL)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, "", err
+	}
+	request, requestKey, err := buildRequest(peerInfo)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, "", err
+	}
 	if peerSupportsV3(peerInfo) {
 		resp, err := runtime.exchangePeerTransportV3(peerURL, peerInfo, request)
 		if err == nil {
-			return resp, nil
+			return resp, requestKey, nil
 		}
 		// On handshake, wire downgrade, session reset, or session closed error, fall back to v2.
 		if transportpkg.IsSessionReset(err) || transportpkg.IsWireDowngrade(err) || isHandshakeErr(err) || transportpkg.IsSessionClosed(err) {
@@ -92,11 +106,27 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, peerInfo n
 			if runtime.sessionMetrics != nil {
 				runtime.sessionMetrics.FallbackToV2Count.Add(1)
 			}
-			return runtime.exchangePeerTransport(peerURL, request)
+			refreshedPeerInfo, refreshErr := runtime.fetchPeerInfoFresh(peerURL)
+			if refreshErr != nil {
+				return transportpkg.TransportEnvelope{}, "", errors.Join(err, fmt.Errorf("refresh peer manifest: %w", refreshErr))
+			}
+			fallbackRequest, fallbackKey, buildErr := buildRequest(refreshedPeerInfo)
+			if buildErr != nil {
+				return transportpkg.TransportEnvelope{}, "", errors.Join(err, fmt.Errorf("rebuild fallback request: %w", buildErr))
+			}
+			resp, fallbackErr := runtime.exchangePeerTransport(peerURL, fallbackRequest)
+			if fallbackErr != nil {
+				return transportpkg.TransportEnvelope{}, "", fallbackErr
+			}
+			return resp, fallbackKey, nil
 		}
-		return transportpkg.TransportEnvelope{}, err
+		return transportpkg.TransportEnvelope{}, "", err
 	}
-	return runtime.exchangePeerTransport(peerURL, request)
+	resp, err := runtime.exchangePeerTransport(peerURL, request)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, "", err
+	}
+	return resp, requestKey, nil
 }
 
 func isHandshakeErr(err error) bool {
@@ -151,6 +181,7 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 	// keepalive processing or unrelated RPCs on the same session.
 	readTimeout := cfg.IdleTimeout
 	writeTimeout := cfg.RequestTimeout
+	handlerSlots := make(chan struct{}, maxV3SessionConcurrentHandlers)
 
 	var writeMu sync.Mutex // serializes noise.Encrypt + conn.Write
 	var wg sync.WaitGroup
@@ -200,14 +231,18 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 			}
 			continue
 		}
-		if request.TransportWireVersion != transportpkg.WireVersion {
-			debugMeshf("v3 wire version mismatch: got %d, want %d", request.TransportWireVersion, transportpkg.WireVersion)
+		handlerSlots <- struct{}{}
+		if !runtime.beginBackgroundTask() {
+			<-handlerSlots
 			return
 		}
-
 		wg.Add(1)
 		go func(req transportpkg.TransportEnvelope) {
 			defer wg.Done()
+			defer runtime.endBackgroundTask()
+			defer func() {
+				<-handlerSlots
+			}()
 			response, handleErr := runtime.handlePeerTransportEnvelope(req)
 			if handleErr != nil {
 				response = runtime.nackFromRequest(req, handleErr)

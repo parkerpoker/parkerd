@@ -53,6 +53,7 @@ type meshRuntime struct {
 	mode                   string
 	mu                     sync.Mutex
 	peerInfoCache          map[string]nativeCachedPeerInfo
+	peerTransportConns     map[net.Conn]struct{}
 	peerIdentity           settlementcore.ScopedIdentity
 	profileName            string
 	profileStore           *walletpkg.ProfileStore
@@ -106,6 +107,7 @@ func newMeshRuntime(profileName string, config cfg.RuntimeConfig, mode string) (
 		lastGuestContribution: map[string]guestContributionSendSnapshot{},
 		mode:                  mode,
 		peerInfoCache:         map[string]nativeCachedPeerInfo{},
+		peerTransportConns:    map[net.Conn]struct{}{},
 		profileName:           profileName,
 		protocolDrives:        map[string]struct{}{},
 		profileStore:          walletpkg.NewProfileStore(config.ProfileDir),
@@ -146,6 +148,7 @@ func (runtime *meshRuntime) Close() error {
 	runtime.server = nil
 	listener := runtime.listener
 	runtime.listener = nil
+	peerConns := runtime.drainPeerTransportConnectionsLocked()
 	torService := runtime.torService
 	runtime.torService = nil
 	runtime.clearPeerURL = ""
@@ -164,6 +167,9 @@ func (runtime *meshRuntime) Close() error {
 	}
 	if listener != nil {
 		joined = errors.Join(joined, listener.Close())
+	}
+	for conn := range peerConns {
+		joined = errors.Join(joined, conn.Close())
 	}
 	runtime.closeSessionManager()
 	runtime.waitForBackgroundTasks()
@@ -228,6 +234,34 @@ func (runtime *meshRuntime) waitForBackgroundTasks() {
 	for runtime.backgroundTasks > 0 {
 		runtime.taskCond.Wait()
 	}
+}
+
+func (runtime *meshRuntime) trackPeerTransportConnection(conn net.Conn) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.started {
+		return false
+	}
+	if runtime.peerTransportConns == nil {
+		runtime.peerTransportConns = map[net.Conn]struct{}{}
+	}
+	runtime.peerTransportConns[conn] = struct{}{}
+	return true
+}
+
+func (runtime *meshRuntime) untrackPeerTransportConnection(conn net.Conn) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	delete(runtime.peerTransportConns, conn)
+}
+
+func (runtime *meshRuntime) drainPeerTransportConnectionsLocked() map[net.Conn]struct{} {
+	if len(runtime.peerTransportConns) == 0 {
+		return nil
+	}
+	conns := runtime.peerTransportConns
+	runtime.peerTransportConns = map[net.Conn]struct{}{}
+	return conns
 }
 
 func (runtime *meshRuntime) hostHeartbeatIntervalMS() int {
@@ -2562,8 +2596,8 @@ func (runtime *meshRuntime) ensureBootstrapLocked(nickname, walletNsec string) e
 			ProtocolPubkeyHex: protocolIdentity.PublicKeyHex,
 			Roles:             []string{runtime.mode},
 		},
-		ProfileName:        runtime.profileName,
-		ProtocolID:         protocolIdentity.ID,
+		ProfileName:          runtime.profileName,
+		ProtocolID:           protocolIdentity.ID,
 		TransportPubkeyHex:   transportPublic,
 		TransportWireVersion: 3,
 		WalletPlayerID:       walletID.PlayerID,

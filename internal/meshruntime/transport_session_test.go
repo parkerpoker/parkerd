@@ -25,6 +25,30 @@ func closeSessionManagersForTest(t *testing.T, runtimes ...*meshRuntime) {
 	})
 }
 
+func rotateTransportKeyForTest(t *testing.T, runtime *meshRuntime) string {
+	t.Helper()
+
+	privateKey, err := randomX25519PrivateKeyHex()
+	if err != nil {
+		t.Fatalf("generate rotated transport private key: %v", err)
+	}
+	publicKey, err := x25519PublicKeyHex(privateKey)
+	if err != nil {
+		t.Fatalf("derive rotated transport public key: %v", err)
+	}
+	runtime.transportPrivate = privateKey
+	runtime.transportPublic = publicKey
+	runtime.transportKeyID = transportKeyID(publicKey)
+	runtime.self.TransportPubkeyHex = publicKey
+	return publicKey
+}
+
+func backgroundTaskCountForTest(runtime *meshRuntime) int {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.backgroundTasks
+}
+
 func TestExchangePeerTransportV3UsesVersion3EndToEnd(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -329,5 +353,266 @@ func TestCachePeerInfoInvalidatesCanonicalSessionOnAliasKeyRotation(t *testing.T
 	}
 	if sm.HasSession(aliasURL) {
 		t.Fatalf("expected alias session for %s to be invalidated by key rotation", aliasURL)
+	}
+}
+
+func TestExchangePeerTransportAutoRefreshesManifestOnFallbackKeyRotation(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	hostURL := host.selfPeerURL()
+
+	staleInfo, err := guest.fetchPeerInfo(hostURL)
+	if err != nil {
+		t.Fatalf("fetch initial host peer info: %v", err)
+	}
+	guest.closeSessionManager()
+	rotatedPub := rotateTransportKeyForTest(t, host)
+	if rotatedPub == staleInfo.TransportPubkeyHex {
+		t.Fatal("expected host transport key rotation to change the public key")
+	}
+
+	table, err := guest.fetchRemoteTable(hostURL, tableID)
+	if err != nil {
+		t.Fatalf("fetch remote table after key rotation: %v", err)
+	}
+	if table.Config.TableID != tableID {
+		t.Fatalf("expected fetched table %s, got %s", tableID, table.Config.TableID)
+	}
+
+	cached, ok := guest.cachedPeerInfo(hostURL)
+	if !ok {
+		t.Fatal("expected refreshed peer info to be cached")
+	}
+	if cached.TransportPubkeyHex != rotatedPub {
+		t.Fatalf("expected refreshed transport key %s, got %s", rotatedPub, cached.TransportPubkeyHex)
+	}
+
+	metrics := guest.SessionMetricsSnapshot()
+	if metrics == nil {
+		t.Fatal("expected session metrics after v3 fallback")
+	}
+	if metrics.FallbackToV2Count != 1 {
+		t.Fatalf("expected one v3-to-v2 fallback after key rotation, got %d", metrics.FallbackToV2Count)
+	}
+}
+
+func TestFetchPeerInfoRefreshInvalidatesExpiredSessionOnKeyRotation(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	hostURL := host.selfPeerURL()
+	peerInfo, err := guest.fetchPeerInfo(hostURL)
+	if err != nil {
+		t.Fatalf("fetch host peer info: %v", err)
+	}
+
+	request, requestKey, err := guest.newOutboundEnvelope(
+		nativeTransportMessagePeerProbe,
+		nativeTransportChannelDiscovery,
+		"",
+		"",
+		map[string]any{},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("build v3 probe: %v", err)
+	}
+	response, err := guest.exchangePeerTransportV3(hostURL, peerInfo, request)
+	if err != nil {
+		t.Fatalf("send v3 probe: %v", err)
+	}
+	if _, err := guest.decodeResponseEnvelope(response, requestKey); err != nil {
+		t.Fatalf("decode v3 probe response: %v", err)
+	}
+
+	sm := guest.ensureSessionManager()
+	if !sm.HasSession(hostURL) {
+		t.Fatalf("expected session for %s to exist", hostURL)
+	}
+
+	guest.peerInfoCache[hostURL] = nativeCachedPeerInfo{
+		FetchedAt: time.Now().Add(-nativePeerInfoCacheTTL - time.Second),
+		PeerSelf:  peerInfo,
+	}
+	rotatedPub := rotateTransportKeyForTest(t, host)
+
+	refreshed, err := guest.fetchPeerInfo(hostURL)
+	if err != nil {
+		t.Fatalf("refresh expired peer info after key rotation: %v", err)
+	}
+	if refreshed.TransportPubkeyHex != rotatedPub {
+		t.Fatalf("expected refreshed transport key %s, got %s", rotatedPub, refreshed.TransportPubkeyHex)
+	}
+	if sm.HasSession(hostURL) {
+		t.Fatalf("expected expired-cache refresh to invalidate stale session for %s", hostURL)
+	}
+}
+
+func TestCachePeerInfoInvalidatesAllAliasSessionsOnKeyRotation(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	canonicalURL := host.selfPeerURL()
+	aliasOne := strings.Replace(canonicalURL, "parker://", "tcp://", 1)
+	aliasTwo := canonicalURL + "?alias=second"
+
+	peerInfo, err := guest.fetchPeerInfo(aliasOne)
+	if err != nil {
+		t.Fatalf("fetch host peer info through first alias: %v", err)
+	}
+	if _, err := guest.fetchPeerInfo(aliasTwo); err != nil {
+		t.Fatalf("fetch host peer info through second alias: %v", err)
+	}
+
+	openSession := func(peerURL string) {
+		t.Helper()
+		request, requestKey, err := guest.newOutboundEnvelope(
+			nativeTransportMessagePeerProbe,
+			nativeTransportChannelDiscovery,
+			"",
+			"",
+			map[string]any{},
+			"",
+		)
+		if err != nil {
+			t.Fatalf("build v3 probe for %s: %v", peerURL, err)
+		}
+		response, err := guest.exchangePeerTransportV3(peerURL, peerInfo, request)
+		if err != nil {
+			t.Fatalf("send v3 probe for %s: %v", peerURL, err)
+		}
+		if _, err := guest.decodeResponseEnvelope(response, requestKey); err != nil {
+			t.Fatalf("decode v3 probe response for %s: %v", peerURL, err)
+		}
+	}
+
+	openSession(canonicalURL)
+	openSession(aliasOne)
+	openSession(aliasTwo)
+
+	sm := guest.ensureSessionManager()
+	for _, peerURL := range []string{canonicalURL, aliasOne, aliasTwo} {
+		if !sm.HasSession(peerURL) {
+			t.Fatalf("expected session for %s to exist", peerURL)
+		}
+	}
+
+	rotated := peerInfo
+	rotated.TransportPubkeyHex = guest.transportPublic
+	guest.cachePeerInfo(aliasOne, rotated)
+
+	for _, peerURL := range []string{canonicalURL, aliasOne, aliasTwo} {
+		if sm.HasSession(peerURL) {
+			t.Fatalf("expected key rotation to invalidate session for %s", peerURL)
+		}
+	}
+}
+
+func TestHandleV3PeerTransportConnectionBoundsConcurrentHandlers(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	hostURL := host.selfPeerURL()
+
+	peerInfo, err := guest.fetchPeerInfo(hostURL)
+	if err != nil {
+		t.Fatalf("fetch host peer info: %v", err)
+	}
+
+	setupRequest, setupKey, err := guest.newOutboundEnvelope(
+		nativeTransportMessagePeerProbe,
+		nativeTransportChannelDiscovery,
+		"",
+		"",
+		map[string]any{},
+		"",
+	)
+	if err != nil {
+		t.Fatalf("build setup v3 probe: %v", err)
+	}
+	setupResponse, err := guest.exchangePeerTransportV3(hostURL, peerInfo, setupRequest)
+	if err != nil {
+		t.Fatalf("send setup v3 probe: %v", err)
+	}
+	if _, err := guest.decodeResponseEnvelope(setupResponse, setupKey); err != nil {
+		t.Fatalf("decode setup v3 probe response: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for backgroundTaskCountForTest(host) < 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	baseline := backgroundTaskCountForTest(host)
+	if baseline < 1 {
+		t.Fatalf("expected active v3 session background task, got %d", baseline)
+	}
+
+	lockHeld := make(chan struct{})
+	releaseLock := make(chan struct{})
+	lockErr := make(chan error, 1)
+	go func() {
+		lockErr <- host.store.withTableLock(tableID, func() error {
+			close(lockHeld)
+			<-releaseLock
+			return nil
+		})
+	}()
+	<-lockHeld
+
+	requestCount := maxV3SessionConcurrentHandlers + 3
+	results := make(chan error, requestCount)
+	for i := 0; i < requestCount; i++ {
+		go func() {
+			requestBody, err := guest.buildTableFetchRequest(tableID)
+			if err != nil {
+				results <- err
+				return
+			}
+			request, requestKey, err := guest.newOutboundEnvelope(
+				nativeTransportMessageTablePull,
+				nativeTransportChannelTable,
+				tableID,
+				peerInfo.Peer.PeerID,
+				requestBody,
+				peerInfo.TransportPubkeyHex,
+			)
+			if err != nil {
+				results <- err
+				return
+			}
+			response, err := guest.exchangePeerTransportV3(hostURL, peerInfo, request)
+			if err == nil {
+				_, err = guest.decodeResponseEnvelope(response, requestKey)
+			}
+			results <- err
+		}()
+	}
+
+	expectedMax := baseline + maxV3SessionConcurrentHandlers
+	deadline = time.Now().Add(2 * time.Second)
+	for backgroundTaskCountForTest(host) < expectedMax && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := backgroundTaskCountForTest(host); got != expectedMax {
+		close(releaseLock)
+		<-lockErr
+		t.Fatalf("expected background task count to saturate at %d, got %d", expectedMax, got)
+	}
+
+	close(releaseLock)
+	if err := <-lockErr; err != nil {
+		t.Fatalf("release table lock: %v", err)
+	}
+	for i := 0; i < requestCount; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("bounded concurrent request %d failed: %v", i, err)
+		}
 	}
 }

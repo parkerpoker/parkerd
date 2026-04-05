@@ -87,8 +87,14 @@ func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
 			_ = connection.Close()
 			continue
 		}
+		if !runtime.trackPeerTransportConnection(connection) {
+			runtime.endBackgroundTask()
+			_ = connection.Close()
+			continue
+		}
 		go func() {
 			defer runtime.endBackgroundTask()
+			defer runtime.untrackPeerTransportConnection(connection)
 			runtime.handlePeerTransportConnection(connection)
 		}()
 	}
@@ -342,8 +348,18 @@ func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transp
 }
 
 func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error) {
-	if cached, ok := runtime.cachedPeerInfo(peerURL); ok {
-		return cached, nil
+	return runtime.fetchPeerInfoWithCache(peerURL, true)
+}
+
+func (runtime *meshRuntime) fetchPeerInfoFresh(peerURL string) (nativePeerSelf, error) {
+	return runtime.fetchPeerInfoWithCache(peerURL, false)
+}
+
+func (runtime *meshRuntime) fetchPeerInfoWithCache(peerURL string, allowCached bool) (nativePeerSelf, error) {
+	if allowCached {
+		if cached, ok := runtime.cachedPeerInfo(peerURL); ok {
+			return cached, nil
+		}
 	}
 	request, _, err := runtime.newOutboundEnvelope(nativeTransportMessagePeerProbe, nativeTransportChannelDiscovery, "", "", map[string]any{}, "")
 	if err != nil {
@@ -384,62 +400,89 @@ func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool
 		return nativePeerSelf{}, false
 	}
 	if time.Since(cached.FetchedAt) > nativePeerInfoCacheTTL {
-		delete(runtime.peerInfoCache, peerURL)
-		if canonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); canonical != "" {
-			delete(runtime.peerInfoCache, canonical)
-		}
 		return nativePeerSelf{}, false
 	}
 	return cached.PeerSelf, true
 }
 
 func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
-	var keyRotated bool
+	invalidateURLs := map[string]struct{}{}
+	updateURLs := map[string]struct{}{}
+	peerURL = strings.TrimSpace(peerURL)
+	canonicalURL := strings.TrimSpace(peerInfo.Peer.PeerURL)
+	newKey := strings.TrimSpace(peerInfo.TransportPubkeyHex)
 
 	runtime.mu.Lock()
 	if runtime.peerInfoCache == nil {
 		runtime.peerInfoCache = map[string]nativeCachedPeerInfo{}
 	}
 
-	// Detect transport key rotation: if we had a cached entry with a different
-	// public key, we need to tear down the existing session.
-	// Check both the lookup URL and canonical URL so we catch rotations
-	// regardless of which alias the session was opened under.
-	var invalidateURLs []string
-	checkRotation := func(url string) {
-		if old, ok := runtime.peerInfoCache[url]; ok {
-			oldKey := strings.TrimSpace(old.PeerSelf.TransportPubkeyHex)
-			newKey := strings.TrimSpace(peerInfo.TransportPubkeyHex)
-			if oldKey != "" && newKey != "" && oldKey != newKey {
-				keyRotated = true
-				invalidateURLs = append(invalidateURLs, url)
+	for url, cached := range runtime.peerInfoCache {
+		if !samePeerInfoCacheEntry(url, cached.PeerSelf, peerURL, peerInfo) {
+			continue
+		}
+		if url != "" {
+			updateURLs[url] = struct{}{}
+		}
+		if oldCanonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); oldCanonical != "" {
+			updateURLs[oldCanonical] = struct{}{}
+		}
+		oldKey := strings.TrimSpace(cached.PeerSelf.TransportPubkeyHex)
+		if oldKey != "" && newKey != "" && oldKey != newKey {
+			if url != "" {
+				invalidateURLs[url] = struct{}{}
+			}
+			if oldCanonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); oldCanonical != "" {
+				invalidateURLs[oldCanonical] = struct{}{}
 			}
 		}
-	}
-	checkRotation(peerURL)
-	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" && canonical != peerURL {
-		checkRotation(canonical)
 	}
 
 	cached := nativeCachedPeerInfo{
 		FetchedAt: time.Now(),
 		PeerSelf:  peerInfo,
 	}
-	if strings.TrimSpace(peerURL) != "" {
-		runtime.peerInfoCache[peerURL] = cached
+	if peerURL != "" {
+		updateURLs[peerURL] = struct{}{}
 	}
-	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" {
-		runtime.peerInfoCache[canonical] = cached
+	if canonicalURL != "" {
+		updateURLs[canonicalURL] = struct{}{}
+	}
+	for url := range updateURLs {
+		runtime.peerInfoCache[url] = cached
 	}
 	runtime.mu.Unlock()
 
 	// Invalidate sessions outside the lock to avoid deadlock with invalidateSessionForPeer.
-	if keyRotated {
-		for _, u := range invalidateURLs {
-			debugMeshf("peer %s rotated transport key, invalidating session", u)
-			runtime.invalidateSessionForPeer(u)
-		}
+	for url := range invalidateURLs {
+		debugMeshf("peer %s rotated transport key, invalidating session", url)
+		runtime.invalidateSessionForPeer(url)
 	}
+}
+
+func samePeerInfoCacheEntry(cacheURL string, cached nativePeerSelf, peerURL string, peerInfo nativePeerSelf) bool {
+	cacheURL = strings.TrimSpace(cacheURL)
+	peerURL = strings.TrimSpace(peerURL)
+	if cacheURL != "" && cacheURL == peerURL {
+		return true
+	}
+	newCanonical := strings.TrimSpace(peerInfo.Peer.PeerURL)
+	oldCanonical := strings.TrimSpace(cached.Peer.PeerURL)
+	if newCanonical != "" && (cacheURL == newCanonical || oldCanonical == newCanonical) {
+		return true
+	}
+	if peerURL != "" && oldCanonical == peerURL {
+		return true
+	}
+	newPeerID := strings.TrimSpace(peerInfo.Peer.PeerID)
+	oldPeerID := strings.TrimSpace(cached.Peer.PeerID)
+	return newPeerID != "" && oldPeerID == newPeerID
+}
+
+func (runtime *meshRuntime) exchangePeerRequestAuto(peerURL, messageType, channel, tableID string, body any) (transportpkg.TransportEnvelope, string, error) {
+	return runtime.exchangePeerTransportAuto(peerURL, func(peerInfo nativePeerSelf) (transportpkg.TransportEnvelope, string, error) {
+		return runtime.newOutboundEnvelope(messageType, channel, tableID, peerInfo.Peer.PeerID, body, peerInfo.TransportPubkeyHex)
+	})
 }
 
 func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTableState, error) {
@@ -447,22 +490,7 @@ func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTa
 	if err != nil {
 		return nil, err
 	}
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nil, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(
-		nativeTransportMessageTablePull,
-		nativeTransportChannelTable,
-		tableID,
-		peerInfo.Peer.PeerID,
-		requestBody,
-		peerInfo.TransportPubkeyHex,
-	)
-	if err != nil {
-		return nil, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTablePull, nativeTransportChannelTable, tableID, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -482,15 +510,7 @@ func (runtime *meshRuntime) remoteJoin(peerURL string, input nativeJoinRequest) 
 }
 
 func (runtime *meshRuntime) remoteActionSignature(peerURL string, input nativeActionSignRequest) (nativeActionRequest, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeActionRequest{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableActSignReq, nativeTransportChannelTable, input.Request.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeActionRequest{}, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableActSignReq, nativeTransportChannelTable, input.Request.TableID, input)
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
@@ -516,15 +536,7 @@ func (runtime *meshRuntime) remoteFunds(peerURL string, input nativeFundsRequest
 	if runtime.fundsSenderHook != nil {
 		return runtime.fundsSenderHook(peerURL, input)
 	}
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeFundsResponse{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableFundsReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeFundsResponse{}, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableFundsReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return nativeFundsResponse{}, err
 	}
@@ -546,15 +558,7 @@ func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMe
 	if runtime.handMessageSenderHook != nil {
 		return runtime.handMessageSenderHook(peerURL, input)
 	}
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeHandMessageResponse{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableHandReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeHandMessageResponse{}, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableHandReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return nativeHandMessageResponse{}, err
 	}
@@ -573,15 +577,7 @@ func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMe
 }
 
 func (runtime *meshRuntime) remoteApproveCustody(peerURL string, input nativeCustodyApprovalRequest) (tablecustody.CustodySignature, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return tablecustody.CustodySignature{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodyReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return tablecustody.CustodySignature{}, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodyReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return tablecustody.CustodySignature{}, err
 	}
@@ -600,15 +596,7 @@ func (runtime *meshRuntime) remoteApproveCustody(peerURL string, input nativeCus
 }
 
 func (runtime *meshRuntime) remoteSignCustodyPSBT(peerURL string, input nativeCustodyTxSignRequest) (string, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return "", err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return "", err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return "", err
 	}
@@ -627,15 +615,7 @@ func (runtime *meshRuntime) remoteSignCustodyPSBT(peerURL string, input nativeCu
 }
 
 func (runtime *meshRuntime) remotePrepareCustodySigner(peerURL string, input nativeCustodySignerPrepareRequest) (nativeCustodySignerPrepareResponse, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeCustodySignerPrepareResponse{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerPrepareReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeCustodySignerPrepareResponse{}, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerPrepareReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return nativeCustodySignerPrepareResponse{}, err
 	}
@@ -654,15 +634,7 @@ func (runtime *meshRuntime) remotePrepareCustodySigner(peerURL string, input nat
 }
 
 func (runtime *meshRuntime) remoteStartCustodySigner(peerURL string, input nativeCustodySignerStartRequest) error {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerStartReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerStartReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return err
 	}
@@ -684,15 +656,7 @@ func (runtime *meshRuntime) remoteStartCustodySigner(peerURL string, input nativ
 }
 
 func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, input nativeCustodySignerNoncesRequest) (bool, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return false, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return false, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerNoncesReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return false, err
 	}
@@ -714,15 +678,7 @@ func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, inp
 }
 
 func (runtime *meshRuntime) remoteAdvanceCustodySignerAggregatedNonces(peerURL string, input nativeCustodySignerAggregatedNoncesRequest) (bool, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return false, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerAggNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return false, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerAggNoncesReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return false, err
 	}
@@ -744,15 +700,7 @@ func (runtime *meshRuntime) remoteAdvanceCustodySignerAggregatedNonces(peerURL s
 }
 
 func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseType, tableID string, input any) (nativeTableState, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeTableState{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(requestType, nativeTransportChannelTable, tableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeTableState{}, err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, requestType, nativeTransportChannelTable, tableID, input)
 	if err != nil {
 		return nativeTableState{}, err
 	}
@@ -771,15 +719,7 @@ func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseT
 }
 
 func (runtime *meshRuntime) sendTableSync(peerURL string, input nativeTableSyncRequest) error {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTablePush, nativeTransportChannelSync, input.Table.Config.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return err
-	}
-	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTablePush, nativeTransportChannelSync, input.Table.Config.TableID, input)
 	if err != nil {
 		return err
 	}

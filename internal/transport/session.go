@@ -19,14 +19,14 @@ var v3SessionPreface = []byte("PARKERv3")
 
 // SessionManager maintains persistent outbound sessions keyed by peer URL.
 type SessionManager struct {
-	mu         sync.Mutex
-	sessions   map[string]*OutboundSession
-	inflight   map[string]chan struct{} // closed when a dial-in-progress completes
-	peerGen    map[string]uint64       // per-peer generation; bumped on invalidation
-	config     SessionConfig
-	metrics    *SessionMetrics
-	dialer     func(peerURL string) (net.Conn, error)
-	closed     bool
+	mu       sync.Mutex
+	sessions map[string]*OutboundSession
+	inflight map[string]chan struct{} // closed when a dial-in-progress completes
+	peerGen  map[string]uint64        // per-peer generation; bumped on invalidation
+	config   SessionConfig
+	metrics  *SessionMetrics
+	dialer   func(peerURL string) (net.Conn, error)
+	closed   bool
 }
 
 // NewSessionManager creates a session manager with the given config and dial function.
@@ -54,11 +54,10 @@ func (sm *SessionManager) Request(peerURL string, peerStaticPub []byte, request 
 
 	resp, err := sess.RoundTrip(request, sm.config.RequestTimeout)
 	if err != nil {
-		// Tear down on broken connections AND timeouts. The server handles
-		// one request at a time per v3 session, so a timed-out request
-		// leaves the connection in an unknown state — reusing it would
-		// cause subsequent requests to time out until idle expiry.
-		if isConnBroken(err) || IsTransportTimeout(err) {
+		// Tear down only on broken connections. Requests are multiplexed on the
+		// session, so a single timed-out RPC must not reset unrelated in-flight
+		// requests or force an unnecessary reconnect for later work.
+		if isConnBroken(err) {
 			sm.removeSession(peerURL)
 		}
 		return TransportEnvelope{}, err

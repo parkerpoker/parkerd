@@ -259,12 +259,12 @@ func TestSessionTimeout(t *testing.T) {
 	if !IsTransportTimeout(err) {
 		t.Fatalf("expected transport timeout error, got: %v", err)
 	}
-	if sm.HasSession("parker://slow-peer:1234") {
-		t.Fatal("session should be torn down after timeout")
+	if !sm.HasSession("parker://slow-peer:1234") {
+		t.Fatal("session should remain available after one request times out")
 	}
 }
 
-func TestSessionTimeoutReconnectsImmediately(t *testing.T) {
+func TestSessionTimeoutDoesNotCloseConcurrentSession(t *testing.T) {
 	serverPriv, serverPub := testKeypair(t)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -280,8 +280,8 @@ func TestSessionTimeoutReconnectsImmediately(t *testing.T) {
 			if err != nil {
 				return
 			}
-			index := connectionCount.Add(1)
-			go func(conn net.Conn, index int32) {
+			connectionCount.Add(1)
+			go func(conn net.Conn) {
 				preface := make([]byte, V3PrefaceLen())
 				if _, err := io.ReadFull(conn, preface); err != nil {
 					conn.Close()
@@ -292,17 +292,41 @@ func TestSessionTimeoutReconnectsImmediately(t *testing.T) {
 					conn.Close()
 					return
 				}
-				if index == 1 {
-					defer conn.Close()
-					if _, err := ReadV3Request(conn, noise, 5*time.Second); err != nil {
+				defer conn.Close()
+
+				var writeMu sync.Mutex
+				var wg sync.WaitGroup
+				defer wg.Wait()
+
+				writeResponse := func(req TransportEnvelope, delay time.Duration) {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						time.Sleep(delay)
+						resp := TransportEnvelope{
+							MessageType:          req.MessageType + ".response",
+							MessageID:            "resp-" + req.MessageID,
+							RetryOf:              req.MessageID,
+							TransportWireVersion: req.TransportWireVersion,
+						}
+						writeMu.Lock()
+						defer writeMu.Unlock()
+						_ = WriteV3Response(conn, noise, resp, 5*time.Second)
+					}()
+				}
+
+				for {
+					req, err := ReadV3Request(conn, noise, 5*time.Second)
+					if err != nil {
 						return
 					}
-					// Hold the first connection open past the client timeout.
-					time.Sleep(750 * time.Millisecond)
-					return
+					if req.MessageType == "slow" {
+						writeResponse(req, 750*time.Millisecond)
+						continue
+					}
+					writeResponse(req, 0)
 				}
-				echoHandler(conn, noise)
-			}(conn, index)
+			}(conn)
 		}
 	}()
 
@@ -319,33 +343,44 @@ func TestSessionTimeoutReconnectsImmediately(t *testing.T) {
 	})
 	defer sm.CloseAll()
 
-	peerURL := "parker://timeout-reconnect-peer:1234"
-	req1 := TransportEnvelope{MessageID: "timeout-1", MessageType: "test"}
-	_, err = sm.Request(peerURL, serverPub, req1)
-	if err == nil {
-		t.Fatal("expected first request to time out")
-	}
-	if !IsTransportTimeout(err) {
-		t.Fatalf("expected transport timeout error, got: %v", err)
-	}
-	if sm.HasSession(peerURL) {
-		t.Fatal("session should be torn down after timeout")
-	}
+	peerURL := "parker://timeout-session-peer:1234"
 
-	start := time.Now()
-	req2 := TransportEnvelope{MessageID: "timeout-2", MessageType: "test"}
+	slowDone := make(chan error, 1)
+	go func() {
+		_, err := sm.Request(peerURL, serverPub, TransportEnvelope{MessageID: "timeout-1", MessageType: "slow"})
+		slowDone <- err
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	req2 := TransportEnvelope{MessageID: "timeout-2", MessageType: "fast"}
 	resp, err := sm.Request(peerURL, serverPub, req2)
 	if err != nil {
-		t.Fatalf("second request should reconnect and succeed: %v", err)
+		t.Fatalf("fast request should succeed while another request is slow: %v", err)
 	}
 	if resp.RetryOf != req2.MessageID {
-		t.Fatalf("second response RetryOf=%q, want %q", resp.RetryOf, req2.MessageID)
+		t.Fatalf("fast response RetryOf=%q, want %q", resp.RetryOf, req2.MessageID)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("expected reconnect well before idle timeout, got %v", elapsed)
+
+	if err := <-slowDone; !IsTransportTimeout(err) {
+		t.Fatalf("expected slow request timeout error, got: %v", err)
 	}
-	if got := connectionCount.Load(); got != 2 {
-		t.Fatalf("expected 2 connections after timeout-triggered reconnect, got %d", got)
+	if !sm.HasSession(peerURL) {
+		t.Fatal("session should remain active after one request times out")
+	}
+
+	time.Sleep(800 * time.Millisecond)
+
+	req3 := TransportEnvelope{MessageID: "timeout-3", MessageType: "fast"}
+	resp, err = sm.Request(peerURL, serverPub, req3)
+	if err != nil {
+		t.Fatalf("request after late timeout response should still succeed: %v", err)
+	}
+	if resp.RetryOf != req3.MessageID {
+		t.Fatalf("post-timeout response RetryOf=%q, want %q", resp.RetryOf, req3.MessageID)
+	}
+	if got := connectionCount.Load(); got != 1 {
+		t.Fatalf("expected requests to stay on one session connection, got %d accepted connections", got)
 	}
 }
 
