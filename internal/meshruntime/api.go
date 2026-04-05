@@ -34,6 +34,8 @@ type Runtime interface {
 	OpenTurnChallenge(tableID string) (NativeMeshTableView, error)
 	ResolveTurnChallenge(tableID, optionID string) (NativeMeshTableView, error)
 	RotateHost(tableID string) (NativeMeshTableView, error)
+	StartNextHand(tableID string) (NativeMeshTableView, error)
+	AbortHand(tableID string) (NativeMeshTableView, error)
 	PublicTables() ([]NativePublicTableView, error)
 	CashOut(tableID string) (map[string]any, error)
 	Renew(tableID string) ([]map[string]any, error)

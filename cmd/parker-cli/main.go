@@ -116,8 +116,43 @@ func runTableCommand(client *parker.Client, positionals []string, flags parker.F
 		if value, ok := parker.FlagString(flags, "name"); ok {
 			table["name"] = value
 		}
+		if value, ok := parker.FlagString(flags, "action-timeout-ms"); ok {
+			parsed, err := parseRequiredNumber(value, "action-timeout-ms")
+			if err != nil {
+				return err
+			}
+			table["actionTimeoutMs"] = parsed
+		}
+		if value, ok := parker.FlagString(flags, "hand-protocol-timeout-ms"); ok {
+			parsed, err := parseRequiredNumber(value, "hand-protocol-timeout-ms")
+			if err != nil {
+				return err
+			}
+			table["handProtocolTimeoutMs"] = parsed
+		}
+		if value, ok := parker.FlagString(flags, "next-hand-delay-ms"); ok {
+			parsed, err := parseRequiredNumber(value, "next-hand-delay-ms")
+			if err != nil {
+				return err
+			}
+			table["nextHandDelayMs"] = parsed
+		}
+		if value, ok := parker.FlagString(flags, "seat-count"); ok {
+			parsed, err := parseRequiredNumber(value, "seat-count")
+			if err != nil {
+				return err
+			}
+			table["seatCount"] = parsed
+		}
 		if value, ok := parker.FlagString(flags, "turn-timeout-mode"); ok {
 			table["turnTimeoutMode"] = value
+		}
+		if value, ok := parker.FlagString(flags, "turn-challenge-window-ms"); ok {
+			parsed, err := parseRequiredNumber(value, "turn-challenge-window-ms")
+			if err != nil {
+				return err
+			}
+			table["turnChallengeWindowMs"] = parsed
 		}
 		visibility, err := resolveTableVisibility(flags)
 		if err != nil {
@@ -185,6 +220,38 @@ func runTableCommand(client *parker.Client, positionals []string, flags parker.F
 		return runWatchCommand(client, outputJSON)
 	case "rotate-host":
 		result, err := client.Request("meshRotateHost", optionalTableParams(positionals, 1), true)
+		if err != nil {
+			return err
+		}
+		return writeResult(outputJSON, result)
+	case "start-next-hand":
+		result, err := client.Request("meshStartNextHand", optionalTableParams(positionals, 1), true)
+		if err != nil {
+			return err
+		}
+		return writeResult(outputJSON, result)
+	case "abort-hand":
+		result, err := client.Request("meshAbortHand", optionalTableParams(positionals, 1), true)
+		if err != nil {
+			return err
+		}
+		return writeResult(outputJSON, result)
+	case "challenge-open":
+		result, err := client.Request("meshOpenTurnChallenge", optionalTableParams(positionals, 1), true)
+		if err != nil {
+			return err
+		}
+		return writeResult(outputJSON, result)
+	case "challenge-resolve":
+		optionID, err := requirePositional(positionals, 1, "optionId")
+		if err != nil {
+			return err
+		}
+		params := map[string]any{"optionId": optionID}
+		if tableID := optionalValue(positionals, 2); tableID != "" {
+			params["tableId"] = tableID
+		}
+		result, err := client.Request("meshResolveTurnChallenge", params, true)
 		if err != nil {
 			return err
 		}
@@ -647,7 +714,7 @@ func printHelp() {
 		"  bootstrap [nickname] [--wallet-nsec <nsec>] --profile <name>",
 		"  wallet [nsec|summary|deposit <sats>|withdraw <sats> <invoice>|faucet <sats>|onboard|offboard <address> [sats]] --profile <name>",
 		"  network peers|bootstrap add <endpoint> [alias] --profile <name>",
-		"  table create [--name <name>] [--visibility <public|private>] [--public|--private] [--witness-peer-ids <id[,id]>] [--turn-timeout-mode <direct|chain-challenge>] | created [--cursor <cursor>] [--limit <n>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
+		"  table create [--name <name>] [--visibility <public|private>] [--public|--private] [--witness-peer-ids <id[,id]>] [--seat-count <n>] [--action-timeout-ms <ms>] [--hand-protocol-timeout-ms <ms>] [--next-hand-delay-ms <ms>] [--turn-timeout-mode <direct|chain-challenge>] [--turn-challenge-window-ms <ms>] | created [--cursor <cursor>] [--limit <n>] | announce [tableId] | join <invite> [buyIn] | public | watch [tableId] | rotate-host [tableId] | start-next-hand [tableId] | abort-hand [tableId] | challenge-open [tableId] | challenge-resolve <optionId> [tableId] | action <fold|check|call|bet|raise> [sats] [--table-id <id>] --profile <name>",
 		"  funds buy-in <invite> [buyIn] | cashout [tableId] | renew [tableId] | exit [tableId] --profile <name>",
 		"  daemon <start|status|stop|watch> --profile <name> [--mode <player|host|witness|indexer>]",
 		"  interactive --profile <name>",

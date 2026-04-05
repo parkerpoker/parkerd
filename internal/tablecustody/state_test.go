@@ -121,3 +121,18 @@ func TestBuildStateProjectsUnmatchedContributionIntoStackClaim(t *testing.T) {
 		t.Fatalf("unexpected big blind stack claim amount %d", got)
 	}
 }
+
+func TestAutoCheckTimeoutWhenCheckIsLegal(t *testing.T) {
+	t.Parallel()
+
+	resolution := BuildTimeoutResolution(TimeoutPolicyAutoCheckOrFold, "alpha", []string{"check", "bet"}, []string{"alpha"})
+	if resolution.ActionType != "check" {
+		t.Fatalf("expected timeout resolution to auto-check, got %+v", resolution)
+	}
+	if len(resolution.DeadPlayerIDs) != 0 {
+		t.Fatalf("expected auto-check timeout to keep players live, got %+v", resolution.DeadPlayerIDs)
+	}
+	if len(resolution.LostEligibilityPlayerIDs) != 0 {
+		t.Fatalf("expected auto-check timeout to preserve eligibility, got %+v", resolution.LostEligibilityPlayerIDs)
+	}
+}

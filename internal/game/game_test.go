@@ -259,6 +259,46 @@ func TestHoldemHandTransitions(t *testing.T) {
 	}
 }
 
+func TestHoldemMarksPlayersAllInWhenStacksReachZero(t *testing.T) {
+	state, err := CreateHoldemHand(HoldemHandConfig{
+		HandID:          "770e8400-e29b-41d4-a716-446655440999",
+		HandNumber:      1,
+		DealerSeatIndex: 0,
+		SmallBlindSats:  50,
+		BigBlindSats:    100,
+		Seats: []HoldemSeatConfig{
+			{PlayerID: "alpha", StackSats: 1000},
+			{PlayerID: "beta", StackSats: 1000},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create hand: %v", err)
+	}
+	state, err = ActivateHoldemHand(state)
+	if err != nil {
+		t.Fatalf("activate hand: %v", err)
+	}
+
+	state, err = ApplyHoldemAction(state, 0, Action{Type: ActionRaise, TotalSats: 1000})
+	if err != nil {
+		t.Fatalf("apply all-in raise: %v", err)
+	}
+	if state.Players[0].Status != PlayerStatusAllIn {
+		t.Fatalf("expected alpha to be all-in after covering raise, got %+v", state.Players[0])
+	}
+
+	state, err = ApplyHoldemAction(state, 1, Action{Type: ActionCall})
+	if err != nil {
+		t.Fatalf("apply all-in call: %v", err)
+	}
+	if state.Players[1].Status != PlayerStatusAllIn {
+		t.Fatalf("expected beta to be all-in after calling off the stack, got %+v", state.Players[1])
+	}
+	if state.ActingSeatIndex != nil {
+		t.Fatalf("expected no acting seat after both players are all-in, got %v", state.ActingSeatIndex)
+	}
+}
+
 func TestHoldemFoldAndShowdown(t *testing.T) {
 	state, err := CreateHoldemHand(HoldemHandConfig{
 		HandID:          "770e8400-e29b-41d4-a716-446655440000",

@@ -49,6 +49,12 @@ func (runtime *meshRuntime) legalActionsHash(hand *game.HoldemState) string {
 }
 
 func (runtime *meshRuntime) canonicalNextHandAt(table nativeTableState) string {
+	if trimmed := strings.TrimSpace(table.NextHandAt); trimmed != "" {
+		return trimmed
+	}
+	if trimmed := strings.TrimSpace(table.ActiveHandStartAt); trimmed != "" {
+		return trimmed
+	}
 	if table.LatestCustodyState != nil && strings.TrimSpace(table.LatestCustodyState.CreatedAt) != "" {
 		return addMillis(table.LatestCustodyState.CreatedAt, runtime.nextHandDelayMSForTable(table))
 	}
@@ -57,12 +63,6 @@ func (runtime *meshRuntime) canonicalNextHandAt(table nativeTableState) string {
 		if lastCreatedAt != "" {
 			return addMillis(lastCreatedAt, runtime.nextHandDelayMSForTable(table))
 		}
-	}
-	if trimmed := strings.TrimSpace(table.ActiveHandStartAt); trimmed != "" {
-		return trimmed
-	}
-	if trimmed := strings.TrimSpace(table.NextHandAt); trimmed != "" {
-		return trimmed
 	}
 	return ""
 }
@@ -142,24 +142,32 @@ func (runtime *meshRuntime) custodyBalancesFromHand(table nativeTableState, hand
 	if hand == nil {
 		for _, seat := range table.Seats {
 			amount := seat.BuyInSats
+			allIn := false
+			folded := false
 			reserve := maxInt(0, sumVTXORefs(seat.FundingRefs)-amount)
 			refs := append([]tablecustody.VTXORef(nil), seat.FundingRefs...)
+			status := seat.Status
 			if table.LatestCustodyState != nil {
 				for _, claim := range table.LatestCustodyState.StackClaims {
 					if claim.PlayerID == seat.PlayerID {
 						amount = claim.AmountSats
+						allIn = claim.AllIn
+						folded = claim.Folded
 						reserve = claim.ReservedFeeSats
 						refs = append([]tablecustody.VTXORef(nil), claim.VTXORefs...)
+						status = firstNonEmptyString(claim.Status, seat.Status)
 						break
 					}
 				}
 			}
 			balances = append(balances, tablecustody.PlayerBalance{
+				AllIn:           allIn,
+				Folded:          folded,
 				PlayerID:        seat.PlayerID,
 				ReservedFeeSats: reserve,
 				SeatIndex:       seat.SeatIndex,
 				StackSats:       amount,
-				Status:          seat.Status,
+				Status:          status,
 				VTXORefs:        refs,
 			})
 		}
@@ -352,7 +360,7 @@ func (runtime *meshRuntime) carryForwardUnchangedCustodyRefs(table nativeTableSt
 	for index := range transition.NextState.StackClaims {
 		nextClaim := transition.NextState.StackClaims[index]
 		prevClaim, ok := prevStacks[nextClaim.PlayerID]
-		if ok && reflect.DeepEqual(comparableStackClaim(prevClaim), comparableStackClaim(nextClaim)) {
+		if ok && runtime.stackClaimRefsReusableForTransition(table, *transition, prevClaim, nextClaim) {
 			transition.NextState.StackClaims[index].VTXORefs = append([]tablecustody.VTXORef(nil), prevClaim.VTXORefs...)
 		}
 	}
@@ -537,7 +545,9 @@ func (runtime *meshRuntime) deriveTimeoutCustodyTransition(table nativeTableStat
 	return runtime.deriveTimeoutCustodyTransitionWithDeadlineCheck(table, true)
 }
 
-func (runtime *meshRuntime) deriveBlindPostCustodyTransition(table nativeTableState, handID string, handNumber int) (tablecustody.CustodyTransition, error) {
+func (runtime *meshRuntime) deriveBlindPostCustodyTransitionWithOverrides(table nativeTableState, handID string, handNumber int, overrides *custodyBindingOverrides) (tablecustody.CustodyTransition, error) {
+	table = cloneJSON(table)
+	runtime.releaseCompletedActiveHandForNextStart(&table)
 	if len(table.Seats) < 2 {
 		return tablecustody.CustodyTransition{}, errors.New("blind-post transition requires two seated players")
 	}
@@ -556,7 +566,11 @@ func (runtime *meshRuntime) deriveBlindPostCustodyTransition(table nativeTableSt
 	if err != nil {
 		return tablecustody.CustodyTransition{}, err
 	}
-	return runtime.buildCustodyTransition(table, tablecustody.TransitionKindBlindPost, &hand, nil, nil)
+	return runtime.buildCustodyTransitionWithOverrides(table, tablecustody.TransitionKindBlindPost, &hand, nil, nil, overrides)
+}
+
+func (runtime *meshRuntime) deriveBlindPostCustodyTransition(table nativeTableState, handID string, handNumber int) (tablecustody.CustodyTransition, error) {
+	return runtime.deriveBlindPostCustodyTransitionWithOverrides(table, handID, handNumber, nil)
 }
 
 func (runtime *meshRuntime) validateCustodyTransitionSemanticsWithOptions(table nativeTableState, transition tablecustody.CustodyTransition, authorizer *nativeTransitionAuthorizer, allowFutureTimeout bool) error {
@@ -626,7 +640,12 @@ func (runtime *meshRuntime) validateCustodyTransitionSemanticsWithOptions(table 
 		}
 		expected, err = runtime.buildFundsCustodyTransitionForPlayer(table, request.PlayerID, transitionKind, finalStatus)
 	case tablecustody.TransitionKindBlindPost:
-		expected, err = runtime.deriveBlindPostCustodyTransition(table, transition.NextState.HandID, transition.NextState.HandNumber)
+		expected, err = runtime.deriveBlindPostCustodyTransitionWithOverrides(
+			table,
+			transition.NextState.HandID,
+			transition.NextState.HandNumber,
+			&custodyBindingOverrides{ActionDeadlineAt: transition.NextState.ActionDeadlineAt},
+		)
 	case tablecustody.TransitionKindShowdownPayout:
 		if table.ActiveHand == nil || table.ActiveHand.State.Phase != game.StreetSettled {
 			return errors.New("showdown-payout transition requires a settled hand")

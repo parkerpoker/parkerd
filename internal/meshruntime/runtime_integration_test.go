@@ -8,15 +8,178 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
 )
 
 const regtestRoundLockPath = "/tmp/parker-regtest-round.lock"
+
+type regtestRoundScenarioSpec struct {
+	Artifacts   map[string]string
+	Markers     []string
+	SkipCashOut bool
+}
+
+var regtestRoundScenarioSpecs = map[string]regtestRoundScenarioSpec{
+	"standard-4d": {
+		Artifacts: map[string]string{
+			"table-active":        "table-active.json",
+			"table-after-hand":    "table-after-hand.json",
+			"table-after-cashout": "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Playing automatic hands until funds move...",
+			"Cashing out...",
+			"Final wallet summaries:",
+		},
+	},
+	"host-player-2d": {
+		Artifacts: map[string]string{
+			"table-active":        "table-active.json",
+			"table-after-hand":    "table-after-hand.json",
+			"table-after-cashout": "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Playing automatic hands until funds move...",
+			"Cashing out...",
+			"Final wallet summaries:",
+		},
+	},
+	"recovery-timeout-2d": {
+		Artifacts: map[string]string{
+			"table-active":     "table-active.json",
+			"table-after-hand": "table-after-hand.json",
+		},
+		Markers: []string{
+			"Forcing deterministic timeout recovery scenario...",
+			"Stopping defaulting player daemon and Ark/indexer services before timeout finalization completes...",
+			"Timeout completion confirmed.",
+			"Skipping cash out because the recovery scenario intentionally leaves the Ark server offline.",
+		},
+		SkipCashOut: true,
+	},
+	"aborted-hand-2d": {
+		Artifacts: map[string]string{
+			"table-active":        "table-active.json",
+			"table-after-abort":   "table-after-abort.json",
+			"table-after-hand":    "table-after-hand.json",
+			"table-after-cashout": "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Forcing aborted-hand scenario...",
+			"Forcing a no-blame hand abort",
+			"Playing a fresh post-abort hand to verify the table continues...",
+			"Cashing out...",
+			"Final wallet summaries:",
+		},
+	},
+	"all-in-side-pot-2d": {
+		Artifacts: map[string]string{
+			"table-active":        "table-active.json",
+			"table-after-all-in":  "table-after-all-in.json",
+			"table-after-hand":    "table-after-hand.json",
+			"table-after-cashout": "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Forcing explicit all-in coverage...",
+			"Sending all-in line via",
+			"Completing all-in with",
+			"Cashing out...",
+			"Final wallet summaries:",
+		},
+	},
+	"turn-challenge-2d": {
+		Artifacts: map[string]string{
+			"table-active":                     "table-active.json",
+			"table-after-challenge-open":       "table-after-challenge-open.json",
+			"table-after-challenge-resolution": "table-after-challenge-resolution.json",
+			"table-after-hand":                 "table-after-hand.json",
+		},
+		Markers: []string{
+			"Forcing on-chain turn challenge option resolution...",
+			"Resolving turn challenge with option",
+			"Skipping cash out because this scenario verifies challenge resolution without requiring a post-resolution cash-out.",
+		},
+		SkipCashOut: true,
+	},
+	"emergency-exit-2d": {
+		Artifacts: map[string]string{
+			"table-active":                "table-active.json",
+			"table-before-emergency-exit": "table-before-emergency-exit.json",
+			"emergency-exit-result":       "emergency-exit-result.json",
+			"table-after-emergency-exit":  "table-after-emergency-exit.json",
+			"table-after-hand":            "table-after-hand.json",
+			"table-after-cashout":         "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Playing a live hand before emergency exit...",
+			"Executing emergency exit...",
+			"Cashing out the non-exiting player after emergency exit...",
+			"Final wallet summaries:",
+		},
+	},
+	"multi-hand-2d": {
+		Artifacts: map[string]string{
+			"table-active":        "table-active.json",
+			"table-after-hand-1":  "table-after-hand-1.json",
+			"table-after-hand":    "table-after-hand.json",
+			"table-after-cashout": "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Playing multiple hands without cashing out...",
+			"Cashing out...",
+			"Final wallet summaries:",
+		},
+	},
+	"challenge-escape-2d": {
+		Artifacts: map[string]string{
+			"table-active":                     "table-active.json",
+			"table-after-challenge-open":       "table-after-challenge-open.json",
+			"table-after-challenge-resolution": "table-after-challenge-resolution.json",
+			"table-after-hand":                 "table-after-hand.json",
+		},
+		Markers: []string{
+			"Forcing turn challenge escape after CSV maturity...",
+			"Mining regtest blocks until challenge escape is eligible...",
+			"Skipping cash out because this scenario verifies the CSV escape path",
+		},
+		SkipCashOut: true,
+	},
+	"recovery-showdown-2d": {
+		Artifacts: map[string]string{
+			"table-active":                   "table-active.json",
+			"table-before-recovery-showdown": "table-before-recovery-showdown.json",
+			"table-after-hand":               "table-after-hand.json",
+		},
+		Markers: []string{
+			"Driving the hand to showdown before forcing payout recovery...",
+			"taking Ark offline before payout settlement",
+			"Skipping cash out because the recovery scenario intentionally leaves the Ark server offline.",
+		},
+		SkipCashOut: true,
+	},
+	"cashout-after-challenge-2d": {
+		Artifacts: map[string]string{
+			"table-active":                     "table-active.json",
+			"table-after-challenge-open":       "table-after-challenge-open.json",
+			"table-after-challenge-resolution": "table-after-challenge-resolution.json",
+			"table-after-hand":                 "table-after-hand.json",
+			"table-after-cashout":              "table-after-cashout.json",
+		},
+		Markers: []string{
+			"Forcing challenged timeout resolution before cash-out...",
+			"Waiting for turn challenge timeout eligibility...",
+			"Cashing out...",
+			"Final wallet summaries:",
+		},
+	},
+}
 
 func lockRegtestRound(t *testing.T) func() {
 	t.Helper()
@@ -51,18 +214,60 @@ func TestRegtestRoundUsesRealArkCustodyRecoveryTimeoutScenario(t *testing.T) {
 	assertRegtestRoundRecoveryArtifacts(t, result)
 }
 
+func TestRegtestRoundUsesRealArkCustodyAbortedHandScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "aborted-hand-2d")
+	assertRegtestRoundAbortedHandArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyAllInScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "all-in-side-pot-2d")
+	assertRegtestRoundAllInArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyTurnChallengeScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "turn-challenge-2d")
+	assertRegtestRoundTurnChallengeOptionArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyEmergencyExitScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "emergency-exit-2d")
+	assertRegtestRoundEmergencyExitArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyMultiHandScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "multi-hand-2d")
+	assertRegtestRoundMultiHandArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyChallengeEscapeScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "challenge-escape-2d")
+	assertRegtestRoundChallengeEscapeArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyRecoveryShowdownScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "recovery-showdown-2d")
+	assertRegtestRoundRecoveryShowdownArtifacts(t, result)
+}
+
+func TestRegtestRoundUsesRealArkCustodyCashoutAfterChallengeScenario(t *testing.T) {
+	result := runRegtestRoundScenario(t, "cashout-after-challenge-2d")
+	assertRegtestRoundCashoutAfterChallengeArtifacts(t, result)
+}
+
 type cliDataEnvelope[T any] struct {
 	Data T `json:"data"`
 }
 
 type regtestRoundResult struct {
-	Scenario           string
-	Output             string
-	RunRoot            string
-	TableActivePath    string
-	TableAfterHandPath string
-	TableAfterCashout  string
-	SkipCashOut        bool
+	Artifacts   map[string]string
+	Output      string
+	RunRoot     string
+	Scenario    string
+	SkipCashOut bool
+}
+
+func (result regtestRoundResult) Artifact(name string) string {
+	return result.Artifacts[name]
 }
 
 func runRegtestRoundScenario(t *testing.T, scenario string) regtestRoundResult {
@@ -70,6 +275,11 @@ func runRegtestRoundScenario(t *testing.T, scenario string) regtestRoundResult {
 		t.Skip("skipping regtest Ark integration round in short mode")
 	}
 	defer lockRegtestRound(t)()
+
+	spec, ok := regtestRoundScenarioSpecs[scenario]
+	if !ok {
+		t.Fatalf("unknown regtest round scenario %q", scenario)
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -122,33 +332,22 @@ func runRegtestRoundScenario(t *testing.T, scenario string) regtestRoundResult {
 		"TABLE_ID=",
 		"Done. Logs are under",
 	}
-	if scenario == "recovery-timeout-2d" {
-		markers = append(markers,
-			"Forcing deterministic timeout recovery scenario...",
-			"Stopping defaulting player daemon and Ark/indexer services before timeout finalization completes...",
-			"Timeout completion confirmed.",
-			"Skipping cash out because the recovery scenario intentionally leaves the Ark server offline.",
-		)
-	} else {
-		markers = append(markers,
-			"Playing automatic hands until funds move...",
-			"Cashing out...",
-			"Final wallet summaries:",
-		)
-	}
+	markers = append(markers, spec.Markers...)
 	for _, marker := range markers {
 		if !strings.Contains(text, marker) {
 			t.Fatalf("regtest round %s output missing %q (artifacts at %s)\n%s", scenario, marker, runRoot, text)
 		}
 	}
+	artifacts := map[string]string{}
+	for name, filename := range spec.Artifacts {
+		artifacts[name] = filepath.Join(baseDir, "artifacts", filename)
+	}
 	return regtestRoundResult{
-		Scenario:           scenario,
-		Output:             text,
-		RunRoot:            runRoot,
-		TableActivePath:    filepath.Join(baseDir, "artifacts", "table-active.json"),
-		TableAfterHandPath: filepath.Join(baseDir, "artifacts", "table-after-hand.json"),
-		TableAfterCashout:  filepath.Join(baseDir, "artifacts", "table-after-cashout.json"),
-		SkipCashOut:        scenario == "recovery-timeout-2d",
+		Artifacts:   artifacts,
+		Output:      text,
+		RunRoot:     runRoot,
+		Scenario:    scenario,
+		SkipCashOut: spec.SkipCashOut,
 	}
 }
 
@@ -202,6 +401,120 @@ func loadIntegrationTableView(t *testing.T, path string) NativeMeshTableView {
 	return envelope.Data
 }
 
+func loadIntegrationArtifactTableView(t *testing.T, result regtestRoundResult, name string) NativeMeshTableView {
+	t.Helper()
+
+	path := result.Artifact(name)
+	if strings.TrimSpace(path) == "" {
+		t.Fatalf("scenario %s is missing artifact mapping for %s", result.Scenario, name)
+	}
+	return loadIntegrationTableView(t, path)
+}
+
+func loadIntegrationArtifactJSONMap(t *testing.T, result regtestRoundResult, name string) map[string]any {
+	t.Helper()
+
+	path := result.Artifact(name)
+	if strings.TrimSpace(path) == "" {
+		t.Fatalf("scenario %s is missing artifact mapping for %s", result.Scenario, name)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read integration artifact %s: %v", path, err)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode integration artifact %s: %v", path, err)
+	}
+	if data, ok := envelope["data"].(map[string]any); ok {
+		return data
+	}
+	return envelope
+}
+
+func assertIntegrationArtifactsExist(t *testing.T, result regtestRoundResult, names ...string) {
+	t.Helper()
+
+	for _, name := range names {
+		path := result.Artifact(name)
+		if strings.TrimSpace(path) == "" {
+			t.Fatalf("scenario %s is missing artifact mapping for %s", result.Scenario, name)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("missing integration artifact %s (%s): %v", name, path, err)
+		}
+	}
+}
+
+func latestIntegrationTransition(t *testing.T, table NativeMeshTableView) tablecustody.CustodyTransition {
+	t.Helper()
+
+	if len(table.CustodyTransitions) == 0 {
+		t.Fatal("expected custody transitions in integration artifact")
+	}
+	return table.CustodyTransitions[len(table.CustodyTransitions)-1]
+}
+
+func countIntegrationEvents(table NativeMeshTableView, eventType string) int {
+	count := 0
+	for _, event := range table.Events {
+		if stringValue(event.Body["type"]) == eventType {
+			count++
+		}
+	}
+	return count
+}
+
+func integrationTableHasEventType(table NativeMeshTableView, eventType string) bool {
+	return countIntegrationEvents(table, eventType) > 0
+}
+
+func assertIntegrationCashOutEvents(t *testing.T, table NativeMeshTableView, minimum int) {
+	t.Helper()
+
+	cashOutCount := 0
+	for index, event := range table.Events {
+		if stringValue(event.Body["type"]) != "CashOut" {
+			continue
+		}
+		cashOutCount++
+		request, hasRequest, err := fundsRequestFromEvent(event)
+		if err != nil {
+			t.Fatalf("decode funds request for event %d: %v", index, err)
+		}
+		if !hasRequest || request == nil {
+			t.Fatalf("cash-out event %d is missing canonical fundsRequest payload", index)
+		}
+		if strings.TrimSpace(request.SignatureHex) == "" || strings.TrimSpace(request.SignedAt) == "" {
+			t.Fatalf("cash-out event %d request is missing its signature material", index)
+		}
+		if strings.TrimSpace(request.PrevCustodyStateHash) == "" {
+			t.Fatalf("cash-out event %d request is missing prev custody hash", index)
+		}
+		custodySeq, err := eventCustodySeq(event)
+		if err != nil {
+			t.Fatalf("decode funds custody seq for event %d: %v", index, err)
+		}
+		transitionHash := eventTransitionHash(event)
+		transition, _, ok := linkedTransitionBySeqHash(table.CustodyTransitions, transitionHash, custodySeq)
+		if !ok {
+			t.Fatalf("cash-out event %d does not link to custody history", index)
+		}
+		if transition.Kind != tablecustody.TransitionKindCashOut {
+			t.Fatalf("cash-out event %d linked transition kind %s, want %s", index, transition.Kind, tablecustody.TransitionKindCashOut)
+		}
+		if request.PrevCustodyStateHash != transition.PrevStateHash {
+			t.Fatalf("cash-out event %d request prev hash %q does not match transition prev hash %q", index, request.PrevCustodyStateHash, transition.PrevStateHash)
+		}
+		if request.PlayerID != transition.ActingPlayerID {
+			t.Fatalf("cash-out event %d request player %q does not match transition actor %q", index, request.PlayerID, transition.ActingPlayerID)
+		}
+	}
+	if cashOutCount < minimum {
+		t.Fatalf("expected at least %d CashOut events in regtest artifact, got %d", minimum, cashOutCount)
+	}
+}
+
 func linkedTransitionBySeqHash(transitions []tablecustody.CustodyTransition, transitionHash string, custodySeq int) (tablecustody.CustodyTransition, *tablecustody.CustodyState, bool) {
 	for index, transition := range transitions {
 		if transition.CustodySeq != custodySeq {
@@ -222,16 +535,20 @@ func linkedTransitionBySeqHash(transitions []tablecustody.CustodyTransition, tra
 func assertRegtestRoundCustodyArtifacts(t *testing.T, result regtestRoundResult) {
 	t.Helper()
 
-	for _, path := range []string{result.TableActivePath, result.TableAfterHandPath, result.TableAfterCashout} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("missing integration artifact %s: %v", path, err)
-		}
+	assertRegtestRoundCustodyArtifactsWithBalanceCheck(t, result, true)
+}
+
+func assertRegtestRoundCustodyArtifactsWithBalanceCheck(t *testing.T, result regtestRoundResult, requireMovedFunds bool) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-active", "table-after-hand", "table-after-cashout")
+
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	afterCashout := loadIntegrationArtifactTableView(t, result, "table-after-cashout")
+
+	if requireMovedFunds {
+		assertRegtestRoundMovedFunds(t, afterHand)
 	}
-
-	afterHand := loadIntegrationTableView(t, result.TableAfterHandPath)
-	afterCashout := loadIntegrationTableView(t, result.TableAfterCashout)
-
-	assertRegtestRoundMovedFunds(t, afterHand)
 
 	handResultCount := 0
 	for index, event := range afterHand.Events {
@@ -324,63 +641,20 @@ func assertRegtestRoundCustodyArtifacts(t *testing.T, result regtestRoundResult)
 	if signedActionCount == 0 {
 		t.Fatal("expected signed action requests in regtest round")
 	}
-
-	cashOutCount := 0
-	for index, event := range afterCashout.Events {
-		if stringValue(event.Body["type"]) != "CashOut" {
-			continue
-		}
-		cashOutCount++
-		request, hasRequest, err := fundsRequestFromEvent(event)
-		if err != nil {
-			t.Fatalf("decode funds request for event %d: %v", index, err)
-		}
-		if !hasRequest || request == nil {
-			t.Fatalf("cash-out event %d is missing canonical fundsRequest payload", index)
-		}
-		if strings.TrimSpace(request.SignatureHex) == "" || strings.TrimSpace(request.SignedAt) == "" {
-			t.Fatalf("cash-out event %d request is missing its signature material", index)
-		}
-		if strings.TrimSpace(request.PrevCustodyStateHash) == "" {
-			t.Fatalf("cash-out event %d request is missing prev custody hash", index)
-		}
-		custodySeq, err := eventCustodySeq(event)
-		if err != nil {
-			t.Fatalf("decode funds custody seq for event %d: %v", index, err)
-		}
-		transitionHash := eventTransitionHash(event)
-		transition, _, ok := linkedTransitionBySeqHash(afterCashout.CustodyTransitions, transitionHash, custodySeq)
-		if !ok {
-			t.Fatalf("cash-out event %d does not link to custody history", index)
-		}
-		if transition.Kind != tablecustody.TransitionKindCashOut {
-			t.Fatalf("cash-out event %d linked transition kind %s, want %s", index, transition.Kind, tablecustody.TransitionKindCashOut)
-		}
-		if request.PrevCustodyStateHash != transition.PrevStateHash {
-			t.Fatalf("cash-out event %d request prev hash %q does not match transition prev hash %q", index, request.PrevCustodyStateHash, transition.PrevStateHash)
-		}
-		if request.PlayerID != transition.ActingPlayerID {
-			t.Fatalf("cash-out event %d request player %q does not match transition actor %q", index, request.PlayerID, transition.ActingPlayerID)
-		}
-	}
-	if cashOutCount < 2 {
-		t.Fatalf("expected at least two CashOut events in regtest round, got %d", cashOutCount)
-	}
+	assertIntegrationCashOutEvents(t, afterCashout, 2)
 }
 
 func assertRegtestRoundRecoveryArtifacts(t *testing.T, result regtestRoundResult) {
 	t.Helper()
 
-	for _, path := range []string{result.TableActivePath, result.TableAfterHandPath} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("missing integration artifact %s: %v", path, err)
+	assertIntegrationArtifactsExist(t, result, "table-active", "table-after-hand")
+	if path := result.Artifact("table-after-cashout"); strings.TrimSpace(path) != "" {
+		if _, err := os.Stat(path); err == nil {
+			t.Fatalf("recovery scenario unexpectedly produced a cash-out artifact at %s", path)
 		}
 	}
-	if _, err := os.Stat(result.TableAfterCashout); err == nil {
-		t.Fatalf("recovery scenario unexpectedly produced a cash-out artifact at %s", result.TableAfterCashout)
-	}
 
-	afterHand := loadIntegrationTableView(t, result.TableAfterHandPath)
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
 	assertRegtestRoundMovedFunds(t, afterHand)
 
 	var recovered tablecustody.CustodyTransition
@@ -506,6 +780,328 @@ func assertRegtestRoundRecoveryArtifacts(t *testing.T, result regtestRoundResult
 	}
 	if handResultCount == 0 {
 		t.Fatal("expected at least one HandResult event in recovery scenario")
+	}
+}
+
+func assertRegtestRoundAbortedHandArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-after-abort")
+	afterAbort := loadIntegrationArtifactTableView(t, result, "table-after-abort")
+	if !integrationTableHasEventType(afterAbort, "HandAbort") {
+		t.Fatal("expected HandAbort event in aborted-hand artifact")
+	}
+	if afterAbort.LatestCustodyState == nil {
+		t.Fatal("expected latest custody state in aborted-hand artifact")
+	}
+
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	abortHandNumber := -1
+	if afterAbort.PublicState != nil {
+		abortHandNumber = afterAbort.PublicState.HandNumber
+	} else if afterAbort.LatestSnapshot != nil {
+		abortHandNumber = afterAbort.LatestSnapshot.HandNumber
+	}
+	afterHandNumber := -1
+	if afterHand.PublicState != nil {
+		afterHandNumber = afterHand.PublicState.HandNumber
+	} else if afterHand.LatestSnapshot != nil {
+		afterHandNumber = afterHand.LatestSnapshot.HandNumber
+	}
+	if afterHandNumber <= abortHandNumber {
+		t.Fatal("expected a fresh hand to start after the aborted-hand artifact")
+	}
+	assertRegtestRoundCustodyArtifacts(t, result)
+}
+
+func assertRegtestRoundAllInArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-after-all-in")
+	afterAllIn := loadIntegrationArtifactTableView(t, result, "table-after-all-in")
+	foundAllIn := false
+	if afterAllIn.PublicState != nil {
+		for _, seat := range afterAllIn.PublicState.SeatedPlayers {
+			if seat.Status == string(game.PlayerStatusAllIn) {
+				foundAllIn = true
+				break
+			}
+		}
+	}
+	if !foundAllIn && afterAllIn.LatestCustodyState != nil {
+		for _, claim := range afterAllIn.LatestCustodyState.StackClaims {
+			if claim.AllIn {
+				foundAllIn = true
+				break
+			}
+		}
+	}
+	if !foundAllIn {
+		t.Fatal("expected explicit all-in status in the all-in artifact")
+	}
+
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	latest := latestIntegrationTransition(t, afterHand)
+	if latest.Kind != tablecustody.TransitionKindShowdownPayout {
+		t.Fatalf("expected all-in hand to settle via %q, got %q", tablecustody.TransitionKindShowdownPayout, latest.Kind)
+	}
+	assertRegtestRoundCustodyArtifactsWithBalanceCheck(t, result, false)
+}
+
+func assertTurnChallengeOpenArtifact(t *testing.T, table NativeMeshTableView) {
+	t.Helper()
+
+	latest := latestIntegrationTransition(t, table)
+	if latest.Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		t.Fatalf("expected latest transition kind %q, got %q", tablecustody.TransitionKindTurnChallengeOpen, latest.Kind)
+	}
+	if latest.Proof.ChallengeWitness == nil {
+		t.Fatal("expected turn challenge open transition to carry a challenge witness")
+	}
+	if latest.Proof.ChallengeBundle == nil || latest.Proof.ChallengeBundle.Kind != tablecustody.TransitionKindTurnChallengeOpen {
+		t.Fatalf("expected turn challenge open bundle kind %q, got %+v", tablecustody.TransitionKindTurnChallengeOpen, latest.Proof.ChallengeBundle)
+	}
+	if table.PendingTurnChallenge == nil || table.PendingTurnChallenge.Status == "" {
+		t.Fatalf("expected pending turn challenge state, got %+v", table.PendingTurnChallenge)
+	}
+}
+
+func assertRegtestRoundTurnChallengeOptionArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-after-challenge-open", "table-after-challenge-resolution", "table-after-hand")
+	openTable := loadIntegrationArtifactTableView(t, result, "table-after-challenge-open")
+	assertTurnChallengeOpenArtifact(t, openTable)
+
+	resolvedTable := loadIntegrationArtifactTableView(t, result, "table-after-challenge-resolution")
+	if resolvedTable.PendingTurnChallenge != nil {
+		t.Fatalf("expected challenge resolution artifact to clear the pending turn challenge, got %+v", resolvedTable.PendingTurnChallenge)
+	}
+	latest := latestIntegrationTransition(t, resolvedTable)
+	if latest.Kind != tablecustody.TransitionKindAction {
+		t.Fatalf("expected challenge option resolution to land as %q, got %q", tablecustody.TransitionKindAction, latest.Kind)
+	}
+	if latest.Proof.ChallengeWitness == nil {
+		t.Fatal("expected challenge option resolution to carry a challenge witness")
+	}
+	if latest.Proof.ChallengeBundle == nil || latest.Proof.ChallengeBundle.Kind != tablecustody.TransitionKindAction {
+		t.Fatalf("expected challenge option bundle kind %q, got %+v", tablecustody.TransitionKindAction, latest.Proof.ChallengeBundle)
+	}
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	if afterHand.PendingTurnChallenge != nil {
+		t.Fatalf("expected final turn-challenge artifact to keep the pending turn challenge cleared, got %+v", afterHand.PendingTurnChallenge)
+	}
+	afterHandLatest := latestIntegrationTransition(t, afterHand)
+	if afterHandLatest.Kind != tablecustody.TransitionKindAction {
+		t.Fatalf("expected final turn-challenge artifact latest transition kind %q, got %q", tablecustody.TransitionKindAction, afterHandLatest.Kind)
+	}
+	if afterHandLatest.Proof.ChallengeWitness == nil {
+		t.Fatal("expected final turn-challenge artifact to preserve challenge witness metadata")
+	}
+}
+
+func assertRegtestRoundCashoutAfterChallengeArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-after-challenge-open", "table-after-challenge-resolution")
+	openTable := loadIntegrationArtifactTableView(t, result, "table-after-challenge-open")
+	assertTurnChallengeOpenArtifact(t, openTable)
+
+	resolvedTable := loadIntegrationArtifactTableView(t, result, "table-after-challenge-resolution")
+	if resolvedTable.PendingTurnChallenge != nil {
+		t.Fatalf("expected timeout challenge resolution artifact to clear the pending turn challenge, got %+v", resolvedTable.PendingTurnChallenge)
+	}
+	latest := latestIntegrationTransition(t, resolvedTable)
+	if latest.Kind != tablecustody.TransitionKindTimeout {
+		t.Fatalf("expected challenged timeout resolution to land as %q, got %q", tablecustody.TransitionKindTimeout, latest.Kind)
+	}
+	if latest.Proof.ChallengeWitness == nil {
+		t.Fatal("expected challenged timeout resolution to carry a challenge witness")
+	}
+	if latest.Proof.ChallengeBundle == nil || latest.Proof.ChallengeBundle.Kind != tablecustody.TransitionKindTimeout {
+		t.Fatalf("expected challenged timeout bundle kind %q, got %+v", tablecustody.TransitionKindTimeout, latest.Proof.ChallengeBundle)
+	}
+	assertRegtestRoundCustodyArtifacts(t, result)
+}
+
+func assertRegtestRoundChallengeEscapeArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-after-challenge-open", "table-after-challenge-resolution", "table-after-hand")
+	openTable := loadIntegrationArtifactTableView(t, result, "table-after-challenge-open")
+	assertTurnChallengeOpenArtifact(t, openTable)
+
+	escapedTable := loadIntegrationArtifactTableView(t, result, "table-after-challenge-resolution")
+	if escapedTable.PendingTurnChallenge != nil {
+		t.Fatalf("expected challenge escape artifact to clear the pending turn challenge, got %+v", escapedTable.PendingTurnChallenge)
+	}
+	latest := latestIntegrationTransition(t, escapedTable)
+	if latest.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected challenge escape transition kind %q, got %q", tablecustody.TransitionKindTurnChallengeEscape, latest.Kind)
+	}
+	if latest.Proof.ChallengeWitness == nil {
+		t.Fatal("expected challenge escape transition to carry a challenge witness")
+	}
+	if latest.Proof.ChallengeBundle == nil || latest.Proof.ChallengeBundle.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected challenge escape bundle kind %q, got %+v", tablecustody.TransitionKindTurnChallengeEscape, latest.Proof.ChallengeBundle)
+	}
+	if !integrationTableHasEventType(escapedTable, "HandAbort") {
+		t.Fatal("expected challenge escape to append HandAbort")
+	}
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	if afterHand.PendingTurnChallenge != nil {
+		t.Fatalf("expected post-escape final artifact to keep the pending turn challenge cleared, got %+v", afterHand.PendingTurnChallenge)
+	}
+	afterHandLatest := latestIntegrationTransition(t, afterHand)
+	if afterHandLatest.Kind != tablecustody.TransitionKindTurnChallengeEscape {
+		t.Fatalf("expected post-escape final artifact latest transition kind %q, got %q", tablecustody.TransitionKindTurnChallengeEscape, afterHandLatest.Kind)
+	}
+	if afterHandLatest.Proof.ChallengeWitness == nil {
+		t.Fatal("expected post-escape final artifact to preserve challenge witness metadata")
+	}
+}
+
+func assertRegtestRoundEmergencyExitArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-before-emergency-exit", "emergency-exit-result", "table-after-emergency-exit", "table-after-cashout")
+	beforeExit := loadIntegrationArtifactTableView(t, result, "table-before-emergency-exit")
+	assertRegtestRoundMovedFunds(t, beforeExit)
+
+	exitResult := loadIntegrationArtifactJSONMap(t, result, "emergency-exit-result")
+	exitStatus := strings.TrimSpace(stringValue(exitResult["status"]))
+	if exitStatus != "pending-exit" && exitStatus != "exited" {
+		t.Fatalf("expected emergency exit result status pending-exit or exited, got %+v", exitResult)
+	}
+	settledArkTx := strings.TrimSpace(stringValue(exitResult["settledArkTx"]))
+	if settledArkTx == "" {
+		t.Fatalf("expected emergency exit result to include a settled Ark tx id, got %+v", exitResult)
+	}
+	receipt, ok := exitResult["receipt"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected emergency exit result receipt payload, got %+v", exitResult["receipt"])
+	}
+	if kind := strings.TrimSpace(stringValue(receipt["kind"])); kind != string(tablecustody.TransitionKindEmergencyExit) {
+		t.Fatalf("expected emergency exit receipt kind %q, got %+v", tablecustody.TransitionKindEmergencyExit, receipt["kind"])
+	}
+	if arkTxID := strings.TrimSpace(stringValue(receipt["arkTxid"])); arkTxID != settledArkTx {
+		t.Fatalf("expected emergency exit receipt ark tx %q, got %q", settledArkTx, arkTxID)
+	}
+	fundsRequest, ok := receipt["fundsRequest"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected emergency exit receipt funds request, got %+v", receipt["fundsRequest"])
+	}
+	exitExecution, ok := fundsRequest["exitExecution"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected emergency exit receipt execution payload, got %+v", fundsRequest["exitExecution"])
+	}
+	broadcastTxIDs, err := decodeJSONValue[[]string](exitExecution["broadcastTxIds"])
+	if err != nil {
+		t.Fatalf("decode emergency exit broadcast tx ids: %v", err)
+	}
+	if len(broadcastTxIDs) == 0 {
+		t.Fatalf("expected emergency exit receipt broadcast tx ids, got %+v", exitExecution)
+	}
+	if !slices.Contains(broadcastTxIDs, settledArkTx) {
+		t.Fatalf("expected emergency exit settled tx %q inside broadcast tx ids %v", settledArkTx, broadcastTxIDs)
+	}
+	sourceRefs, err := decodeJSONValue[[]tablecustody.VTXORef](exitExecution["sourceRefs"])
+	if err != nil {
+		t.Fatalf("decode emergency exit source refs: %v", err)
+	}
+	if len(sourceRefs) == 0 {
+		t.Fatalf("expected emergency exit receipt source refs, got %+v", exitExecution)
+	}
+
+	exitTable := loadIntegrationArtifactTableView(t, result, "table-after-emergency-exit")
+	if exitTable.PublicState == nil {
+		t.Fatal("expected emergency exit artifact to retain public state")
+	}
+	if got := strings.TrimSpace(exitTable.PublicState.Status); got != "seating" {
+		t.Fatalf("expected emergency exit to leave the remaining player in seating status, got %q", got)
+	}
+	if integrationTableHasEventType(exitTable, "EmergencyExit") {
+		latest := latestIntegrationTransition(t, exitTable)
+		if latest.Kind != tablecustody.TransitionKindEmergencyExit {
+			t.Fatalf("expected latest transition kind %q, got %q", tablecustody.TransitionKindEmergencyExit, latest.Kind)
+		}
+		if latest.Proof.ExitWitness == nil {
+			t.Fatal("expected emergency exit transition to persist an exit witness")
+		}
+		if latest.Proof.SettlementWitness != nil {
+			t.Fatal("did not expect emergency exit transition to carry an Ark settlement witness")
+		}
+	}
+
+	afterCashout := loadIntegrationArtifactTableView(t, result, "table-after-cashout")
+	assertIntegrationCashOutEvents(t, afterCashout, 1)
+}
+
+func assertRegtestRoundMultiHandArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-after-hand-1", "table-after-hand", "table-after-cashout")
+	firstHand := loadIntegrationArtifactTableView(t, result, "table-after-hand-1")
+	secondHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	if firstHand.PublicState == nil || secondHand.PublicState == nil {
+		t.Fatal("expected public state in multi-hand artifacts")
+	}
+	if secondHand.PublicState.HandNumber <= firstHand.PublicState.HandNumber {
+		t.Fatalf("expected later hand number after multi-hand run, got first=%d second=%d", firstHand.PublicState.HandNumber, secondHand.PublicState.HandNumber)
+	}
+	if countIntegrationEvents(secondHand, "HandResult") < 2 {
+		t.Fatalf("expected at least two HandResult events after multi-hand run, got %d", countIntegrationEvents(secondHand, "HandResult"))
+	}
+	if firstHand.PublicState.DealerSeatIndex == secondHand.PublicState.DealerSeatIndex {
+		t.Fatalf("expected dealer rotation across multi-hand run, got first=%v second=%v", firstHand.PublicState.DealerSeatIndex, secondHand.PublicState.DealerSeatIndex)
+	}
+	if firstHand.LatestCustodyState == nil || strings.TrimSpace(firstHand.LatestCustodyState.StateHash) == "" {
+		t.Fatal("expected first multi-hand artifact to include the settled custody state hash")
+	}
+	continuedBlindPostFound := false
+	blindPostCount := 0
+	for _, transition := range secondHand.CustodyTransitions {
+		if transition.Kind != tablecustody.TransitionKindBlindPost {
+			continue
+		}
+		blindPostCount++
+		if transition.PrevStateHash == firstHand.LatestCustodyState.StateHash {
+			continuedBlindPostFound = true
+		}
+	}
+	if blindPostCount < 2 {
+		t.Fatalf("expected at least two blind-post transitions after multi-hand run, got %d", blindPostCount)
+	}
+	if !continuedBlindPostFound {
+		t.Fatalf("expected a later blind-post transition to continue from settled custody state %q", firstHand.LatestCustodyState.StateHash)
+	}
+	afterCashout := loadIntegrationArtifactTableView(t, result, "table-after-cashout")
+	assertIntegrationCashOutEvents(t, afterCashout, 2)
+}
+
+func assertRegtestRoundRecoveryShowdownArtifacts(t *testing.T, result regtestRoundResult) {
+	t.Helper()
+
+	assertIntegrationArtifactsExist(t, result, "table-before-recovery-showdown", "table-after-hand")
+	beforeRecovery := loadIntegrationArtifactTableView(t, result, "table-before-recovery-showdown")
+	if beforeRecovery.PublicState == nil || beforeRecovery.PublicState.Phase != string(game.StreetShowdownReveal) {
+		t.Fatalf("expected showdown-reveal phase before recovery showdown, got %+v", beforeRecovery.PublicState)
+	}
+
+	afterHand := loadIntegrationArtifactTableView(t, result, "table-after-hand")
+	assertRegtestRoundMovedFunds(t, afterHand)
+	latest := latestIntegrationTransition(t, afterHand)
+	if latest.Kind != tablecustody.TransitionKindShowdownPayout {
+		t.Fatalf("expected recovered showdown payout transition kind %q, got %q", tablecustody.TransitionKindShowdownPayout, latest.Kind)
+	}
+	if latest.Proof.RecoveryWitness == nil {
+		t.Fatal("expected recovered showdown payout to carry a recovery witness")
+	}
+	if latest.Proof.SettlementWitness != nil {
+		t.Fatal("did not expect recovered showdown payout to carry a settlement witness")
+	}
+	if !integrationTableHasEventType(afterHand, "HandResult") {
+		t.Fatal("expected HandResult event after recovered showdown payout")
 	}
 }
 

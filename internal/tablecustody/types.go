@@ -24,6 +24,21 @@ const (
 	TransitionKindCarryForward        TransitionKind = "carry-forward"
 )
 
+func AllTransitionKinds() []TransitionKind {
+	return []TransitionKind{
+		TransitionKindBuyInLock,
+		TransitionKindBlindPost,
+		TransitionKindAction,
+		TransitionKindTimeout,
+		TransitionKindTurnChallengeOpen,
+		TransitionKindTurnChallengeEscape,
+		TransitionKindShowdownPayout,
+		TransitionKindCashOut,
+		TransitionKindEmergencyExit,
+		TransitionKindCarryForward,
+	}
+}
+
 type VTXORef struct {
 	AmountSats    int      `json:"amountSats"`
 	ArkIntentID   string   `json:"arkIntentId,omitempty"`

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,7 +28,33 @@ import (
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
 )
 
-const unilateralExitSweepTimeout = 90 * time.Second
+const (
+	unilateralExitSweepTimeout             = 90 * time.Second
+	unilateralExitWitnessLookupTimeout     = 15 * time.Second
+	unilateralExitWitnessLookupPollInterval = 250 * time.Millisecond
+)
+
+func waitForExplorerTxHex(fetchTxHex func(string) (string, error), txid string, timeout, pollInterval time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = unilateralExitWitnessLookupTimeout
+	}
+	if pollInterval <= 0 {
+		pollInterval = unilateralExitWitnessLookupPollInterval
+	}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		txHex, err := fetchTxHex(txid)
+		if err == nil {
+			return txHex, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return "", lastErr
+		}
+		time.Sleep(pollInterval)
+	}
+}
 
 func finalizedSignedCustodyTxFromPacket(packet *psbt.Packet) (*wire.MsgTx, error) {
 	if packet == nil {
@@ -193,15 +220,20 @@ func (runtime *Runtime) UnilateralExitCustodyRefs(profileName string, refs []tab
 		if err != nil {
 			return CustodyExitResult{}, err
 		}
-		txid, err := explorerSvc.Broadcast(nextTx, childTx)
+		if _, err := explorerSvc.Broadcast(nextTx, childTx); err != nil {
+			return CustodyExitResult{}, err
+		}
+		txids, err := packageBroadcastTxIDs(childTx, nextTx)
 		if err != nil {
 			return CustodyExitResult{}, err
 		}
-		if _, ok := broadcasted[txid]; ok {
-			continue
+		for _, txid := range txids {
+			if _, ok := broadcasted[txid]; ok {
+				continue
+			}
+			broadcasted[txid] = struct{}{}
+			result.BroadcastTxIDs = append(result.BroadcastTxIDs, txid)
 		}
-		broadcasted[txid] = struct{}{}
-		result.BroadcastTxIDs = append(result.BroadcastTxIDs, txid)
 	}
 
 	sweepTxID, err := client.CompleteUnroll(ctx, destination)
@@ -233,6 +265,17 @@ func custodyExitOutpointKey(txid string, vout uint32) string {
 	return fmt.Sprintf("%s:%d", strings.TrimSpace(txid), vout)
 }
 
+func custodyExitSourceTxID(ref tablecustody.VTXORef) string {
+	if trimmed := strings.TrimSpace(ref.ArkTxID); trimmed != "" {
+		return trimmed
+	}
+	return strings.TrimSpace(ref.TxID)
+}
+
+func custodyExitSourceOutpointKey(ref tablecustody.VTXORef) string {
+	return custodyExitOutpointKey(custodyExitSourceTxID(ref), ref.VOut)
+}
+
 func uniqueExitTxIDs(txids []string) []string {
 	seen := map[string]struct{}{}
 	unique := make([]string, 0, len(txids))
@@ -248,6 +291,18 @@ func uniqueExitTxIDs(txids []string) []string {
 		unique = append(unique, trimmed)
 	}
 	return unique
+}
+
+func packageBroadcastTxIDs(txHexs ...string) ([]string, error) {
+	txids := make([]string, 0, len(txHexs))
+	for _, txHex := range txHexs {
+		tx, err := decodeCustodyExitTxHex(txHex, "")
+		if err != nil {
+			return nil, err
+		}
+		txids = append(txids, tx.TxHash().String())
+	}
+	return uniqueExitTxIDs(txids), nil
 }
 
 func encodeCustodyExitTxHex(tx *wire.MsgTx) (string, error) {
@@ -267,9 +322,10 @@ func mockCustodyExitWitness(refs []tablecustody.VTXORef, includeSweep bool) (*ta
 	}
 	anchorTx := wire.NewMsgTx(2)
 	for _, ref := range refs {
-		hash, err := chainhash.NewHashFromStr(strings.TrimSpace(ref.TxID))
+		sourceTxID := custodyExitSourceTxID(ref)
+		hash, err := chainhash.NewHashFromStr(sourceTxID)
 		if err != nil {
-			return nil, fmt.Errorf("mock custody exit source ref %s is invalid: %w", custodyExitOutpointKey(ref.TxID, ref.VOut), err)
+			return nil, fmt.Errorf("mock custody exit source ref %s is invalid: %w", custodyExitSourceOutpointKey(ref), err)
 		}
 		anchorTx.AddTxIn(&wire.TxIn{
 			PreviousOutPoint: wire.OutPoint{
@@ -333,7 +389,7 @@ func VerifyUnilateralExitWitness(refs []tablecustody.VTXORef, witness tablecusto
 	}
 	sourceOutpoints := map[string]struct{}{}
 	for _, ref := range refs {
-		sourceOutpoints[custodyExitOutpointKey(ref.TxID, ref.VOut)] = struct{}{}
+		sourceOutpoints[custodyExitSourceOutpointKey(ref)] = struct{}{}
 	}
 	broadcastSet := map[string]struct{}{}
 	broadcastTxs := map[string]*wire.MsgTx{}
@@ -441,7 +497,7 @@ func (runtime *Runtime) BuildUnilateralExitWitness(profileName string, refs []ta
 		BroadcastTransactions: make([]tablecustody.CustodyExitTransaction, 0, len(claimedBroadcastTxIDs)),
 	}
 	for _, txid := range claimedBroadcastTxIDs {
-		txHex, err := explorerSvc.GetTxHex(txid)
+		txHex, err := waitForExplorerTxHex(explorerSvc.GetTxHex, txid, unilateralExitWitnessLookupTimeout, unilateralExitWitnessLookupPollInterval)
 		if err != nil {
 			return nil, fmt.Errorf("unable to verify custody exit tx %s: %w", txid, err)
 		}
@@ -452,7 +508,7 @@ func (runtime *Runtime) BuildUnilateralExitWitness(profileName string, refs []ta
 	}
 	trimmedSweepTxID := strings.TrimSpace(sweepTxID)
 	if trimmedSweepTxID != "" {
-		sweepTxHex, err := explorerSvc.GetTxHex(trimmedSweepTxID)
+		sweepTxHex, err := waitForExplorerTxHex(explorerSvc.GetTxHex, trimmedSweepTxID, unilateralExitWitnessLookupTimeout, unilateralExitWitnessLookupPollInterval)
 		if err != nil {
 			return nil, fmt.Errorf("unable to verify custody exit sweep tx %s: %w", trimmedSweepTxID, err)
 		}
@@ -537,16 +593,19 @@ func (runtime *Runtime) ExecuteCustodyRecoveryTransaction(profileName, signedPSB
 		return CustodyRecoveryResult{}, err
 	}
 	parentHex := hex.EncodeToString(serialized.Bytes())
-	broadcastTxID, err := explorerSvc.Broadcast(parentHex, childTx)
+	if _, err := explorerSvc.Broadcast(parentHex, childTx); err != nil {
+		return CustodyRecoveryResult{}, err
+	}
+	broadcastTxIDs, err := packageBroadcastTxIDs(childTx, parentHex)
 	if err != nil {
 		return CustodyRecoveryResult{}, err
 	}
 
 	result := CustodyRecoveryResult{
-		BroadcastTxIDs: []string{broadcastTxID},
+		BroadcastTxIDs: append([]string(nil), broadcastTxIDs...),
 		RecoveryTxID:   recoveryTxID,
 	}
-	if broadcastTxID != recoveryTxID {
+	if !slices.Contains(result.BroadcastTxIDs, recoveryTxID) {
 		result.BroadcastTxIDs = append(result.BroadcastTxIDs, recoveryTxID)
 	}
 	return result, nil

@@ -317,6 +317,10 @@ func (d *ProxyDaemon) handleRuntimeRequest(method string, params map[string]any)
 		)
 	case "meshRotateHost":
 		return d.runtime.RotateHost(stringFromMap(params, "tableId", d.runtime.currentTableID()))
+	case "meshStartNextHand":
+		return d.runtime.StartNextHand(stringFromMap(params, "tableId", d.runtime.currentTableID()))
+	case "meshAbortHand":
+		return d.runtime.AbortHand(stringFromMap(params, "tableId", d.runtime.currentTableID()))
 	case "meshPublicTables":
 		return d.runtime.PublicTables()
 	case "meshCashOut":

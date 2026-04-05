@@ -308,6 +308,24 @@ func sameRecoverySettlementSemantics(left []custodyBatchOutput, right []custodyB
 	return reflect.DeepEqual(leftSemantics, rightSemantics)
 }
 
+func recoveryBundleMatchesTarget(bundle tablecustody.CustodyRecoveryBundle, target tablecustody.CustodyTransition, outputs []custodyBatchOutput) bool {
+	recoveryOutputs := recoveryOutputsFromBundle(bundle)
+	outputsMatch := sameRecoveryAuthorizedOutputs(recoveryOutputs, outputs)
+	settlementSemanticsMatch := sameRecoverySettlementSemantics(recoveryOutputs, outputs)
+	if !outputsMatch && !settlementSemanticsMatch {
+		return false
+	}
+	if recoveryBundleTimeoutEquivalent(bundle.TimeoutResolution, target.TimeoutResolution) {
+		return true
+	}
+	// A settled-hand payout can legitimately reuse an equivalent showdown-reveal
+	// recovery bundle when the money movement is identical but the timeout reason
+	// has advanced from "showdown-reveal" to "settlement deadline expired".
+	return bundle.Kind == tablecustody.TransitionKindShowdownPayout &&
+		target.Kind == tablecustody.TransitionKindShowdownPayout &&
+		settlementSemanticsMatch
+}
+
 func (runtime *meshRuntime) selectPotCSVExitSpendPath(table nativeTableState, ref tablecustody.VTXORef) (custodySpendPath, error) {
 	if len(ref.Tapscripts) == 0 {
 		return custodySpendPath{}, fmt.Errorf("custody ref %s:%d is missing tapscripts", ref.TxID, ref.VOut)
@@ -920,15 +938,10 @@ func (runtime *meshRuntime) matchingStoredRecoveryBundle(table nativeTableState,
 		if bundle.Kind != target.Kind {
 			continue
 		}
-		if !recoveryBundleTimeoutEquivalent(bundle.TimeoutResolution, target.TimeoutResolution) {
-			continue
-		}
 		if !sameCanonicalVTXORefs(bundle.SourcePotRefs, sourceRefs) {
 			continue
 		}
-		recoveryOutputs := recoveryOutputsFromBundle(bundle)
-		if !sameRecoveryAuthorizedOutputs(recoveryOutputs, outputs) &&
-			!sameRecoverySettlementSemantics(recoveryOutputs, outputs) {
+		if !recoveryBundleMatchesTarget(bundle, target, outputs) {
 			continue
 		}
 		candidate := bundle
