@@ -70,7 +70,7 @@ func (sm *SessionManager) CloseAll() {
 	sm.mu.Unlock()
 
 	for _, s := range sessions {
-		s.Close()
+		s.CloseAndWait()
 	}
 }
 
@@ -83,7 +83,7 @@ func (sm *SessionManager) CloseSession(peerURL string) {
 	}
 	sm.mu.Unlock()
 	if ok {
-		sess.Close()
+		sess.CloseAndWait()
 	}
 }
 
@@ -179,7 +179,7 @@ func (sm *SessionManager) removeSession(peerURL string) {
 	}
 	sm.mu.Unlock()
 	if ok {
-		sess.Close()
+		sess.CloseAndWait()
 	}
 }
 
@@ -247,8 +247,14 @@ func (s *OutboundSession) Close() {
 			s.pending.Delete(key)
 			return true
 		})
-		s.wg.Wait()
 	})
+}
+
+// CloseAndWait closes the session and waits for background goroutines to exit.
+// External callers (e.g. SessionManager) use this for clean shutdown.
+func (s *OutboundSession) CloseAndWait() {
+	s.Close()
+	s.wg.Wait()
 }
 
 // RoundTrip sends a request and waits for the correlated response.
