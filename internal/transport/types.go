@@ -1,6 +1,9 @@
 package transport
 
-const WireVersion = 2
+const WireVersion = 3
+
+// CapabilitySessionTransport is advertised in peer manifests to indicate v3 support.
+const CapabilitySessionTransport = "session-transport-v3"
 
 type TransportPeerEndpoints struct {
 	DirectOnion      string   `json:"directOnion,omitempty"`

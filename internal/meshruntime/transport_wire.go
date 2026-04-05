@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ import (
 )
 
 const (
-	TransportWireVersion = 2
+	TransportWireVersion = transportpkg.WireVersion
 
 	nativeTransportChannelDiscovery = "discovery"
 	nativeTransportChannelTable     = "table"
@@ -59,6 +60,8 @@ const (
 	nativeTransportMessageAck                             = "ack"
 	nativeTransportMessageNack                            = "nack"
 
+	nativeTransportOneShotWireVersion = 2
+
 	nativeTransportRequestTTL      = 30 * time.Second
 	nativeTransportReadTimeout     = 10 * time.Second
 	nativeTransportWriteTimeout    = 20 * time.Second
@@ -86,18 +89,45 @@ func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
 			_ = connection.Close()
 			continue
 		}
+		if !runtime.trackPeerTransportConnection(connection) {
+			runtime.endBackgroundTask()
+			_ = connection.Close()
+			continue
+		}
 		go func() {
 			defer runtime.endBackgroundTask()
+			defer runtime.untrackPeerTransportConnection(connection)
 			runtime.handlePeerTransportConnection(connection)
 		}()
 	}
 }
 
 func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
+	// Peek the first bytes to detect v3 session preface vs v2 one-shot.
+	// Use io.ReadFull to avoid TCP short-read misclassification.
+	_ = connection.SetReadDeadline(time.Now().Add(nativeTransportReadTimeout))
+	prefaceLen := transportpkg.V3PrefaceLen()
+	peek := make([]byte, prefaceLen)
+	n, peekErr := io.ReadFull(connection, peek)
+	if peekErr != nil && n == 0 {
+		connection.Close()
+		return
+	}
+	_ = connection.SetReadDeadline(time.Time{})
+
+	if n == prefaceLen && transportpkg.IsV3Preface(peek[:n]) {
+		// v3 session: delegate to session handler (does NOT close conn, handleV3 does).
+		runtime.handleV3PeerTransportConnection(connection)
+		return
+	}
+
+	// v2 one-shot: the bytes we peeked are the start of the JSON envelope line.
 	defer connection.Close()
 	_ = connection.SetReadDeadline(time.Now().Add(nativeTransportReadTimeout))
 
-	reader := bufio.NewReader(connection)
+	// Reconstruct a reader with the already-consumed bytes prepended.
+	combined := io.MultiReader(strings.NewReader(string(peek[:n])), connection)
+	reader := bufio.NewReader(combined)
 	line, err := readTrimmedLine(reader)
 	if err != nil || line == "" {
 		return
@@ -107,7 +137,11 @@ func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	var request transportpkg.TransportEnvelope
 	if err := json.Unmarshal([]byte(line), &request); err != nil {
 		_ = connection.SetWriteDeadline(time.Now().Add(nativeTransportWriteTimeout))
-		_ = writeJSONLine(connection, runtime.plainNack("", err))
+		nack := runtime.plainNack("", err)
+		if signed, signErr := runtime.oneShotTransportEnvelope(nack); signErr == nil {
+			nack = signed
+		}
+		_ = writeJSONLine(connection, nack)
 		return
 	}
 
@@ -288,6 +322,10 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 }
 
 func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	return runtime.exchangePeerTransportWithTimeout(peerURL, request, nativeTransportExchangeTimeout)
+}
+
+func (runtime *meshRuntime) exchangePeerTransportWithTimeout(peerURL string, request transportpkg.TransportEnvelope, timeout time.Duration) (transportpkg.TransportEnvelope, error) {
 	if !runtime.isRunning() {
 		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
 	}
@@ -300,7 +338,7 @@ func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transp
 		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
 	}
 
-	_ = connection.SetDeadline(time.Now().Add(nativeTransportExchangeTimeout))
+	_ = connection.SetDeadline(time.Now().Add(timeout))
 	if err := writeJSONLine(connection, request); err != nil {
 		return transportpkg.TransportEnvelope{}, err
 	}
@@ -320,14 +358,32 @@ func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transp
 }
 
 func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error) {
-	if cached, ok := runtime.cachedPeerInfo(peerURL); ok {
-		return cached, nil
+	return runtime.fetchPeerInfoWithCache(peerURL, true, nativeTransportExchangeTimeout)
+}
+
+func (runtime *meshRuntime) fetchPeerInfoFresh(peerURL string) (nativePeerSelf, error) {
+	return runtime.fetchPeerInfoFreshWithTimeout(peerURL, nativeTransportExchangeTimeout)
+}
+
+func (runtime *meshRuntime) fetchPeerInfoFreshWithTimeout(peerURL string, timeout time.Duration) (nativePeerSelf, error) {
+	return runtime.fetchPeerInfoWithCache(peerURL, false, timeout)
+}
+
+func (runtime *meshRuntime) fetchPeerInfoWithCache(peerURL string, allowCached bool, timeout time.Duration) (nativePeerSelf, error) {
+	if allowCached {
+		if cached, ok := runtime.cachedPeerInfo(peerURL); ok {
+			return cached, nil
+		}
 	}
 	request, _, err := runtime.newOutboundEnvelope(nativeTransportMessagePeerProbe, nativeTransportChannelDiscovery, "", "", map[string]any{}, "")
 	if err != nil {
 		return nativePeerSelf{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	request, err = runtime.oneShotTransportEnvelope(request)
+	if err != nil {
+		return nativePeerSelf{}, err
+	}
+	response, err := runtime.exchangePeerTransportWithTimeout(peerURL, request, timeout)
 	if err != nil {
 		return nativePeerSelf{}, err
 	}
@@ -362,32 +418,89 @@ func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool
 		return nativePeerSelf{}, false
 	}
 	if time.Since(cached.FetchedAt) > nativePeerInfoCacheTTL {
-		delete(runtime.peerInfoCache, peerURL)
-		if canonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); canonical != "" {
-			delete(runtime.peerInfoCache, canonical)
-		}
 		return nativePeerSelf{}, false
 	}
 	return cached.PeerSelf, true
 }
 
 func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
-	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
+	invalidateURLs := map[string]struct{}{}
+	updateURLs := map[string]struct{}{}
+	peerURL = strings.TrimSpace(peerURL)
+	canonicalURL := strings.TrimSpace(peerInfo.Peer.PeerURL)
+	newKey := strings.TrimSpace(peerInfo.TransportPubkeyHex)
 
+	runtime.mu.Lock()
 	if runtime.peerInfoCache == nil {
 		runtime.peerInfoCache = map[string]nativeCachedPeerInfo{}
 	}
+
+	for url, cached := range runtime.peerInfoCache {
+		if !samePeerInfoCacheEntry(url, cached.PeerSelf, peerURL, peerInfo) {
+			continue
+		}
+		if url != "" {
+			updateURLs[url] = struct{}{}
+		}
+		if oldCanonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); oldCanonical != "" {
+			updateURLs[oldCanonical] = struct{}{}
+		}
+		oldKey := strings.TrimSpace(cached.PeerSelf.TransportPubkeyHex)
+		if oldKey != "" && newKey != "" && oldKey != newKey {
+			if url != "" {
+				invalidateURLs[url] = struct{}{}
+			}
+			if oldCanonical := strings.TrimSpace(cached.PeerSelf.Peer.PeerURL); oldCanonical != "" {
+				invalidateURLs[oldCanonical] = struct{}{}
+			}
+		}
+	}
+
 	cached := nativeCachedPeerInfo{
 		FetchedAt: time.Now(),
 		PeerSelf:  peerInfo,
 	}
-	if strings.TrimSpace(peerURL) != "" {
-		runtime.peerInfoCache[peerURL] = cached
+	if peerURL != "" {
+		updateURLs[peerURL] = struct{}{}
 	}
-	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" {
-		runtime.peerInfoCache[canonical] = cached
+	if canonicalURL != "" {
+		updateURLs[canonicalURL] = struct{}{}
 	}
+	for url := range updateURLs {
+		runtime.peerInfoCache[url] = cached
+	}
+	runtime.mu.Unlock()
+
+	// Invalidate sessions outside the lock to avoid deadlock with invalidateSessionForPeer.
+	for url := range invalidateURLs {
+		debugMeshf("peer %s rotated transport key, invalidating session", url)
+		runtime.invalidateSessionForPeer(url)
+	}
+}
+
+func samePeerInfoCacheEntry(cacheURL string, cached nativePeerSelf, peerURL string, peerInfo nativePeerSelf) bool {
+	cacheURL = strings.TrimSpace(cacheURL)
+	peerURL = strings.TrimSpace(peerURL)
+	if cacheURL != "" && cacheURL == peerURL {
+		return true
+	}
+	newCanonical := strings.TrimSpace(peerInfo.Peer.PeerURL)
+	oldCanonical := strings.TrimSpace(cached.Peer.PeerURL)
+	if newCanonical != "" && (cacheURL == newCanonical || oldCanonical == newCanonical) {
+		return true
+	}
+	if peerURL != "" && oldCanonical == peerURL {
+		return true
+	}
+	newPeerID := strings.TrimSpace(peerInfo.Peer.PeerID)
+	oldPeerID := strings.TrimSpace(cached.Peer.PeerID)
+	return newPeerID != "" && oldPeerID == newPeerID
+}
+
+func (runtime *meshRuntime) exchangePeerRequestAuto(peerURL, messageType, channel, tableID string, body any) (transportpkg.TransportEnvelope, string, error) {
+	return runtime.exchangePeerTransportAuto(peerURL, func(peerInfo nativePeerSelf) (transportpkg.TransportEnvelope, string, error) {
+		return runtime.newOutboundEnvelope(messageType, channel, tableID, peerInfo.Peer.PeerID, body, peerInfo.TransportPubkeyHex)
+	})
 }
 
 func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTableState, error) {
@@ -395,22 +508,7 @@ func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTa
 	if err != nil {
 		return nil, err
 	}
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nil, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(
-		nativeTransportMessageTablePull,
-		nativeTransportChannelTable,
-		tableID,
-		peerInfo.Peer.PeerID,
-		requestBody,
-		peerInfo.TransportPubkeyHex,
-	)
-	if err != nil {
-		return nil, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTablePull, nativeTransportChannelTable, tableID, requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -430,15 +528,7 @@ func (runtime *meshRuntime) remoteJoin(peerURL string, input nativeJoinRequest) 
 }
 
 func (runtime *meshRuntime) remoteActionSignature(peerURL string, input nativeActionSignRequest) (nativeActionRequest, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeActionRequest{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableActSignReq, nativeTransportChannelTable, input.Request.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeActionRequest{}, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableActSignReq, nativeTransportChannelTable, input.Request.TableID, input)
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
@@ -464,15 +554,7 @@ func (runtime *meshRuntime) remoteFunds(peerURL string, input nativeFundsRequest
 	if runtime.fundsSenderHook != nil {
 		return runtime.fundsSenderHook(peerURL, input)
 	}
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeFundsResponse{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableFundsReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeFundsResponse{}, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableFundsReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return nativeFundsResponse{}, err
 	}
@@ -494,15 +576,7 @@ func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMe
 	if runtime.handMessageSenderHook != nil {
 		return runtime.handMessageSenderHook(peerURL, input)
 	}
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeHandMessageResponse{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableHandReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeHandMessageResponse{}, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableHandReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return nativeHandMessageResponse{}, err
 	}
@@ -521,15 +595,7 @@ func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMe
 }
 
 func (runtime *meshRuntime) remoteApproveCustody(peerURL string, input nativeCustodyApprovalRequest) (tablecustody.CustodySignature, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return tablecustody.CustodySignature{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodyReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return tablecustody.CustodySignature{}, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodyReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return tablecustody.CustodySignature{}, err
 	}
@@ -548,15 +614,7 @@ func (runtime *meshRuntime) remoteApproveCustody(peerURL string, input nativeCus
 }
 
 func (runtime *meshRuntime) remoteSignCustodyPSBT(peerURL string, input nativeCustodyTxSignRequest) (string, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return "", err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return "", err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return "", err
 	}
@@ -575,15 +633,7 @@ func (runtime *meshRuntime) remoteSignCustodyPSBT(peerURL string, input nativeCu
 }
 
 func (runtime *meshRuntime) remotePrepareCustodySigner(peerURL string, input nativeCustodySignerPrepareRequest) (nativeCustodySignerPrepareResponse, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeCustodySignerPrepareResponse{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerPrepareReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeCustodySignerPrepareResponse{}, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerPrepareReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return nativeCustodySignerPrepareResponse{}, err
 	}
@@ -602,15 +652,7 @@ func (runtime *meshRuntime) remotePrepareCustodySigner(peerURL string, input nat
 }
 
 func (runtime *meshRuntime) remoteStartCustodySigner(peerURL string, input nativeCustodySignerStartRequest) error {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerStartReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerStartReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return err
 	}
@@ -632,15 +674,7 @@ func (runtime *meshRuntime) remoteStartCustodySigner(peerURL string, input nativ
 }
 
 func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, input nativeCustodySignerNoncesRequest) (bool, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return false, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return false, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerNoncesReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return false, err
 	}
@@ -662,15 +696,7 @@ func (runtime *meshRuntime) remoteAdvanceCustodySignerNonces(peerURL string, inp
 }
 
 func (runtime *meshRuntime) remoteAdvanceCustodySignerAggregatedNonces(peerURL string, input nativeCustodySignerAggregatedNoncesRequest) (bool, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return false, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTableCustodySignerAggNoncesReq, nativeTransportChannelTable, input.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return false, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTableCustodySignerAggNoncesReq, nativeTransportChannelTable, input.TableID, input)
 	if err != nil {
 		return false, err
 	}
@@ -692,15 +718,7 @@ func (runtime *meshRuntime) remoteAdvanceCustodySignerAggregatedNonces(peerURL s
 }
 
 func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseType, tableID string, input any) (nativeTableState, error) {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return nativeTableState{}, err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(requestType, nativeTransportChannelTable, tableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return nativeTableState{}, err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, requestType, nativeTransportChannelTable, tableID, input)
 	if err != nil {
 		return nativeTableState{}, err
 	}
@@ -719,15 +737,7 @@ func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseT
 }
 
 func (runtime *meshRuntime) sendTableSync(peerURL string, input nativeTableSyncRequest) error {
-	peerInfo, err := runtime.fetchPeerInfo(peerURL)
-	if err != nil {
-		return err
-	}
-	request, requestKey, err := runtime.newOutboundEnvelope(nativeTransportMessageTablePush, nativeTransportChannelSync, input.Table.Config.TableID, peerInfo.Peer.PeerID, input, peerInfo.TransportPubkeyHex)
-	if err != nil {
-		return err
-	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, requestKey, err := runtime.exchangePeerRequestAuto(peerURL, nativeTransportMessageTablePush, nativeTransportChannelSync, input.Table.Config.TableID, input)
 	if err != nil {
 		return err
 	}
@@ -752,7 +762,18 @@ func (runtime *meshRuntime) encodeResponseEnvelope(request transportpkg.Transpor
 	if err != nil {
 		return transportpkg.TransportEnvelope{}, err
 	}
-	return runtime.buildEnvelope(messageType, channel, request.TableID, request.SenderPeerID, bodyBytes, sharedSecret, request.MessageID)
+	envelope, err := runtime.buildEnvelope(messageType, channel, request.TableID, request.SenderPeerID, bodyBytes, sharedSecret, request.MessageID)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, err
+	}
+	// Propagate the wire version from the request so v3 sessions get v3 responses.
+	if request.TransportWireVersion != 0 {
+		envelope, err = runtime.signEnvelopeForWireVersion(envelope, request.TransportWireVersion)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
+		}
+	}
+	return envelope, nil
 }
 
 func (runtime *meshRuntime) nackFromRequest(request transportpkg.TransportEnvelope, err error) transportpkg.TransportEnvelope {
@@ -761,7 +782,14 @@ func (runtime *meshRuntime) nackFromRequest(request transportpkg.TransportEnvelo
 	if nackErr == nil {
 		return envelope
 	}
-	return runtime.plainNack(request.MessageID, err)
+	fallback := runtime.plainNack(request.MessageID, err)
+	if request.TransportWireVersion == 0 {
+		return fallback
+	}
+	if signed, signErr := runtime.signEnvelopeForWireVersion(fallback, request.TransportWireVersion); signErr == nil {
+		return signed
+	}
+	return fallback
 }
 
 func (runtime *meshRuntime) plainNack(retryOf string, err error) transportpkg.TransportEnvelope {
@@ -771,6 +799,10 @@ func (runtime *meshRuntime) plainNack(retryOf string, err error) transportpkg.Tr
 		return transportpkg.TransportEnvelope{MessageType: nativeTransportMessageNack, RetryOf: retryOf}
 	}
 	return envelope
+}
+
+func (runtime *meshRuntime) oneShotTransportEnvelope(envelope transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	return runtime.signEnvelopeForWireVersion(envelope, nativeTransportOneShotWireVersion)
 }
 
 func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, recipientID string, body any, recipientTransportPub string) (transportpkg.TransportEnvelope, string, error) {
@@ -791,9 +823,7 @@ func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, r
 			return transportpkg.TransportEnvelope{}, "", err
 		}
 		envelope.EncryptionEphemeral = ephemeralPub
-		unsigned := rawJSONMap(envelope)
-		delete(unsigned, "signature")
-		envelope.Signature, err = settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
+		envelope, err = runtime.signEnvelope(envelope)
 		if err != nil {
 			return transportpkg.TransportEnvelope{}, "", err
 		}
@@ -801,6 +831,29 @@ func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, r
 	}
 	envelope, err := runtime.buildEnvelope(messageType, channel, tableID, recipientID, bodyBytes, nil, "")
 	return envelope, "", err
+}
+
+func (runtime *meshRuntime) signEnvelope(envelope transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	unsigned := rawJSONMap(envelope)
+	delete(unsigned, "signature")
+	signature, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, err
+	}
+	envelope.Signature = signature
+	return envelope, nil
+}
+
+func isSupportedTransportWireVersion(wireVersion int) bool {
+	return wireVersion == nativeTransportOneShotWireVersion || wireVersion == transportpkg.WireVersion
+}
+
+func (runtime *meshRuntime) signEnvelopeForWireVersion(envelope transportpkg.TransportEnvelope, wireVersion int) (transportpkg.TransportEnvelope, error) {
+	if !isSupportedTransportWireVersion(wireVersion) {
+		return transportpkg.TransportEnvelope{}, fmt.Errorf("unsupported transport wire version %d", wireVersion)
+	}
+	envelope.TransportWireVersion = wireVersion
+	return runtime.signEnvelope(envelope)
 }
 
 func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipientID string, body []byte, sharedSecret []byte, retryOf string) (transportpkg.TransportEnvelope, error) {
@@ -839,18 +892,11 @@ func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipie
 	} else {
 		envelope.BodyCiphertext = base64.RawStdEncoding.EncodeToString(body)
 	}
-	unsigned := rawJSONMap(envelope)
-	delete(unsigned, "signature")
-	signature, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
-	if err != nil {
-		return transportpkg.TransportEnvelope{}, err
-	}
-	envelope.Signature = signature
-	return envelope, nil
+	return runtime.signEnvelope(envelope)
 }
 
 func (runtime *meshRuntime) decodeIncomingEnvelope(envelope transportpkg.TransportEnvelope) ([]byte, []byte, error) {
-	if envelope.TransportWireVersion != TransportWireVersion {
+	if !isSupportedTransportWireVersion(envelope.TransportWireVersion) {
 		return nil, nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
@@ -877,7 +923,7 @@ func (runtime *meshRuntime) decodeResponseEnvelope(envelope transportpkg.Transpo
 	if envelope.MessageType == nativeTransportMessageNack && strings.TrimSpace(envelope.Signature) == "" {
 		return nil, errors.New("transport request failed")
 	}
-	if envelope.TransportWireVersion != TransportWireVersion {
+	if !isSupportedTransportWireVersion(envelope.TransportWireVersion) {
 		return nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
