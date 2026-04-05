@@ -191,6 +191,28 @@ func TestNoiseNKConnectionClosedDuringHandshake(t *testing.T) {
 	clientConn.Close()
 }
 
+func TestNoiseNKSymmetricStateInit(t *testing.T) {
+	// The protocol name "Noise_NK_25519_ChaChaPoly_SHA256" is exactly 32 bytes.
+	// Per Noise spec section 5.2, h and ck must be initialized by zero-padding
+	// the name, NOT by hashing it.
+	name := []byte("Noise_NK_25519_ChaChaPoly_SHA256")
+	if len(name) != 32 {
+		t.Fatalf("protocol name length: got %d, want 32", len(name))
+	}
+
+	ss := newSymmetricState()
+
+	// Verify h equals zero-padded name (which is just the name since len == 32).
+	var expected [32]byte
+	copy(expected[:], name)
+	if ss.h != expected {
+		t.Fatalf("h should be zero-padded protocol name, not SHA256 hash.\ngot:  %x\nwant: %x", ss.h, expected)
+	}
+	if ss.ck != expected {
+		t.Fatalf("ck should be zero-padded protocol name, not SHA256 hash.\ngot:  %x\nwant: %x", ss.ck, expected)
+	}
+}
+
 func TestNoiseFraming(t *testing.T) {
 	r, w := io.Pipe()
 	defer r.Close()

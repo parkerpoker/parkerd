@@ -35,13 +35,13 @@ func TestV2PeerInteroperability(t *testing.T) {
 				// Read first bytes to detect v3 vs v2.
 				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 				preface := make([]byte, V3PrefaceLen())
-				n, err := conn.Read(preface)
-				if err != nil {
+				n, err := io.ReadFull(conn, preface)
+				if err != nil && n == 0 {
 					return
 				}
 				_ = conn.SetReadDeadline(time.Time{})
 
-				if n >= V3PrefaceLen() && IsV3Preface(preface[:n]) {
+				if n == V3PrefaceLen() && IsV3Preface(preface[:n]) {
 					noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
 					if err != nil {
 						return
@@ -314,6 +314,98 @@ func TestConfigFromEnv(t *testing.T) {
 	// Non-overridden values should use defaults.
 	if cfg.HandshakeTimeout != 5*time.Second {
 		t.Fatalf("handshake timeout: got %v, want 5s", cfg.HandshakeTimeout)
+	}
+}
+
+// TestPartialPrefaceRead verifies that a server using io.ReadFull correctly
+// handles a TCP client that delivers the v3 preface in multiple small writes.
+func TestPartialPrefaceRead(t *testing.T) {
+	serverPriv, serverPub := testKeypair(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	// Server that uses io.ReadFull for preface detection (like the production code).
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				preface := make([]byte, V3PrefaceLen())
+				n, err := io.ReadFull(conn, preface)
+				if err != nil || n != V3PrefaceLen() {
+					return
+				}
+				_ = conn.SetReadDeadline(time.Time{})
+
+				if !IsV3Preface(preface) {
+					return
+				}
+				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
+				if err != nil {
+					return
+				}
+				echoHandler(conn, noise)
+			}()
+		}
+	}()
+
+	// Client that writes the preface in two separate TCP writes to simulate
+	// a partial read scenario (e.g., "PARK" then "ERv3").
+	conn, err := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	preface := []byte("PARKERv3")
+	// Write first 4 bytes, then remaining 4.
+	if _, err := conn.Write(preface[:4]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond) // ensure separate TCP segments
+	if _, err := conn.Write(preface[4:]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now do a Noise handshake and exchange a message.
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	noise, err := NoiseNKInitiator(conn, serverPub)
+	if err != nil {
+		t.Fatalf("handshake after partial preface: %v", err)
+	}
+
+	req := TransportEnvelope{MessageID: "partial-1", MessageType: "test.request"}
+	reqData, _ := json.Marshal(req)
+	encrypted, err := noise.Encrypt(reqData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrameBytes(conn, encrypted); err != nil {
+		t.Fatal(err)
+	}
+
+	frame, err := readFrameBytes(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := noise.Decrypt(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp TransportEnvelope
+	if err := json.Unmarshal(plain, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RetryOf != "partial-1" {
+		t.Fatalf("expected RetryOf=partial-1, got %q", resp.RetryOf)
 	}
 }
 

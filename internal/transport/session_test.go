@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -40,7 +41,7 @@ func testSessionPair(t *testing.T, serverHandler func(net.Conn, *NoiseSession)) 
 			go func() {
 				// Read v3 preface.
 				preface := make([]byte, V3PrefaceLen())
-				if _, err := conn.Read(preface); err != nil {
+				if _, err := io.ReadFull(conn, preface); err != nil {
 					conn.Close()
 					return
 				}
@@ -219,7 +220,7 @@ func TestSessionTimeout(t *testing.T) {
 			}
 			go func() {
 				preface := make([]byte, V3PrefaceLen())
-				conn.Read(preface)
+				io.ReadFull(conn, preface)
 				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
 				if err != nil {
 					conn.Close()
@@ -278,7 +279,7 @@ func TestSessionReconnectAfterDrop(t *testing.T) {
 			connections <- conn
 			go func() {
 				preface := make([]byte, V3PrefaceLen())
-				conn.Read(preface)
+				io.ReadFull(conn, preface)
 				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
 				if err != nil {
 					conn.Close()
@@ -490,7 +491,7 @@ func TestSessionIdleTimeout(t *testing.T) {
 			}
 			go func() {
 				preface := make([]byte, V3PrefaceLen())
-				conn.Read(preface)
+				io.ReadFull(conn, preface)
 				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
 				if err != nil {
 					conn.Close()
@@ -612,7 +613,7 @@ func TestKeepalivePreventsIdleTimeout(t *testing.T) {
 			}
 			go func() {
 				preface := make([]byte, V3PrefaceLen())
-				conn.Read(preface)
+				io.ReadFull(conn, preface)
 				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
 				if err != nil {
 					conn.Close()

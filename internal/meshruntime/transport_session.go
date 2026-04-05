@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"strings"
-	"time"
 
 	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
@@ -18,11 +17,6 @@ import (
 // The session manager is initialized lazily on first v3 exchange. Discovery
 // (peer.manifest.get) stays on the v2 one-shot path. All other RPCs attempt
 // v3 when the peer advertises session-transport-v3, falling back to v2.
-
-const (
-	v3ReadTimeout  = 120 * time.Second // idle read deadline on server-side v3 sessions
-	v3WriteTimeout = 20 * time.Second
-)
 
 // ensureSessionManager lazily creates the outbound session manager.
 func (runtime *meshRuntime) ensureSessionManager() *transportpkg.SessionManager {
@@ -145,8 +139,11 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 	}
 
 	// Serve requests over the session until idle timeout or error.
+	// Use config-driven timeouts so env knobs govern both client and server.
+	readTimeout := cfg.IdleTimeout
+	writeTimeout := cfg.RequestTimeout
 	for {
-		request, err := transportpkg.ReadV3Request(conn, noise, v3ReadTimeout)
+		request, err := transportpkg.ReadV3Request(conn, noise, readTimeout)
 		if err != nil {
 			if err != io.EOF {
 				debugMeshf("v3 read error: %v", err)
@@ -161,7 +158,7 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 				MessageID:   request.MessageID,
 				RetryOf:     request.MessageID,
 			}
-			if err := transportpkg.WriteV3Response(conn, noise, pong, v3WriteTimeout); err != nil {
+			if err := transportpkg.WriteV3Response(conn, noise, pong, writeTimeout); err != nil {
 				return
 			}
 			continue
@@ -176,7 +173,7 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 			response.RetryOf = request.MessageID
 		}
 
-		if err := transportpkg.WriteV3Response(conn, noise, response, v3WriteTimeout); err != nil {
+		if err := transportpkg.WriteV3Response(conn, noise, response, writeTimeout); err != nil {
 			return
 		}
 	}

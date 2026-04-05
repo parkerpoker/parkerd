@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	TransportWireVersion = 3
+	TransportWireVersion = 2
 
 	nativeTransportChannelDiscovery = "discovery"
 	nativeTransportChannelTable     = "table"
@@ -96,17 +96,18 @@ func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
 
 func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	// Peek the first bytes to detect v3 session preface vs v2 one-shot.
+	// Use io.ReadFull to avoid TCP short-read misclassification.
 	_ = connection.SetReadDeadline(time.Now().Add(nativeTransportReadTimeout))
 	prefaceLen := transportpkg.V3PrefaceLen()
 	peek := make([]byte, prefaceLen)
-	n, peekErr := connection.Read(peek)
-	if peekErr != nil || n == 0 {
+	n, peekErr := io.ReadFull(connection, peek)
+	if peekErr != nil && n == 0 {
 		connection.Close()
 		return
 	}
 	_ = connection.SetReadDeadline(time.Time{})
 
-	if n >= prefaceLen && transportpkg.IsV3Preface(peek[:n]) {
+	if n == prefaceLen && transportpkg.IsV3Preface(peek[:n]) {
 		// v3 session: delegate to session handler (does NOT close conn, handleV3 does).
 		runtime.handleV3PeerTransportConnection(connection)
 		return
@@ -393,12 +394,25 @@ func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool
 }
 
 func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
-	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
+	var keyRotated bool
+	var invalidateURL string
 
+	runtime.mu.Lock()
 	if runtime.peerInfoCache == nil {
 		runtime.peerInfoCache = map[string]nativeCachedPeerInfo{}
 	}
+
+	// Detect transport key rotation: if we had a cached entry with a different
+	// public key, we need to tear down the existing session.
+	if old, ok := runtime.peerInfoCache[peerURL]; ok {
+		oldKey := strings.TrimSpace(old.PeerSelf.TransportPubkeyHex)
+		newKey := strings.TrimSpace(peerInfo.TransportPubkeyHex)
+		if oldKey != "" && newKey != "" && oldKey != newKey {
+			keyRotated = true
+			invalidateURL = peerURL
+		}
+	}
+
 	cached := nativeCachedPeerInfo{
 		FetchedAt: time.Now(),
 		PeerSelf:  peerInfo,
@@ -408,6 +422,13 @@ func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSel
 	}
 	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" {
 		runtime.peerInfoCache[canonical] = cached
+	}
+	runtime.mu.Unlock()
+
+	// Invalidate session outside the lock to avoid deadlock with invalidateSessionForPeer.
+	if keyRotated {
+		debugMeshf("peer %s rotated transport key, invalidating session", invalidateURL)
+		runtime.invalidateSessionForPeer(invalidateURL)
 	}
 }
 

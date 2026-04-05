@@ -38,8 +38,17 @@ type noiseSymmetricState struct {
 }
 
 func newSymmetricState() noiseSymmetricState {
-	protocolHash := sha256.Sum256([]byte(noiseProtocolName))
-	return noiseSymmetricState{h: protocolHash, ck: protocolHash}
+	// Per Noise spec section 5.2: if the protocol name is ≤ 32 bytes,
+	// h and ck are initialized by zero-padding the name to 32 bytes.
+	// Only if the name exceeds 32 bytes do we hash it.
+	name := []byte(noiseProtocolName)
+	var h [32]byte
+	if len(name) <= 32 {
+		copy(h[:], name)
+	} else {
+		h = sha256.Sum256(name)
+	}
+	return noiseSymmetricState{h: h, ck: h}
 }
 
 func (s *noiseSymmetricState) mixHash(data []byte) {
