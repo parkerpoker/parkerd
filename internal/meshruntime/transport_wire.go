@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ import (
 )
 
 const (
-	TransportWireVersion = 2
+	TransportWireVersion = 3
 
 	nativeTransportChannelDiscovery = "discovery"
 	nativeTransportChannelTable     = "table"
@@ -94,10 +95,30 @@ func (runtime *meshRuntime) servePeerTransport(listener net.Listener) {
 }
 
 func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
+	// Peek the first bytes to detect v3 session preface vs v2 one-shot.
+	_ = connection.SetReadDeadline(time.Now().Add(nativeTransportReadTimeout))
+	prefaceLen := transportpkg.V3PrefaceLen()
+	peek := make([]byte, prefaceLen)
+	n, peekErr := connection.Read(peek)
+	if peekErr != nil || n == 0 {
+		connection.Close()
+		return
+	}
+	_ = connection.SetReadDeadline(time.Time{})
+
+	if n >= prefaceLen && transportpkg.IsV3Preface(peek[:n]) {
+		// v3 session: delegate to session handler (does NOT close conn, handleV3 does).
+		runtime.handleV3PeerTransportConnection(connection)
+		return
+	}
+
+	// v2 one-shot: the bytes we peeked are the start of the JSON envelope line.
 	defer connection.Close()
 	_ = connection.SetReadDeadline(time.Now().Add(nativeTransportReadTimeout))
 
-	reader := bufio.NewReader(connection)
+	// Reconstruct a reader with the already-consumed bytes prepended.
+	combined := io.MultiReader(strings.NewReader(string(peek[:n])), connection)
+	reader := bufio.NewReader(combined)
 	line, err := readTrimmedLine(reader)
 	if err != nil || line == "" {
 		return
@@ -850,7 +871,7 @@ func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipie
 }
 
 func (runtime *meshRuntime) decodeIncomingEnvelope(envelope transportpkg.TransportEnvelope) ([]byte, []byte, error) {
-	if envelope.TransportWireVersion != TransportWireVersion {
+	if envelope.TransportWireVersion != 2 && envelope.TransportWireVersion != 3 {
 		return nil, nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
@@ -877,7 +898,7 @@ func (runtime *meshRuntime) decodeResponseEnvelope(envelope transportpkg.Transpo
 	if envelope.MessageType == nativeTransportMessageNack && strings.TrimSpace(envelope.Signature) == "" {
 		return nil, errors.New("transport request failed")
 	}
-	if envelope.TransportWireVersion != TransportWireVersion {
+	if envelope.TransportWireVersion != 2 && envelope.TransportWireVersion != 3 {
 		return nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)

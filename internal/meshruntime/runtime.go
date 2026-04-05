@@ -23,6 +23,7 @@ import (
 	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
+	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 	walletpkg "github.com/parkerpoker/parkerd/internal/wallet"
 )
 
@@ -71,6 +72,8 @@ type meshRuntime struct {
 	transportKeyID         string
 	transportPrivate       string
 	transportPublic        string
+	sessionManager         *transportpkg.SessionManager
+	sessionMetrics         *transportpkg.SessionMetrics
 	walletID               settlementcore.LocalIdentity
 	walletRuntime          *walletpkg.Runtime
 }
@@ -162,6 +165,7 @@ func (runtime *meshRuntime) Close() error {
 	if listener != nil {
 		joined = errors.Join(joined, listener.Close())
 	}
+	runtime.closeSessionManager()
 	runtime.waitForBackgroundTasks()
 	if runtime.store != nil {
 		joined = errors.Join(joined, runtime.store.close())

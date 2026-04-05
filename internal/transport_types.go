@@ -11,3 +11,5 @@ type TransportRuntimeState = transportpkg.TransportRuntimeState
 type TransportEnvelope = transportpkg.TransportEnvelope
 type TransportDedupeRecord = transportpkg.TransportDedupeRecord
 type TransportDeadLetter = transportpkg.TransportDeadLetter
+type TransportError = transportpkg.TransportError
+type SessionMetricsSnapshot = transportpkg.SessionMetricsSnapshot
