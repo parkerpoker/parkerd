@@ -2108,11 +2108,13 @@ func (runtime *meshRuntime) observeLockedActionState(table nativeTableState) {
 	switch pendingTurnStageForTable(table) {
 	case pendingTurnStageLocked:
 		if lockedAt, err := parseISOTimestamp(menu.LockedAt); err == nil {
+			age := time.Since(lockedAt)
 			emitMeshTiming(
 				actionMetricFields("action_locked_unsettled_age_ms", sendActionStageSettlement, table, menu.SelectedCandidateHash, ""),
-				time.Since(lockedAt),
+				age,
 				nil,
 			)
+			debugMeshf("action locked unsettled age table=%s epoch=%d lock_epoch=%d turn_anchor=%s candidate=%s age_ms=%d", table.Config.TableID, table.CurrentEpoch, menu.Epoch, menu.TurnAnchorHash, menu.SelectedCandidateHash, age/time.Millisecond)
 		}
 	case pendingTurnStageSettled:
 		signedAt := menu.LockedAt
@@ -2120,11 +2122,13 @@ func (runtime *meshRuntime) observeLockedActionState(table nativeTableState) {
 			signedAt = menu.SettledRequest.SignedAt
 		}
 		if settledAt, err := parseISOTimestamp(signedAt); err == nil {
+			age := time.Since(settledAt)
 			emitMeshTiming(
 				actionMetricFields("action_settled_unpublished_age_ms", sendActionStageSettlement, table, menu.SelectedCandidateHash, ""),
-				time.Since(settledAt),
+				age,
 				nil,
 			)
+			debugMeshf("action settled unpublished age table=%s epoch=%d lock_epoch=%d turn_anchor=%s candidate=%s age_ms=%d", table.Config.TableID, table.CurrentEpoch, menu.Epoch, menu.TurnAnchorHash, menu.SelectedCandidateHash, age/time.Millisecond)
 		}
 	}
 }

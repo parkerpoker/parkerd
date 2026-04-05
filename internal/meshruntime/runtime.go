@@ -27,52 +27,57 @@ import (
 )
 
 type meshRuntime struct {
-	backgroundTasks        int
-	candidateIntentAckHook func(table nativeTableState, bundle NativeTurnCandidateBundle) (*tablecustody.CandidateIntentAck, error)
-	chainTipStatus         func(profileName string) (walletpkg.ChainTipStatus, error)
-	chainTxStatus          func(profileName, txid string) (walletpkg.ChainTransactionStatus, error)
-	config                 cfg.RuntimeConfig
-	arkTransportFactory    func() (arkclient.TransportClient, error)
-	clearPeerURL           string
-	custodyApprovalHook    func(request nativeCustodyApprovalRequest) error
-	custodyArkVerify       func(refs []tablecustody.VTXORef, requireSpendable bool) error
-	custodyBatchExecute    func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
-	custodyExitExecute     func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
-	custodyExitVerify      func(profileName string, execution nativeFundsExitExecution) error
-	custodyPSBTSign        func(profileName, tx string) (string, error)
-	custodyRecoveryExecute func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
-	custodySignerAuth      map[string]custodySignerAuthorization
-	custodySigners         map[string]walletpkg.CustodySignerSession
-	handMessageSenderHook  func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error)
-	httpClient             *http.Client
-	lastSyncAt             map[string]time.Time
-	lastChainTipRefreshAt  time.Time
-	lastGuestContribution  map[string]guestContributionSendSnapshot
-	listener               net.Listener
-	mode                   string
-	mu                     sync.Mutex
-	peerInfoCache          map[string]nativeCachedPeerInfo
-	peerIdentity           settlementcore.ScopedIdentity
-	profileName            string
-	profileStore           *walletpkg.ProfileStore
-	protocolID             string
-	protocolIdentity       settlementcore.ScopedIdentity
-	protocolDrives         map[string]struct{}
-	self                   nativePeerSelf
-	server                 *http.Server
-	fundsSenderHook        func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
-	tableSyncSender        func(peerURL string, input nativeTableSyncRequest) error
-	testActionTimeoutMS    int
-	testHandProtocolMS     int
-	started                bool
-	store                  *meshStore
-	taskCond               *sync.Cond
-	torService             *runtimeHiddenService
-	transportKeyID         string
-	transportPrivate       string
-	transportPublic        string
-	walletID               settlementcore.LocalIdentity
-	walletRuntime          *walletpkg.Runtime
+	actionSenderHook                 func(peerURL string, input nativeActionChooseRequest) (nativeActionChooseResponse, error)
+	actionSettlementSenderHook       func(peerURL string, input nativeActionSettlementRequest) (nativeActionSettlementResponse, error)
+	afterActionSelectionPersistHook  func(table nativeTableState, request nativeActionChooseRequest) error
+	afterActionSettlementPersistHook func(table nativeTableState, request nativeActionSettlementRequest) error
+	backgroundTasks                  int
+	candidateIntentAckHook           func(table nativeTableState, bundle NativeTurnCandidateBundle) (*tablecustody.CandidateIntentAck, error)
+	chainTipStatus                   func(profileName string) (walletpkg.ChainTipStatus, error)
+	chainTxStatus                    func(profileName, txid string) (walletpkg.ChainTransactionStatus, error)
+	config                           cfg.RuntimeConfig
+	arkTransportFactory              func() (arkclient.TransportClient, error)
+	clearPeerURL                     string
+	custodyApprovalHook              func(request nativeCustodyApprovalRequest) error
+	custodyArkVerify                 func(refs []tablecustody.VTXORef, requireSpendable bool) error
+	custodyBatchExecute              func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error)
+	custodyExitExecute               func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error)
+	custodyExitVerify                func(profileName string, execution nativeFundsExitExecution) error
+	custodyPSBTSign                  func(profileName, tx string) (string, error)
+	custodyRecoveryExecute           func(profileName, signedPSBT string) (walletpkg.CustodyRecoveryResult, error)
+	custodySignerAuth                map[string]custodySignerAuthorization
+	custodySigners                   map[string]walletpkg.CustodySignerSession
+	handMessageSenderHook            func(peerURL string, input nativeHandMessageRequest) (nativeHandMessageResponse, error)
+	httpClient                       *http.Client
+	lastSyncAt                       map[string]time.Time
+	lastChainTipRefreshAt            time.Time
+	lastGuestContribution            map[string]guestContributionSendSnapshot
+	listener                         net.Listener
+	mode                             string
+	mu                               sync.Mutex
+	peerInfoCache                    map[string]nativeCachedPeerInfo
+	peerIdentity                     settlementcore.ScopedIdentity
+	profileName                      string
+	profileStore                     *walletpkg.ProfileStore
+	protocolID                       string
+	protocolIdentity                 settlementcore.ScopedIdentity
+	protocolDrives                   map[string]struct{}
+	self                             nativePeerSelf
+	server                           *http.Server
+	fundsSenderHook                  func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error)
+	tableSyncSender                  func(peerURL string, input nativeTableSyncRequest) error
+	testActionTimeoutMS              int
+	testHandProtocolMS               int
+	started                          bool
+	store                            *meshStore
+	tableFetchHook                   func(peerURL, tableID string) (*nativeTableState, error)
+	taskCond                         *sync.Cond
+	torService                       *runtimeHiddenService
+	transportKeyID                   string
+	transportPrivate                 string
+	transportPublic                  string
+	walletID                         settlementcore.LocalIdentity
+	walletRuntime                    *walletpkg.Runtime
 }
 
 const (
@@ -2233,6 +2238,38 @@ func classifySendActionFailure(err error) sendActionFailure {
 	}
 }
 
+func actionFailureClassMetricName(class sendActionFailureClass) string {
+	switch class {
+	case sendActionFailureRetryableState:
+		return "action_failure_retryable_state_total"
+	case sendActionFailureRetryableHost:
+		return "action_failure_retryable_host_total"
+	case sendActionFailureTerminalSemantic:
+		return "action_failure_terminal_semantic_total"
+	default:
+		return ""
+	}
+}
+
+func emitActionFailureClassification(stage sendActionStage, table nativeTableState, candidateHash string, failure sendActionFailure, err error) {
+	metric := actionFailureClassMetricName(failure.Class)
+	if metric != "" {
+		emitMeshTiming(actionMetricFields(metric, stage, table, candidateHash, failure.Reason), 0, nil)
+	}
+	fields := actionMetricFields("", stage, table, candidateHash, failure.Reason)
+	debugMeshf(
+		"action stage failure classified table=%s stage=%s epoch=%d turn_anchor=%s candidate=%s class=%s reason=%s err=%v",
+		table.Config.TableID,
+		stage,
+		table.CurrentEpoch,
+		fields.TurnAnchorHash,
+		strings.TrimSpace(candidateHash),
+		failure.Class,
+		failure.Reason,
+		err,
+	)
+}
+
 func actionMetricFields(metric string, stage sendActionStage, table nativeTableState, candidateHash, reason string) meshTimingFields {
 	fields := meshTimingFields{
 		Metric:        metric,
@@ -2406,11 +2443,14 @@ func (runtime *meshRuntime) recoverActionStageTable(tableID string, table native
 
 func (runtime *meshRuntime) maybeRetryActionStage(tableID string, stage sendActionStage, table nativeTableState, originalErr error, failoverReason, candidateHash string, assess func(nativeTableState) sendActionStageAssessment) (bool, *nativeTableState, error) {
 	failure := classifySendActionFailure(originalErr)
+	if failure.Class != "" {
+		emitActionFailureClassification(stage, table, candidateHash, failure, originalErr)
+	}
 	if failure.Class == sendActionFailureTerminalSemantic {
 		return false, nil, originalErr
 	}
 	emitMeshTiming(actionMetricFields(fmt.Sprintf("action_%s_retry_total", stage), stage, table, candidateHash, failure.Reason), 0, nil)
-	debugMeshf("action stage retry table=%s stage=%s epoch=%d turn_anchor=%s candidate=%s reason=%s err=%v", table.Config.TableID, stage, table.CurrentEpoch, actionMetricFields("", stage, table, candidateHash, failure.Reason).TurnAnchorHash, strings.TrimSpace(candidateHash), failure.Reason, originalErr)
+	debugMeshf("action stage retry table=%s stage=%s epoch=%d turn_anchor=%s candidate=%s class=%s reason=%s err=%v", table.Config.TableID, stage, table.CurrentEpoch, actionMetricFields("", stage, table, candidateHash, failure.Reason).TurnAnchorHash, strings.TrimSpace(candidateHash), failure.Class, failure.Reason, originalErr)
 	before := actionAcceptedProgressSnapshot(table)
 	refreshed := runtime.recoverActionStageTable(tableID, table)
 	assessment := assess(refreshed)
@@ -2422,6 +2462,9 @@ func (runtime *meshRuntime) maybeRetryActionStage(tableID string, stage sendActi
 	}
 	if actionRetryStateChanged(table, refreshed) || before != actionAcceptedProgressSnapshot(refreshed) {
 		return true, nil, nil
+	}
+	if failure.Class != sendActionFailureRetryableHost {
+		return false, nil, originalErr
 	}
 	if !runtime.shouldHandleFailover(refreshed) {
 		if refreshed.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
@@ -2449,7 +2492,7 @@ func (runtime *meshRuntime) maybeRetryActionStage(tableID string, stage sendActi
 		return true, nil, nil
 	}
 	emitMeshTiming(actionMetricFields("action_forced_failover_total", stage, *rotated, candidateHash, failure.Reason), 0, nil)
-	debugMeshf("action stage forced failover table=%s stage=%s epoch=%d turn_anchor=%s candidate=%s reason=%s", rotated.Config.TableID, stage, rotated.CurrentEpoch, actionMetricFields("", stage, *rotated, candidateHash, failure.Reason).TurnAnchorHash, strings.TrimSpace(candidateHash), failure.Reason)
+	debugMeshf("action stage forced failover table=%s stage=%s epoch=%d turn_anchor=%s candidate=%s class=%s reason=%s", rotated.Config.TableID, stage, rotated.CurrentEpoch, actionMetricFields("", stage, *rotated, candidateHash, failure.Reason).TurnAnchorHash, strings.TrimSpace(candidateHash), failure.Class, failure.Reason)
 	return true, nil, nil
 }
 

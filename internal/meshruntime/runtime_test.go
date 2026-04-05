@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -6522,6 +6523,444 @@ func TestLockedPendingTurnStateSurvivesHostRotationAndOldHostResync(t *testing.T
 	}
 	if !reflect.DeepEqual(accepted.PendingTurnMenu.SettledRequest, expectedMenu.SettledRequest) {
 		t.Fatalf("expected stale old host to keep settled request, got %+v want %+v", accepted.PendingTurnMenu.SettledRequest, expectedMenu.SettledRequest)
+	}
+}
+
+func TestSendActionFailsOverAndRelocksWhenHostDiesBeforeLockResponse(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+
+	before := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	beforeTransitions := len(before.CustodyTransitions)
+	beforeActionLog := len(before.ActiveHand.State.ActionLog)
+
+	closeDone := make(chan struct{})
+	guest.actionSenderHook = func(peerURL string, input nativeActionChooseRequest) (nativeActionChooseResponse, error) {
+		guest.actionSenderHook = nil
+		go func() {
+			defer close(closeDone)
+			_ = host.Close()
+		}()
+		return nativeActionChooseResponse{}, errors.New("connection refused")
+	}
+
+	if _, err := guest.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+		t.Fatalf("guest send action after host died before lock response: %v", err)
+	}
+
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out closing old host")
+	}
+
+	after := mustReadNativeTable(t, guest, tableID)
+	if after.CurrentHost.Peer.PeerID != guest.selfPeerID() {
+		t.Fatalf("expected acting player to become successor host, got %q", after.CurrentHost.Peer.PeerID)
+	}
+	if after.CurrentEpoch != before.CurrentEpoch+1 {
+		t.Fatalf("expected failover to advance epoch to %d, got %d", before.CurrentEpoch+1, after.CurrentEpoch)
+	}
+	if len(after.CustodyTransitions) != beforeTransitions+1 {
+		t.Fatalf("expected exactly one custody transition after relocking under successor host, got %d want %d", len(after.CustodyTransitions), beforeTransitions+1)
+	}
+	if len(after.ActiveHand.State.ActionLog) != beforeActionLog+1 {
+		t.Fatalf("expected exactly one action log entry after relocking under successor host, got %d want %d", len(after.ActiveHand.State.ActionLog), beforeActionLog+1)
+	}
+	lastAction := after.ActiveHand.State.ActionLog[len(after.ActiveHand.State.ActionLog)-1]
+	if lastAction.ActorPlayerID != guest.walletID.PlayerID || lastAction.Action.Type != game.ActionCheck {
+		t.Fatalf("expected successor-host recovery to publish the acting player's check, got %+v", lastAction)
+	}
+	if !tableHasEventType(after, "HostRotated") {
+		t.Fatal("expected relock recovery to append HostRotated")
+	}
+}
+
+func TestRetryableLockMismatchResyncsWithoutFailover(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  string
+	}{
+		{name: "epoch-mismatch", err: "action request epoch mismatch"},
+		{name: "custody-mismatch", err: "action request custody mismatch"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			host := newMeshTestRuntime(t, "host")
+			guest := newMeshTestRuntime(t, "guest")
+
+			tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+			waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+			if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+				t.Fatalf("host send preflop call: %v", err)
+			}
+
+			progressed := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+			stale := cloneJSON(progressed)
+			if len(stale.Events) == 0 {
+				t.Fatal("expected accepted events before stale-state retry test")
+			}
+			stale.Events = append([]NativeSignedTableEvent(nil), stale.Events[:len(stale.Events)-1]...)
+			stale.LastEventHash = "stale"
+			if err := guest.persistLocalTable(&stale, false); err != nil {
+				t.Fatalf("persist stale guest table: %v", err)
+			}
+
+			fetches := 0
+			guest.tableFetchHook = func(peerURL, requestedTableID string) (*nativeTableState, error) {
+				fetches++
+				if requestedTableID != tableID {
+					return nil, fmt.Errorf("unexpected table fetch %s", requestedTableID)
+				}
+				refreshed := cloneJSON(progressed)
+				return &refreshed, nil
+			}
+			defer func() {
+				guest.tableFetchHook = nil
+			}()
+
+			retry, satisfied, err := guest.maybeRetryActionStage(
+				tableID,
+				sendActionStageLock,
+				stale,
+				errors.New(testCase.err),
+				"valid acting-player choice was not locked by the current host",
+				guest.candidateHashForAction(progressed, game.Action{Type: game.ActionCheck}),
+				func(refreshed nativeTableState) sendActionStageAssessment {
+					return guest.assessLockStage(refreshed, game.Action{Type: game.ActionCheck})
+				},
+			)
+			if err != nil {
+				t.Fatalf("maybe retry action stage: %v", err)
+			}
+			if !retry {
+				t.Fatal("expected retryable mismatch to trigger a resync retry")
+			}
+			if satisfied != nil {
+				t.Fatalf("did not expect stage to become satisfied during retry classification, got %+v", satisfied)
+			}
+			if fetches == 0 {
+				t.Fatal("expected mismatch recovery to refresh accepted state from the current host")
+			}
+
+			accepted := mustReadNativeTable(t, guest, tableID)
+			if accepted.CurrentHost.Peer.PeerID != host.selfPeerID() {
+				t.Fatalf("expected current host to remain %q after resync, got %q", host.selfPeerID(), accepted.CurrentHost.Peer.PeerID)
+			}
+			if accepted.CurrentEpoch != progressed.CurrentEpoch {
+				t.Fatalf("expected accepted epoch %d after resync, got %d", progressed.CurrentEpoch, accepted.CurrentEpoch)
+			}
+			if tableHasEventType(accepted, "HostRotated") {
+				t.Fatal("did not expect retryable mismatch recovery to force host rotation")
+			}
+		})
+	}
+}
+
+func TestSuccessorContinuesLockedTurnWhenHostDisappearsBeforeActingPlayerRefresh(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	selection, err := guest.buildActionSelectionRequest(guestTable, action)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	expectedCandidateHash := selection.CandidateHash
+	beforeTransitions := len(guestTable.CustodyTransitions)
+
+	host.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+		if input.Table.Config.TableID == tableID &&
+			peerURL == guest.selfPeerURL() &&
+			input.Table.PendingTurnMenu != nil &&
+			strings.TrimSpace(input.Table.PendingTurnMenu.SelectedCandidateHash) == expectedCandidateHash &&
+			input.Table.PendingTurnMenu.SettledRequest == nil {
+			return nil
+		}
+		return host.sendTableSync(peerURL, input)
+	}
+
+	closeDone := make(chan struct{})
+	host.afterActionSelectionPersistHook = func(table nativeTableState, request nativeActionChooseRequest) error {
+		host.afterActionSelectionPersistHook = nil
+		go func() {
+			defer close(closeDone)
+			_ = host.Close()
+		}()
+		return errors.New("use of closed network connection")
+	}
+
+	if _, err := guest.SendAction(tableID, action); err == nil {
+		t.Fatal("expected initial guest action to fail while a witness-owned failover was still pending")
+	}
+
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out closing old host after lock persist")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		table := mustReadNativeTable(t, witness, tableID)
+		if pendingTurnHasLockedCandidate(table) &&
+			table.PendingTurnMenu != nil &&
+			table.PendingTurnMenu.SelectedCandidateHash == expectedCandidateHash {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	lockedReplica := mustReadNativeTable(t, witness, tableID)
+	if !pendingTurnHasLockedCandidate(lockedReplica) || lockedReplica.PendingTurnMenu == nil {
+		t.Fatalf("expected witness to receive replicated locked turn state, got %+v", lockedReplica.PendingTurnMenu)
+	}
+	if lockedReplica.PendingTurnMenu.SelectedCandidateHash != expectedCandidateHash {
+		t.Fatalf("expected witness to persist candidate %q, got %q", expectedCandidateHash, lockedReplica.PendingTurnMenu.SelectedCandidateHash)
+	}
+
+	if err := witness.forceProtocolFailover(tableID, "test successor continues replicated locked state"); err != nil {
+		t.Fatalf("force protocol failover from replicated locked state: %v", err)
+	}
+
+	if _, err := guest.SendAction(tableID, action); err != nil {
+		t.Fatalf("guest continue locked turn from successor host: %v", err)
+	}
+
+	after := mustReadNativeTable(t, guest, tableID)
+	if after.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness successor host %q, got %q", witness.selfPeerID(), after.CurrentHost.Peer.PeerID)
+	}
+	if len(after.CustodyTransitions) != beforeTransitions+1 {
+		t.Fatalf("expected successor continuation to append exactly one custody transition, got %d want %d", len(after.CustodyTransitions), beforeTransitions+1)
+	}
+	lastAction := after.ActiveHand.State.ActionLog[len(after.ActiveHand.State.ActionLog)-1]
+	if lastAction.ActorPlayerID != guest.walletID.PlayerID || !reflect.DeepEqual(lastAction.Action, action) {
+		t.Fatalf("expected successor continuation to publish original acting-player action %+v, got %+v", action, lastAction)
+	}
+}
+
+func TestLocalFailoverPublishesExactPersistedSettledRequest(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	beforeTransitions := len(guestTable.CustodyTransitions)
+
+	closeDone := make(chan struct{})
+	var persistedRequest nativeActionSettlementRequest
+	host.afterActionSettlementPersistHook = func(table nativeTableState, request nativeActionSettlementRequest) error {
+		host.afterActionSettlementPersistHook = nil
+		persistedRequest = cloneJSON(request)
+		go func() {
+			defer close(closeDone)
+			_ = host.Close()
+		}()
+		return errors.New("use of closed network connection")
+	}
+
+	if _, err := guest.SendAction(tableID, action); err != nil {
+		t.Fatalf("guest publish settled action through local failover: %v", err)
+	}
+
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out closing old host after settlement persist")
+	}
+	if persistedRequest.TableID == "" {
+		t.Fatal("expected host to persist a settled request before going silent")
+	}
+
+	after := mustReadNativeTable(t, guest, tableID)
+	if after.CurrentHost.Peer.PeerID != guest.selfPeerID() {
+		t.Fatalf("expected acting player to become successor host, got %q", after.CurrentHost.Peer.PeerID)
+	}
+	if len(after.CustodyTransitions) != beforeTransitions+1 {
+		t.Fatalf("expected exactly one custody transition across settlement retries and failover, got %d want %d", len(after.CustodyTransitions), beforeTransitions+1)
+	}
+	lastTransition := after.CustodyTransitions[len(after.CustodyTransitions)-1]
+	if lastTransition.Proof.TransitionHash != persistedRequest.Transition.Proof.TransitionHash {
+		t.Fatalf("expected local failover to publish transition %s, got %s", persistedRequest.Transition.Proof.TransitionHash, lastTransition.Proof.TransitionHash)
+	}
+	if !reflect.DeepEqual(lastTransition.Proof.SettlementWitness, persistedRequest.Transition.Proof.SettlementWitness) {
+		t.Fatalf("expected local failover to publish exact persisted settlement witness, got %+v want %+v", lastTransition.Proof.SettlementWitness, persistedRequest.Transition.Proof.SettlementWitness)
+	}
+}
+
+func TestSuccessorSettlesLockedSelectedBundleAfterSettlementDeadline(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	selection, err := guest.buildActionSelectionRequest(guestTable, action)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	lockResponse, err := host.handleActionSelectionFromPeer(selection)
+	if err != nil {
+		t.Fatalf("lock guest action: %v", err)
+	}
+	if err := guest.acceptRemoteTable(lockResponse.Table); err != nil {
+		t.Fatalf("guest accept locked table: %v", err)
+	}
+	hostLocked := mustReadNativeTable(t, host, tableID)
+	if err := witness.acceptRemoteTable(host.networkTableView(hostLocked, witness.walletID.PlayerID)); err != nil {
+		t.Fatalf("witness accept locked table: %v", err)
+	}
+
+	before := mustReadNativeTable(t, witness, tableID)
+	if before.PendingTurnMenu == nil || before.PendingTurnMenu.SelectedBundle == nil {
+		t.Fatalf("expected locked selected bundle before successor deadline settlement, got %+v", before.PendingTurnMenu)
+	}
+	expectedTransition, _, err := witness.settleTurnCandidateTransition(before, *before.PendingTurnMenu.SelectedBundle)
+	if err != nil {
+		t.Fatalf("build expected successor settlement transition: %v", err)
+	}
+	beforeTransitions := len(before.CustodyTransitions)
+
+	if err := witness.store.withTableLock(tableID, func() error {
+		table, err := witness.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.PendingTurnMenu.SettlementDeadlineAt = addMillis(nowISO(), -1_000)
+		return witness.persistLocalTable(table, false)
+	}); err != nil {
+		t.Fatalf("expire locked settlement deadline: %v", err)
+	}
+
+	if err := witness.forceProtocolFailover(tableID, "test successor settles locked selected bundle"); err != nil {
+		t.Fatalf("force protocol failover for locked selected bundle settlement: %v", err)
+	}
+
+	after := mustReadNativeTable(t, witness, tableID)
+	if after.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness successor host %q, got %q", witness.selfPeerID(), after.CurrentHost.Peer.PeerID)
+	}
+	if len(after.CustodyTransitions) != beforeTransitions+1 {
+		t.Fatalf("expected successor settlement to append one custody transition, got %d want %d", len(after.CustodyTransitions), beforeTransitions+1)
+	}
+	lastTransition := after.CustodyTransitions[len(after.CustodyTransitions)-1]
+	if lastTransition.Proof.TransitionHash != expectedTransition.Proof.TransitionHash {
+		t.Fatalf("expected successor settlement transition %s, got %s", expectedTransition.Proof.TransitionHash, lastTransition.Proof.TransitionHash)
+	}
+}
+
+func TestUnlockedTurnsUseDeterministicTimeoutSuccessor(t *testing.T) {
+	testCases := []struct {
+		name           string
+		prepare        func(t *testing.T, host, guest *meshRuntime, tableID string) nativeTableState
+		expectedAction game.ActionType
+	}{
+		{
+			name: "check-when-available",
+			prepare: func(t *testing.T, host, guest *meshRuntime, tableID string) nativeTableState {
+				waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+				if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+					t.Fatalf("host send preflop call: %v", err)
+				}
+				_ = waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+				return mustReadNativeTable(t, host, tableID)
+			},
+			expectedAction: game.ActionCheck,
+		},
+		{
+			name: "fold-when-check-unavailable",
+			prepare: func(t *testing.T, host, guest *meshRuntime, tableID string) nativeTableState {
+				return waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+			},
+			expectedAction: game.ActionFold,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			host := newMeshTestRuntime(t, "host")
+			guest := newMeshTestRuntime(t, "guest")
+
+			tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+			table := testCase.prepare(t, host, guest, tableID)
+			beforeTransitions := len(table.CustodyTransitions)
+			beforeActionLog := len(table.ActiveHand.State.ActionLog)
+
+			table.Config.TurnTimeoutMode = turnTimeoutModeDirect
+			expireCurrentTurnActionDeadlineForTest(t, &table)
+			handled, err := host.handleActionTimeoutLocked(&table)
+			if err != nil {
+				t.Fatalf("handle action timeout: %v", err)
+			}
+			if !handled {
+				t.Fatal("expected unlocked turn timeout to publish the deterministic timeout successor")
+			}
+			if len(table.CustodyTransitions) != beforeTransitions+1 {
+				t.Fatalf("expected timeout successor to append one custody transition, got %d want %d", len(table.CustodyTransitions), beforeTransitions+1)
+			}
+			if len(table.ActiveHand.State.ActionLog) != beforeActionLog+1 {
+				t.Fatalf("expected timeout successor to append one action log entry, got %d want %d", len(table.ActiveHand.State.ActionLog), beforeActionLog+1)
+			}
+			lastAction := table.ActiveHand.State.ActionLog[len(table.ActiveHand.State.ActionLog)-1]
+			if lastAction.Action.Type != testCase.expectedAction {
+				t.Fatalf("expected timeout successor %s, got %+v", testCase.expectedAction, lastAction)
+			}
+		})
+	}
+}
+
+func TestAcceptedReplayFromCustodyHistorySucceedsOfflineWithoutNewProofStates(t *testing.T) {
+	_, guest, table, _ := syntheticRealAcceptedTableForTest(t)
+
+	before := cloneJSON(table)
+	arkVerifyCalls := 0
+	guest.custodyArkVerify = func(refs []tablecustody.VTXORef, requireSpendable bool) error {
+		arkVerifyCalls++
+		return errors.New("ark unavailable")
+	}
+	if err := guest.validateAcceptedCustodyHistory(nil, table); err != nil {
+		t.Fatalf("expected accepted replay to succeed offline, got %v", err)
+	}
+	if arkVerifyCalls != 0 {
+		t.Fatalf("expected offline accepted replay to avoid live Ark verification, got %d calls", arkVerifyCalls)
+	}
+	if !reflect.DeepEqual(table, before) {
+		t.Fatal("expected accepted replay to leave custody proof state unchanged")
 	}
 }
 

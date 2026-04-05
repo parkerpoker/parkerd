@@ -40,8 +40,8 @@ const (
 	nativeTransportMessageTableActSignResp                = "table.action.sign.response"
 	nativeTransportMessageTableActReq                     = "table.action.request"
 	nativeTransportMessageTableActResp                    = "table.action.response"
-	nativeTransportMessageTableActSettleReq              = "table.action.settlement.request"
-	nativeTransportMessageTableActSettleResp             = "table.action.settlement.response"
+	nativeTransportMessageTableActSettleReq               = "table.action.settlement.request"
+	nativeTransportMessageTableActSettleResp              = "table.action.settlement.response"
 	nativeTransportMessageTableFundsReq                   = "table.funds.request"
 	nativeTransportMessageTableFundsResp                  = "table.funds.response"
 	nativeTransportMessageTableCustodyReq                 = "table.custody.request"
@@ -399,6 +399,9 @@ func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSel
 }
 
 func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTableState, error) {
+	if runtime.tableFetchHook != nil {
+		return runtime.tableFetchHook(peerURL, tableID)
+	}
 	requestBody, err := runtime.buildTableFetchRequest(tableID)
 	if err != nil {
 		return nil, err
@@ -465,6 +468,9 @@ func (runtime *meshRuntime) remoteActionSignature(peerURL string, input nativeAc
 }
 
 func (runtime *meshRuntime) remoteAction(peerURL string, input nativeActionChooseRequest) (nativeActionChooseResponse, error) {
+	if runtime.actionSenderHook != nil {
+		return runtime.actionSenderHook(peerURL, input)
+	}
 	peerInfo, err := runtime.fetchPeerInfo(peerURL)
 	if err != nil {
 		return nativeActionChooseResponse{}, err
@@ -492,6 +498,9 @@ func (runtime *meshRuntime) remoteAction(peerURL string, input nativeActionChoos
 }
 
 func (runtime *meshRuntime) remoteActionSettlement(peerURL string, input nativeActionSettlementRequest) (nativeActionSettlementResponse, error) {
+	if runtime.actionSettlementSenderHook != nil {
+		return runtime.actionSettlementSenderHook(peerURL, input)
+	}
 	peerInfo, err := runtime.fetchPeerInfo(peerURL)
 	if err != nil {
 		return nativeActionSettlementResponse{}, err

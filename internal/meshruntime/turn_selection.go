@@ -902,6 +902,11 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionCh
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
 		}
+		if runtime.afterActionSelectionPersistHook != nil {
+			if hookErr := runtime.afterActionSelectionPersistHook(cloneJSON(*table), request); hookErr != nil {
+				return hookErr
+			}
+		}
 		updated = nativeActionChooseResponse{
 			LockedAck: ack,
 			Table:     runtime.networkTableView(*table, request.SelectionAuth.PlayerID),
@@ -973,6 +978,11 @@ func (runtime *meshRuntime) handleActionSettlementFromPeer(request nativeActionS
 		table.PendingTurnMenu.SettledRequest = cloneJSON(&request)
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
+		}
+		if runtime.afterActionSettlementPersistHook != nil {
+			if hookErr := runtime.afterActionSettlementPersistHook(cloneJSON(*table), request); hookErr != nil {
+				return hookErr
+			}
 		}
 		published, err := runtime.publishLockedActionTransitionLocked(table, *table.PendingTurnMenu.SelectedBundle, request.Transition)
 		if err != nil {
