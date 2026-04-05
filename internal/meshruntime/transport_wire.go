@@ -452,7 +452,7 @@ func (runtime *meshRuntime) fetchRemoteTable(peerURL, tableID string) (*nativeTa
 	if err != nil {
 		return nil, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +480,7 @@ func (runtime *meshRuntime) remoteActionSignature(peerURL string, input nativeAc
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return nativeActionRequest{}, err
 	}
@@ -514,7 +514,7 @@ func (runtime *meshRuntime) remoteFunds(peerURL string, input nativeFundsRequest
 	if err != nil {
 		return nativeFundsResponse{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return nativeFundsResponse{}, err
 	}
@@ -544,7 +544,7 @@ func (runtime *meshRuntime) remoteHandMessage(peerURL string, input nativeHandMe
 	if err != nil {
 		return nativeHandMessageResponse{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return nativeHandMessageResponse{}, err
 	}
@@ -571,7 +571,7 @@ func (runtime *meshRuntime) remoteApproveCustody(peerURL string, input nativeCus
 	if err != nil {
 		return tablecustody.CustodySignature{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return tablecustody.CustodySignature{}, err
 	}
@@ -598,7 +598,7 @@ func (runtime *meshRuntime) remoteSignCustodyPSBT(peerURL string, input nativeCu
 	if err != nil {
 		return "", err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return "", err
 	}
@@ -625,7 +625,7 @@ func (runtime *meshRuntime) remotePrepareCustodySigner(peerURL string, input nat
 	if err != nil {
 		return nativeCustodySignerPrepareResponse{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return nativeCustodySignerPrepareResponse{}, err
 	}
@@ -742,7 +742,7 @@ func (runtime *meshRuntime) sendPeerTableRequest(peerURL, requestType, responseT
 	if err != nil {
 		return nativeTableState{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return nativeTableState{}, err
 	}
@@ -769,7 +769,7 @@ func (runtime *meshRuntime) sendTableSync(peerURL string, input nativeTableSyncR
 	if err != nil {
 		return err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	response, err := runtime.exchangePeerTransportAuto(peerURL, peerInfo, request)
 	if err != nil {
 		return err
 	}

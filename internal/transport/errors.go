@@ -75,3 +75,9 @@ func IsWireDowngrade(err error) bool {
 	var te *TransportError
 	return errors.As(err, &te) && te.Kind == ErrKindWireDowngrade
 }
+
+// IsSessionClosed returns true if the error is a session closed error.
+func IsSessionClosed(err error) bool {
+	var te *TransportError
+	return errors.As(err, &te) && te.Kind == ErrKindSessionClosed
+}

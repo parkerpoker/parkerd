@@ -21,6 +21,7 @@ var v3SessionPreface = []byte("PARKERv3")
 type SessionManager struct {
 	mu       sync.Mutex
 	sessions map[string]*OutboundSession
+	inflight map[string]chan struct{} // closed when a dial-in-progress completes
 	config   SessionConfig
 	metrics  *SessionMetrics
 	dialer   func(peerURL string) (net.Conn, error)
@@ -31,6 +32,7 @@ type SessionManager struct {
 func NewSessionManager(config SessionConfig, metrics *SessionMetrics, dialer func(string) (net.Conn, error)) *SessionManager {
 	return &SessionManager{
 		sessions: make(map[string]*OutboundSession),
+		inflight: make(map[string]chan struct{}),
 		config:   config,
 		metrics:  metrics,
 		dialer:   dialer,
@@ -96,46 +98,63 @@ func (sm *SessionManager) HasSession(peerURL string) bool {
 }
 
 func (sm *SessionManager) getOrCreateSession(peerURL string, peerStaticPub []byte) (*OutboundSession, error) {
-	sm.mu.Lock()
-	if sm.closed {
+	for {
+		sm.mu.Lock()
+		if sm.closed {
+			sm.mu.Unlock()
+			return nil, &TransportError{Kind: ErrKindSessionClosed, PeerURL: peerURL, Detail: "session manager closed"}
+		}
+		sess, ok := sm.sessions[peerURL]
+		if ok && !sess.isClosed() {
+			sm.mu.Unlock()
+			return sess, nil
+		}
+		// Another goroutine is already dialing this peer — wait for it.
+		if wait, exists := sm.inflight[peerURL]; exists {
+			sm.mu.Unlock()
+			<-wait
+			continue
+		}
+		// We are the dialer for this peer.
+		done := make(chan struct{})
+		sm.inflight[peerURL] = done
+		wasReconnect := ok // old entry existed but was closed
 		sm.mu.Unlock()
-		return nil, &TransportError{Kind: ErrKindSessionClosed, PeerURL: peerURL, Detail: "session manager closed"}
-	}
-	sess, ok := sm.sessions[peerURL]
-	if ok && !sess.isClosed() {
+
+		newSess, err := sm.dialAndHandshake(peerURL, peerStaticPub)
+
+		sm.mu.Lock()
+		delete(sm.inflight, peerURL)
+		close(done)
+
+		if err != nil {
+			sm.mu.Unlock()
+			return nil, err
+		}
+		if sm.closed {
+			sm.mu.Unlock()
+			newSess.Close()
+			return nil, &TransportError{Kind: ErrKindSessionClosed, PeerURL: peerURL, Detail: "session manager closed"}
+		}
+		// Double-check: another path may have inserted a session.
+		if existing, ok := sm.sessions[peerURL]; ok && !existing.isClosed() {
+			sm.mu.Unlock()
+			newSess.Close()
+			return existing, nil
+		}
+		sm.sessions[peerURL] = newSess
 		sm.mu.Unlock()
-		return sess, nil
+		if wasReconnect {
+			sm.metrics.ReconnectCount.Add(1)
+		}
+		return newSess, nil
 	}
-	sm.mu.Unlock()
-
-	// Dial and handshake outside the lock to avoid blocking other peers.
-	newSess, err := sm.dialAndHandshake(peerURL, peerStaticPub)
-	if err != nil {
-		return nil, err
-	}
-
-	sm.mu.Lock()
-	defer sm.mu.Unlock()
-	if sm.closed {
-		newSess.Close()
-		return nil, &TransportError{Kind: ErrKindSessionClosed, PeerURL: peerURL, Detail: "session manager closed"}
-	}
-	// Check again — another goroutine may have created a session concurrently.
-	if existing, ok := sm.sessions[peerURL]; ok && !existing.isClosed() {
-		newSess.Close()
-		return existing, nil
-	}
-	sm.sessions[peerURL] = newSess
-	if ok {
-		sm.metrics.ReconnectCount.Add(1)
-	}
-	return newSess, nil
 }
 
 func (sm *SessionManager) dialAndHandshake(peerURL string, peerStaticPub []byte) (*OutboundSession, error) {
-	conn, err := sm.dialer(peerURL)
+	conn, err := sm.dialWithTimeout(peerURL)
 	if err != nil {
-		return nil, &TransportError{Kind: ErrKindHandshakeFailed, PeerURL: peerURL, Detail: "dial failed", Cause: err}
+		return nil, err
 	}
 
 	// Set a single deadline covering preface write + Noise handshake.
@@ -169,6 +188,36 @@ func (sm *SessionManager) dialAndHandshake(peerURL string, peerStaticPub []byte)
 
 	sess := newOutboundSession(conn, noise, peerURL, sm.config)
 	return sess, nil
+}
+
+func (sm *SessionManager) dialWithTimeout(peerURL string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, e := sm.dialer(peerURL)
+		ch <- result{c, e}
+	}()
+	timer := time.NewTimer(sm.config.ConnectTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, &TransportError{Kind: ErrKindHandshakeFailed, PeerURL: peerURL, Detail: "dial failed", Cause: r.err}
+		}
+		return r.conn, nil
+	case <-timer.C:
+		// Clean up the connection if the dial eventually succeeds.
+		go func() {
+			r := <-ch
+			if r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, &TransportError{Kind: ErrKindHandshakeFailed, PeerURL: peerURL, Detail: "connect timeout"}
+	}
 }
 
 func (sm *SessionManager) removeSession(peerURL string) {

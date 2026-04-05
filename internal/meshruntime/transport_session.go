@@ -36,11 +36,7 @@ func (runtime *meshRuntime) ensureSessionManager() *transportpkg.SessionManager 
 
 // peerSupportsV3 checks whether the peer manifest advertises session-transport-v3.
 func peerSupportsV3(info nativePeerSelf) bool {
-	// The peer info doesn't directly expose capabilities, but we can check the
-	// TransportPubkeyHex (required for v3) and rely on the wire version from exchange.
-	// For now, we check if the peer explicitly includes the capability in its manifest.
-	// The caller should check TransportWireVersion from the cached manifest.
-	return strings.TrimSpace(info.TransportPubkeyHex) != ""
+	return info.TransportWireVersion >= 3 && strings.TrimSpace(info.TransportPubkeyHex) != ""
 }
 
 // peerStaticPubBytes returns the 32-byte X25519 public key from the peer info.
@@ -60,9 +56,10 @@ func (runtime *meshRuntime) exchangePeerTransportV3(peerURL string, peerInfo nat
 		return transportpkg.TransportEnvelope{}, err
 	}
 	sm := runtime.ensureSessionManager()
+	request.TransportWireVersion = 3
 	resp, err := sm.Request(peerURL, pubBytes, request)
 	if err != nil {
-		if runtime.sessionMetrics != nil {
+		if runtime.sessionMetrics != nil && transportpkg.IsTransportTimeout(err) {
 			runtime.sessionMetrics.RequestTimeoutCount.Add(1)
 		}
 		return transportpkg.TransportEnvelope{}, err
@@ -77,8 +74,8 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, peerInfo n
 		if err == nil {
 			return resp, nil
 		}
-		// On handshake or session error, fall back to v2.
-		if transportpkg.IsSessionReset(err) || isHandshakeErr(err) {
+		// On handshake, session reset, or session closed error, fall back to v2.
+		if transportpkg.IsSessionReset(err) || isHandshakeErr(err) || transportpkg.IsSessionClosed(err) {
 			debugMeshf("v3 session failed for %s, falling back to v2: %v", peerURL, err)
 			if runtime.sessionMetrics != nil {
 				runtime.sessionMetrics.FallbackToV2Count.Add(1)
