@@ -31,10 +31,14 @@ const (
 	tagLen            = chacha20poly1305.Overhead // 16
 )
 
-// noiseSymmetricState holds the evolving handshake hash and chaining key.
+// noiseSymmetricState holds the evolving handshake hash, chaining key, and
+// optional cipher key for within-handshake encryption (per Noise spec §5.2).
 type noiseSymmetricState struct {
-	h  [32]byte // handshake hash
-	ck [32]byte // chaining key
+	h    [32]byte // handshake hash
+	ck   [32]byte // chaining key
+	k    [32]byte // cipher key set by mixKey
+	n    uint64   // nonce counter for handshake encryption
+	hasK bool     // true after first mixKey call
 }
 
 func newSymmetricState() noiseSymmetricState {
@@ -81,17 +85,50 @@ func hmacSHA256(key, data []byte) [32]byte {
 }
 
 func (s *noiseSymmetricState) mixKey(dhOutput []byte) {
-	s.ck, _ = hkdfSHA256(s.ck[:], dhOutput)
-	// The second output is discarded per Noise spec when we don't need a transport key yet.
-	// We update ck with the first output. The actual transport keys are split later.
+	s.ck, s.k = hkdfSHA256(s.ck[:], dhOutput)
+	s.n = 0
+	s.hasK = true
 }
 
-func (s *noiseSymmetricState) mixKeyAndSplit(dhOutput []byte) (send, recv *noiseCipherState) {
-	newCK, tempK := hkdfSHA256(s.ck[:], dhOutput)
-	s.ck = newCK
-	k1, k2 := hkdfSHA256(s.ck[:], nil)
-	_ = tempK
-	return &noiseCipherState{key: k1}, &noiseCipherState{key: k2}
+// encryptAndHash encrypts plaintext using the handshake cipher key (if set)
+// with the handshake hash as associated data, then mixes the ciphertext into h.
+func (s *noiseSymmetricState) encryptAndHash(plaintext []byte) ([]byte, error) {
+	if !s.hasK {
+		s.mixHash(plaintext)
+		return append([]byte(nil), plaintext...), nil
+	}
+	aead, err := chacha20poly1305.New(s.k[:])
+	if err != nil {
+		return nil, err
+	}
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], s.n)
+	s.n++
+	ciphertext := aead.Seal(nil, nonce[:], plaintext, s.h[:])
+	s.mixHash(ciphertext)
+	return ciphertext, nil
+}
+
+// decryptAndHash decrypts ciphertext using the handshake cipher key (if set)
+// with the handshake hash as associated data, then mixes the ciphertext into h.
+func (s *noiseSymmetricState) decryptAndHash(ciphertext []byte) ([]byte, error) {
+	if !s.hasK {
+		s.mixHash(ciphertext)
+		return append([]byte(nil), ciphertext...), nil
+	}
+	aead, err := chacha20poly1305.New(s.k[:])
+	if err != nil {
+		return nil, err
+	}
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], s.n)
+	s.n++
+	plaintext, err := aead.Open(nil, nonce[:], ciphertext, s.h[:])
+	if err != nil {
+		return nil, err
+	}
+	s.mixHash(ciphertext)
+	return plaintext, nil
 }
 
 // split derives the final two transport cipher states from the current chaining key.
@@ -195,8 +232,17 @@ func NoiseNKInitiator(rw io.ReadWriter, responderStaticPub []byte) (*NoiseSessio
 	}
 	ss.mixKey(dhES)
 
-	// Send message 1: initiator ephemeral public key
-	if err := writeNoiseMsg(rw, ePub); err != nil {
+	// Encrypt empty payload — the tag provides key confirmation for es.
+	tag1, err := ss.encryptAndHash(nil)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt handshake msg1 payload: %w", err)
+	}
+
+	// Send message 1: initiator ephemeral public key + encrypted payload (tag).
+	msg1Out := make([]byte, 0, len(ePub)+len(tag1))
+	msg1Out = append(msg1Out, ePub...)
+	msg1Out = append(msg1Out, tag1...)
+	if err := writeNoiseMsg(rw, msg1Out); err != nil {
 		return nil, fmt.Errorf("write handshake msg1: %w", err)
 	}
 
@@ -205,19 +251,25 @@ func NoiseNKInitiator(rw io.ReadWriter, responderStaticPub []byte) (*NoiseSessio
 	if err != nil {
 		return nil, fmt.Errorf("read handshake msg2: %w", err)
 	}
-	if len(msg2) != dhKeyLen {
+	if len(msg2) < dhKeyLen+tagLen {
 		return nil, errors.New("invalid handshake msg2 length")
 	}
-	responderEPub := msg2
+	responderEPub := msg2[:dhKeyLen]
 	ss.mixHash(responderEPub)
 
 	dhEE, err := x25519DH(ePriv, responderEPub)
 	if err != nil {
 		return nil, fmt.Errorf("DH(e_i, e_r): %w", err)
 	}
+	ss.mixKey(dhEE)
+
+	// Decrypt and verify responder's payload tag — key confirmation for ee.
+	if _, err := ss.decryptAndHash(msg2[dhKeyLen:]); err != nil {
+		return nil, fmt.Errorf("handshake msg2 key confirmation failed: %w", err)
+	}
 
 	// Split into transport keys
-	c1, c2 := ss.mixKeyAndSplit(dhEE)
+	c1, c2 := ss.split()
 	return &NoiseSession{Send: c1, Recv: c2}, nil
 }
 
@@ -232,15 +284,15 @@ func NoiseNKResponder(rw io.ReadWriter, staticPriv, staticPub []byte) (*NoiseSes
 	// Pre-message: mix our static key into handshake hash
 	ss.mixHash(staticPub)
 
-	// -> e, es (read initiator ephemeral)
+	// -> e, es (read initiator ephemeral + encrypted payload)
 	msg1, err := readNoiseMsg(rw)
 	if err != nil {
 		return nil, fmt.Errorf("read handshake msg1: %w", err)
 	}
-	if len(msg1) != dhKeyLen {
+	if len(msg1) < dhKeyLen+tagLen {
 		return nil, errors.New("invalid handshake msg1 length")
 	}
-	initiatorEPub := msg1
+	initiatorEPub := msg1[:dhKeyLen]
 	ss.mixHash(initiatorEPub)
 
 	dhES, err := x25519DH(staticPriv, initiatorEPub)
@@ -248,6 +300,11 @@ func NoiseNKResponder(rw io.ReadWriter, staticPriv, staticPub []byte) (*NoiseSes
 		return nil, fmt.Errorf("DH(s, e): %w", err)
 	}
 	ss.mixKey(dhES)
+
+	// Decrypt and verify initiator's payload tag — key confirmation for es.
+	if _, err := ss.decryptAndHash(msg1[dhKeyLen:]); err != nil {
+		return nil, fmt.Errorf("handshake msg1 key confirmation failed: %w", err)
+	}
 
 	// <- e, ee
 	ePriv, ePub, err := generateX25519Keypair()
@@ -260,14 +317,24 @@ func NoiseNKResponder(rw io.ReadWriter, staticPriv, staticPub []byte) (*NoiseSes
 	if err != nil {
 		return nil, fmt.Errorf("DH(e_r, e_i): %w", err)
 	}
+	ss.mixKey(dhEE)
 
-	// Send message 2: responder ephemeral public key
-	if err := writeNoiseMsg(rw, ePub); err != nil {
+	// Encrypt empty payload — the tag provides key confirmation for ee.
+	tag2, err := ss.encryptAndHash(nil)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt handshake msg2 payload: %w", err)
+	}
+
+	// Send message 2: responder ephemeral public key + encrypted payload (tag).
+	msg2Out := make([]byte, 0, len(ePub)+len(tag2))
+	msg2Out = append(msg2Out, ePub...)
+	msg2Out = append(msg2Out, tag2...)
+	if err := writeNoiseMsg(rw, msg2Out); err != nil {
 		return nil, fmt.Errorf("write handshake msg2: %w", err)
 	}
 
 	// Split into transport keys (reversed direction for responder)
-	c1, c2 := ss.mixKeyAndSplit(dhEE)
+	c1, c2 := ss.split()
 	return &NoiseSession{Send: c2, Recv: c1}, nil
 }
 

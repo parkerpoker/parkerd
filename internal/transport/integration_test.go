@@ -3,6 +3,7 @@ package transport
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -105,31 +106,106 @@ func TestV2PeerInteroperability(t *testing.T) {
 	}
 }
 
-// TestV3FallbackOnDiscoveryV2 verifies that when a peer reports wire v2,
-// the session manager is not used (callers should use v2 path).
+// TestV3FallbackOnDiscoveryV2 verifies that a v2-only server (no v3 preface
+// support) can still be reached via the v2 one-shot path, and that the v3
+// session path correctly fails with a handshake error that callers use to
+// trigger fallback.
 func TestV3FallbackOnDiscoveryV2(t *testing.T) {
-	// This test simply verifies the config/error types work correctly
-	// for the fallback decision logic.
-	metrics := &SessionMetrics{}
+	// Start a v2-only server: it reads a JSON line and echoes a response.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
 
-	// Simulate a v2 fallback counter increment.
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				reader := bufio.NewReader(conn)
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				var req TransportEnvelope
+				if json.Unmarshal([]byte(strings.TrimSpace(line)), &req) != nil {
+					return
+				}
+				resp := TransportEnvelope{
+					MessageID:   "v2-resp-" + req.MessageID,
+					MessageType: req.MessageType + ".response",
+					RetryOf:     req.MessageID,
+				}
+				data, _ := json.Marshal(resp)
+				conn.Write(append(data, '\n'))
+			}()
+		}
+	}()
+
+	// Attempt a v3 session against the v2-only server. The server will interpret
+	// "PARKERv3" as the start of a JSON line, fail to parse it, and close. The
+	// session manager should get a handshake error.
+	_, serverPub := testKeypair(t)
+	metrics := &SessionMetrics{}
+	cfg := DefaultSessionConfig(false)
+	cfg.HandshakeTimeout = 2 * time.Second
+	cfg.ConnectTimeout = 2 * time.Second
+
+	sm := NewSessionManager(cfg, metrics, func(peerURL string) (net.Conn, error) {
+		return net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	})
+	defer sm.CloseAll()
+
+	req := TransportEnvelope{MessageID: "v3-attempt-1", MessageType: "test"}
+	_, err = sm.Request("parker://v2-only:1234", serverPub, req)
+	if err == nil {
+		t.Fatal("expected v3 request to fail against v2-only server")
+	}
+	var te *TransportError
+	if !errors.As(err, &te) || te.Kind != ErrKindHandshakeFailed {
+		t.Fatalf("expected handshake failure, got: %v", err)
+	}
+
+	// Verify fallback metrics/error helpers.
 	metrics.FallbackToV2Count.Add(1)
 	snap := metrics.Snapshot()
 	if snap.FallbackToV2Count != 1 {
 		t.Fatalf("expected fallback count 1, got %d", snap.FallbackToV2Count)
 	}
+	if !IsWireDowngrade(&TransportError{Kind: ErrKindWireDowngrade}) {
+		t.Fatal("IsWireDowngrade should return true")
+	}
 
-	// Verify wire downgrade error type.
-	err := &TransportError{
-		Kind:    ErrKindWireDowngrade,
-		PeerURL: "parker://old-peer:1234",
-		Detail:  "peer advertises wire version 2",
+	// Verify that a plain v2 request still works.
+	conn, err := net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !IsWireDowngrade(err) {
-		t.Fatal("should be wire downgrade")
+	defer conn.Close()
+	v2req := TransportEnvelope{
+		MessageID:            "v2-fallback-1",
+		MessageType:          "table.state.pull",
+		TransportWireVersion: 2,
 	}
-	if IsTransportTimeout(err) {
-		t.Fatal("should not be timeout")
+	data, _ := json.Marshal(v2req)
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	conn.Write(append(data, '\n'))
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("v2 fallback read: %v", err)
+	}
+	var v2resp TransportEnvelope
+	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &v2resp); err != nil {
+		t.Fatal(err)
+	}
+	if v2resp.RetryOf != "v2-fallback-1" {
+		t.Fatalf("expected RetryOf=v2-fallback-1, got %q", v2resp.RetryOf)
 	}
 }
 

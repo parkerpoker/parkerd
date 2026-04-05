@@ -84,7 +84,6 @@ func TestNoiseNKWrongStaticKey(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
-	var clientSession, serverSession *NoiseSession
 	var clientErr, serverErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -92,31 +91,24 @@ func TestNoiseNKWrongStaticKey(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		// Client uses the correct server public key.
-		clientSession, clientErr = NoiseNKInitiator(clientConn, serverPub)
+		_, clientErr = NoiseNKInitiator(clientConn, serverPub)
 	}()
 	go func() {
 		defer wg.Done()
-		// Server uses a WRONG keypair.
-		serverSession, serverErr = NoiseNKResponder(serverConn, wrongPriv, wrongPub)
+		// Server uses a WRONG keypair. Close the conn on failure so the
+		// initiator unblocks instead of hanging on readNoiseMsg.
+		_, serverErr = NoiseNKResponder(serverConn, wrongPriv, wrongPub)
+		if serverErr != nil {
+			serverConn.Close()
+		}
 	}()
 	wg.Wait()
 
-	// The handshake itself may succeed (Noise NK doesn't authenticate the responder's
-	// ephemeral in msg2 against the static key), but the derived keys will differ,
-	// so encryption/decryption will fail.
-	if clientErr != nil || serverErr != nil {
-		// If handshake itself fails, that's also acceptable.
-		return
-	}
-
-	plaintext := []byte("test message")
-	ct, err := clientSession.Encrypt(plaintext)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = serverSession.Decrypt(ct)
-	if err == nil {
-		t.Fatal("expected decryption to fail with wrong static key, but it succeeded")
+	// With key confirmation tags, the handshake must fail when the responder
+	// uses the wrong static key — the es DH result will differ, causing
+	// the msg1 payload tag decryption to fail on the responder side.
+	if clientErr == nil && serverErr == nil {
+		t.Fatal("expected handshake to fail with wrong static key, but both sides succeeded")
 	}
 }
 

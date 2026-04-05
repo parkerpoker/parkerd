@@ -2564,8 +2564,9 @@ func (runtime *meshRuntime) ensureBootstrapLocked(nickname, walletNsec string) e
 		},
 		ProfileName:        runtime.profileName,
 		ProtocolID:         protocolIdentity.ID,
-		TransportPubkeyHex: transportPublic,
-		WalletPlayerID:     walletID.PlayerID,
+		TransportPubkeyHex:   transportPublic,
+		TransportWireVersion: 3,
+		WalletPlayerID:       walletID.PlayerID,
 	}
 	return nil
 }

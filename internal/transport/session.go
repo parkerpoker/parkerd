@@ -260,7 +260,7 @@ type OutboundSession struct {
 	pending      sync.Map // messageID -> chan TransportEnvelope
 	closeOnce    sync.Once
 	closeCh      chan struct{}
-	closeErr     error
+	closeErr     atomic.Value // stores error
 	wg           sync.WaitGroup
 	keepaliveSeq atomic.Uint64
 }
@@ -383,23 +383,23 @@ func (s *OutboundSession) readLoop() {
 		_ = s.conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
 		frame, err := readFrameBytes(s.conn)
 		if err != nil {
-			s.closeErr = err
+			s.closeErr.CompareAndSwap(nil, err)
 			return
 		}
 
 		plaintext, err := s.noise.Decrypt(frame)
 		if err != nil {
-			s.closeErr = err
+			s.closeErr.CompareAndSwap(nil, err)
 			return
 		}
 		if len(plaintext) > maxDecryptedFrameSize {
-			s.closeErr = errors.New("decrypted frame exceeds max size")
+			s.closeErr.CompareAndSwap(nil, errors.New("decrypted frame exceeds max size"))
 			return
 		}
 
 		var resp TransportEnvelope
 		if err := json.Unmarshal(plaintext, &resp); err != nil {
-			s.closeErr = err
+			s.closeErr.CompareAndSwap(nil, err)
 			return
 		}
 
@@ -434,7 +434,7 @@ func (s *OutboundSession) keepaliveLoop() {
 				MessageID:   "keepalive-" + strconv.FormatUint(seq, 10),
 			}
 			if err := s.writeFrame(ping); err != nil {
-				s.closeErr = err
+				s.closeErr.CompareAndSwap(nil, err)
 				return
 			}
 		}
