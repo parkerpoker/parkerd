@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 
 	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
@@ -137,8 +138,21 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 
 	// Serve requests over the session until idle timeout or error.
 	// Use config-driven timeouts so env knobs govern both client and server.
+	// Requests are handled concurrently so a slow handler doesn't block
+	// keepalive processing or unrelated RPCs on the same session.
 	readTimeout := cfg.IdleTimeout
 	writeTimeout := cfg.RequestTimeout
+
+	var writeMu sync.Mutex // serializes noise.Encrypt + conn.Write
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
+	writeResponse := func(resp transportpkg.TransportEnvelope) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return transportpkg.WriteV3Response(conn, noise, resp, writeTimeout)
+	}
+
 	for {
 		request, err := transportpkg.ReadV3Request(conn, noise, readTimeout)
 		if err != nil {
@@ -148,31 +162,33 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 			return
 		}
 
-		// Ignore keepalive pings.
+		// Respond to keepalive pings inline (cheap, no handler work).
 		if request.MessageType == "keepalive" {
 			pong := transportpkg.TransportEnvelope{
 				MessageType: "keepalive",
 				MessageID:   request.MessageID,
 				RetryOf:     request.MessageID,
 			}
-			if err := transportpkg.WriteV3Response(conn, noise, pong, writeTimeout); err != nil {
+			if err := writeResponse(pong); err != nil {
 				return
 			}
 			continue
 		}
 
-		response, handleErr := runtime.handlePeerTransportEnvelope(request)
-		if handleErr != nil {
-			response = runtime.nackFromRequest(request, handleErr)
-		}
-		// Ensure RetryOf is set so the client can correlate the response.
-		if response.RetryOf == "" {
-			response.RetryOf = request.MessageID
-		}
-
-		if err := transportpkg.WriteV3Response(conn, noise, response, writeTimeout); err != nil {
-			return
-		}
+		wg.Add(1)
+		go func(req transportpkg.TransportEnvelope) {
+			defer wg.Done()
+			response, handleErr := runtime.handlePeerTransportEnvelope(req)
+			if handleErr != nil {
+				response = runtime.nackFromRequest(req, handleErr)
+			}
+			if response.RetryOf == "" {
+				response.RetryOf = req.MessageID
+			}
+			if err := writeResponse(response); err != nil {
+				debugMeshf("v3 write error: %v", err)
+			}
+		}(request)
 	}
 }
 

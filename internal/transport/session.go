@@ -54,7 +54,11 @@ func (sm *SessionManager) Request(peerURL string, peerStaticPub []byte, request 
 
 	resp, err := sess.RoundTrip(request, sm.config.RequestTimeout)
 	if err != nil {
-		if isConnBroken(err) {
+		// Tear down on broken connections AND timeouts. The server handles
+		// one request at a time per v3 session, so a timed-out request
+		// leaves the connection in an unknown state — reusing it would
+		// cause subsequent requests to time out until idle expiry.
+		if isConnBroken(err) || IsTransportTimeout(err) {
 			sm.removeSession(peerURL)
 		}
 		return TransportEnvelope{}, err

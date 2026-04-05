@@ -395,7 +395,6 @@ func (runtime *meshRuntime) cachedPeerInfo(peerURL string) (nativePeerSelf, bool
 
 func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSelf) {
 	var keyRotated bool
-	var invalidateURL string
 
 	runtime.mu.Lock()
 	if runtime.peerInfoCache == nil {
@@ -404,13 +403,22 @@ func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSel
 
 	// Detect transport key rotation: if we had a cached entry with a different
 	// public key, we need to tear down the existing session.
-	if old, ok := runtime.peerInfoCache[peerURL]; ok {
-		oldKey := strings.TrimSpace(old.PeerSelf.TransportPubkeyHex)
-		newKey := strings.TrimSpace(peerInfo.TransportPubkeyHex)
-		if oldKey != "" && newKey != "" && oldKey != newKey {
-			keyRotated = true
-			invalidateURL = peerURL
+	// Check both the lookup URL and canonical URL so we catch rotations
+	// regardless of which alias the session was opened under.
+	var invalidateURLs []string
+	checkRotation := func(url string) {
+		if old, ok := runtime.peerInfoCache[url]; ok {
+			oldKey := strings.TrimSpace(old.PeerSelf.TransportPubkeyHex)
+			newKey := strings.TrimSpace(peerInfo.TransportPubkeyHex)
+			if oldKey != "" && newKey != "" && oldKey != newKey {
+				keyRotated = true
+				invalidateURLs = append(invalidateURLs, url)
+			}
 		}
+	}
+	checkRotation(peerURL)
+	if canonical := strings.TrimSpace(peerInfo.Peer.PeerURL); canonical != "" && canonical != peerURL {
+		checkRotation(canonical)
 	}
 
 	cached := nativeCachedPeerInfo{
@@ -425,10 +433,12 @@ func (runtime *meshRuntime) cachePeerInfo(peerURL string, peerInfo nativePeerSel
 	}
 	runtime.mu.Unlock()
 
-	// Invalidate session outside the lock to avoid deadlock with invalidateSessionForPeer.
+	// Invalidate sessions outside the lock to avoid deadlock with invalidateSessionForPeer.
 	if keyRotated {
-		debugMeshf("peer %s rotated transport key, invalidating session", invalidateURL)
-		runtime.invalidateSessionForPeer(invalidateURL)
+		for _, u := range invalidateURLs {
+			debugMeshf("peer %s rotated transport key, invalidating session", u)
+			runtime.invalidateSessionForPeer(u)
+		}
 	}
 }
 
@@ -794,7 +804,23 @@ func (runtime *meshRuntime) encodeResponseEnvelope(request transportpkg.Transpor
 	if err != nil {
 		return transportpkg.TransportEnvelope{}, err
 	}
-	return runtime.buildEnvelope(messageType, channel, request.TableID, request.SenderPeerID, bodyBytes, sharedSecret, request.MessageID)
+	envelope, err := runtime.buildEnvelope(messageType, channel, request.TableID, request.SenderPeerID, bodyBytes, sharedSecret, request.MessageID)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, err
+	}
+	// Propagate the wire version from the request so v3 sessions get v3 responses.
+	if request.TransportWireVersion != 0 {
+		envelope.TransportWireVersion = request.TransportWireVersion
+		// Re-sign with the correct wire version in the payload.
+		unsigned := rawJSONMap(envelope)
+		delete(unsigned, "signature")
+		sig, sigErr := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
+		if sigErr != nil {
+			return transportpkg.TransportEnvelope{}, sigErr
+		}
+		envelope.Signature = sig
+	}
+	return envelope, nil
 }
 
 func (runtime *meshRuntime) nackFromRequest(request transportpkg.TransportEnvelope, err error) transportpkg.TransportEnvelope {
