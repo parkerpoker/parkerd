@@ -318,11 +318,12 @@ Turn state is split into a replicated public layer and a local pre-signed bundle
 
 Non-acting peers receive only the compact public menu before lock. Sibling pre-signed bundles are not part of replicated pending-turn state.
 
-Ordinary turn resolution has three explicit stages:
+Ordinary turn resolution has four explicit steps:
 
 1. The acting player sends `ActionChooseRequest` carrying `candidateHash` plus `SelectionAuth`.
 2. The host validates `SelectionAuth`, locks that exact candidate, persists the public lock state, replicates exactly one selected bundle, and replies with `ActionLockedAck`.
-3. The acting player settles the locked bundle locally and sends `ActionSettlementRequest` carrying the fully settled transition and witness material. The host validates that settled transition against the locked bundle and publishes the accepted `action` transition.
+3. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material.
+4. The host validates that signed settled transition against the locked bundle, persists the exact settled request in pending-turn state until publication, and publishes the accepted `action` transition.
 
 `SelectionAuth` binds:
 
@@ -367,7 +368,7 @@ Resolution then splits:
 
 After ordinary action lock, recovery does not switch to timeout fold/check substitution. Recovery uses the locked selected bundle:
 
-- if the host disappears after lock and the acting player already settled, failover publishes that exact settled transition
+- if the host disappears after lock and the acting player already settled, failover publishes that exact persisted settled transition
 - if the acting player disappears after lock and before settlement, the current host or a successor host can settle the replicated selected bundle after `settlementDeadlineAt`
 
 Escape maturity depends on the CSV type:

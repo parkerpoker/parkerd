@@ -4983,6 +4983,11 @@ func mergeAcceptedPendingTurnMenu(existing *nativeTableState, accepted *nativeTa
 			firstNonEmptyString(accepted.PendingTurnMenu.SelectedCandidateHash, existing.PendingTurnMenu.SelectedCandidateHash) == existing.PendingTurnMenu.SelectedCandidateHash {
 			accepted.PendingTurnMenu.SelectedBundle = cloneJSON(existing.PendingTurnMenu.SelectedBundle)
 		}
+		if accepted.PendingTurnMenu.SettledRequest == nil &&
+			existing.PendingTurnMenu.SettledRequest != nil &&
+			firstNonEmptyString(accepted.PendingTurnMenu.SelectedCandidateHash, existing.PendingTurnMenu.SelectedCandidateHash) == existing.PendingTurnMenu.SelectedCandidateHash {
+			accepted.PendingTurnMenu.SettledRequest = cloneJSON(existing.PendingTurnMenu.SettledRequest)
+		}
 	}
 }
 

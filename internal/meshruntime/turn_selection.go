@@ -242,6 +242,41 @@ func actionLockedAckPayload(ack tablecustody.ActionLockedAck) map[string]any {
 	}
 }
 
+func actionSettlementTransitionHash(request nativeActionSettlementRequest) string {
+	return tablecustody.HashCustodyTransition(request.Transition)
+}
+
+func actionSettlementRequestPayload(request nativeActionSettlementRequest) map[string]any {
+	return map[string]any{
+		"candidateHash":   request.CandidateHash,
+		"playerId":        request.PlayerID,
+		"protocolVersion": request.ProtocolVersion,
+		"signedAt":        request.SignedAt,
+		"tableId":         request.TableID,
+		"transitionHash":  actionSettlementTransitionHash(request),
+		"type":            "action-settlement-request",
+	}
+}
+
+func validateLockedCandidateBinding(menu *NativePendingTurnMenu) error {
+	if menu == nil || strings.TrimSpace(menu.SelectedCandidateHash) == "" {
+		return nil
+	}
+	if menu.SelectionAuth != nil && menu.SelectionAuth.CandidateHash != menu.SelectedCandidateHash {
+		return errors.New("pending turn menu selection auth candidate does not match the locked candidate")
+	}
+	if menu.SelectedBundle != nil && menu.SelectedBundle.CandidateHash != menu.SelectedCandidateHash {
+		return errors.New("pending turn menu selected bundle does not match the locked candidate")
+	}
+	if menu.SelectionAuth != nil && menu.SelectedBundle != nil && menu.SelectionAuth.CandidateHash != menu.SelectedBundle.CandidateHash {
+		return errors.New("pending turn menu selection auth does not match the selected bundle")
+	}
+	if menu.SettledRequest != nil && menu.SettledRequest.CandidateHash != menu.SelectedCandidateHash {
+		return errors.New("pending turn menu settled request does not match the locked candidate")
+	}
+	return nil
+}
+
 func (runtime *meshRuntime) buildSelectionAuth(table nativeTableState, candidateHash string) (tablecustody.SelectionAuth, error) {
 	if table.ActiveHand == nil || table.ActiveHand.State.ActingSeatIndex == nil {
 		return tablecustody.SelectionAuth{}, errors.New("selection auth requires an actionable hand")
@@ -363,6 +398,12 @@ func (runtime *meshRuntime) verifyActionLockedAck(table nativeTableState, ack ta
 	if table.PendingTurnMenu == nil {
 		return errors.New("action locked ack requires a pending turn menu")
 	}
+	if strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash) != "" && ack.CandidateHash != table.PendingTurnMenu.SelectedCandidateHash {
+		return errors.New("action locked ack candidate mismatch")
+	}
+	if table.PendingTurnMenu.SelectionAuth != nil && ack.CandidateHash != table.PendingTurnMenu.SelectionAuth.CandidateHash {
+		return errors.New("action locked ack does not match the locked selection auth")
+	}
 	if ack.TableID != table.Config.TableID {
 		return errors.New("action locked ack table mismatch")
 	}
@@ -400,13 +441,56 @@ func (runtime *meshRuntime) hasTimelySelectedCandidate(table nativeTableState) b
 	if strings.TrimSpace(menu.SelectedCandidateHash) == "" || menu.SelectionAuth == nil || menu.SelectedBundle == nil {
 		return false
 	}
-	if menu.SelectedBundle.CandidateHash != menu.SelectedCandidateHash {
+	if err := validateLockedCandidateBinding(menu); err != nil {
 		return false
 	}
 	if err := runtime.verifySelectionAuth(table, *menu.SelectionAuth); err != nil {
 		return false
 	}
 	return acceptedBeforeOrAtDeadline(menu.SelectionAuth.SignedAt, menu.ActionDeadlineAt)
+}
+
+func (runtime *meshRuntime) signActionSettlementRequest(request nativeActionSettlementRequest) (nativeActionSettlementRequest, error) {
+	request.SignedAt = nowISO()
+	signatureHex, err := settlementcore.SignStructuredData(runtime.walletID.PrivateKeyHex, actionSettlementRequestPayload(request))
+	if err != nil {
+		return nativeActionSettlementRequest{}, err
+	}
+	request.SignatureHex = signatureHex
+	return request, nil
+}
+
+func (runtime *meshRuntime) verifyActionSettlementRequest(table nativeTableState, request nativeActionSettlementRequest) error {
+	if table.PendingTurnMenu == nil {
+		return errors.New("action settlement requires a pending turn menu")
+	}
+	if request.TableID != table.Config.TableID {
+		return errors.New("action settlement table mismatch")
+	}
+	if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
+		return err
+	}
+	if request.PlayerID != table.PendingTurnMenu.ActingPlayerID {
+		return errors.New("action settlement player mismatch")
+	}
+	if strings.TrimSpace(request.SignedAt) == "" {
+		return errors.New("action settlement signed timestamp is missing")
+	}
+	if strings.TrimSpace(request.SignatureHex) == "" {
+		return errors.New("action settlement signature is missing")
+	}
+	seat, ok := seatRecordForPlayer(table, request.PlayerID)
+	if !ok {
+		return fmt.Errorf("missing seat for action settlement player %s", request.PlayerID)
+	}
+	ok, err := settlementcore.VerifyStructuredData(seat.WalletPubkeyHex, actionSettlementRequestPayload(request), request.SignatureHex)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("action settlement signature is invalid")
+	}
+	return nil
 }
 
 func nextHandStateForCandidate(table nativeTableState, bundle NativeTurnCandidateBundle) (game.HoldemState, error) {
@@ -629,8 +713,10 @@ func (runtime *meshRuntime) publishLockedActionTransitionLocked(table *nativeTab
 	if err != nil {
 		return false, err
 	}
-	if err := runtime.attachDeterministicRecoveryBundles(*table, &transition, authorizerForCandidate(bundle), &nextHand); err != nil {
-		return false, err
+	if len(transition.Proof.RecoveryBundles) == 0 {
+		if err := runtime.attachDeterministicRecoveryBundles(*table, &transition, authorizerForCandidate(bundle), &nextHand); err != nil {
+			return false, err
+		}
 	}
 	table.ActiveHand.State = nextHand
 	runtime.applyCustodyTransition(table, transition)
@@ -665,6 +751,26 @@ func (runtime *meshRuntime) publishLockedActionTransitionLocked(table *nativeTab
 	return true, nil
 }
 
+func (runtime *meshRuntime) handlePersistedLockedActionSettlementLocked(table *nativeTableState) (bool, error) {
+	if table == nil || !turnMenuMatchesTable(*table, table.PendingTurnMenu) || table.PendingTurnMenu == nil {
+		return false, nil
+	}
+	menu := table.PendingTurnMenu
+	if strings.TrimSpace(menu.SelectedCandidateHash) == "" || menu.SelectedBundle == nil || menu.SettledRequest == nil {
+		return false, nil
+	}
+	if err := validateLockedCandidateBinding(menu); err != nil {
+		return false, err
+	}
+	if err := runtime.verifyActionSettlementRequest(*table, *menu.SettledRequest); err != nil {
+		return false, err
+	}
+	if err := runtime.validateLockedActionSettlement(*table, *menu.SelectedBundle, menu.SettledRequest.Transition); err != nil {
+		return false, err
+	}
+	return runtime.publishLockedActionTransitionLocked(table, *menu.SelectedBundle, menu.SettledRequest.Transition)
+}
+
 func (runtime *meshRuntime) handleLockedActionSettlementTimeoutLocked(table *nativeTableState) (bool, error) {
 	if table == nil || !turnMenuMatchesTable(*table, table.PendingTurnMenu) || table.PendingTurnMenu == nil {
 		return false, nil
@@ -672,6 +778,9 @@ func (runtime *meshRuntime) handleLockedActionSettlementTimeoutLocked(table *nat
 	menu := table.PendingTurnMenu
 	if strings.TrimSpace(menu.SelectedCandidateHash) == "" || menu.SelectedBundle == nil {
 		return false, nil
+	}
+	if menu.SettledRequest != nil {
+		return runtime.handlePersistedLockedActionSettlementLocked(table)
 	}
 	if strings.TrimSpace(menu.SettlementDeadlineAt) == "" || elapsedMillis(menu.SettlementDeadlineAt) < 0 {
 		return false, nil
@@ -749,6 +858,9 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionCh
 		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
 			return errors.New("turn menu is unavailable for the current table state")
 		}
+		if request.CandidateHash != request.SelectionAuth.CandidateHash {
+			return errors.New("selection auth candidate does not match the requested candidate")
+		}
 		if err := runtime.verifySelectionAuth(*table, request.SelectionAuth); err != nil {
 			return err
 		}
@@ -774,6 +886,7 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionCh
 		table.PendingTurnMenu.SettlementDeadlineAt = addMillis(lockedAt, runtime.selectionSettlementTimeoutMSForTable(*table))
 		selectedBundle := cloneJSON(expected)
 		table.PendingTurnMenu.SelectedBundle = &selectedBundle
+		table.PendingTurnMenu.SettledRequest = nil
 		table.LocalTurnBundleCache = nil
 		if err := runtime.storeLocalTurnBundleCache(request.TableID, nil); err != nil {
 			return err
@@ -797,17 +910,24 @@ func (runtime *meshRuntime) buildActionSettlementRequest(table nativeTableState)
 	if strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash) == "" || table.PendingTurnMenu.SelectedBundle == nil {
 		return nativeActionSettlementRequest{}, errors.New("this turn does not have a locked action")
 	}
-	transition, _, err := runtime.settleTurnCandidateTransition(table, *table.PendingTurnMenu.SelectedBundle)
+	if table.PendingTurnMenu.ActingPlayerID != runtime.walletID.PlayerID {
+		return nativeActionSettlementRequest{}, errors.New("only the acting player may build action settlement for the locked turn")
+	}
+	transition, nextHand, err := runtime.settleTurnCandidateTransition(table, *table.PendingTurnMenu.SelectedBundle)
 	if err != nil {
 		return nativeActionSettlementRequest{}, err
 	}
-	return nativeActionSettlementRequest{
+	if err := runtime.attachDeterministicRecoveryBundles(table, &transition, authorizerForCandidate(*table.PendingTurnMenu.SelectedBundle), &nextHand); err != nil {
+		return nativeActionSettlementRequest{}, err
+	}
+	request := nativeActionSettlementRequest{
 		CandidateHash:   table.PendingTurnMenu.SelectedCandidateHash,
 		PlayerID:        runtime.walletID.PlayerID,
 		ProtocolVersion: nativeProtocolVersion,
 		TableID:         table.Config.TableID,
 		Transition:      transition,
-	}, nil
+	}
+	return runtime.signActionSettlementRequest(request)
 }
 
 func (runtime *meshRuntime) handleActionSettlementFromPeer(request nativeActionSettlementRequest) (updated nativeActionSettlementResponse, err error) {
@@ -825,16 +945,25 @@ func (runtime *meshRuntime) handleActionSettlementFromPeer(request nativeActionS
 		if strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash) == "" || table.PendingTurnMenu.SelectedBundle == nil {
 			return errors.New("this turn does not have a locked action")
 		}
+		if err := validateLockedCandidateBinding(table.PendingTurnMenu); err != nil {
+			return err
+		}
 		if request.CandidateHash != table.PendingTurnMenu.SelectedCandidateHash {
 			return errors.New("action settlement candidate does not match the locked action")
 		}
-		if request.PlayerID != table.PendingTurnMenu.ActingPlayerID {
-			return errors.New("action settlement player mismatch")
-		}
-		if err := validateSettlementRequestProtocolVersion(request.ProtocolVersion); err != nil {
+		if err := runtime.verifyActionSettlementRequest(*table, request); err != nil {
 			return err
 		}
 		if err := runtime.validateLockedActionSettlement(*table, *table.PendingTurnMenu.SelectedBundle, request.Transition); err != nil {
+			return err
+		}
+		if existing := table.PendingTurnMenu.SettledRequest; existing != nil {
+			if actionSettlementTransitionHash(*existing) != actionSettlementTransitionHash(request) {
+				return errors.New("locked action already has a different persisted settled transition")
+			}
+		}
+		table.PendingTurnMenu.SettledRequest = cloneJSON(&request)
+		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
 		}
 		published, err := runtime.publishLockedActionTransitionLocked(table, *table.PendingTurnMenu.SelectedBundle, request.Transition)

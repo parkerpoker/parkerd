@@ -499,6 +499,9 @@ func (runtime *meshRuntime) validatePendingTurnMenu(table nativeTableState, menu
 	if menu.SelectionAuth == nil {
 		return errors.New("pending turn menu is missing selection auth for its locked candidate")
 	}
+	if err := validateLockedCandidateBinding(menu); err != nil {
+		return err
+	}
 	if err := runtime.verifySelectionAuth(validationTable, *menu.SelectionAuth); err != nil {
 		return err
 	}
@@ -513,6 +516,14 @@ func (runtime *meshRuntime) validatePendingTurnMenu(table nativeTableState, menu
 	}
 	if err := runtime.validateTurnCandidateBundle(validationTable, menu, *menu.SelectedBundle, &selectedOption); err != nil {
 		return fmt.Errorf("pending turn menu selected bundle is invalid: %w", err)
+	}
+	if menu.SettledRequest != nil {
+		if err := runtime.verifyActionSettlementRequest(validationTable, *menu.SettledRequest); err != nil {
+			return err
+		}
+		if err := runtime.validateLockedActionSettlement(validationTable, *menu.SelectedBundle, menu.SettledRequest.Transition); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -556,6 +567,9 @@ func (runtime *meshRuntime) validateAcceptedPendingTurnMenu(table nativeTableSta
 	if menu.SelectionAuth == nil {
 		return errors.New("pending turn menu is missing selection auth for its locked candidate")
 	}
+	if err := validateLockedCandidateBinding(menu); err != nil {
+		return err
+	}
 	if err := runtime.verifySelectionAuth(validationTable, *menu.SelectionAuth); err != nil {
 		return err
 	}
@@ -565,7 +579,18 @@ func (runtime *meshRuntime) validateAcceptedPendingTurnMenu(table nativeTableSta
 	if menu.SelectedBundle == nil {
 		return errors.New("pending turn menu is missing its selected bundle")
 	}
-	return runtime.validateTurnCandidateBundle(validationTable, menu, *menu.SelectedBundle, &selectedOption)
+	if err := runtime.validateTurnCandidateBundle(validationTable, menu, *menu.SelectedBundle, &selectedOption); err != nil {
+		return err
+	}
+	if menu.SettledRequest != nil {
+		if err := runtime.verifyActionSettlementRequest(validationTable, *menu.SettledRequest); err != nil {
+			return err
+		}
+		if err := runtime.validateLockedActionSettlement(validationTable, *menu.SelectedBundle, menu.SettledRequest.Transition); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (runtime *meshRuntime) signedActionRequestForOption(table nativeTableState, option NativeActionMenuOption) (nativeActionRequest, error) {

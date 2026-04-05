@@ -90,7 +90,7 @@ For ordinary betting turns, the acting player chooses exactly one candidate by s
 - candidate hash
 - action deadline
 
-The host validates that signature, locks that exact candidate, persists the selected bundle in replicated pending-turn state, and acknowledges the lock with `ActionLockedAck`. The acting player then settles the locked bundle locally and sends `ActionSettlementRequest` carrying the fully settled transition and witness data. Accepted custody history still advances only after the fully witnessed transition is replay-valid.
+The host validates that signature, locks that exact candidate, persists the selected bundle in replicated pending-turn state, and acknowledges the lock with `ActionLockedAck`. The acting player then settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness data. The host persists that exact settled request in pending-turn state until publication. Accepted custody history still advances only after the fully witnessed transition is replay-valid.
 
 Runtime guarantee:
 

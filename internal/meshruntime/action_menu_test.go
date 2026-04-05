@@ -247,6 +247,42 @@ func TestPendingTurnMenuRejectsLockedCandidateWithoutSelectionAuth(t *testing.T)
 	}
 }
 
+func TestPendingTurnMenuRejectsLockedCandidateWithMismatchedSelectionAuth(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		t.Fatal("expected a pending turn menu for the actionable turn")
+	}
+	cache, err := host.loadLocalTurnBundleCache(table)
+	if err != nil || cache == nil {
+		t.Fatalf("load local turn bundle cache: %v", err)
+	}
+	if len(cache.Candidates) < 2 {
+		t.Fatalf("expected at least two candidate bundles, got %d", len(cache.Candidates))
+	}
+
+	auth, err := host.buildSelectionAuth(table, cache.Candidates[0].CandidateHash)
+	if err != nil {
+		t.Fatalf("build selection auth: %v", err)
+	}
+	selectedBundle := cloneJSON(cache.Candidates[1])
+	menu := cloneJSON(*table.PendingTurnMenu)
+	menu.SelectedCandidateHash = selectedBundle.CandidateHash
+	menu.SelectionAuth = &auth
+	menu.LockedAt = nowISO()
+	menu.SettlementDeadlineAt = addMillis(menu.LockedAt, host.selectionSettlementTimeoutMSForTable(table))
+	menu.SelectedBundle = &selectedBundle
+	table.PendingTurnMenu = &menu
+
+	if err := host.validatePendingTurnMenu(table, table.PendingTurnMenu); err == nil || !strings.Contains(err.Error(), "selection auth candidate") {
+		t.Fatalf("expected mismatched selection auth to be rejected, got %v", err)
+	}
+}
+
 func TestVerifyCandidateIntentAckRejectsTampering(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")

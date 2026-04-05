@@ -1965,6 +1965,12 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 			changed = true
 			continue
 		}
+		if completed, err := runtime.handlePersistedLockedActionSettlementLocked(table); err != nil {
+			return err
+		} else if completed {
+			changed = true
+			continue
+		}
 		if completed, err := runtime.handleLockedActionSettlementTimeoutLocked(table); err != nil {
 			return err
 		} else if completed {
