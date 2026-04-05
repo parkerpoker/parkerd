@@ -19,13 +19,14 @@ var v3SessionPreface = []byte("PARKERv3")
 
 // SessionManager maintains persistent outbound sessions keyed by peer URL.
 type SessionManager struct {
-	mu       sync.Mutex
-	sessions map[string]*OutboundSession
-	inflight map[string]chan struct{} // closed when a dial-in-progress completes
-	config   SessionConfig
-	metrics  *SessionMetrics
-	dialer   func(peerURL string) (net.Conn, error)
-	closed   bool
+	mu         sync.Mutex
+	sessions   map[string]*OutboundSession
+	inflight   map[string]chan struct{} // closed when a dial-in-progress completes
+	peerGen    map[string]uint64       // per-peer generation; bumped on invalidation
+	config     SessionConfig
+	metrics    *SessionMetrics
+	dialer     func(peerURL string) (net.Conn, error)
+	closed     bool
 }
 
 // NewSessionManager creates a session manager with the given config and dial function.
@@ -33,6 +34,7 @@ func NewSessionManager(config SessionConfig, metrics *SessionMetrics, dialer fun
 	return &SessionManager{
 		sessions: make(map[string]*OutboundSession),
 		inflight: make(map[string]chan struct{}),
+		peerGen:  make(map[string]uint64),
 		config:   config,
 		metrics:  metrics,
 		dialer:   dialer,
@@ -77,12 +79,15 @@ func (sm *SessionManager) CloseAll() {
 }
 
 // CloseSession tears down the session for a specific peer URL (e.g. on key rotation).
+// It also bumps the peer generation so that any in-flight dial with the old key
+// will be discarded when it completes, preventing stale sessions from being installed.
 func (sm *SessionManager) CloseSession(peerURL string) {
 	sm.mu.Lock()
 	sess, ok := sm.sessions[peerURL]
 	if ok {
 		delete(sm.sessions, peerURL)
 	}
+	sm.peerGen[peerURL]++
 	sm.mu.Unlock()
 	if ok {
 		sess.CloseAndWait()
@@ -119,6 +124,7 @@ func (sm *SessionManager) getOrCreateSession(peerURL string, peerStaticPub []byt
 		done := make(chan struct{})
 		sm.inflight[peerURL] = done
 		wasReconnect := ok // old entry existed but was closed
+		genAtDial := sm.peerGen[peerURL]
 		sm.mu.Unlock()
 
 		newSess, err := sm.dialAndHandshake(peerURL, peerStaticPub)
@@ -135,6 +141,13 @@ func (sm *SessionManager) getOrCreateSession(peerURL string, peerStaticPub []byt
 			sm.mu.Unlock()
 			newSess.Close()
 			return nil, &TransportError{Kind: ErrKindSessionClosed, PeerURL: peerURL, Detail: "session manager closed"}
+		}
+		// If the peer was invalidated (e.g. key rotation) while we were dialing,
+		// discard this session — it was authenticated against the old key.
+		if sm.peerGen[peerURL] != genAtDial {
+			sm.mu.Unlock()
+			newSess.Close()
+			return nil, &TransportError{Kind: ErrKindSessionReset, PeerURL: peerURL, Detail: "peer key rotated during dial"}
 		}
 		// Double-check: another path may have inserted a session.
 		if existing, ok := sm.sessions[peerURL]; ok && !existing.isClosed() {
@@ -342,13 +355,17 @@ func (s *OutboundSession) writeFrame(envelope TransportEnvelope) error {
 	if err != nil {
 		return err
 	}
+
+	// Encrypt and write must be serialized together: nonce allocation in
+	// Encrypt must match wire order, otherwise the receiver will see
+	// out-of-order nonces and AEAD decryption will fail.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	encrypted, err := s.noise.Encrypt(data)
 	if err != nil {
 		return err
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 
 	_ = s.conn.SetWriteDeadline(time.Now().Add(s.config.RequestTimeout))
 	return writeFrameBytes(s.conn, encrypted)

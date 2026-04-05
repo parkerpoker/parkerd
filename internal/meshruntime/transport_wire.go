@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	TransportWireVersion = 2
+	TransportWireVersion = 3
 
 	nativeTransportChannelDiscovery = "discovery"
 	nativeTransportChannelTable     = "table"
