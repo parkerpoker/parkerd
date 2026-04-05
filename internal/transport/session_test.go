@@ -558,3 +558,128 @@ func TestEnvelopeJSONRoundTrip(t *testing.T) {
 		t.Fatalf("wire version: got %d, want 3", decoded.TransportWireVersion)
 	}
 }
+
+func TestSessionConcurrentRequestAndClose(t *testing.T) {
+	sm, serverPub, _, listener := testSessionPair(t, echoHandler)
+	defer listener.Close()
+
+	peerURL := "parker://race-peer:1234"
+
+	// Establish a session first.
+	req := TransportEnvelope{MessageID: "race-setup", MessageType: "test"}
+	_, err := sm.Request(peerURL, serverPub, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire concurrent requests while closing.
+	const numRequests = 20
+	var wg sync.WaitGroup
+	wg.Add(numRequests + 1)
+
+	for i := 0; i < numRequests; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			r := TransportEnvelope{
+				MessageID:   fmt.Sprintf("race-%d", idx),
+				MessageType: "test",
+			}
+			// Either succeeds or returns a session error — must not panic.
+			sm.Request(peerURL, serverPub, r)
+		}(i)
+	}
+	go func() {
+		defer wg.Done()
+		sm.CloseAll()
+	}()
+
+	wg.Wait()
+}
+
+func TestKeepalivePreventsIdleTimeout(t *testing.T) {
+	serverPriv, serverPub := testKeypair(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				preface := make([]byte, V3PrefaceLen())
+				conn.Read(preface)
+				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
+				if err != nil {
+					conn.Close()
+					return
+				}
+				echoHandler(conn, noise)
+			}()
+		}
+	}()
+
+	metrics := &SessionMetrics{}
+	cfg := SessionConfig{
+		ConnectTimeout:    2 * time.Second,
+		HandshakeTimeout:  2 * time.Second,
+		RequestTimeout:    3 * time.Second,
+		IdleTimeout:       400 * time.Millisecond,
+		KeepaliveInterval: 150 * time.Millisecond, // fires well within idle timeout
+	}
+	sm := NewSessionManager(cfg, metrics, func(string) (net.Conn, error) {
+		return net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	})
+	defer sm.CloseAll()
+
+	peerURL := "parker://keepalive-peer:1234"
+
+	// First request establishes the session.
+	req := TransportEnvelope{MessageID: "ka-1", MessageType: "test"}
+	_, err = sm.Request(peerURL, serverPub, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait longer than idle timeout; keepalives should keep the session alive.
+	time.Sleep(700 * time.Millisecond)
+
+	if !sm.HasSession(peerURL) {
+		t.Fatal("session should still be alive due to keepalives")
+	}
+
+	// Another request should succeed on the same session (no reconnect needed).
+	req2 := TransportEnvelope{MessageID: "ka-2", MessageType: "test"}
+	_, err = sm.Request(peerURL, serverPub, req2)
+	if err != nil {
+		t.Fatalf("request after keepalive period should succeed: %v", err)
+	}
+}
+
+func TestErrorsAsWrapped(t *testing.T) {
+	inner := &TransportError{Kind: ErrKindRequestTimeout, PeerURL: "test"}
+	wrapped := fmt.Errorf("outer: %w", inner)
+
+	if !IsTransportTimeout(wrapped) {
+		t.Fatal("IsTransportTimeout should work through wrapping")
+	}
+	if IsSessionReset(wrapped) {
+		t.Fatal("IsSessionReset should not match timeout")
+	}
+
+	resetInner := &TransportError{Kind: ErrKindSessionReset}
+	resetWrapped := fmt.Errorf("outer: %w", resetInner)
+	if !IsSessionReset(resetWrapped) {
+		t.Fatal("IsSessionReset should work through wrapping")
+	}
+
+	downgradeInner := &TransportError{Kind: ErrKindWireDowngrade}
+	downgradeWrapped := fmt.Errorf("outer: %w", downgradeInner)
+	if !IsWireDowngrade(downgradeWrapped) {
+		t.Fatal("IsWireDowngrade should work through wrapping")
+	}
+}

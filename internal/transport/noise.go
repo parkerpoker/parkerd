@@ -2,6 +2,7 @@ package transport
 
 import (
 	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -63,28 +64,10 @@ func hkdfSHA256(ck, ikm []byte) ([32]byte, [32]byte) {
 }
 
 func hmacSHA256(key, data []byte) [32]byte {
-	const blockSize = 64
-	if len(key) > blockSize {
-		h := sha256.Sum256(key)
-		key = h[:]
-	}
-	ipad := make([]byte, blockSize)
-	opad := make([]byte, blockSize)
-	copy(ipad, key)
-	copy(opad, key)
-	for i := range ipad {
-		ipad[i] ^= 0x36
-		opad[i] ^= 0x5c
-	}
-	inner := sha256.New()
-	inner.Write(ipad)
-	inner.Write(data)
-	innerSum := inner.Sum(nil)
-	outer := sha256.New()
-	outer.Write(opad)
-	outer.Write(innerSum)
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
 	var result [32]byte
-	copy(result[:], outer.Sum(nil))
+	copy(result[:], mac.Sum(nil))
 	return result
 }
 

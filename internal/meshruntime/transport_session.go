@@ -3,6 +3,7 @@ package meshruntime
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -96,8 +97,8 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, peerInfo n
 }
 
 func isHandshakeErr(err error) bool {
-	te, ok := err.(*transportpkg.TransportError)
-	return ok && te.Kind == transportpkg.ErrKindHandshakeFailed
+	var te *transportpkg.TransportError
+	return errors.As(err, &te) && te.Kind == transportpkg.ErrKindHandshakeFailed
 }
 
 // closeSessionManager tears down the session manager if active.

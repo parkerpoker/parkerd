@@ -60,18 +60,18 @@ func transportErrorKindLabel(kind TransportErrorKind) string {
 
 // IsTransportTimeout returns true if the error is a transport request timeout.
 func IsTransportTimeout(err error) bool {
-	te, ok := err.(*TransportError)
-	return ok && te.Kind == ErrKindRequestTimeout
+	var te *TransportError
+	return errors.As(err, &te) && te.Kind == ErrKindRequestTimeout
 }
 
 // IsSessionReset returns true if the error is a session reset.
 func IsSessionReset(err error) bool {
-	te, ok := err.(*TransportError)
-	return ok && te.Kind == ErrKindSessionReset
+	var te *TransportError
+	return errors.As(err, &te) && te.Kind == ErrKindSessionReset
 }
 
 // IsWireDowngrade returns true if the error is a wire version downgrade.
 func IsWireDowngrade(err error) bool {
-	te, ok := err.(*TransportError)
-	return ok && te.Kind == ErrKindWireDowngrade
+	var te *TransportError
+	return errors.As(err, &te) && te.Kind == ErrKindWireDowngrade
 }
