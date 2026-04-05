@@ -63,6 +63,14 @@ func (sm *SessionManager) Request(peerURL string, peerStaticPub []byte, request 
 		}
 		return TransportEnvelope{}, err
 	}
+	if request.TransportWireVersion != 0 && resp.TransportWireVersion != request.TransportWireVersion {
+		sm.removeSession(peerURL)
+		return TransportEnvelope{}, &TransportError{
+			Kind:    ErrKindWireDowngrade,
+			PeerURL: peerURL,
+			Detail:  fmt.Sprintf("expected wire version %d, got %d", request.TransportWireVersion, resp.TransportWireVersion),
+		}
+	}
 	return resp, nil
 }
 

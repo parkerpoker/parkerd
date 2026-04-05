@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -83,17 +84,23 @@ func echoHandler(conn net.Conn, noise *NoiseSession) {
 			return
 		}
 		if req.MessageType == "keepalive" {
-			resp := TransportEnvelope{MessageType: "keepalive", MessageID: req.MessageID, RetryOf: req.MessageID}
+			resp := TransportEnvelope{
+				MessageType:          "keepalive",
+				MessageID:            req.MessageID,
+				RetryOf:              req.MessageID,
+				TransportWireVersion: req.TransportWireVersion,
+			}
 			if err := WriteV3Response(conn, noise, resp, 5*time.Second); err != nil {
 				return
 			}
 			continue
 		}
 		resp := TransportEnvelope{
-			MessageType: req.MessageType + ".response",
-			MessageID:   "resp-" + req.MessageID,
-			RetryOf:     req.MessageID,
-			BodyCiphertext: req.BodyCiphertext,
+			MessageType:          req.MessageType + ".response",
+			MessageID:            "resp-" + req.MessageID,
+			RetryOf:              req.MessageID,
+			BodyCiphertext:       req.BodyCiphertext,
+			TransportWireVersion: req.TransportWireVersion,
 		}
 		if err := WriteV3Response(conn, noise, resp, 5*time.Second); err != nil {
 			return
@@ -252,6 +259,94 @@ func TestSessionTimeout(t *testing.T) {
 	if !IsTransportTimeout(err) {
 		t.Fatalf("expected transport timeout error, got: %v", err)
 	}
+	if sm.HasSession("parker://slow-peer:1234") {
+		t.Fatal("session should be torn down after timeout")
+	}
+}
+
+func TestSessionTimeoutReconnectsImmediately(t *testing.T) {
+	serverPriv, serverPub := testKeypair(t)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	var connectionCount atomic.Int32
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			index := connectionCount.Add(1)
+			go func(conn net.Conn, index int32) {
+				preface := make([]byte, V3PrefaceLen())
+				if _, err := io.ReadFull(conn, preface); err != nil {
+					conn.Close()
+					return
+				}
+				noise, err := AcceptV3Session(conn, serverPriv, serverPub, 5*time.Second)
+				if err != nil {
+					conn.Close()
+					return
+				}
+				if index == 1 {
+					defer conn.Close()
+					if _, err := ReadV3Request(conn, noise, 5*time.Second); err != nil {
+						return
+					}
+					// Hold the first connection open past the client timeout.
+					time.Sleep(750 * time.Millisecond)
+					return
+				}
+				echoHandler(conn, noise)
+			}(conn, index)
+		}
+	}()
+
+	metrics := &SessionMetrics{}
+	cfg := SessionConfig{
+		ConnectTimeout:    2 * time.Second,
+		HandshakeTimeout:  2 * time.Second,
+		RequestTimeout:    200 * time.Millisecond,
+		IdleTimeout:       5 * time.Second,
+		KeepaliveInterval: 60 * time.Second,
+	}
+	sm := NewSessionManager(cfg, metrics, func(string) (net.Conn, error) {
+		return net.DialTimeout("tcp", listener.Addr().String(), 2*time.Second)
+	})
+	defer sm.CloseAll()
+
+	peerURL := "parker://timeout-reconnect-peer:1234"
+	req1 := TransportEnvelope{MessageID: "timeout-1", MessageType: "test"}
+	_, err = sm.Request(peerURL, serverPub, req1)
+	if err == nil {
+		t.Fatal("expected first request to time out")
+	}
+	if !IsTransportTimeout(err) {
+		t.Fatalf("expected transport timeout error, got: %v", err)
+	}
+	if sm.HasSession(peerURL) {
+		t.Fatal("session should be torn down after timeout")
+	}
+
+	start := time.Now()
+	req2 := TransportEnvelope{MessageID: "timeout-2", MessageType: "test"}
+	resp, err := sm.Request(peerURL, serverPub, req2)
+	if err != nil {
+		t.Fatalf("second request should reconnect and succeed: %v", err)
+	}
+	if resp.RetryOf != req2.MessageID {
+		t.Fatalf("second response RetryOf=%q, want %q", resp.RetryOf, req2.MessageID)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected reconnect well before idle timeout, got %v", elapsed)
+	}
+	if got := connectionCount.Load(); got != 2 {
+		t.Fatalf("expected 2 connections after timeout-triggered reconnect, got %d", got)
+	}
 }
 
 func TestSessionReconnectAfterDrop(t *testing.T) {
@@ -324,6 +419,43 @@ func TestSessionReconnectAfterDrop(t *testing.T) {
 	_, err = sm.Request(peerURL, serverPub, req2)
 	if err != nil {
 		t.Fatalf("second request (after reconnect) failed: %v", err)
+	}
+}
+
+func TestSessionRequestRejectsWireVersionMismatch(t *testing.T) {
+	serverHandler := func(conn net.Conn, noise *NoiseSession) {
+		defer conn.Close()
+		req, err := ReadV3Request(conn, noise, 10*time.Second)
+		if err != nil {
+			return
+		}
+		resp := TransportEnvelope{
+			MessageType:          req.MessageType + ".response",
+			MessageID:            "resp-" + req.MessageID,
+			RetryOf:              req.MessageID,
+			TransportWireVersion: 2,
+		}
+		_ = WriteV3Response(conn, noise, resp, 5*time.Second)
+	}
+
+	sm, serverPub, _, listener := testSessionPair(t, serverHandler)
+	defer listener.Close()
+	defer sm.CloseAll()
+
+	peerURL := "parker://wire-version-peer:1234"
+	_, err := sm.Request(peerURL, serverPub, TransportEnvelope{
+		MessageID:            "wire-version-1",
+		MessageType:          "test",
+		TransportWireVersion: 3,
+	})
+	if err == nil {
+		t.Fatal("expected wire version mismatch error")
+	}
+	if !IsWireDowngrade(err) {
+		t.Fatalf("expected wire version downgrade error, got %v", err)
+	}
+	if sm.HasSession(peerURL) {
+		t.Fatal("session should be torn down after a wire version mismatch")
 	}
 }
 

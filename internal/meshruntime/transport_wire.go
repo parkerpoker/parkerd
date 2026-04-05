@@ -810,15 +810,10 @@ func (runtime *meshRuntime) encodeResponseEnvelope(request transportpkg.Transpor
 	}
 	// Propagate the wire version from the request so v3 sessions get v3 responses.
 	if request.TransportWireVersion != 0 {
-		envelope.TransportWireVersion = request.TransportWireVersion
-		// Re-sign with the correct wire version in the payload.
-		unsigned := rawJSONMap(envelope)
-		delete(unsigned, "signature")
-		sig, sigErr := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
-		if sigErr != nil {
-			return transportpkg.TransportEnvelope{}, sigErr
+		envelope, err = runtime.signEnvelopeForWireVersion(envelope, request.TransportWireVersion)
+		if err != nil {
+			return transportpkg.TransportEnvelope{}, err
 		}
-		envelope.Signature = sig
 	}
 	return envelope, nil
 }
@@ -859,9 +854,7 @@ func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, r
 			return transportpkg.TransportEnvelope{}, "", err
 		}
 		envelope.EncryptionEphemeral = ephemeralPub
-		unsigned := rawJSONMap(envelope)
-		delete(unsigned, "signature")
-		envelope.Signature, err = settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
+		envelope, err = runtime.signEnvelope(envelope)
 		if err != nil {
 			return transportpkg.TransportEnvelope{}, "", err
 		}
@@ -869,6 +862,27 @@ func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, r
 	}
 	envelope, err := runtime.buildEnvelope(messageType, channel, tableID, recipientID, bodyBytes, nil, "")
 	return envelope, "", err
+}
+
+func (runtime *meshRuntime) signEnvelope(envelope transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	unsigned := rawJSONMap(envelope)
+	delete(unsigned, "signature")
+	signature, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, err
+	}
+	envelope.Signature = signature
+	return envelope, nil
+}
+
+func (runtime *meshRuntime) signEnvelopeForWireVersion(envelope transportpkg.TransportEnvelope, wireVersion int) (transportpkg.TransportEnvelope, error) {
+	switch wireVersion {
+	case TransportWireVersion, transportpkg.WireVersion:
+	default:
+		return transportpkg.TransportEnvelope{}, fmt.Errorf("unsupported transport wire version %d", wireVersion)
+	}
+	envelope.TransportWireVersion = wireVersion
+	return runtime.signEnvelope(envelope)
 }
 
 func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipientID string, body []byte, sharedSecret []byte, retryOf string) (transportpkg.TransportEnvelope, error) {
@@ -907,14 +921,7 @@ func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipie
 	} else {
 		envelope.BodyCiphertext = base64.RawStdEncoding.EncodeToString(body)
 	}
-	unsigned := rawJSONMap(envelope)
-	delete(unsigned, "signature")
-	signature, err := settlementcore.SignStructuredData(runtime.protocolIdentity.PrivateKeyHex, unsigned)
-	if err != nil {
-		return transportpkg.TransportEnvelope{}, err
-	}
-	envelope.Signature = signature
-	return envelope, nil
+	return runtime.signEnvelope(envelope)
 }
 
 func (runtime *meshRuntime) decodeIncomingEnvelope(envelope transportpkg.TransportEnvelope) ([]byte, []byte, error) {

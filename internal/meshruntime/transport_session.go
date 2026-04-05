@@ -57,13 +57,24 @@ func (runtime *meshRuntime) exchangePeerTransportV3(peerURL string, peerInfo nat
 		return transportpkg.TransportEnvelope{}, err
 	}
 	sm := runtime.ensureSessionManager()
-	request.TransportWireVersion = 3
+	request, err = runtime.signEnvelopeForWireVersion(request, transportpkg.WireVersion)
+	if err != nil {
+		return transportpkg.TransportEnvelope{}, err
+	}
 	resp, err := sm.Request(peerURL, pubBytes, request)
 	if err != nil {
 		if runtime.sessionMetrics != nil && transportpkg.IsTransportTimeout(err) {
 			runtime.sessionMetrics.RequestTimeoutCount.Add(1)
 		}
 		return transportpkg.TransportEnvelope{}, err
+	}
+	if resp.MessageType != "keepalive" && resp.TransportWireVersion != transportpkg.WireVersion {
+		runtime.invalidateSessionForPeer(peerURL)
+		return transportpkg.TransportEnvelope{}, &transportpkg.TransportError{
+			Kind:    transportpkg.ErrKindWireDowngrade,
+			PeerURL: peerURL,
+			Detail:  fmt.Sprintf("expected wire version %d, got %d", transportpkg.WireVersion, resp.TransportWireVersion),
+		}
 	}
 	return resp, nil
 }
@@ -75,8 +86,8 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, peerInfo n
 		if err == nil {
 			return resp, nil
 		}
-		// On handshake, session reset, or session closed error, fall back to v2.
-		if transportpkg.IsSessionReset(err) || isHandshakeErr(err) || transportpkg.IsSessionClosed(err) {
+		// On handshake, wire downgrade, session reset, or session closed error, fall back to v2.
+		if transportpkg.IsSessionReset(err) || transportpkg.IsWireDowngrade(err) || isHandshakeErr(err) || transportpkg.IsSessionClosed(err) {
 			debugMeshf("v3 session failed for %s, falling back to v2: %v", peerURL, err)
 			if runtime.sessionMetrics != nil {
 				runtime.sessionMetrics.FallbackToV2Count.Add(1)
@@ -117,8 +128,6 @@ func (runtime *meshRuntime) invalidateSessionForPeer(peerURL string) {
 // handleV3PeerTransportConnection handles an inbound v3 session connection.
 // The v3 preface has already been consumed by the listener dispatch.
 func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
-	defer conn.Close()
-
 	staticPrivBytes, err := hex.DecodeString(runtime.transportPrivate)
 	if err != nil {
 		return
@@ -145,7 +154,10 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 
 	var writeMu sync.Mutex // serializes noise.Encrypt + conn.Write
 	var wg sync.WaitGroup
-	defer wg.Wait()
+	defer func() {
+		_ = conn.Close()
+		wg.Wait()
+	}()
 
 	writeResponse := func(resp transportpkg.TransportEnvelope) error {
 		writeMu.Lock()
@@ -173,6 +185,24 @@ func (runtime *meshRuntime) handleV3PeerTransportConnection(conn net.Conn) {
 				return
 			}
 			continue
+		}
+		if request.TransportWireVersion != transportpkg.WireVersion {
+			downgrade := &transportpkg.TransportError{
+				Kind:   transportpkg.ErrKindWireDowngrade,
+				Detail: fmt.Sprintf("expected wire version %d, got %d", transportpkg.WireVersion, request.TransportWireVersion),
+			}
+			response, nackErr := runtime.signEnvelopeForWireVersion(runtime.plainNack(request.MessageID, downgrade), transportpkg.WireVersion)
+			if nackErr != nil {
+				return
+			}
+			if err := writeResponse(response); err != nil {
+				return
+			}
+			continue
+		}
+		if request.TransportWireVersion != transportpkg.WireVersion {
+			debugMeshf("v3 wire version mismatch: got %d, want %d", request.TransportWireVersion, transportpkg.WireVersion)
+			return
 		}
 
 		wg.Add(1)
