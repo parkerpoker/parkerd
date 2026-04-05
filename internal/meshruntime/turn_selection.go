@@ -1011,6 +1011,9 @@ func (runtime *meshRuntime) handleActionSettlementFromPeer(request nativeActionS
 		if !published {
 			return errors.New("locked action settlement did not publish")
 		}
+		if err := runtime.advanceHandProtocolLocked(table); err != nil {
+			return err
+		}
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
 		}

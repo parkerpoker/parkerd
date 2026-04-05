@@ -196,8 +196,6 @@ func (runtime *meshRuntime) ensurePendingTurnMenuLocked(table *nativeTableState)
 			}
 		}
 	}
-	table.PendingTurnMenu = nil
-	table.LocalTurnBundleCache = nil
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		if err := runtime.syncTableToCustodySigners(*table, playerIDsFromSeats(table.Seats)); err != nil {
 			debugMeshf("pending turn menu pre-sync deferred table=%s err=%v", table.Config.TableID, err)
@@ -207,7 +205,6 @@ func (runtime *meshRuntime) ensurePendingTurnMenuLocked(table *nativeTableState)
 	if err != nil {
 		if transportFailureReason(err) != "" || strings.Contains(err.Error(), "missing peer url for acting player") {
 			debugMeshf("pending turn menu build deferred table=%s err=%v", table.Config.TableID, err)
-			return nil
 		}
 		return err
 	}

@@ -2369,7 +2369,7 @@ func tableHasTransitionHash(table nativeTableState, transitionHash string) bool 
 func (runtime *meshRuntime) assessLockStage(table nativeTableState, action game.Action) sendActionStageAssessment {
 	if turnChallengeMatchesTable(table, table.PendingTurnChallenge) {
 		return sendActionStageAssessment{
-			Err:   errors.New("turn challenge is open for this turn; requested ordinary action is stale"),
+			Err:   errors.New("turn challenge is open for this turn; ordinary SendAction is disabled"),
 			Stale: true,
 		}
 	}
