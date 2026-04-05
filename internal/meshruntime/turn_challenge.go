@@ -19,6 +19,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/tablecustody"
 )
 
@@ -154,8 +155,16 @@ func turnChallengeMatchesTable(table nativeTableState, challenge *NativePendingT
 	if challenge == nil || !tableHasActionableTurn(table) {
 		return false
 	}
+	expectedEpoch := table.CurrentEpoch
+	if table.PendingTurnMenu != nil &&
+		table.PendingTurnMenu.Epoch > 0 &&
+		table.PendingTurnMenu.HandID == table.ActiveHand.State.HandID &&
+		table.PendingTurnMenu.DecisionIndex == custodyDecisionIndex(&table.ActiveHand.State) &&
+		table.PendingTurnMenu.ActingPlayerID == seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex) {
+		expectedEpoch = pendingTurnEpoch(table, table.PendingTurnMenu)
+	}
 	return challenge.TableID == table.Config.TableID &&
-		challenge.Epoch == table.CurrentEpoch &&
+		challenge.Epoch == expectedEpoch &&
 		challenge.HandID == table.ActiveHand.State.HandID &&
 		challenge.DecisionIndex == custodyDecisionIndex(&table.ActiveHand.State) &&
 		challenge.ActingPlayerID == seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex)
@@ -337,6 +346,7 @@ func (runtime *meshRuntime) buildTurnChallengeOpenTransition(table nativeTableSt
 	if menu == nil || !turnMenuMatchesTable(table, menu) {
 		return tablecustody.CustodyTransition{}, errors.New("turn challenge open requires a valid pending turn menu")
 	}
+	table = tableWithEpoch(table, menu.Epoch)
 	hand := cloneJSON(table.ActiveHand.State)
 	transition, err := runtime.buildCustodyTransitionWithOverrides(
 		table,
@@ -358,6 +368,7 @@ func (runtime *meshRuntime) buildTurnChallengeEscapeTransition(table nativeTable
 	if table.ActiveHand == nil {
 		return tablecustody.CustodyTransition{}, errors.New("turn challenge escape requires an active hand")
 	}
+	table = tableWithEpoch(table, pendingTurnEpoch(table, table.PendingTurnMenu))
 	hand := cloneJSON(table.ActiveHand.State)
 	transition, err := runtime.buildCustodyTransitionWithOverrides(
 		table,
@@ -1132,6 +1143,9 @@ func (runtime *meshRuntime) buildChallengeEnvelope(table nativeTableState, menu 
 		envelope.OptionResolutionBundles = append(envelope.OptionResolutionBundles, *bundle)
 	}
 	timeoutAuthorizer := &nativeTransitionAuthorizer{TurnDeadlineAt: menu.ActionDeadlineAt}
+	if menu.TimeoutCandidate == nil {
+		return nil, errors.New("pending turn menu is missing its timeout candidate")
+	}
 	timeoutBundle, err := runtime.buildTurnChallengeResolutionBundle(table, menu, openBundle, challengeRef, menu.TimeoutCandidate.Transition, timeoutAuthorizer, "")
 	if err != nil {
 		return nil, err
@@ -1382,6 +1396,9 @@ func (runtime *meshRuntime) validateChallengeEnvelope(table nativeTableState, me
 			return fmt.Errorf("pending turn challenge option bundle %s is invalid: %w", option.OptionID, err)
 		}
 	}
+	if menu.TimeoutCandidate == nil {
+		return errors.New("pending turn menu is missing its timeout candidate")
+	}
 	if err := runtime.validateTurnChallengeResolutionBundle(table, menu, menu.ChallengeEnvelope.OpenBundle, menu.TimeoutCandidate.Transition, "", menu.ChallengeEnvelope.TimeoutResolutionBundle); err != nil {
 		return fmt.Errorf("pending turn challenge timeout bundle is invalid: %w", err)
 	}
@@ -1419,18 +1436,19 @@ func (runtime *meshRuntime) pendingTurnChallengeFromEnvelope(table nativeTableSt
 }
 
 func (runtime *meshRuntime) challengeBundleForSelectedCandidate(table nativeTableState) (*NativeTurnCandidateBundle, tablecustody.CustodyChallengeBundle, bool) {
-	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu == nil || table.PendingTurnMenu.ChallengeEnvelope == nil {
+	menu, err := runtime.pendingTurnMenuWithLocalBundles(table)
+	if err != nil || menu == nil || menu.ChallengeEnvelope == nil {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
-	selected := strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash)
+	selected := strings.TrimSpace(menu.SelectedCandidateHash)
 	if selected == "" {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
-	candidate, ok := findTurnCandidateByHash(table.PendingTurnMenu, selected)
+	candidate, ok := findTurnCandidateByHash(menu, selected)
 	if !ok || candidate.OptionID == "timeout" {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
-	bundle, ok := challengeEnvelopeBundleByOption(table.PendingTurnMenu.ChallengeEnvelope, candidate.OptionID)
+	bundle, ok := challengeEnvelopeBundleByOption(menu.ChallengeEnvelope, candidate.OptionID)
 	if !ok {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
@@ -1438,18 +1456,19 @@ func (runtime *meshRuntime) challengeBundleForSelectedCandidate(table nativeTabl
 }
 
 func (runtime *meshRuntime) challengeBundleForOptionID(table nativeTableState, optionID string) (*NativeTurnCandidateBundle, tablecustody.CustodyChallengeBundle, bool) {
-	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu == nil || table.PendingTurnMenu.ChallengeEnvelope == nil {
+	menu, err := runtime.pendingTurnMenuWithLocalBundles(table)
+	if err != nil || menu == nil || menu.ChallengeEnvelope == nil {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
 	trimmedOptionID := strings.TrimSpace(optionID)
 	if trimmedOptionID == "" {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
-	candidate, ok := findTurnCandidateByOption(table.PendingTurnMenu, trimmedOptionID)
+	candidate, ok := findTurnCandidateByOption(menu, trimmedOptionID)
 	if !ok {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
-	bundle, ok := challengeEnvelopeBundleByOption(table.PendingTurnMenu.ChallengeEnvelope, candidate.OptionID)
+	bundle, ok := challengeEnvelopeBundleByOption(menu.ChallengeEnvelope, candidate.OptionID)
 	if !ok {
 		return nil, tablecustody.CustodyChallengeBundle{}, false
 	}
@@ -1500,6 +1519,24 @@ func comparableChallengeResolutionTransition(transition tablecustody.CustodyTran
 	return comparable
 }
 
+func rebaseChallengeResolutionTransition(table nativeTableState, transition *tablecustody.CustodyTransition) error {
+	if transition == nil {
+		return errors.New("challenge resolution transition is missing")
+	}
+	if table.LatestCustodyState == nil {
+		return errors.New("challenge resolution requires a prior custody state")
+	}
+	transition.CustodySeq = table.LatestCustodyState.CustodySeq + 1
+	transition.PrevStateHash = table.LatestCustodyState.StateHash
+	transition.NextState.CustodySeq = transition.CustodySeq
+	transition.NextState.PrevStateHash = transition.PrevStateHash
+	transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
+	transition.NextStateHash = transition.NextState.StateHash
+	transition.Proof.StateHash = transition.NextStateHash
+	transition.Proof.TransitionHash = tablecustody.HashCustodyTransition(*transition)
+	return nil
+}
+
 func (runtime *meshRuntime) validateChallengeResolutionSemanticMatch(currentTable, sourceTable nativeTableState, actual, expected tablecustody.CustodyTransition) error {
 	actualComparable, err := runtime.semanticComparableCustodyTransition(currentTable, actual)
 	if err != nil {
@@ -1518,27 +1555,10 @@ func (runtime *meshRuntime) validateChallengeResolutionSemanticMatch(currentTabl
 }
 
 func (runtime *meshRuntime) deriveChallengeResolutionTransition(table nativeTableState, bundle NativeTurnCandidateBundle) (tablecustody.CustodyTransition, *nativeTransitionAuthorizer, error) {
-	sourceTable := turnMenuValidationTable(table)
 	switch {
-	case bundle.ActionRequest != nil:
-		nextHand, err := nextHandStateForCandidate(table, bundle)
-		if err != nil {
-			return tablecustody.CustodyTransition{}, nil, err
-		}
-		transition, err := runtime.buildCustodyTransition(table, tablecustody.TransitionKindAction, &nextHand, &bundle.ActionRequest.Action, nil)
-		if err != nil {
-			return tablecustody.CustodyTransition{}, nil, err
-		}
-		if err := runtime.validateChallengeResolutionSemanticMatch(table, sourceTable, transition, bundle.Transition); err != nil {
-			return tablecustody.CustodyTransition{}, nil, err
-		}
-		return transition, nil, nil
-	case bundle.TimeoutResolution != nil:
-		transition, err := runtime.deriveTimeoutCustodyTransitionWithOptions(table, false, false)
-		if err != nil {
-			return tablecustody.CustodyTransition{}, nil, err
-		}
-		if err := runtime.validateChallengeResolutionSemanticMatch(table, sourceTable, transition, bundle.Transition); err != nil {
+	case bundle.ActionRequest != nil, bundle.TimeoutResolution != nil:
+		transition := cloneJSON(bundle.Transition)
+		if err := rebaseChallengeResolutionTransition(table, &transition); err != nil {
 			return tablecustody.CustodyTransition{}, nil, err
 		}
 		return transition, nil, nil
@@ -1695,20 +1715,28 @@ func (runtime *meshRuntime) openTurnChallengeLocked(table *nativeTableState) (bo
 	if table == nil ||
 		turnTimeoutModeForTable(*table) != turnTimeoutModeChainChallenge ||
 		table.PendingTurnChallenge != nil ||
-		table.PendingTurnMenu == nil ||
-		table.PendingTurnMenu.ChallengeEnvelope == nil ||
 		!turnMenuMatchesTable(*table, table.PendingTurnMenu) {
 		return false, nil
 	}
-	if elapsedMillis(table.PendingTurnMenu.ActionDeadlineAt) < 0 || !turnChallengeOpenReady(table.PendingTurnMenu) {
-		return false, nil
-	}
-	pending, err := runtime.pendingTurnChallengeFromEnvelope(*table, table.PendingTurnMenu, table.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
+	menu, err := runtime.pendingTurnMenuWithLocalBundles(*table)
 	if err != nil {
 		return false, err
 	}
-	transition := cloneJSON(table.PendingTurnMenu.ChallengeEnvelope.OpenTransition)
-	witness, err := runtime.executeTurnChallengeBundle(table.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
+	if menu == nil || menu.ChallengeEnvelope == nil {
+		return false, nil
+	}
+	if runtime.hasTimelySelectedCandidate(*table) {
+		return false, nil
+	}
+	if elapsedMillis(menu.ActionDeadlineAt) < 0 || !turnChallengeOpenReady(menu) {
+		return false, nil
+	}
+	pending, err := runtime.pendingTurnChallengeFromEnvelope(*table, menu, menu.ChallengeEnvelope.OpenBundle)
+	if err != nil {
+		return false, err
+	}
+	transition := cloneJSON(menu.ChallengeEnvelope.OpenTransition)
+	witness, err := runtime.executeTurnChallengeBundle(menu.ChallengeEnvelope.OpenBundle)
 	if err != nil {
 		return false, err
 	}
@@ -1718,7 +1746,7 @@ func (runtime *meshRuntime) openTurnChallengeLocked(table *nativeTableState) (bo
 		return false, err
 	}
 	pending.EscapeEligibleAt = turnChallengeEscapeEligibleAt(pending.OpenedAt, escapeSpendPath)
-	transition.Proof.ChallengeBundle = cloneJSON(&table.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
+	transition.Proof.ChallengeBundle = cloneJSON(&menu.ChallengeEnvelope.OpenBundle)
 	transition.Proof.ChallengeWitness = witness
 	transition.Proof.FinalizedAt = witness.ExecutedAt
 	transition.Proof.ReplayValidated = true
@@ -1750,11 +1778,21 @@ func (runtime *meshRuntime) handlePendingTurnChallengeLocked(table *nativeTableS
 	if candidate, bundle, ok := runtime.challengeBundleForSelectedCandidate(*table); ok {
 		return runtime.finalizeTurnChallengeResolutionLocked(table, *candidate, bundle)
 	}
-	timeoutBundle := challengeTimeoutBundle(table.PendingTurnMenu.ChallengeEnvelope)
+	menu, err := runtime.pendingTurnMenuWithLocalBundles(*table)
+	if err != nil {
+		return false, err
+	}
+	if menu == nil {
+		return false, nil
+	}
+	timeoutBundle := challengeTimeoutBundle(menu.ChallengeEnvelope)
 	if timeoutBundle == nil || strings.TrimSpace(table.PendingTurnChallenge.TimeoutEligibleAt) == "" || elapsedMillis(table.PendingTurnChallenge.TimeoutEligibleAt) < 0 {
 		return false, nil
 	}
-	return runtime.finalizeTurnChallengeResolutionLocked(table, table.PendingTurnMenu.TimeoutCandidate, *timeoutBundle)
+	if menu.TimeoutCandidate == nil {
+		return false, errors.New("pending turn menu is missing its timeout candidate")
+	}
+	return runtime.finalizeTurnChallengeResolutionLocked(table, *menu.TimeoutCandidate, *timeoutBundle)
 }
 
 func (runtime *meshRuntime) validateAcceptedPendingTurnChallenge(table nativeTableState, challenge *NativePendingTurnChallenge) error {
@@ -1767,11 +1805,18 @@ func (runtime *meshRuntime) validateAcceptedPendingTurnChallenge(table nativeTab
 	if !turnChallengeMatchesTable(table, challenge) {
 		return errors.New("pending turn challenge does not match the current turn")
 	}
-	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu == nil || table.PendingTurnMenu.ChallengeEnvelope == nil {
-		return errors.New("pending turn challenge requires its matching pending turn menu envelope")
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu == nil {
+		return errors.New("pending turn challenge requires its matching pending turn menu")
 	}
-	if challenge.OpenBundleHash != table.PendingTurnMenu.ChallengeEnvelope.OpenBundle.BundleHash {
-		return errors.New("pending turn challenge open bundle hash mismatch")
+	optionIDs := make([]string, 0, len(table.PendingTurnMenu.Options))
+	for _, option := range table.PendingTurnMenu.Options {
+		optionIDs = append(optionIDs, option.OptionID)
+	}
+	sort.Strings(optionIDs)
+	challengeOptionIDs := append([]string(nil), challenge.OptionIDs...)
+	sort.Strings(challengeOptionIDs)
+	if !reflect.DeepEqual(optionIDs, challengeOptionIDs) {
+		return errors.New("pending turn challenge option ids mismatch")
 	}
 	if challenge.Status != turnChallengeStatusOpen {
 		return errors.New("pending turn challenge status mismatch")
@@ -1783,6 +1828,12 @@ func (runtime *meshRuntime) validateAcceptedPendingTurnChallenge(table nativeTab
 	if openTransition.Proof.ChallengeWitness == nil {
 		return errors.New("latest turn challenge open transition is missing its witness")
 	}
+	if openTransition.Proof.ChallengeBundle == nil {
+		return errors.New("latest turn challenge open transition is missing its challenge bundle")
+	}
+	if challenge.OpenBundleHash != openTransition.Proof.ChallengeBundle.BundleHash {
+		return errors.New("pending turn challenge open bundle hash mismatch")
+	}
 	openSourceTable := cloneJSON(table)
 	if len(table.CustodyTransitions) > 1 {
 		previous := cloneJSON(table.CustodyTransitions[len(table.CustodyTransitions)-2].NextState)
@@ -1790,23 +1841,31 @@ func (runtime *meshRuntime) validateAcceptedPendingTurnChallenge(table nativeTab
 	} else {
 		openSourceTable.LatestCustodyState = nil
 	}
-	expected, err := runtime.pendingTurnChallengeFromEnvelope(openSourceTable, table.PendingTurnMenu, table.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
+	openSourceTable = tableWithEpoch(openSourceTable, pendingTurnEpoch(table, table.PendingTurnMenu))
+	if latestCustodyStateHash(openSourceTable) != challenge.SourceStateHash {
+		return errors.New("pending turn challenge source state hash mismatch")
+	}
+	legalActions := game.GetLegalActions(openSourceTable.ActiveHand.State, openSourceTable.ActiveHand.State.ActingSeatIndex)
+	actionTypes := make([]string, 0, len(legalActions))
+	for _, legal := range legalActions {
+		actionTypes = append(actionTypes, string(legal.Type))
+	}
+	expectedTimeoutResolution := tablecustody.BuildTimeoutResolution(timeoutPolicyFromState(openSourceTable.LatestCustodyState), challenge.ActingPlayerID, actionTypes, []string{challenge.ActingPlayerID})
+	if !reflect.DeepEqual(cloneTimeoutResolution(&expectedTimeoutResolution), cloneTimeoutResolution(challenge.TimeoutResolution)) {
+		return errors.New("pending turn challenge timeout resolution mismatch")
+	}
+	outputRefs, _, err := challengeOutputRefsFromBundle(*openTransition.Proof.ChallengeBundle)
 	if err != nil {
 		return err
 	}
-	if expected.SourceStateHash != challenge.SourceStateHash {
-		return errors.New("pending turn challenge source state hash mismatch")
+	expectedChallengeRef, ok := outputRefs[turnChallengeClaimKey]
+	if !ok || len(expectedChallengeRef) != 1 {
+		return errors.New("pending turn challenge open bundle is missing its challenge ref")
 	}
-	if !reflect.DeepEqual(cloneTimeoutResolution(expected.TimeoutResolution), cloneTimeoutResolution(challenge.TimeoutResolution)) {
-		return errors.New("pending turn challenge timeout resolution mismatch")
-	}
-	if !sameCanonicalVTXORefs([]tablecustody.VTXORef{expected.ChallengeRef}, []tablecustody.VTXORef{challenge.ChallengeRef}) {
+	if !sameCanonicalVTXORefs([]tablecustody.VTXORef{expectedChallengeRef[0]}, []tablecustody.VTXORef{challenge.ChallengeRef}) {
 		return errors.New("pending turn challenge ref mismatch")
 	}
-	if !reflect.DeepEqual(append([]string(nil), expected.OptionIDs...), append([]string(nil), challenge.OptionIDs...)) {
-		return errors.New("pending turn challenge option ids mismatch")
-	}
-	if expected.TimeoutEligibleAt != challenge.TimeoutEligibleAt {
+	if turnChallengeTimeoutEligibleAt(table.PendingTurnMenu, turnChallengeWindowMSForTable(table)) != challenge.TimeoutEligibleAt {
 		return errors.New("pending turn challenge timeout window mismatch")
 	}
 	expectedOpenedAt := firstNonEmptyString(openTransition.Proof.ChallengeWitness.ExecutedAt, openTransition.Proof.FinalizedAt)
@@ -2011,7 +2070,9 @@ func (runtime *meshRuntime) validateAcceptedCustodyChallengeWitness(table native
 		if err != nil {
 			return err
 		}
-		outputs, err := runtime.fullChallengeOutputsForTransition(baseTable, transition)
+		expected := cloneJSON(transition)
+		clearTurnChallengeRefs(&expected)
+		outputs, err := runtime.fullChallengeOutputsForTransition(baseTable, expected)
 		if err != nil {
 			return err
 		}
@@ -2035,7 +2096,6 @@ func (runtime *meshRuntime) validateAcceptedCustodyChallengeWitness(table native
 		if !containsString(witness.BroadcastTxIDs, txid) {
 			return errors.New("custody challenge witness broadcast metadata is missing the challenge transaction")
 		}
-		expected := cloneJSON(transition)
 		applyChallengeOutputRefsToTransition(&expected, outputRefs)
 		if !reflect.DeepEqual(canonicalCustodyMoneyStacks(&expected.NextState), canonicalCustodyMoneyStacks(&transition.NextState)) {
 			return errors.New("challenge-derived stack refs do not match the accepted next state")

@@ -204,9 +204,10 @@ type NativeTableLocalView struct {
 	MyHoleCards        any                             `json:"myHoleCards"`
 	MyPlayerID         any                             `json:"myPlayerId"`
 	MySeatIndex        any                             `json:"mySeatIndex"`
+	TurnBundleCache    *LocalTurnBundleCache           `json:"turnBundleCache,omitempty"`
 	TurnChallenge      *NativePendingTurnChallenge     `json:"turnChallenge,omitempty"`
 	TurnChallengeChain *NativeTurnChallengeChainStatus `json:"turnChallengeChain,omitempty"`
-	TurnMenu           *NativePendingTurnMenu          `json:"turnMenu,omitempty"`
+	TurnMenu           *PendingTurnMenuPublic          `json:"turnMenu,omitempty"`
 }
 
 type NativeMeshTableView struct {
@@ -218,7 +219,7 @@ type NativeMeshTableView struct {
 	LatestSnapshot            *NativeCooperativeTableSnapshot  `json:"latestSnapshot"`
 	Local                     NativeTableLocalView             `json:"local"`
 	PendingTurnChallenge      *NativePendingTurnChallenge      `json:"pendingTurnChallenge,omitempty"`
-	PendingTurnMenu           *NativePendingTurnMenu           `json:"pendingTurnMenu,omitempty"`
+	PendingTurnMenu           *PendingTurnMenuPublic           `json:"pendingTurnMenu,omitempty"`
 	PublicState               *NativePublicTableState          `json:"publicState"`
 }
 
@@ -320,9 +321,10 @@ type nativeTableState struct {
 	LatestFullySignedSnapshot *NativeCooperativeTableSnapshot  `json:"latestFullySignedSnapshot,omitempty"`
 	LatestSnapshot            *NativeCooperativeTableSnapshot  `json:"latestSnapshot,omitempty"`
 	ActiveHandStartAt         string                           `json:"activeHandStartAt,omitempty"`
+	LocalTurnBundleCache      *LocalTurnBundleCache            `json:"localTurnBundleCache,omitempty"`
 	NextHandAt                string                           `json:"nextHandAt,omitempty"`
 	PendingTurnChallenge      *NativePendingTurnChallenge      `json:"pendingTurnChallenge,omitempty"`
-	PendingTurnMenu           *NativePendingTurnMenu           `json:"pendingTurnMenu,omitempty"`
+	PendingTurnMenu           *PendingTurnMenuPublic           `json:"pendingTurnMenu,omitempty"`
 	PublicState               *NativePublicTableState          `json:"publicState,omitempty"`
 	Seats                     []nativeSeatRecord               `json:"seats"`
 	Snapshots                 []NativeCooperativeTableSnapshot `json:"snapshots"`
@@ -387,22 +389,43 @@ type NativeTurnCandidateBundle struct {
 	TurnAnchorHash    string                          `json:"turnAnchorHash"`
 }
 
-type NativePendingTurnMenu struct {
-	AcceptedIntentAck     *tablecustody.CandidateIntentAck `json:"acceptedIntentAck,omitempty"`
+type LocalTurnBundleCache struct {
+	ActionDeadlineAt     string                      `json:"actionDeadlineAt,omitempty"`
+	ActingPlayerID       string                      `json:"actingPlayerId,omitempty"`
+	Candidates           []NativeTurnCandidateBundle `json:"candidates,omitempty"`
+	ChallengeEnvelope    *NativeChallengeEnvelope    `json:"challengeEnvelope,omitempty"`
+	DecisionIndex        int                         `json:"decisionIndex"`
+	Epoch                int                         `json:"epoch"`
+	HandID               string                      `json:"handId,omitempty"`
+	PrevCustodyStateHash string                      `json:"prevCustodyStateHash,omitempty"`
+	TableID              string                      `json:"tableId"`
+	TimeoutCandidate     *NativeTurnCandidateBundle  `json:"timeoutCandidate,omitempty"`
+	TurnAnchorHash       string                      `json:"turnAnchorHash"`
+}
+
+type PendingTurnMenuPublic struct {
+	AcceptedIntentAck     *tablecustody.CandidateIntentAck `json:"-"`
 	ActionDeadlineAt      string                           `json:"actionDeadlineAt,omitempty"`
 	ActingPlayerID        string                           `json:"actingPlayerId,omitempty"`
-	Candidates            []NativeTurnCandidateBundle      `json:"candidates,omitempty"`
+	Candidates            []NativeTurnCandidateBundle      `json:"-"`
 	ChallengeEnvelope     *NativeChallengeEnvelope         `json:"challengeEnvelope,omitempty"`
 	DecisionIndex         int                              `json:"decisionIndex"`
 	DeliveredAt           string                           `json:"deliveredAt,omitempty"`
 	Epoch                 int                              `json:"epoch"`
 	HandID                string                           `json:"handId,omitempty"`
+	LockedAt              string                           `json:"lockedAt,omitempty"`
 	Options               []NativeActionMenuOption         `json:"options,omitempty"`
 	PrevCustodyStateHash  string                           `json:"prevCustodyStateHash,omitempty"`
+	SelectedBundle        *NativeTurnCandidateBundle       `json:"selectedBundle,omitempty"`
 	SelectedCandidateHash string                           `json:"selectedCandidateHash,omitempty"`
-	TimeoutCandidate      NativeTurnCandidateBundle        `json:"timeoutCandidate"`
+	SettledRequest        *nativeActionSettlementRequest   `json:"settledRequest,omitempty"`
+	SelectionAuth         *tablecustody.SelectionAuth      `json:"selectionAuth,omitempty"`
+	SettlementDeadlineAt  string                           `json:"settlementDeadlineAt,omitempty"`
+	TimeoutCandidate      *NativeTurnCandidateBundle       `json:"timeoutCandidate,omitempty"`
 	TurnAnchorHash        string                           `json:"turnAnchorHash"`
 }
+
+type NativePendingTurnMenu = PendingTurnMenuPublic
 
 type nativePeerSelf struct {
 	Alias              string            `json:"alias"`
@@ -452,9 +475,29 @@ type nativeActionRequest struct {
 	TranscriptRoot       string      `json:"transcriptRoot,omitempty"`
 }
 
-type nativeActionSelectionRequest struct {
-	Candidate NativeTurnCandidateBundle `json:"candidate"`
-	TableID   string                    `json:"tableId"`
+type nativeActionChooseRequest struct {
+	CandidateHash string                     `json:"candidateHash"`
+	SelectionAuth tablecustody.SelectionAuth `json:"selectionAuth"`
+	TableID       string                     `json:"tableId"`
+}
+
+type nativeActionChooseResponse struct {
+	LockedAck tablecustody.ActionLockedAck `json:"lockedAck"`
+	Table     nativeTableState             `json:"table"`
+}
+
+type nativeActionSettlementRequest struct {
+	CandidateHash   string                         `json:"candidateHash"`
+	PlayerID        string                         `json:"playerId"`
+	ProtocolVersion string                         `json:"protocolVersion,omitempty"`
+	SignatureHex    string                         `json:"signatureHex,omitempty"`
+	SignedAt        string                         `json:"signedAt,omitempty"`
+	TableID         string                         `json:"tableId"`
+	Transition      tablecustody.CustodyTransition `json:"transition"`
+}
+
+type nativeActionSettlementResponse struct {
+	Table nativeTableState `json:"table"`
 }
 
 type nativeFundsRequest struct {

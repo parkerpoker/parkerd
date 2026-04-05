@@ -6,7 +6,7 @@ For component topology, see [architecture.md](./architecture.md). For dealerless
 
 ## Short Version
 
-The runtime version is `poker/v1`.
+The runtime protocol tag is `poker/v1`.
 
 The important protocol properties are:
 
@@ -32,7 +32,7 @@ Bundles are stored when the accepted transition leaves contested pot refs and th
 - `showdown-reveal` timeout that kills the missing player for the contested pot
 - settled `showdown-payout` timeout
 
-They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result. Earlier protocol-timeout phases such as `private-delivery` fail closed in v1 unless or until the runtime reaches one of the objectively money-resolving states above.
+They are not stored for auto-check states, because those states do not yet determine a winner-take-all money result. Earlier protocol-timeout phases such as `private-delivery` fail closed unless or until the runtime reaches one of the objectively money-resolving states above.
 
 Each stored bundle carries:
 
@@ -296,25 +296,61 @@ Hashing and approval semantics follow the same split:
 
 Live Ark/indexer checks remain in the protocol only where liveness or spendability matters, such as join funding admission and other interactive safety checks.
 
-## Turn Challenge Fallback
+## Locked Turn Resolution
 
-Tables default `turnTimeoutMode` to `chain-challenge`. Accepted legacy tables that omit the field are interpreted as `direct` timeout tables for backward compatibility.
+Tables use either `turnTimeoutMode = "chain-challenge"` or `turnTimeoutMode = "direct"`. The default heads-up flow uses `chain-challenge`.
 
-`PendingTurnMenu` carries two parallel artifacts for the same deterministic finite menu:
+Turn state is split into a replicated public layer and a local pre-signed bundle cache.
 
-- the ordinary prebuilt finite-menu candidate bundles used by the cooperative Ark fast path
-- a deterministic `ChallengeEnvelope` containing:
-  - one fully signed onchain `turn-challenge-open` bundle at locktime `D`
-  - one fully signed option-resolution bundle per menu option
-  - one fully signed timeout-resolution bundle at locktime `D + C`
-  - one fully signed escape bundle spending the `TurnChallengeRef` through its CSV exit path
+`PendingTurnMenuPublic` is the replicated turn object. It carries deterministic turn metadata only:
 
-`turn-challenge-open` always consumes the full live turn bankroll:
+- acting player, epoch, hand id, and decision index
+- previous custody state hash and turn anchor hash
+- compact option descriptors plus candidate hashes
+- action deadline
+- after lock, `selectedCandidateHash`, `SelectionAuth`, `lockedAt`, `settlementDeadlineAt`, and the single `selectedBundle`
 
-- all current stack refs
-- all current pot refs
+`LocalTurnBundleCache` stays local to the acting player and current host before lock. It carries:
 
-It reissues the entire live bankroll into one dedicated `TurnChallengeRef`. The challenge path is intentionally a full reissuance path, not a delta path.
+- the full prebuilt candidate bundles for every legal ordinary option
+- the timeout candidate bundle
+- the local `ChallengeEnvelope` used for `chain-challenge` opening and resolution
+
+Non-acting peers receive only the compact public menu before lock. Sibling pre-signed bundles are not part of replicated pending-turn state.
+
+Ordinary turn resolution has four explicit steps:
+
+1. The acting player sends `ActionChooseRequest` carrying `candidateHash` plus `SelectionAuth`.
+2. The host validates `SelectionAuth`, locks that exact candidate, persists the public lock state, replicates exactly one selected bundle, and replies with `ActionLockedAck`.
+3. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material.
+4. The host validates that signed settled transition against the locked bundle, persists the exact settled request in pending-turn state until publication, and publishes the accepted `action` transition.
+
+`SelectionAuth` binds:
+
+- table id
+- epoch
+- hand id
+- decision index
+- previous custody state hash
+- turn anchor hash
+- candidate hash
+- action deadline
+
+`ActionLockedAck` signs the same binding plus `lockedAt`. It is coordination data for the pending turn. It does not advance accepted custody history.
+
+Locked ordinary-turn rules are:
+
+- the acting player is the only party that can choose an ordinary candidate
+- once a candidate is locked, no sibling candidate may be accepted, settled, or published for that turn
+- accepted `LatestCustodyState` advances only when the fully witnessed transition is replay-valid
+- ordinary timeout suppression comes from the locked selection state, not from Ark intent registration metadata or `CandidateIntentAck`
+
+If the turn is still unlocked when the action deadline `D` passes and the table uses `chain-challenge`, Parker can open a deterministic onchain fallback:
+
+- `turn-challenge-open` spends every live stack ref and pot ref through its predeclared `D` locktime leaf
+- that spend reissues the full live bankroll into one dedicated `TurnChallengeRef`
+- the precomputed option-resolution bundles and timeout-resolution bundle spend `TurnChallengeRef` through its cooperative player-only leaf
+- the escape bundle spends `TurnChallengeRef` through its CSV leaf
 
 While `PendingTurnChallenge` exists:
 
@@ -328,7 +364,12 @@ Resolution then splits:
 - `meshResolveTurnChallenge` with an option id executes the matching pre-signed option-resolution bundle and appends the ordinary `PlayerAction` event for that option
 - `meshResolveTurnChallenge` with `optionId="timeout"` executes the pre-signed timeout-resolution bundle once `timeoutEligibleAt` has passed
 - `meshResolveTurnChallenge` with `optionId="escape"` executes the pre-signed escape bundle only after the escape CSV delay has matured
-- host tick also auto-finalizes the timeout-resolution bundle after `D + C` if no option bundle resolved first
+- host tick also auto-finalizes the timeout-resolution bundle after `D + C` if no option bundle resolves first
+
+After ordinary action lock, recovery does not switch to timeout fold/check substitution. Recovery uses the locked selected bundle:
+
+- if the host disappears after lock and the acting player already settled, failover publishes that exact persisted settled transition
+- if the acting player disappears after lock and before settlement, the current host or a successor host can settle the replicated selected bundle after `settlementDeadlineAt`
 
 Escape maturity depends on the CSV type:
 
@@ -339,12 +380,10 @@ Escape maturity depends on the CSV type:
 - Parker does not persist live tip height or transaction confirmation heights into accepted table state; those observations stay local to the wallet/runtime and are re-queried as needed
 - if Parker cannot verify the required chain heights for a block-based escape, local escape resolution and accepted replay both fail closed
 
-The accepted transition kind after challenge resolution is `action` or `timeout`. What changes is the proof surface:
+The accepted transition kind after challenge resolution is still `action` or `timeout`. What changes is the proof surface:
 
 - `turn-challenge-open`, challenge-resolved `action`, challenge-resolved `timeout`, and `turn-challenge-escape` transitions carry `CustodyProof.ChallengeBundle` plus `CustodyProof.ChallengeWitness`
-- those transitions do not depend on Ark intent registration, `CandidateIntentAck`, or live Ark batch registration
-
-The ordinary cooperative fast path is unchanged. Selected ordinary finite-menu candidates carry `SignedProofPSBT` and `RegisterMessage`, and Parker uses Ark intent registration plus the resulting settlement witness when that fast path finalizes first.
+- ordinary Ark-settled locked actions carry the usual `CustodyProof.SettlementWitness`
 
 `NativeTableLocalView` also exposes local-only challenge telemetry through `TurnChallengeChain`:
 
@@ -399,7 +438,10 @@ Witness or player failover behavior:
 
 - best-effort sync the latest accepted table copy from known participants
 - rotate host authority when heartbeat or protocol deadlines require it
-- continue from the latest custody checkpoint
+- continue from the latest custody checkpoint plus any replicated locked-action state
+- if the turn is unlocked, continue the ordinary selection flow or open `turn-challenge-open` after the action deadline
+- if the turn is locked and the acting player already settled, publish that exact settled transition
+- if the turn is locked and the acting player disappears before settlement, settle the replicated selected bundle after `settlementDeadlineAt`
 - if a player is dead for a timeout successor, exclude that dead player from the successor approval set when appropriate
 
 ## Runtime Scope And Limits

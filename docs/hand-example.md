@@ -367,6 +367,17 @@ The only things changing are:
 
 Parker may create non-money custody updates later that bind those fields, but the card protocol itself does not respend the pot or stack refs.
 
+### Ordinary Action Staging Before Money Moves
+
+Every ordinary betting action in the examples below follows the same locked-action protocol before Parker accepts the resulting custody transition:
+
+1. The host prebuilds the full candidate bundles locally and replicates only the compact public turn menu.
+2. The acting player chooses exactly one deterministic option by signing `SelectionAuth` over the table id, epoch, hand id, decision index, previous custody state hash, turn anchor hash, candidate hash, and action deadline.
+3. The host validates that binding, locks that exact candidate, replicates only the selected bundle, and acknowledges the lock with `ActionLockedAck`.
+4. The acting player settles that locked bundle locally, signs `ActionSettlementRequest`, and the host persists that exact settled request until it publishes the accepted `action` transition.
+
+The examples below show the accepted money result of each action after that lock, settlement, and publication flow completes.
+
 ### Step 5: Alice Calls Preflop
 
 Alice completes the blind by calling `100`.
@@ -690,7 +701,7 @@ The important property is that the open leaf is uniform across all live refs:
 
 ### Step 2: `turn-challenge-open` reissues the full live bankroll
 
-When `D` passes, Parker can execute the pre-signed `turn-challenge-open` bundle.
+If the turn is still unlocked when `D` passes, Parker can execute the pre-signed `turn-challenge-open` bundle.
 
 Example transaction shape:
 

@@ -12,11 +12,14 @@ The model is:
 - the browser/controller and indexer remain non-custodial
 - monetary truth is the latest accepted `CustodyState`, not replicated UI state
 - the host is a proposer and sequencer, not a unilateral money authority
+- the acting player is the only party that can lock an ordinary turn option through `SelectionAuth`
+- public pending-turn replication carries compact menu metadata and, after lock, exactly one selected bundle
 - deterministic contested-pot recovery uses pre-signed recovery bundles over the shared pot CSV exit
-- turn timeouts default to a `chain-challenge` fallback instead of immediate timeout payout
+- before action lock, turn timeouts use a `chain-challenge` fallback instead of immediate timeout payout
+- after action lock, recovery uses the replicated selected bundle plus `settlementDeadlineAt`
 - in the heads-up runtime, once a custody-backed betting or payout step is accepted, the counterparty does not get a second funds path back to a pre-loss balance
 - operator outage affects liveness and visibility, not ownership of the latest accepted custody claim
-- the v1 liveness tradeoff is eventual deterministic recovery after `U`, not immediate forced recovery at `D`
+- deterministic pot recovery still uses eventual execution after `U`, not an immediate forced recovery at `D`
 
 ## Money Authority
 
@@ -63,24 +66,40 @@ Compromising a player's local wallet key compromises that player's funds.
 The host has responsibility for:
 
 - join acceptance
-- action ordering
+- action publication ordering
 - transcript progression
 - liveness timers
 - replication
 - failover sequencing
 
-The host is not the unilateral money sequencer.
+The host is not the unilateral money sequencer and it is not the authority that chooses an ordinary betting option.
 
 For user-initiated transitions, honest replicas do not trust a host-authored summary of intent. They derive the expected successor locally from:
 
 - the latest accepted custody state
 - the signed `nativeActionRequest` or `nativeFundsRequest`
 
+For ordinary betting turns, the acting player chooses exactly one candidate by signing `SelectionAuth` over:
+
+- table id
+- epoch
+- hand id
+- decision index
+- previous custody state hash
+- turn anchor hash
+- candidate hash
+- action deadline
+
+The host validates that signature, locks that exact candidate, persists the selected bundle in replicated pending-turn state, and acknowledges the lock with `ActionLockedAck`. The acting player then settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness data. The host persists that exact settled request in pending-turn state until publication. Accepted custody history still advances only after the fully witnessed transition is replay-valid.
+
 Runtime guarantee:
 
 - `action` successors exact-match the locally derived next custody state, including `ActionDeadlineAt`, `ChallengeAnchor`, `TranscriptRoot`, and the derived public money state hash, using the latest accepted custody state plus the signed `nativeActionRequest`
 - `timeout`, `blind-post`, `cash-out`, `emergency-exit`, and the other host-derived non-action successors such as `buy-in-lock`, `showdown-payout`, and `carry-forward` also exact-match those locally derived custody bindings
 - deadline derivation uses the accepted table timing profile (`actionTimeoutMs`, `handProtocolTimeoutMs`, `nextHandDelayMs`) instead of the local daemon's mock/real settlement mode, so accepted replay stays stable across local settlement-mode changes
+- before lock, sibling pre-signed action bundles remain local to the acting player and current host rather than public table replication
+- after lock, the selected bundle is the only recoverable ordinary action for that turn
+- publication authority moves only through host failover, not through action selection itself
 
 In practice, that means the host is a proposer of the next valid state, not the sole owner of monetary truth.
 
@@ -88,15 +107,19 @@ In practice, that means the host is a proposer of the next valid state, not the 
 
 The chain-challenge fallback changes the trust story for betting turns.
 
-By default:
+The ordinary turn flow has two stages:
 
-- the ordinary fast path is the same deterministic finite-menu selection plus cooperative Ark settlement
-- after the ordinary action deadline `D`, the fallback is not an immediate timeout payout
-- instead, Parker can open a pre-signed onchain `turn-challenge-open` spend into a dedicated `TurnChallengeRef`
+- the acting player chooses a deterministic candidate before the action deadline `D`
+- that exact locked candidate is then settled and published as an accepted custody transition
+
+The `chain-challenge` fallback applies only while the turn is still unlocked. If no valid `SelectionAuth` lock exists by `D`, Parker can open a pre-signed onchain `turn-challenge-open` spend into a dedicated `TurnChallengeRef`.
 
 Guarantees and non-guarantees:
 
 - `chain-challenge` removes Bob's immediate timeout-payout path at `D`
+- `SelectionAuth` is the only authority that chooses an ordinary action candidate
+- `ActionLockedAck` records host acceptance of that exact candidate but does not advance accepted custody history
+- once a candidate is locked, recovery uses that locked selected bundle rather than timeout fold/check substitution
 - before `D + C`, only the option-resolution bundles are valid
 - at `D + C`, the timeout-resolution bundle also becomes valid without requiring fresh cooperation from the non-acting side
 - after `D + C`, a late option-resolution and the timeout-resolution can both be valid; confirmation order decides if both are published then
@@ -106,7 +129,7 @@ Guarantees and non-guarantees:
 - accepted table state does not carry chain tip height or transaction confirmation heights
 - if Parker cannot verify the required block heights for a block-based challenge escape, local resolution and accepted replay fail closed
 
-Candidate intent acks and operator acceptance receipts support the ordinary cooperative Ark path. Under the challenge fallback, timeout suppression and onchain sequencing come from the pre-signed `D` and `D + C` challenge bundles rather than from a later operator acknowledgment.
+Ordinary timeout suppression comes from locked-selection state, not from Ark registration receipts or `CandidateIntentAck`. Under the challenge fallback, onchain sequencing comes from the pre-signed `D` and `D + C` challenge bundles.
 
 ## Cooperative Approval And Dead Players
 
@@ -214,7 +237,10 @@ If the host disappears between hands:
 If the host disappears mid-hand:
 
 - failover first attempts to sync the latest accepted table from known participants
-- the successor resumes from the latest accepted custody state
+- the successor resumes from the latest accepted custody state and the replicated pending-turn lock state
+- if the turn is unlocked, the successor can continue the ordinary lock flow or open `turn-challenge-open` after the action deadline
+- if the turn is locked and the acting player already settled, the successor can publish that exact settled transition
+- if the turn is locked and the acting player disappears before settlement, the successor can settle the replicated selected bundle after `settlementDeadlineAt`
 - if timeout logic resolves the hand, the missing player can become dead for the contested pots without losing uncontested stack
 
 ### Operator or indexer outage
@@ -238,7 +264,7 @@ If Ark-backed services are unavailable:
 
 Accepted historical replay of already-settled Ark custody steps succeeds from the stored witness material even while Ark services are unavailable. Deterministic contested pots also recover after `U` if the required recovery bundle is already stored on the source transition. Again, the remaining failures are liveness issues, not ownership changes.
 
-Explicit v1 stall cases are:
+Stall cases include:
 
 - auto-check states do not get winner-take-all recovery bundles
 - non-deterministic missing-card situations fail closed

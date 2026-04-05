@@ -38,7 +38,7 @@ Accepted custody history has three proof surfaces:
 - stored `CustodyProof.RecoveryBundles` plus an executed `CustodyProof.RecoveryWitness` for deterministic heads-up contested-pot recovery after the shared pot CSV delay `U`
 - stored `CustodyProof.ChallengeBundle` plus an executed `CustodyProof.ChallengeWitness` for `turn-challenge-open`, challenge-resolved actions, challenge-resolved timeouts, and challenge escapes
 
-The recovery path is intentionally narrow in v1:
+The recovery path is intentionally narrow:
 
 - heads-up only
 - only deterministic money-resolving states get stored bundles
@@ -353,22 +353,26 @@ The repository exercises these local shapes:
 ### Gameplay loop
 
 1. The host daemon starts the hand from the latest accepted custody state, posts blinds through custody, coordinates the dealerless transcript phases, and records the resulting transcript root in public state.
-2. Player daemons send signed `table.action.request` envelopes to the current host.
-3. The host validates the action signature and custody base hash, applies Hold'em rules, finalizes the required custody transition, then appends `PlayerAction` and persists the updated table.
-4. Each receiving daemon verifies the accepted hand transcript, public replay, custody history, approval signatures, and Ark-linked proof material before persisting the replicated table.
-5. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
-6. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
+2. For each actionable turn, the host builds the full finite menu locally, replicates only `PendingTurnMenuPublic`, and stores the full `LocalTurnBundleCache` only on the acting player and current host.
+3. The acting player chooses a candidate by sending `ActionChooseRequest` with `candidateHash` plus `SelectionAuth`.
+4. The host validates the signed binding, locks that exact candidate, persists the public lock state, replicates exactly one selected bundle, and replies with `ActionLockedAck`.
+5. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material. The host validates it against the locked bundle, persists that exact settled request until publication, publishes the accepted `action` transition, then appends `PlayerAction`.
+6. If the turn remains unlocked through the action deadline and the table uses `chain-challenge`, the host or a successor opens the precomputed challenge path. If the turn is locked but settlement stalls past `settlementDeadlineAt`, the current host or successor settles the replicated selected bundle instead.
+7. Each receiving daemon verifies the accepted hand transcript, public replay, custody history, approval signatures, and Ark-linked proof material before persisting the replicated table.
+8. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
+9. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
 
 ### Chain-challenge flow
 
 When `turnTimeoutMode = "chain-challenge"`, the gameplay loop also carries a deterministic onchain fallback:
 
-1. The host precomputes a `ChallengeEnvelope` for the active finite turn menu.
-2. The `turn-challenge-open` bundle spends every live stack ref and pot ref through its predeclared `D` locktime leaf and reissues the full live bankroll into one `TurnChallengeRef`.
-3. Option-resolution bundles and the timeout-resolution bundle spend `TurnChallengeRef` through its cooperative player-only leaf.
-4. The escape bundle spends `TurnChallengeRef` through its CSV leaf.
-5. Local escape readiness for block-based CSV comes from the wallet runtime's explorer-backed chain-status surface, which queries the configured explorer for tip height and transaction confirmation heights.
-6. Accepted replay uses those same live chain lookups for exact block-height verification and fails closed when the required heights cannot be verified.
+1. The host precomputes a local-only `ChallengeEnvelope` for the active finite turn menu.
+2. The challenge path is used only while the turn is still unlocked. Once `SelectionAuth` locks a candidate, recovery uses the locked selected bundle rather than timeout substitution.
+3. The `turn-challenge-open` bundle spends every live stack ref and pot ref through its predeclared `D` locktime leaf and reissues the full live bankroll into one `TurnChallengeRef`.
+4. Option-resolution bundles and the timeout-resolution bundle spend `TurnChallengeRef` through its cooperative player-only leaf.
+5. The escape bundle spends `TurnChallengeRef` through its CSV leaf.
+6. Local escape readiness for block-based CSV comes from the wallet runtime's explorer-backed chain-status surface, which queries the configured explorer for tip height and transaction confirmation heights.
+7. Accepted replay uses those same live chain lookups for exact block-height verification and fails closed when the required heights cannot be verified.
 
 That explorer-backed chain-status surface uses:
 
@@ -403,6 +407,10 @@ If the host disappears during an active hand:
 
 - the failover daemon appends `HostRotated`
 - it syncs the best known accepted table and replays custody, transcript, and public state to decide whether the hand can continue
+- if the turn is unlocked, it resumes from the compact public menu and can continue locking the action or open `turn-challenge-open` after the action deadline
+- if the turn is locked, it continues from the replicated selected bundle and lock metadata
+- if the acting player already settled, it publishes that exact settled transition
+- if the acting player disappears before settlement, it can settle the replicated selected bundle after `settlementDeadlineAt`
 - if required protocol records are missing or invalid, it appends `HandAbort`
 - it returns to the latest replay-valid custody-backed table state when abort is required
 
@@ -415,7 +423,7 @@ If a hand reaches an objectively determined money result but cooperative Ark fin
 - after `U`, the host can execute the stored PSBT through the unilateral-exit broadcaster
 - the accepted successor is the ordinary semantic `timeout` or `showdown-payout` transition, but it carries `RecoveryWitness` instead of `SettlementWitness`
 
-This is an eventual-recovery design, not an instant-at-`D` design. The v1 tradeoff is explicit: deterministic contested pots can recover after `U`, while non-deterministic or auto-check states fail closed.
+This is an eventual-recovery design, not an instant-at-`D` design. Deterministic contested pots recover after `U`, while non-deterministic or auto-check states fail closed.
 
 ## Relationship To Other Docs
 
