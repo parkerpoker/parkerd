@@ -13,6 +13,10 @@ const meshTimingLogPrefix = "[mesh-timing]"
 type meshTimingFields struct {
 	Metric         string
 	TableID        string
+	Epoch          int
+	TurnAnchorHash string
+	CandidateHash  string
+	Reason         string
 	CustodySeq     int
 	TransitionKind string
 	Phase          string
@@ -28,6 +32,10 @@ type meshTimingFields struct {
 type meshTimingEntry struct {
 	Metric         string  `json:"metric"`
 	TableID        string  `json:"tableId,omitempty"`
+	Epoch          int     `json:"epoch,omitempty"`
+	TurnAnchorHash string  `json:"turnAnchorHash,omitempty"`
+	CandidateHash  string  `json:"candidateHash,omitempty"`
+	Reason         string  `json:"reason,omitempty"`
 	CustodySeq     int     `json:"custodySeq,omitempty"`
 	TransitionKind string  `json:"transitionKind,omitempty"`
 	Phase          string  `json:"phase,omitempty"`
@@ -111,6 +119,10 @@ func (logger meshTimingLogger) emit(fields meshTimingFields, duration time.Durat
 	entry := meshTimingEntry{
 		Metric:         fields.Metric,
 		TableID:        strings.TrimSpace(fields.TableID),
+		Epoch:          fields.Epoch,
+		TurnAnchorHash: strings.TrimSpace(fields.TurnAnchorHash),
+		CandidateHash:  strings.TrimSpace(fields.CandidateHash),
+		Reason:         strings.TrimSpace(fields.Reason),
 		CustodySeq:     fields.CustodySeq,
 		TransitionKind: strings.TrimSpace(fields.TransitionKind),
 		Phase:          strings.TrimSpace(fields.Phase),

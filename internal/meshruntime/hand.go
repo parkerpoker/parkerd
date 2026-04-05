@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/parkerpoker/parkerd/internal/game"
 	"github.com/parkerpoker/parkerd/internal/settlementcore"
@@ -1951,6 +1952,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 	}
 	for iteration := 0; iteration < 8; iteration++ {
 		changed := false
+		runtime.observeLockedActionState(*table)
 		if tableHasActionableTurn(*table) &&
 			table.CurrentHost.Peer.PeerID == runtime.selfPeerID() &&
 			!turnMenuMatchesTable(*table, table.PendingTurnMenu) {
@@ -1959,12 +1961,10 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 			}
 			changed = true
 		}
-		if handled, err := runtime.handlePendingTurnChallengeLocked(table); err != nil {
-			return err
-		} else if handled {
-			changed = true
-			continue
-		}
+		// Protocol invariant: a successor host always consumes any locked-action
+		// state before it considers challenge-open or ordinary timeout
+		// substitution. Locked ordinary turns only continue through the persisted
+		// settled request or the selected bundle after SettlementDeadlineAt.
 		if completed, err := runtime.handlePersistedLockedActionSettlementLocked(table); err != nil {
 			return err
 		} else if completed {
@@ -1981,16 +1981,24 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 			runtime.setProtocolDeadline(table)
 			changed = true
 		}
-		if opened, err := runtime.openTurnChallengeLocked(table); err != nil {
-			return err
-		} else if opened {
-			changed = true
-			continue
-		}
-		if handled, err := runtime.handleActionTimeoutLocked(table); err != nil {
-			return err
-		} else if handled {
-			changed = true
+		if pendingTurnStageForTable(*table) == pendingTurnStageUnlocked {
+			if handled, err := runtime.handlePendingTurnChallengeLocked(table); err != nil {
+				return err
+			} else if handled {
+				changed = true
+				continue
+			}
+			if opened, err := runtime.openTurnChallengeLocked(table); err != nil {
+				return err
+			} else if opened {
+				changed = true
+				continue
+			}
+			if handled, err := runtime.handleActionTimeoutLocked(table); err != nil {
+				return err
+			} else if handled {
+				changed = true
+			}
 		}
 		if record, err := runtime.buildLocalContributionRecord(*table); err != nil {
 			return err
@@ -2088,6 +2096,37 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 	publicState := runtime.publicStateFromHand(*table, table.ActiveHand.State)
 	table.PublicState = &publicState
 	return runtime.storeLocalHoleCards(*table)
+}
+
+func (runtime *meshRuntime) observeLockedActionState(table nativeTableState) {
+	if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() ||
+		!turnMenuMatchesTable(table, table.PendingTurnMenu) ||
+		table.PendingTurnMenu == nil {
+		return
+	}
+	menu := table.PendingTurnMenu
+	switch pendingTurnStageForTable(table) {
+	case pendingTurnStageLocked:
+		if lockedAt, err := parseISOTimestamp(menu.LockedAt); err == nil {
+			emitMeshTiming(
+				actionMetricFields("action_locked_unsettled_age_ms", sendActionStageSettlement, table, menu.SelectedCandidateHash, ""),
+				time.Since(lockedAt),
+				nil,
+			)
+		}
+	case pendingTurnStageSettled:
+		signedAt := menu.LockedAt
+		if menu.SettledRequest != nil && strings.TrimSpace(menu.SettledRequest.SignedAt) != "" {
+			signedAt = menu.SettledRequest.SignedAt
+		}
+		if settledAt, err := parseISOTimestamp(signedAt); err == nil {
+			emitMeshTiming(
+				actionMetricFields("action_settled_unpublished_age_ms", sendActionStageSettlement, table, menu.SelectedCandidateHash, ""),
+				time.Since(settledAt),
+				nil,
+			)
+		}
+	}
 }
 
 func handMessageCards(cards []game.CardCode) []string {

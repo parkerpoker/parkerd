@@ -768,6 +768,10 @@ func (runtime *meshRuntime) handlePersistedLockedActionSettlementLocked(table *n
 	if err := runtime.validateLockedActionSettlement(*table, *menu.SelectedBundle, menu.SettledRequest.Transition); err != nil {
 		return false, err
 	}
+	if table.CurrentEpoch > menu.Epoch {
+		emitMeshTiming(actionMetricFields("action_successor_publish_total", sendActionStageSettlement, *table, menu.SelectedCandidateHash, "persisted_settled_request"), 0, nil)
+		debugMeshf("successor host publishing persisted settled request table=%s epoch=%d turn_anchor=%s candidate=%s", table.Config.TableID, table.CurrentEpoch, menu.TurnAnchorHash, menu.SelectedCandidateHash)
+	}
 	return runtime.publishLockedActionTransitionLocked(table, *menu.SelectedBundle, menu.SettledRequest.Transition)
 }
 
@@ -788,6 +792,10 @@ func (runtime *meshRuntime) handleLockedActionSettlementTimeoutLocked(table *nat
 	transition, _, err := runtime.settleTurnCandidateTransition(*table, *menu.SelectedBundle)
 	if err != nil {
 		return false, err
+	}
+	if table.CurrentEpoch > menu.Epoch {
+		emitMeshTiming(actionMetricFields("action_successor_settlement_total", sendActionStageSettlement, *table, menu.SelectedCandidateHash, "settlement_deadline_expired"), 0, nil)
+		debugMeshf("successor host settling locked action after settlement deadline table=%s epoch=%d turn_anchor=%s candidate=%s deadline=%s", table.Config.TableID, table.CurrentEpoch, menu.TurnAnchorHash, menu.SelectedCandidateHash, menu.SettlementDeadlineAt)
 	}
 	return runtime.publishLockedActionTransitionLocked(table, *menu.SelectedBundle, transition)
 }
