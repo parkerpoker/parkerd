@@ -516,8 +516,8 @@ func (runtime *meshRuntime) deriveTimeoutCustodyTransitionWithOptions(table nati
 	if table.LatestCustodyState == nil {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition requires a prior custody state")
 	}
-	if runtime.hasTimelySelectedCandidate(table) {
-		return tablecustody.CustodyTransition{}, errors.New("timeout transition is stale after a valid selected turn candidate")
+	if pendingTurnHasLockedCandidate(table) {
+		return tablecustody.CustodyTransition{}, errors.New("timeout transition is stale after the turn locked a candidate")
 	}
 	if requireCompleteMenu && runtime.validatePendingTurnMenu(table, table.PendingTurnMenu) != nil {
 		return tablecustody.CustodyTransition{}, errors.New("timeout transition requires a complete pending turn menu")

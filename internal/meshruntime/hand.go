@@ -1664,14 +1664,14 @@ func (runtime *meshRuntime) handleActionTimeoutLocked(table *nativeTableState) (
 	if !game.PhaseAllowsActions(table.ActiveHand.State.Phase) || table.ActiveHand.State.ActingSeatIndex == nil {
 		return false, nil
 	}
+	if pendingTurnHasLockedCandidate(*table) {
+		return false, nil
+	}
 	if turnTimeoutModeForTable(*table) == turnTimeoutModeChainChallenge || table.PendingTurnChallenge != nil {
 		return false, nil
 	}
 	if turnMenuMatchesTable(*table, table.PendingTurnMenu) {
 		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
-			return false, nil
-		}
-		if runtime.hasTimelySelectedCandidate(*table) {
 			return false, nil
 		}
 	}
@@ -1981,7 +1981,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 			runtime.setProtocolDeadline(table)
 			changed = true
 		}
-		if pendingTurnStageForTable(*table) == pendingTurnStageUnlocked {
+		if pendingTurnAllowsUnlockedResolution(*table) {
 			if handled, err := runtime.handlePendingTurnChallengeLocked(table); err != nil {
 				return err
 			} else if handled {

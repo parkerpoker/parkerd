@@ -1718,14 +1718,14 @@ func (runtime *meshRuntime) openTurnChallengeLocked(table *nativeTableState) (bo
 		!turnMenuMatchesTable(*table, table.PendingTurnMenu) {
 		return false, nil
 	}
+	if !pendingTurnAllowsUnlockedResolution(*table) {
+		return false, nil
+	}
 	menu, err := runtime.pendingTurnMenuWithLocalBundles(*table)
 	if err != nil {
 		return false, err
 	}
 	if menu == nil || menu.ChallengeEnvelope == nil {
-		return false, nil
-	}
-	if runtime.hasTimelySelectedCandidate(*table) {
 		return false, nil
 	}
 	if elapsedMillis(menu.ActionDeadlineAt) < 0 || !turnChallengeOpenReady(menu) {

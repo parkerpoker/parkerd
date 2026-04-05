@@ -2111,10 +2111,28 @@ func pendingTurnStageForTable(table nativeTableState) pendingTurnPublicationStag
 	if strings.TrimSpace(menu.SelectedCandidateHash) == "" {
 		return pendingTurnStageUnlocked
 	}
+	if err := validateLockedCandidateBinding(menu); err != nil {
+		return pendingTurnStageUnavailable
+	}
+	if menu.SelectionAuth == nil ||
+		strings.TrimSpace(menu.LockedAt) == "" ||
+		strings.TrimSpace(menu.SettlementDeadlineAt) == "" ||
+		menu.SelectedBundle == nil {
+		return pendingTurnStageUnavailable
+	}
 	if menu.SettledRequest != nil {
 		return pendingTurnStageSettled
 	}
 	return pendingTurnStageLocked
+}
+
+func pendingTurnHasLockedCandidate(table nativeTableState) bool {
+	stage := pendingTurnStageForTable(table)
+	return stage == pendingTurnStageLocked || stage == pendingTurnStageSettled
+}
+
+func pendingTurnAllowsUnlockedResolution(table nativeTableState) bool {
+	return pendingTurnStageForTable(table) == pendingTurnStageUnlocked
 }
 
 func actionAcceptedProgressSnapshot(table nativeTableState) actionAcceptedProgress {
@@ -2180,8 +2198,6 @@ func actionFailureReasonCode(err error) string {
 		return "epoch_mismatch"
 	case strings.Contains(message, "must be sent to the current host"), strings.Contains(message, "host mismatch"):
 		return "stale_host"
-	case isRetryableActionResponseStateError(err), isStaleRemoteTableError(err):
-		return "accepted_history_growth"
 	case strings.Contains(message, "turn menu is unavailable"):
 		return "turn_menu_unavailable"
 	case strings.Contains(message, "turn challenge is open"):
@@ -2192,6 +2208,8 @@ func actionFailureReasonCode(err error) string {
 		return "settled_transition_conflict"
 	case strings.Contains(message, "a sibling candidate for this turn is already selected"):
 		return "locked_candidate_conflict"
+	case isRetryableActionResponseStateError(err), isStaleRemoteTableError(err):
+		return "accepted_history_growth"
 	case strings.Contains(message, "selection auth"), strings.Contains(message, "action settlement signature"), strings.Contains(message, "action settlement approvals"), strings.Contains(message, "does not match the prebuilt bundle"), strings.Contains(message, "action is not one of the deterministic menu options"):
 		return "semantic_validation"
 	default:
@@ -2226,7 +2244,6 @@ func actionMetricFields(metric string, stage sendActionStage, table nativeTableS
 		Epoch:         table.CurrentEpoch,
 	}
 	if turnMenuMatchesTable(table, table.PendingTurnMenu) && table.PendingTurnMenu != nil {
-		fields.Epoch = table.PendingTurnMenu.Epoch
 		fields.TurnAnchorHash = strings.TrimSpace(table.PendingTurnMenu.TurnAnchorHash)
 		if fields.CandidateHash == "" {
 			fields.CandidateHash = strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash)
@@ -3564,6 +3581,29 @@ func (runtime *meshRuntime) syncTableBeforeFailover(tableID string) {
 	runtime.syncTableFromKnownParticipants(tableID)
 }
 
+func (runtime *meshRuntime) rehydratePendingTurnStateForHostRotation(table *nativeTableState) error {
+	if table == nil {
+		return nil
+	}
+	switch {
+	case !turnMenuMatchesTable(*table, table.PendingTurnMenu):
+		table.PendingTurnMenu = nil
+		table.LocalTurnBundleCache = nil
+	case pendingTurnHasLockedCandidate(*table):
+		// Locked turns must continue from the replicated selected bundle and any
+		// persisted settled request. Successor hosts do not need sibling
+		// candidates to preserve or publish locked-action progress.
+		table.LocalTurnBundleCache = nil
+	default:
+		cache, err := runtime.loadLocalTurnBundleCache(*table)
+		if err != nil {
+			return err
+		}
+		table.LocalTurnBundleCache = cache
+	}
+	return runtime.storeLocalTurnBundleCache(table.Config.TableID, table.LocalTurnBundleCache)
+}
+
 func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostFailure bool, resetProtocolDeadline bool) error {
 	observedHostFailure := false
 	var rotatedTable *nativeTableState
@@ -3593,20 +3633,7 @@ func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostF
 		table.CurrentHost = nativeKnownParticipant{ProfileName: runtime.profileName, Peer: runtime.self.Peer}
 		table.Config.HostPeerID = runtime.selfPeerID()
 		table.LastHostHeartbeatAt = nowISO()
-		preservePendingMenu := turnMenuMatchesTable(*table, table.PendingTurnMenu)
-		if !preservePendingMenu {
-			table.PendingTurnMenu = nil
-		}
-		if preservePendingMenu {
-			cache, err := runtime.loadLocalTurnBundleCache(*table)
-			if err != nil {
-				return err
-			}
-			table.LocalTurnBundleCache = cache
-		} else {
-			table.LocalTurnBundleCache = nil
-		}
-		if err := runtime.storeLocalTurnBundleCache(tableID, table.LocalTurnBundleCache); err != nil {
+		if err := runtime.rehydratePendingTurnStateForHostRotation(table); err != nil {
 			return err
 		}
 		lease := map[string]any{
@@ -5381,15 +5408,7 @@ func (runtime *meshRuntime) acceptRemoteTable(table nativeTableState) (err error
 	if err := runtime.syncPrivateAndFunds(accepted); err != nil {
 		return err
 	}
-	if turnMenuMatchesTable(accepted, accepted.PendingTurnMenu) &&
-		accepted.PendingTurnMenu != nil &&
-		strings.TrimSpace(accepted.PendingTurnMenu.SelectedCandidateHash) == "" &&
-		incomingCache != nil &&
-		accepted.PendingTurnMenu.ActingPlayerID == runtime.walletID.PlayerID {
-		if err := runtime.storeLocalTurnBundleCache(accepted.Config.TableID, incomingCache); err != nil {
-			return err
-		}
-	} else if err := runtime.storeLocalTurnBundleCache(accepted.Config.TableID, nil); err != nil {
+	if err := runtime.storeAcceptedTurnBundleCache(accepted, incomingCache); err != nil {
 		return err
 	}
 	return nil
@@ -5404,6 +5423,17 @@ func stripReplicatedPendingTurnBundles(table *nativeTableState) {
 	table.PendingTurnMenu.TimeoutCandidate = nil
 }
 
+func (runtime *meshRuntime) storeAcceptedTurnBundleCache(table nativeTableState, incomingCache *LocalTurnBundleCache) error {
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) &&
+		table.PendingTurnMenu != nil &&
+		pendingTurnAllowsUnlockedResolution(table) &&
+		incomingCache != nil &&
+		table.PendingTurnMenu.ActingPlayerID == runtime.walletID.PlayerID {
+		return runtime.storeLocalTurnBundleCache(table.Config.TableID, incomingCache)
+	}
+	return runtime.storeLocalTurnBundleCache(table.Config.TableID, nil)
+}
+
 func mergeAcceptedPendingTurnMenu(existing *nativeTableState, accepted *nativeTableState) {
 	if existing == nil || accepted == nil {
 		return
@@ -5414,28 +5444,39 @@ func mergeAcceptedPendingTurnMenu(existing *nativeTableState, accepted *nativeTa
 	case existingValid && accepted.PendingTurnMenu == nil && turnMenuMatchesTable(*accepted, existing.PendingTurnMenu):
 		accepted.PendingTurnMenu = cloneJSON(existing.PendingTurnMenu)
 	case existingValid && incomingValid && existing.PendingTurnMenu.TurnAnchorHash == accepted.PendingTurnMenu.TurnAnchorHash:
+		if strings.TrimSpace(existing.PendingTurnMenu.DeliveredAt) != "" {
+			accepted.PendingTurnMenu.DeliveredAt = existing.PendingTurnMenu.DeliveredAt
+		}
+		if strings.TrimSpace(existing.PendingTurnMenu.ActionDeadlineAt) != "" {
+			accepted.PendingTurnMenu.ActionDeadlineAt = existing.PendingTurnMenu.ActionDeadlineAt
+		}
 		if strings.TrimSpace(accepted.PendingTurnMenu.SelectedCandidateHash) == "" && strings.TrimSpace(existing.PendingTurnMenu.SelectedCandidateHash) != "" {
 			accepted.PendingTurnMenu.SelectedCandidateHash = existing.PendingTurnMenu.SelectedCandidateHash
 		}
+		selectedCandidateMatchesExisting := strings.TrimSpace(existing.PendingTurnMenu.SelectedCandidateHash) != "" &&
+			firstNonEmptyString(
+				accepted.PendingTurnMenu.SelectedCandidateHash,
+				existing.PendingTurnMenu.SelectedCandidateHash,
+			) == existing.PendingTurnMenu.SelectedCandidateHash
 		if accepted.PendingTurnMenu.SelectionAuth == nil &&
 			existing.PendingTurnMenu.SelectionAuth != nil &&
-			firstNonEmptyString(accepted.PendingTurnMenu.SelectedCandidateHash, existing.PendingTurnMenu.SelectedCandidateHash) == existing.PendingTurnMenu.SelectedCandidateHash {
+			selectedCandidateMatchesExisting {
 			accepted.PendingTurnMenu.SelectionAuth = cloneJSON(existing.PendingTurnMenu.SelectionAuth)
 		}
-		if strings.TrimSpace(accepted.PendingTurnMenu.LockedAt) == "" && strings.TrimSpace(existing.PendingTurnMenu.LockedAt) != "" {
+		if selectedCandidateMatchesExisting && strings.TrimSpace(existing.PendingTurnMenu.LockedAt) != "" {
 			accepted.PendingTurnMenu.LockedAt = existing.PendingTurnMenu.LockedAt
 		}
-		if strings.TrimSpace(accepted.PendingTurnMenu.SettlementDeadlineAt) == "" && strings.TrimSpace(existing.PendingTurnMenu.SettlementDeadlineAt) != "" {
+		if selectedCandidateMatchesExisting && strings.TrimSpace(existing.PendingTurnMenu.SettlementDeadlineAt) != "" {
 			accepted.PendingTurnMenu.SettlementDeadlineAt = existing.PendingTurnMenu.SettlementDeadlineAt
 		}
 		if accepted.PendingTurnMenu.SelectedBundle == nil &&
 			existing.PendingTurnMenu.SelectedBundle != nil &&
-			firstNonEmptyString(accepted.PendingTurnMenu.SelectedCandidateHash, existing.PendingTurnMenu.SelectedCandidateHash) == existing.PendingTurnMenu.SelectedCandidateHash {
+			selectedCandidateMatchesExisting {
 			accepted.PendingTurnMenu.SelectedBundle = cloneJSON(existing.PendingTurnMenu.SelectedBundle)
 		}
 		if accepted.PendingTurnMenu.SettledRequest == nil &&
 			existing.PendingTurnMenu.SettledRequest != nil &&
-			firstNonEmptyString(accepted.PendingTurnMenu.SelectedCandidateHash, existing.PendingTurnMenu.SelectedCandidateHash) == existing.PendingTurnMenu.SelectedCandidateHash {
+			selectedCandidateMatchesExisting {
 			accepted.PendingTurnMenu.SettledRequest = cloneJSON(existing.PendingTurnMenu.SettledRequest)
 		}
 	}
