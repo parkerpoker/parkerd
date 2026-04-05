@@ -307,8 +307,9 @@ Turn state is split into a replicated public layer and a local pre-signed bundle
 - acting player, epoch, hand id, and decision index
 - previous custody state hash and turn anchor hash
 - compact option descriptors plus candidate hashes
-- action deadline
+- action deadline while the turn is still unlocked
 - after lock, `selectedCandidateHash`, `SelectionAuth`, `lockedAt`, `settlementDeadlineAt`, and the single `selectedBundle`
+- after settlement but before publication, that same locked object also carries the exact persisted `settledRequest`
 
 `LocalTurnBundleCache` stays local to the acting player and current host before lock. It carries:
 
@@ -370,6 +371,14 @@ After ordinary action lock, recovery does not switch to timeout fold/check subst
 
 - if the host disappears after lock and the acting player already settled, failover publishes that exact persisted settled transition
 - if the acting player disappears after lock and before settlement, the current host or a successor host can settle the replicated selected bundle after `settlementDeadlineAt`
+- before `settlementDeadlineAt`, a successor host preserves the locked turn and waits; it does not reopen challenge or substitute the ordinary timeout path
+
+Successor-host locked-turn ordering is a protocol invariant:
+
+1. publish the persisted `settledRequest` when it already exists
+2. otherwise, if `settlementDeadlineAt` has expired, settle the locked `selectedBundle`
+3. only still-unlocked turns may open challenge or use the deterministic ordinary timeout successor
+4. when an unlocked acting player disappears, that deterministic timeout successor remains the existing `fold-or-check` rule rather than an always-fold rule
 
 Escape maturity depends on the CSV type:
 

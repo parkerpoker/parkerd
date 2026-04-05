@@ -112,6 +112,12 @@ The ordinary turn flow has two stages:
 - the acting player chooses a deterministic candidate before the action deadline `D`
 - that exact locked candidate is then settled and published as an accepted custody transition
 
+`PendingTurnMenuPublic` stays the accepted coordination surface for that stage machine:
+
+- unlocked turns have no `selectedCandidateHash`
+- locked turns add `SelectionAuth`, `lockedAt`, `settlementDeadlineAt`, and the single `selectedBundle`
+- settled-but-unpublished locked turns keep that same lock state and also carry the exact persisted `settledRequest`
+
 The `chain-challenge` fallback applies only while the turn is still unlocked. If no valid `SelectionAuth` lock exists by `D`, Parker can open a pre-signed onchain `turn-challenge-open` spend into a dedicated `TurnChallengeRef`.
 
 Guarantees and non-guarantees:
@@ -239,8 +245,10 @@ If the host disappears mid-hand:
 - failover first attempts to sync the latest accepted table from known participants
 - the successor resumes from the latest accepted custody state and the replicated pending-turn lock state
 - if the turn is unlocked, the successor can continue the ordinary lock flow or open `turn-challenge-open` after the action deadline
-- if the turn is locked and the acting player already settled, the successor can publish that exact settled transition
-- if the turn is locked and the acting player disappears before settlement, the successor can settle the replicated selected bundle after `settlementDeadlineAt`
+- if the turn is locked and the acting player already settled, the successor publishes that exact persisted settled transition first
+- if the turn is locked and the acting player disappears before settlement, the successor waits until `settlementDeadlineAt` and then settles the replicated selected bundle
+- if the turn is locked and neither of those conditions holds yet, the successor preserves the lock state and waits
+- only an unlocked acting-player disappearance uses the existing deterministic `fold-or-check` timeout successor
 - if timeout logic resolves the hand, the missing player can become dead for the contested pots without losing uncontested stack
 
 ### Operator or indexer outage

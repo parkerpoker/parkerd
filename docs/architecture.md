@@ -408,9 +408,10 @@ If the host disappears during an active hand:
 - the failover daemon appends `HostRotated`
 - it syncs the best known accepted table and replays custody, transcript, and public state to decide whether the hand can continue
 - if the turn is unlocked, it resumes from the compact public menu and can continue locking the action or open `turn-challenge-open` after the action deadline
-- if the turn is locked, it continues from the replicated selected bundle and lock metadata
-- if the acting player already settled, it publishes that exact settled transition
-- if the acting player disappears before settlement, it can settle the replicated selected bundle after `settlementDeadlineAt`
+- if the turn is locked, it continues from the replicated selected bundle and lock metadata without requiring sibling bundles
+- if the acting player already settled, it first publishes that exact persisted settled transition
+- if the acting player disappears before settlement, it waits until `settlementDeadlineAt` and then settles the replicated selected bundle
+- a locked turn never falls back to the ordinary timeout substitution path; only an unlocked turn can still resolve through the deterministic `fold-or-check` timeout successor
 - if required protocol records are missing or invalid, it appends `HandAbort`
 - it returns to the latest replay-valid custody-backed table state when abort is required
 

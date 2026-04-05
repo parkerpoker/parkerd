@@ -2090,17 +2090,17 @@ type sendActionStageAssessment struct {
 }
 
 type actionAcceptedProgress struct {
-	protocol              protocolDriveSnapshot
-	lastEventHash         string
-	eventCount            int
-	snapshotCount         int
+	protocol               protocolDriveSnapshot
+	lastEventHash          string
+	eventCount             int
+	snapshotCount          int
 	custodyTransitionCount int
-	pendingStage          pendingTurnPublicationStage
-	pendingEpoch          int
-	turnAnchorHash        string
-	selectedCandidateHash string
-	settledTransitionHash string
-	challengeStatus       string
+	pendingStage           pendingTurnPublicationStage
+	pendingEpoch           int
+	turnAnchorHash         string
+	selectedCandidateHash  string
+	settledTransitionHash  string
+	challengeStatus        string
 }
 
 func pendingTurnStageForTable(table nativeTableState) pendingTurnPublicationStage {
@@ -2248,7 +2248,12 @@ func actionMatchesLegalAction(action game.Action, legal game.LegalAction) bool {
 		return false
 	}
 	if action.Type == game.ActionBet || action.Type == game.ActionRaise {
-		return action.TotalSats == legal.TotalSats
+		if legal.MinTotalSats != nil && action.TotalSats < *legal.MinTotalSats {
+			return false
+		}
+		if legal.MaxTotalSats != nil && action.TotalSats > *legal.MaxTotalSats {
+			return false
+		}
 	}
 	return true
 }
@@ -2325,9 +2330,14 @@ func (runtime *meshRuntime) assessSettlementStage(table nativeTableState, reques
 	if turnMenuMatchesTable(table, table.PendingTurnMenu) && table.PendingTurnMenu != nil {
 		selected := strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash)
 		switch {
-		case selected == request.CandidateHash && table.PendingTurnMenu.SettledRequest != nil &&
-			actionSettlementTransitionHash(*table.PendingTurnMenu.SettledRequest) == actionSettlementTransitionHash(request):
-			return sendActionStageAssessment{}
+		case selected == request.CandidateHash && table.PendingTurnMenu.SettledRequest != nil:
+			if actionSettlementTransitionHash(*table.PendingTurnMenu.SettledRequest) == actionSettlementTransitionHash(request) {
+				return sendActionStageAssessment{}
+			}
+			return sendActionStageAssessment{
+				Err:   errors.New("locked action already has a different persisted settled transition"),
+				Stale: true,
+			}
 		case selected == request.CandidateHash:
 			return sendActionStageAssessment{}
 		case selected != "":
@@ -5400,10 +5410,8 @@ func mergeAcceptedPendingTurnMenu(existing *nativeTableState, accepted *nativeTa
 	}
 	existingValid := turnMenuMatchesTable(*existing, existing.PendingTurnMenu)
 	incomingValid := turnMenuMatchesTable(*accepted, accepted.PendingTurnMenu)
-	sameHostAndEpoch := accepted.CurrentEpoch == existing.CurrentEpoch &&
-		accepted.CurrentHost.Peer.PeerID == existing.CurrentHost.Peer.PeerID
 	switch {
-	case existingValid && sameHostAndEpoch && accepted.PendingTurnMenu == nil && turnMenuMatchesTable(*accepted, existing.PendingTurnMenu):
+	case existingValid && accepted.PendingTurnMenu == nil && turnMenuMatchesTable(*accepted, existing.PendingTurnMenu):
 		accepted.PendingTurnMenu = cloneJSON(existing.PendingTurnMenu)
 	case existingValid && incomingValid && existing.PendingTurnMenu.TurnAnchorHash == accepted.PendingTurnMenu.TurnAnchorHash:
 		if strings.TrimSpace(accepted.PendingTurnMenu.SelectedCandidateHash) == "" && strings.TrimSpace(existing.PendingTurnMenu.SelectedCandidateHash) != "" {

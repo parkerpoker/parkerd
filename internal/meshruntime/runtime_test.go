@@ -6213,6 +6213,82 @@ func TestSuccessorHostPublishesPersistedSettledLockedAction(t *testing.T) {
 	}
 }
 
+func TestSuccessorHostKeepsLockedTurnOutOfOrdinaryTimeoutSubstitution(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest, witness}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	selection, err := guest.buildActionSelectionRequest(guestTable, action)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	lockResponse, err := host.handleActionSelectionFromPeer(selection)
+	if err != nil {
+		t.Fatalf("lock guest action: %v", err)
+	}
+	if err := guest.acceptRemoteTable(lockResponse.Table); err != nil {
+		t.Fatalf("guest accept locked table: %v", err)
+	}
+	hostLocked := mustReadNativeTable(t, host, tableID)
+	if err := witness.acceptRemoteTable(host.networkTableView(hostLocked, witness.walletID.PlayerID)); err != nil {
+		t.Fatalf("witness accept locked table: %v", err)
+	}
+
+	before := mustReadNativeTable(t, witness, tableID)
+	if before.PendingTurnMenu == nil || strings.TrimSpace(before.PendingTurnMenu.SelectedCandidateHash) == "" {
+		t.Fatalf("expected locked pending turn menu before successor timeout check, got %+v", before.PendingTurnMenu)
+	}
+	beforeTransitions := len(before.CustodyTransitions)
+	beforeActionLog := len(before.ActiveHand.State.ActionLog)
+
+	if err := witness.store.withTableLock(tableID, func() error {
+		table, err := witness.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.CurrentEpoch++
+		table.CurrentHost = nativeKnownParticipant{ProfileName: witness.profileName, Peer: witness.self.Peer}
+		table.Config.HostPeerID = witness.selfPeerID()
+		table.LastHostHeartbeatAt = nowISO()
+		table.PendingTurnMenu.ActionDeadlineAt = addMillis(nowISO(), -1_000)
+		table.PendingTurnMenu.SettlementDeadlineAt = addMillis(nowISO(), 30_000)
+		if err := witness.advanceHandProtocolLocked(table); err != nil {
+			return err
+		}
+		return witness.persistLocalTable(table, false)
+	}); err != nil {
+		t.Fatalf("advance locked turn under successor host: %v", err)
+	}
+
+	after := mustReadNativeTable(t, witness, tableID)
+	if after.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness to stay current host, got %q", after.CurrentHost.Peer.PeerID)
+	}
+	if len(after.CustodyTransitions) != beforeTransitions {
+		t.Fatalf("expected locked turn to avoid ordinary timeout publication, transitions=%d want=%d", len(after.CustodyTransitions), beforeTransitions)
+	}
+	if len(after.ActiveHand.State.ActionLog) != beforeActionLog {
+		t.Fatalf("expected locked turn action log to stay at %d before settlement deadline, got %d", beforeActionLog, len(after.ActiveHand.State.ActionLog))
+	}
+	if after.PendingTurnMenu == nil || strings.TrimSpace(after.PendingTurnMenu.SelectedCandidateHash) == "" {
+		t.Fatalf("expected locked pending turn menu to survive successor tick, got %+v", after.PendingTurnMenu)
+	}
+	if after.PendingTurnMenu.SettledRequest != nil {
+		t.Fatalf("did not expect successor host to synthesize a settled request before publication, got %+v", after.PendingTurnMenu.SettledRequest)
+	}
+}
+
 func TestSyntheticRealModeSupportsCallThenCheck(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -6526,6 +6602,124 @@ func TestActionRetryStateChangedDetectsAcceptedHistoryAdvance(t *testing.T) {
 
 	if !actionRetryStateChanged(previous, refreshed) {
 		t.Fatal("expected accepted-history growth to trigger an action retry")
+	}
+}
+
+func TestActionRetryStateChangedDetectsLockedTurnProgress(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		t.Fatalf("expected actionable pending turn menu, got %+v", table.PendingTurnMenu)
+	}
+	cache, err := host.loadLocalTurnBundleCache(table)
+	if err != nil {
+		t.Fatalf("load local turn bundle cache: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected local turn bundle cache for actionable lock progress test")
+	}
+	option := table.PendingTurnMenu.Options[0]
+	bundle, ok := findTurnCandidateByOptionFromCache(table.PendingTurnMenu, cache, option.OptionID)
+	if !ok {
+		t.Fatalf("expected cached bundle for option %s", option.OptionID)
+	}
+	auth, err := host.buildSelectionAuth(table, bundle.CandidateHash)
+	if err != nil {
+		t.Fatalf("build selection auth: %v", err)
+	}
+
+	previous := cloneJSON(table)
+	refreshed := cloneJSON(table)
+	refreshed.PendingTurnMenu.SelectedCandidateHash = bundle.CandidateHash
+	refreshed.PendingTurnMenu.SelectionAuth = cloneJSON(&auth)
+	refreshed.PendingTurnMenu.LockedAt = nowISO()
+	refreshed.PendingTurnMenu.SettlementDeadlineAt = addMillis(refreshed.PendingTurnMenu.LockedAt, host.selectionSettlementTimeoutMSForTable(refreshed))
+	selectedBundle := cloneJSON(bundle)
+	refreshed.PendingTurnMenu.SelectedBundle = &selectedBundle
+
+	if !actionRetryStateChanged(previous, refreshed) {
+		t.Fatal("expected locked pending-turn progress to trigger an action retry")
+	}
+}
+
+func TestActionRetryStateChangedDetectsPersistedSettlementProgress(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) {
+		t.Fatalf("expected actionable pending turn menu, got %+v", table.PendingTurnMenu)
+	}
+	cache, err := host.loadLocalTurnBundleCache(table)
+	if err != nil {
+		t.Fatalf("load local turn bundle cache: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected local turn bundle cache for settlement progress test")
+	}
+	option := table.PendingTurnMenu.Options[0]
+	bundle, ok := findTurnCandidateByOptionFromCache(table.PendingTurnMenu, cache, option.OptionID)
+	if !ok {
+		t.Fatalf("expected cached bundle for option %s", option.OptionID)
+	}
+	auth, err := host.buildSelectionAuth(table, bundle.CandidateHash)
+	if err != nil {
+		t.Fatalf("build selection auth: %v", err)
+	}
+	locked := cloneJSON(table)
+	locked.PendingTurnMenu.SelectedCandidateHash = bundle.CandidateHash
+	locked.PendingTurnMenu.SelectionAuth = cloneJSON(&auth)
+	locked.PendingTurnMenu.LockedAt = nowISO()
+	locked.PendingTurnMenu.SettlementDeadlineAt = addMillis(locked.PendingTurnMenu.LockedAt, host.selectionSettlementTimeoutMSForTable(locked))
+	selectedBundle := cloneJSON(bundle)
+	locked.PendingTurnMenu.SelectedBundle = &selectedBundle
+	settlementRequest, err := host.buildActionSettlementRequest(locked)
+	if err != nil {
+		t.Fatalf("build action settlement request: %v", err)
+	}
+
+	refreshed := cloneJSON(locked)
+	refreshed.PendingTurnMenu.SettledRequest = cloneJSON(&settlementRequest)
+	if !actionRetryStateChanged(locked, refreshed) {
+		t.Fatal("expected persisted settled request progress to trigger an action retry")
+	}
+}
+
+func TestSendActionReturnsStaleWhenDifferentCandidateIsAlreadyLocked(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	lockedAction := aggressiveActionForTable(t, guestTable)
+	staleAction := passiveActionForTable(t, guestTable)
+	if reflect.DeepEqual(lockedAction, staleAction) {
+		t.Fatalf("expected distinct guest actions for stale-lock test, got %+v", lockedAction)
+	}
+
+	selection, err := guest.buildActionSelectionRequest(guestTable, lockedAction)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	lockResponse, err := host.handleActionSelectionFromPeer(selection)
+	if err != nil {
+		t.Fatalf("lock guest action: %v", err)
+	}
+	if err := guest.acceptRemoteTable(lockResponse.Table); err != nil {
+		t.Fatalf("guest accept locked table: %v", err)
+	}
+
+	if _, err := guest.SendAction(tableID, staleAction); err == nil || !strings.Contains(err.Error(), "different candidate") {
+		t.Fatalf("expected stale send action to stop on the conflicting locked candidate, got %v", err)
 	}
 }
 
