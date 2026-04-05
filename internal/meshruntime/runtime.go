@@ -1287,7 +1287,7 @@ func (runtime *meshRuntime) driveActionLockStage(tableID string, action game.Act
 
 		selection, buildErr := runtime.buildActionSelectionRequest(*table, action)
 		if buildErr != nil {
-			if strings.Contains(buildErr.Error(), "turn menu is not available") && table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
+			if isTurnMenuUnavailableError(buildErr) && table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 				if err := runtime.ensureLocalTurnMenu(tableID); err != nil {
 					return nil, err
 				}
@@ -1318,7 +1318,7 @@ func (runtime *meshRuntime) driveActionLockStage(tableID string, action game.Act
 		if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 			lockResponse, err = runtime.handleActionSelectionFromPeer(selection)
 		} else {
-			lockResponse, err = runtime.remoteAction(table.CurrentHost.Peer.PeerURL, selection)
+			lockResponse, err = runtime.remoteAction(runtime.currentHostPeerURL(*table), selection)
 		}
 		if err == nil && table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
 			if acceptErr := runtime.acceptRemoteTable(lockResponse.Table); acceptErr != nil {
@@ -1388,7 +1388,8 @@ func (runtime *meshRuntime) driveActionSettlementStage(tableID string, settlemen
 		if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 			settlementResponse, err = runtime.handleActionSettlementFromPeer(settlementRequest)
 		} else {
-			settlementResponse, err = runtime.remoteActionSettlement(table.CurrentHost.Peer.PeerURL, settlementRequest)
+			peerURL := runtime.currentHostPeerURL(*table)
+			settlementResponse, err = runtime.remoteActionSettlement(peerURL, settlementRequest)
 		}
 		if err == nil && table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
 			if acceptErr := runtime.acceptRemoteTable(settlementResponse.Table); acceptErr != nil {
@@ -2054,9 +2055,21 @@ func isRetryableActionResponseStateError(err error) bool {
 		strings.Contains(message, "accepted history would roll back table snapshots") ||
 		strings.Contains(message, "accepted active hand transcript would roll back") ||
 		strings.Contains(message, "ready public state latest event hash does not match accepted event history") ||
-		strings.Contains(message, "turn menu is unavailable for the current table state") ||
+		isTurnMenuUnavailableMessage(message) ||
 		strings.Contains(message, "this turn does not have a locked action") ||
 		strings.Contains(message, "locked action already has a different persisted settled transition")
+}
+
+func isTurnMenuUnavailableMessage(message string) bool {
+	return strings.Contains(message, "turn menu is unavailable") ||
+		strings.Contains(message, "turn menu is not available")
+}
+
+func isTurnMenuUnavailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isTurnMenuUnavailableMessage(err.Error())
 }
 
 type pendingTurnPublicationStage string
@@ -2137,7 +2150,7 @@ func pendingTurnHasLockedCandidate(table nativeTableState) bool {
 }
 
 func pendingTurnAllowsUnlockedResolution(table nativeTableState) bool {
-	return pendingTurnStageForTable(table) == pendingTurnStageUnlocked
+	return tableHasActionableTurn(table) && !pendingTurnHasLockedCandidate(table)
 }
 
 func actionAcceptedProgressSnapshot(table nativeTableState) actionAcceptedProgress {
@@ -2203,7 +2216,7 @@ func actionFailureReasonCode(err error) string {
 		return "epoch_mismatch"
 	case strings.Contains(message, "must be sent to the current host"), strings.Contains(message, "host mismatch"):
 		return "stale_host"
-	case strings.Contains(message, "turn menu is unavailable"):
+	case isTurnMenuUnavailableMessage(message):
 		return "turn_menu_unavailable"
 	case strings.Contains(message, "turn challenge is open"):
 		return "turn_challenge_open"
@@ -2220,6 +2233,19 @@ func actionFailureReasonCode(err error) string {
 	default:
 		return "semantic_validation"
 	}
+}
+
+func sendActionFailureAllowsFailover(failure sendActionFailure) bool {
+	switch failure.Class {
+	case sendActionFailureRetryableHost:
+		return true
+	case sendActionFailureRetryableState:
+		switch failure.Reason {
+		case "stale_host", "custody_mismatch", "epoch_mismatch":
+			return true
+		}
+	}
+	return false
 }
 
 func classifySendActionFailure(err error) sendActionFailure {
@@ -2411,10 +2437,11 @@ func (runtime *meshRuntime) refreshActionStageFromHost(tableID string, table *na
 	if table == nil {
 		return nil
 	}
-	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() || strings.TrimSpace(table.CurrentHost.Peer.PeerURL) == "" {
+	peerURL := runtime.currentHostPeerURL(*table)
+	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() || peerURL == "" {
 		return table
 	}
-	remote, err := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
+	remote, err := runtime.fetchRemoteTable(peerURL, tableID)
 	if err != nil || remote == nil {
 		return table
 	}
@@ -2463,7 +2490,7 @@ func (runtime *meshRuntime) maybeRetryActionStage(tableID string, stage sendActi
 	if actionRetryStateChanged(table, refreshed) || before != actionAcceptedProgressSnapshot(refreshed) {
 		return true, nil, nil
 	}
-	if failure.Class != sendActionFailureRetryableHost {
+	if !sendActionFailureAllowsFailover(failure) {
 		return false, nil, originalErr
 	}
 	if !runtime.shouldHandleFailover(refreshed) {
@@ -5743,6 +5770,16 @@ func (runtime *meshRuntime) knownPeerURL(peerID string) string {
 		}
 	}
 	return ""
+}
+
+func (runtime *meshRuntime) currentHostPeerURL(table nativeTableState) string {
+	peerID := strings.TrimSpace(table.CurrentHost.Peer.PeerID)
+	if peerID != "" {
+		if peerURL := strings.TrimSpace(runtime.knownPeerURL(peerID)); peerURL != "" {
+			return peerURL
+		}
+	}
+	return strings.TrimSpace(table.CurrentHost.Peer.PeerURL)
 }
 
 func (runtime *meshRuntime) unsignedActionRequest(table nativeTableState, action game.Action) (nativeActionRequest, error) {

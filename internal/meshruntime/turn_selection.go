@@ -745,9 +745,6 @@ func (runtime *meshRuntime) publishLockedActionTransitionLocked(table *nativeTab
 			return false, err
 		}
 	}
-	if err := runtime.advanceHandProtocolLocked(table); err != nil {
-		return false, err
-	}
 	return true, nil
 }
 

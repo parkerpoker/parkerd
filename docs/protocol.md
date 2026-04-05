@@ -326,6 +326,13 @@ Ordinary turn resolution has four explicit steps:
 3. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material.
 4. The host validates that signed settled transition against the locked bundle, persists the exact settled request in pending-turn state until publication, and publishes the accepted `action` transition.
 
+`meshSendAction` drives those two action stages explicitly:
+
+- stage A locks the acting player's chosen candidate
+- stage B publishes the exact settled locked transition
+- after retryable stale-state or host-liveness failures, the actor refreshes accepted state from the current host and known participants before deciding whether failover is eligible
+- the call stops as soon as accepted history already contains the exact lock, the exact published transition, or a newer accepted turn state makes the request stale
+
 `SelectionAuth` binds:
 
 - table id
@@ -379,6 +386,8 @@ Successor-host locked-turn ordering is a protocol invariant:
 2. otherwise, if `settlementDeadlineAt` has expired, settle the locked `selectedBundle`
 3. only still-unlocked turns may open challenge or use the deterministic ordinary timeout successor
 4. when an unlocked acting player disappears, that deterministic timeout successor remains the existing `fold-or-check` rule rather than an always-fold rule
+
+That publication/settlement work happens before ordinary continuation work such as rebuilding the next turn menu or advancing the next protocol phase. A successor host never needs sibling candidate bundles to finish a locked action.
 
 Escape maturity depends on the CSV type:
 

@@ -92,6 +92,8 @@ For ordinary betting turns, the acting player chooses exactly one candidate by s
 
 The host validates that signature, locks that exact candidate, persists the selected bundle in replicated pending-turn state, and acknowledges the lock with `ActionLockedAck`. The acting player then settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness data. The host persists that exact settled request in pending-turn state until publication. Accepted custody history still advances only after the fully witnessed transition is replay-valid.
 
+For ordinary heads-up turns, that means a dead or ignoring host can delay the protocol but cannot strand a valid locked action between selection and publication forever: the actor retries against refreshed accepted state, and once failover is eligible the successor host can publish the exact persisted settled request or, after `settlementDeadlineAt`, settle the replicated selected bundle.
+
 Runtime guarantee:
 
 - `action` successors exact-match the locally derived next custody state, including `ActionDeadlineAt`, `ChallengeAnchor`, `TranscriptRoot`, and the derived public money state hash, using the latest accepted custody state plus the signed `nativeActionRequest`
@@ -248,6 +250,7 @@ If the host disappears mid-hand:
 - if the turn is locked and the acting player already settled, the successor publishes that exact persisted settled transition first
 - if the turn is locked and the acting player disappears before settlement, the successor waits until `settlementDeadlineAt` and then settles the replicated selected bundle
 - if the turn is locked and neither of those conditions holds yet, the successor preserves the lock state and waits
+- that locked-action publish/settle step happens before later continuation work, so a failed next-turn menu build does not rewrite or replace the already locked action
 - only an unlocked acting-player disappearance uses the existing deterministic `fold-or-check` timeout successor
 - if timeout logic resolves the hand, the missing player can become dead for the contested pots without losing uncontested stack
 
