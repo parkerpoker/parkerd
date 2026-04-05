@@ -2235,7 +2235,7 @@ func actionFailureReasonCode(err error) string {
 	}
 }
 
-func sendActionFailureAllowsFailover(failure sendActionFailure) bool {
+func sendActionFailureAllowsFailover(stage sendActionStage, failure sendActionFailure) bool {
 	switch failure.Class {
 	case sendActionFailureRetryableHost:
 		return true
@@ -2243,6 +2243,8 @@ func sendActionFailureAllowsFailover(failure sendActionFailure) bool {
 		switch failure.Reason {
 		case "stale_host", "custody_mismatch", "epoch_mismatch":
 			return true
+		case "turn_menu_unavailable":
+			return stage == sendActionStageLock
 		}
 	}
 	return false
@@ -2490,7 +2492,7 @@ func (runtime *meshRuntime) maybeRetryActionStage(tableID string, stage sendActi
 	if actionRetryStateChanged(table, refreshed) || before != actionAcceptedProgressSnapshot(refreshed) {
 		return true, nil, nil
 	}
-	if !sendActionFailureAllowsFailover(failure) {
+	if !sendActionFailureAllowsFailover(stage, failure) {
 		return false, nil, originalErr
 	}
 	if !runtime.shouldHandleFailover(refreshed) {

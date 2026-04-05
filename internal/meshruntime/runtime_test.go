@@ -6096,6 +6096,184 @@ func TestHandleActionSelectionRejectsSelectionAuthCandidateMismatch(t *testing.T
 	}
 }
 
+func resignActionSelectionRequestForTest(t *testing.T, signer *meshRuntime, request nativeActionChooseRequest, signedAt string) nativeActionChooseRequest {
+	t.Helper()
+
+	resigned := cloneJSON(request)
+	resigned.SelectionAuth.SignedAt = signedAt
+	signatureHex, err := settlementcore.SignStructuredData(signer.walletID.PrivateKeyHex, selectionAuthPayload(resigned.SelectionAuth))
+	if err != nil {
+		t.Fatalf("re-sign selection auth: %v", err)
+	}
+	resigned.SelectionAuth.SignatureHex = signatureHex
+	return resigned
+}
+
+func resignActionSettlementRequestForTest(t *testing.T, signer *meshRuntime, request nativeActionSettlementRequest, signedAt string) nativeActionSettlementRequest {
+	t.Helper()
+
+	resigned := cloneJSON(request)
+	resigned.SignedAt = signedAt
+	signatureHex, err := settlementcore.SignStructuredData(signer.walletID.PrivateKeyHex, actionSettlementRequestPayload(resigned))
+	if err != nil {
+		t.Fatalf("re-sign action settlement request: %v", err)
+	}
+	resigned.SignatureHex = signatureHex
+	return resigned
+}
+
+func assertPendingTurnLockedStateEqual(t *testing.T, got *NativePendingTurnMenu, want NativePendingTurnMenu) {
+	t.Helper()
+
+	if got == nil {
+		t.Fatal("expected pending turn menu in locked-state comparison")
+	}
+	if got.SelectedCandidateHash != want.SelectedCandidateHash {
+		t.Fatalf("expected selected candidate %q, got %q", want.SelectedCandidateHash, got.SelectedCandidateHash)
+	}
+	if got.LockedAt != want.LockedAt {
+		t.Fatalf("expected locked-at %q, got %q", want.LockedAt, got.LockedAt)
+	}
+	if got.SettlementDeadlineAt != want.SettlementDeadlineAt {
+		t.Fatalf("expected settlement deadline %q, got %q", want.SettlementDeadlineAt, got.SettlementDeadlineAt)
+	}
+	if !reflect.DeepEqual(got.SelectionAuth, want.SelectionAuth) {
+		t.Fatalf("expected selection auth %+v, got %+v", want.SelectionAuth, got.SelectionAuth)
+	}
+	if !reflect.DeepEqual(got.SelectedBundle, want.SelectedBundle) {
+		t.Fatalf("expected selected bundle %+v, got %+v", want.SelectedBundle, got.SelectedBundle)
+	}
+	if !reflect.DeepEqual(got.SettledRequest, want.SettledRequest) {
+		t.Fatalf("expected settled request %+v, got %+v", want.SettledRequest, got.SettledRequest)
+	}
+}
+
+func TestHandleActionSelectionDuplicateRequestPreservesExistingLockState(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	selection, err := guest.buildActionSelectionRequest(guestTable, action)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	lockResponse, err := host.handleActionSelectionFromPeer(selection)
+	if err != nil {
+		t.Fatalf("lock guest action: %v", err)
+	}
+	if err := guest.acceptRemoteTable(lockResponse.Table); err != nil {
+		t.Fatalf("guest accept locked table: %v", err)
+	}
+
+	locked := mustReadNativeTable(t, host, tableID)
+	if locked.PendingTurnMenu == nil {
+		t.Fatal("expected locked pending turn menu before duplicate selection retry")
+	}
+	if cache, err := host.loadLocalTurnBundleCache(locked); err != nil {
+		t.Fatalf("load host turn bundle cache after initial lock: %v", err)
+	} else if cache != nil {
+		t.Fatalf("expected host to clear local turn bundle cache after initial lock, got %+v", cache)
+	}
+	beforeMenu := cloneJSON(*locked.PendingTurnMenu)
+
+	resend := resignActionSelectionRequestForTest(t, guest, selection, addMillis(selection.SelectionAuth.SignedAt, 1))
+	if resend.SelectionAuth.SignedAt == beforeMenu.SelectionAuth.SignedAt {
+		t.Fatal("expected duplicate selection retry to carry a different auth envelope")
+	}
+
+	duplicateResponse, err := host.handleActionSelectionFromPeer(resend)
+	if err != nil {
+		t.Fatalf("duplicate selection retry should be idempotent, got %v", err)
+	}
+
+	after := mustReadNativeTable(t, host, tableID)
+	if !reflect.DeepEqual(after.PendingTurnMenu, &beforeMenu) {
+		t.Fatalf("expected duplicate selection retry to preserve locked turn state, got %+v want %+v", after.PendingTurnMenu, beforeMenu)
+	}
+	if duplicateResponse.LockedAck.LockedAt != beforeMenu.LockedAt {
+		t.Fatalf("expected duplicate selection retry to reuse locked-at %q, got %q", beforeMenu.LockedAt, duplicateResponse.LockedAck.LockedAt)
+	}
+	assertPendingTurnLockedStateEqual(t, duplicateResponse.Table.PendingTurnMenu, beforeMenu)
+}
+
+func TestHandleActionSelectionDuplicateRequestPreservesSettledRequest(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	selection, err := guest.buildActionSelectionRequest(guestTable, action)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	lockResponse, err := host.handleActionSelectionFromPeer(selection)
+	if err != nil {
+		t.Fatalf("lock guest action: %v", err)
+	}
+	if err := guest.acceptRemoteTable(lockResponse.Table); err != nil {
+		t.Fatalf("guest accept locked table: %v", err)
+	}
+
+	guestLocked := mustReadNativeTable(t, guest, tableID)
+	settlementRequest, err := guest.buildActionSettlementRequest(guestLocked)
+	if err != nil {
+		t.Fatalf("build settlement request: %v", err)
+	}
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.PendingTurnMenu.SettledRequest = cloneJSON(&settlementRequest)
+		return host.persistLocalTable(table, false)
+	}); err != nil {
+		t.Fatalf("persist settled request before duplicate selection retry: %v", err)
+	}
+
+	before := mustReadNativeTable(t, host, tableID)
+	if before.PendingTurnMenu == nil || before.PendingTurnMenu.SettledRequest == nil {
+		t.Fatalf("expected persisted settled request before duplicate selection retry, got %+v", before.PendingTurnMenu)
+	}
+	if cache, err := host.loadLocalTurnBundleCache(before); err != nil {
+		t.Fatalf("load host turn bundle cache after settled request persistence: %v", err)
+	} else if cache != nil {
+		t.Fatalf("expected host to keep local turn bundle cache cleared after settled request persistence, got %+v", cache)
+	}
+	beforeMenu := cloneJSON(*before.PendingTurnMenu)
+
+	resend := resignActionSelectionRequestForTest(t, guest, selection, addMillis(selection.SelectionAuth.SignedAt, 1))
+	if resend.SelectionAuth.SignedAt == beforeMenu.SelectionAuth.SignedAt {
+		t.Fatal("expected duplicate settled selection retry to carry a different auth envelope")
+	}
+
+	duplicateResponse, err := host.handleActionSelectionFromPeer(resend)
+	if err != nil {
+		t.Fatalf("duplicate selection retry after settlement persistence should be idempotent, got %v", err)
+	}
+
+	after := mustReadNativeTable(t, host, tableID)
+	if !reflect.DeepEqual(after.PendingTurnMenu, &beforeMenu) {
+		t.Fatalf("expected duplicate selection retry after settlement persistence to preserve locked turn state, got %+v want %+v", after.PendingTurnMenu, beforeMenu)
+	}
+	if duplicateResponse.LockedAck.LockedAt != beforeMenu.LockedAt {
+		t.Fatalf("expected duplicate settled selection retry to reuse locked-at %q, got %q", beforeMenu.LockedAt, duplicateResponse.LockedAck.LockedAt)
+	}
+	assertPendingTurnLockedStateEqual(t, duplicateResponse.Table.PendingTurnMenu, beforeMenu)
+}
+
 func TestHandleActionSettlementRejectsForgedActingPlayerSignature(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -6138,6 +6316,87 @@ func TestHandleActionSettlementRejectsForgedActingPlayerSignature(t *testing.T) 
 
 	if _, err := host.handleActionSettlementFromPeer(forged); err == nil || !strings.Contains(err.Error(), "action settlement signature is invalid") {
 		t.Fatalf("expected forged action settlement signature to be rejected, got %v", err)
+	}
+}
+
+func TestHandleActionSettlementDuplicateRequestReusesPersistedEnvelope(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	guestTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	action := aggressiveActionForTable(t, guestTable)
+	selection, err := guest.buildActionSelectionRequest(guestTable, action)
+	if err != nil {
+		t.Fatalf("build guest action selection request: %v", err)
+	}
+	lockResponse, err := host.handleActionSelectionFromPeer(selection)
+	if err != nil {
+		t.Fatalf("lock guest action: %v", err)
+	}
+	if err := guest.acceptRemoteTable(lockResponse.Table); err != nil {
+		t.Fatalf("guest accept locked table: %v", err)
+	}
+
+	guestLocked := mustReadNativeTable(t, guest, tableID)
+	settlementRequest, err := guest.buildActionSettlementRequest(guestLocked)
+	if err != nil {
+		t.Fatalf("build settlement request: %v", err)
+	}
+
+	host.afterActionSettlementPersistHook = func(table nativeTableState, request nativeActionSettlementRequest) error {
+		host.afterActionSettlementPersistHook = nil
+		return errors.New("stop after settlement persist")
+	}
+	if _, err := host.handleActionSettlementFromPeer(settlementRequest); err == nil || !strings.Contains(err.Error(), "stop after settlement persist") {
+		t.Fatalf("expected first settlement attempt to stop after persist, got %v", err)
+	}
+
+	persisted := mustReadNativeTable(t, host, tableID)
+	if persisted.PendingTurnMenu == nil || persisted.PendingTurnMenu.SettledRequest == nil {
+		t.Fatalf("expected settled request to persist before duplicate resend, got %+v", persisted.PendingTurnMenu)
+	}
+	savedRequest := cloneJSON(*persisted.PendingTurnMenu.SettledRequest)
+	if !reflect.DeepEqual(savedRequest, settlementRequest) {
+		t.Fatalf("expected first persisted settlement request to match the original envelope, got %+v want %+v", savedRequest, settlementRequest)
+	}
+	beforeTransitions := len(persisted.CustodyTransitions)
+
+	resend := resignActionSettlementRequestForTest(t, guest, settlementRequest, addMillis(settlementRequest.SignedAt, 1))
+	if resend.SignedAt == savedRequest.SignedAt {
+		t.Fatal("expected duplicate settlement resend to carry a different signed-at value")
+	}
+	if actionSettlementTransitionHash(resend) != actionSettlementTransitionHash(savedRequest) {
+		t.Fatalf("expected duplicate settlement resend to preserve transition hash %s, got %s", actionSettlementTransitionHash(savedRequest), actionSettlementTransitionHash(resend))
+	}
+
+	secondPersisted := false
+	host.afterActionSettlementPersistHook = func(table nativeTableState, request nativeActionSettlementRequest) error {
+		secondPersisted = true
+		return nil
+	}
+	if _, err := host.handleActionSettlementFromPeer(resend); err != nil {
+		t.Fatalf("duplicate settlement resend should reuse the persisted envelope, got %v", err)
+	}
+	if secondPersisted {
+		t.Fatal("expected duplicate settlement resend to skip rewriting the persisted settlement request")
+	}
+
+	after := mustReadNativeTable(t, host, tableID)
+	if len(after.CustodyTransitions) != beforeTransitions+1 {
+		t.Fatalf("expected duplicate settlement resend to publish exactly one custody transition, got %d want %d", len(after.CustodyTransitions), beforeTransitions+1)
+	}
+	lastTransition := after.CustodyTransitions[len(after.CustodyTransitions)-1]
+	if lastTransition.Proof.TransitionHash != savedRequest.Transition.Proof.TransitionHash {
+		t.Fatalf("expected duplicate settlement resend to publish persisted transition %s, got %s", savedRequest.Transition.Proof.TransitionHash, lastTransition.Proof.TransitionHash)
+	}
+	if !reflect.DeepEqual(lastTransition.Proof.SettlementWitness, savedRequest.Transition.Proof.SettlementWitness) {
+		t.Fatalf("expected duplicate settlement resend to preserve the persisted settlement witness, got %+v want %+v", lastTransition.Proof.SettlementWitness, savedRequest.Transition.Proof.SettlementWitness)
 	}
 }
 
@@ -6666,7 +6925,7 @@ func TestRetryableLockMismatchResyncsWithoutFailover(t *testing.T) {
 	}
 }
 
-func TestMaybeRetryActionStageFailsOverWhenMismatchPersistsWithoutAcceptedProgress(t *testing.T) {
+func TestMaybeRetryActionStageFailsOverWhenRetryableLockFailurePersistsWithoutAcceptedProgress(t *testing.T) {
 	testCases := []struct {
 		name string
 		err  string
@@ -6674,6 +6933,7 @@ func TestMaybeRetryActionStageFailsOverWhenMismatchPersistsWithoutAcceptedProgre
 		{name: "epoch-mismatch", err: "selection auth epoch mismatch"},
 		{name: "custody-mismatch", err: "selection auth prev custody mismatch"},
 		{name: "stale-host", err: "action request must be sent to the current host"},
+		{name: "turn-menu-unavailable", err: "turn menu is not available for the current action"},
 	}
 
 	for _, testCase := range testCases {
