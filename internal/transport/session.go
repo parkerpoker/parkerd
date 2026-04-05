@@ -347,18 +347,38 @@ func (s *OutboundSession) RoundTrip(request TransportEnvelope, timeout time.Dura
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
+	return s.awaitRoundTripResponse(respCh, timer, timeout)
+}
+
+func (s *OutboundSession) awaitRoundTripResponse(respCh <-chan TransportEnvelope, timer *time.Timer, timeout time.Duration) (TransportEnvelope, error) {
 	select {
 	case resp := <-respCh:
-		if resp.MessageID == "" && resp.MessageType == "" {
-			return TransportEnvelope{}, &TransportError{Kind: ErrKindSessionReset, PeerURL: s.peerURL, Detail: "session closed while waiting"}
-		}
-		return resp, nil
+		return s.finishRoundTripResponse(resp)
 	case <-timer.C:
 		s.Close()
 		return TransportEnvelope{}, &TransportError{Kind: ErrKindRequestTimeout, PeerURL: s.peerURL, Detail: fmt.Sprintf("timeout after %s", timeout)}
 	case <-s.closeCh:
-		return TransportEnvelope{}, &TransportError{Kind: ErrKindSessionClosed, PeerURL: s.peerURL}
+		select {
+		case resp := <-respCh:
+			return s.finishRoundTripResponse(resp)
+		default:
+		}
+		return TransportEnvelope{}, s.pendingCloseError("session closed while waiting")
 	}
+}
+
+func (s *OutboundSession) finishRoundTripResponse(resp TransportEnvelope) (TransportEnvelope, error) {
+	if resp.MessageID == "" && resp.MessageType == "" {
+		return TransportEnvelope{}, s.pendingCloseError("session closed while waiting")
+	}
+	return resp, nil
+}
+
+func (s *OutboundSession) pendingCloseError(detail string) error {
+	if closeErr, ok := s.closeErr.Load().(error); ok && closeErr != nil {
+		return &TransportError{Kind: ErrKindSessionReset, PeerURL: s.peerURL, Detail: detail, Cause: closeErr}
+	}
+	return &TransportError{Kind: ErrKindSessionClosed, PeerURL: s.peerURL, Detail: detail}
 }
 
 func (s *OutboundSession) writeFrame(envelope TransportEnvelope) error {

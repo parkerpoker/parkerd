@@ -108,6 +108,88 @@ func TestExchangePeerTransportV3UsesVersion3EndToEnd(t *testing.T) {
 	}
 }
 
+func TestFetchPeerInfoUsesV2OneShotWireVersion(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	peerURL := "parker://" + listener.Addr().String()
+	advertisedPeer := host.self
+	advertisedPeer.Peer.PeerURL = peerURL
+
+	serverErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.Close()
+
+		line, err := readTrimmedLine(bufio.NewReader(conn))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		var request transportpkg.TransportEnvelope
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			serverErr <- err
+			return
+		}
+		if request.MessageType != nativeTransportMessagePeerProbe {
+			serverErr <- fmt.Errorf("unexpected discovery request type %q", request.MessageType)
+			return
+		}
+		if request.TransportWireVersion != nativeTransportOneShotWireVersion {
+			serverErr <- fmt.Errorf("discovery request wire version: got %d, want %d", request.TransportWireVersion, nativeTransportOneShotWireVersion)
+			return
+		}
+
+		body, err := json.Marshal(advertisedPeer)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		response, err := host.buildEnvelope(nativeTransportMessagePeerManifest, nativeTransportChannelDiscovery, "", "", body, nil, request.MessageID)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		response, err = host.signEnvelopeForWireVersion(response, nativeTransportOneShotWireVersion)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		data, err := json.Marshal(response)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if _, err := conn.Write(append(data, '\n')); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	peerInfo, err := guest.fetchPeerInfo(peerURL)
+	if err != nil {
+		t.Fatalf("fetch peer info: %v", err)
+	}
+	if peerInfo.Peer.PeerURL != peerURL {
+		t.Fatalf("peer url: got %q, want %q", peerInfo.Peer.PeerURL, peerURL)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("v2 discovery server: %v", err)
+	}
+}
+
 func TestExchangePeerTransportV3RejectsWireDowngrade(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
@@ -172,6 +254,11 @@ func TestExchangePeerTransportV3RejectsWireDowngrade(t *testing.T) {
 			serverErr <- err
 			return
 		}
+		response, err = host.signEnvelopeForWireVersion(response, nativeTransportOneShotWireVersion)
+		if err != nil {
+			serverErr <- err
+			return
+		}
 		if err := transportpkg.WriteV3Response(conn, noise, response, 5*time.Second); err != nil {
 			serverErr <- err
 			return
@@ -201,6 +288,166 @@ func TestExchangePeerTransportV3RejectsWireDowngrade(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("downgrade test server: %v", err)
+	}
+}
+
+func TestExchangePeerTransportAutoFallsBackToV2WireVersionAfterManifestDowngrade(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	peerURL := "parker://" + listener.Addr().String()
+	advertisedPeer := host.self
+	advertisedPeer.Peer.PeerURL = peerURL
+	downgradedPeer := advertisedPeer
+	downgradedPeer.TransportWireVersion = nativeTransportOneShotWireVersion
+
+	staticPrivBytes, err := hex.DecodeString(host.transportPrivate)
+	if err != nil {
+		t.Fatalf("decode host transport private key: %v", err)
+	}
+	staticPubBytes, err := hex.DecodeString(host.transportPublic)
+	if err != nil {
+		t.Fatalf("decode host transport public key: %v", err)
+	}
+
+	var manifestRequests atomic.Int32
+	var v3Requests atomic.Int32
+	var fallbackV2Requests atomic.Int32
+	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			if err := func() error {
+				defer conn.Close()
+
+				preface := make([]byte, transportpkg.V3PrefaceLen())
+				n, readErr := io.ReadFull(conn, preface)
+				if readErr == nil && n == transportpkg.V3PrefaceLen() && transportpkg.IsV3Preface(preface) {
+					noise, err := transportpkg.AcceptV3Session(conn, staticPrivBytes, staticPubBytes, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					request, err := transportpkg.ReadV3Request(conn, noise, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					v3Requests.Add(1)
+					response, err := host.buildEnvelope(request.MessageType+".response", request.Channel, request.TableID, "", []byte(`{}`), nil, request.MessageID)
+					if err != nil {
+						return err
+					}
+					response, err = host.signEnvelopeForWireVersion(response, nativeTransportOneShotWireVersion)
+					if err != nil {
+						return err
+					}
+					return transportpkg.WriteV3Response(conn, noise, response, 5*time.Second)
+				}
+
+				reader := bufio.NewReader(io.MultiReader(strings.NewReader(string(preface[:n])), conn))
+				line, err := readTrimmedLine(reader)
+				if err != nil {
+					return err
+				}
+				var request transportpkg.TransportEnvelope
+				if err := json.Unmarshal([]byte(line), &request); err != nil {
+					return err
+				}
+				if request.MessageType == nativeTransportMessagePeerProbe {
+					manifestCount := manifestRequests.Add(1)
+					manifest := advertisedPeer
+					if manifestCount > 1 {
+						manifest = downgradedPeer
+					}
+					body, err := json.Marshal(manifest)
+					if err != nil {
+						return err
+					}
+					response, err := host.buildEnvelope(nativeTransportMessagePeerManifest, nativeTransportChannelDiscovery, "", "", body, nil, request.MessageID)
+					if err != nil {
+						return err
+					}
+					response, err = host.signEnvelopeForWireVersion(response, nativeTransportOneShotWireVersion)
+					if err != nil {
+						return err
+					}
+					data, err := json.Marshal(response)
+					if err != nil {
+						return err
+					}
+					_, err = conn.Write(append(data, '\n'))
+					return err
+				}
+
+				fallbackV2Requests.Add(1)
+				if request.TransportWireVersion != nativeTransportOneShotWireVersion {
+					return fmt.Errorf("fallback request wire version: got %d, want %d", request.TransportWireVersion, nativeTransportOneShotWireVersion)
+				}
+				response, err := host.buildEnvelope(request.MessageType+".response", request.Channel, request.TableID, "", []byte(`{}`), nil, request.MessageID)
+				if err != nil {
+					return err
+				}
+				response, err = host.signEnvelopeForWireVersion(response, nativeTransportOneShotWireVersion)
+				if err != nil {
+					return err
+				}
+				data, err := json.Marshal(response)
+				if err != nil {
+					return err
+				}
+				_, err = conn.Write(append(data, '\n'))
+				return err
+			}(); err != nil {
+				select {
+				case serverErr <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	response, requestKey, err := guest.exchangePeerTransportAuto(peerURL, func(peerInfo nativePeerSelf) (transportpkg.TransportEnvelope, string, error) {
+		return guest.newOutboundEnvelope("test.rpc", nativeTransportChannelTable, "table-1", peerInfo.Peer.PeerID, map[string]any{"ok": true}, "")
+	})
+	if err != nil {
+		t.Fatalf("send auto request with downgrade fallback: %v", err)
+	}
+	if response.TransportWireVersion != nativeTransportOneShotWireVersion {
+		t.Fatalf("fallback response wire version: got %d, want %d", response.TransportWireVersion, nativeTransportOneShotWireVersion)
+	}
+	if _, err := guest.decodeResponseEnvelope(response, requestKey); err != nil {
+		t.Fatalf("decode fallback response: %v", err)
+	}
+
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	<-serverDone
+	select {
+	case err := <-serverErr:
+		t.Fatalf("downgrade fallback server: %v", err)
+	default:
+	}
+	if v3Requests.Load() != 1 {
+		t.Fatalf("expected one downgraded v3 attempt, got %d", v3Requests.Load())
+	}
+	if manifestRequests.Load() != 2 {
+		t.Fatalf("expected initial and refreshed manifest fetches, got %d", manifestRequests.Load())
+	}
+	if fallbackV2Requests.Load() != 1 {
+		t.Fatalf("expected exactly one v2 fallback request, got %d", fallbackV2Requests.Load())
 	}
 }
 
@@ -344,6 +591,127 @@ func TestExchangePeerTransportAutoRejectsDowngradeWhenRefreshStillAdvertisesV3(t
 	}
 	if fallbackV2Requests.Load() != 0 {
 		t.Fatalf("expected downgrade to stop before v2 fallback, got %d unexpected v2 retries", fallbackV2Requests.Load())
+	}
+}
+
+func TestExchangePeerTransportAutoDoesNotRefreshManifestOnV3RequestTimeout(t *testing.T) {
+	t.Setenv("PARKER_PEER_TRANSPORT_REQUEST_TIMEOUT_MS", "200")
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	closeSessionManagersForTest(t, host, guest)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	peerURL := "parker://" + listener.Addr().String()
+	advertisedPeer := host.self
+	advertisedPeer.Peer.PeerURL = peerURL
+
+	staticPrivBytes, err := hex.DecodeString(host.transportPrivate)
+	if err != nil {
+		t.Fatalf("decode host transport private key: %v", err)
+	}
+	staticPubBytes, err := hex.DecodeString(host.transportPublic)
+	if err != nil {
+		t.Fatalf("decode host transport public key: %v", err)
+	}
+
+	var manifestRequests atomic.Int32
+	serverErr := make(chan error, 1)
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			if err := func() error {
+				defer conn.Close()
+
+				preface := make([]byte, transportpkg.V3PrefaceLen())
+				n, readErr := io.ReadFull(conn, preface)
+				if readErr == nil && n == transportpkg.V3PrefaceLen() && transportpkg.IsV3Preface(preface) {
+					noise, err := transportpkg.AcceptV3Session(conn, staticPrivBytes, staticPubBytes, 5*time.Second)
+					if err != nil {
+						return err
+					}
+					if _, err := transportpkg.ReadV3Request(conn, noise, 5*time.Second); err != nil {
+						return err
+					}
+					time.Sleep(350 * time.Millisecond)
+					return nil
+				}
+
+				reader := bufio.NewReader(io.MultiReader(strings.NewReader(string(preface[:n])), conn))
+				line, err := readTrimmedLine(reader)
+				if err != nil {
+					return err
+				}
+				var request transportpkg.TransportEnvelope
+				if err := json.Unmarshal([]byte(line), &request); err != nil {
+					return err
+				}
+				if request.MessageType != nativeTransportMessagePeerProbe {
+					return fmt.Errorf("unexpected one-shot request after timeout %q", request.MessageType)
+				}
+				if manifestRequests.Add(1) > 1 {
+					return nil
+				}
+
+				body, err := json.Marshal(advertisedPeer)
+				if err != nil {
+					return err
+				}
+				response, err := host.buildEnvelope(nativeTransportMessagePeerManifest, nativeTransportChannelDiscovery, "", "", body, nil, request.MessageID)
+				if err != nil {
+					return err
+				}
+				response, err = host.signEnvelopeForWireVersion(response, nativeTransportOneShotWireVersion)
+				if err != nil {
+					return err
+				}
+				data, err := json.Marshal(response)
+				if err != nil {
+					return err
+				}
+				_, err = conn.Write(append(data, '\n'))
+				return err
+			}(); err != nil {
+				select {
+				case serverErr <- err:
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	_, _, err = guest.exchangePeerTransportAuto(peerURL, func(peerInfo nativePeerSelf) (transportpkg.TransportEnvelope, string, error) {
+		return guest.newOutboundEnvelope("test.rpc", nativeTransportChannelTable, "table-1", peerInfo.Peer.PeerID, map[string]any{"ok": true}, "")
+	})
+	if err == nil {
+		t.Fatal("expected transport timeout")
+	}
+	if !transportpkg.IsTransportTimeout(err) {
+		t.Fatalf("expected transport timeout, got %v", err)
+	}
+
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+	<-serverDone
+	select {
+	case err := <-serverErr:
+		t.Fatalf("timeout test server: %v", err)
+	default:
+	}
+	if manifestRequests.Load() != 1 {
+		t.Fatalf("expected only the initial manifest fetch, got %d requests", manifestRequests.Load())
 	}
 }
 

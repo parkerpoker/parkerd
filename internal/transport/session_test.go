@@ -727,6 +727,31 @@ func TestEnvelopeJSONRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAwaitRoundTripResponsePrefersReadyResponseOverClosedSession(t *testing.T) {
+	session := &OutboundSession{
+		peerURL: "parker://race-peer:1234",
+		closeCh: make(chan struct{}),
+	}
+	respCh := make(chan TransportEnvelope, 1)
+	respCh <- TransportEnvelope{
+		MessageID:   "resp-race-1",
+		MessageType: "test.response",
+		RetryOf:     "race-1",
+	}
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+
+	close(session.closeCh)
+
+	resp, err := session.awaitRoundTripResponse(respCh, timer, time.Second)
+	if err != nil {
+		t.Fatalf("expected queued response to win over close notification, got %v", err)
+	}
+	if resp.MessageID != "resp-race-1" {
+		t.Fatalf("response MessageID=%q, want resp-race-1", resp.MessageID)
+	}
+}
+
 func TestSessionConcurrentRequestAndClose(t *testing.T) {
 	sm, serverPub, _, listener := testSessionPair(t, echoHandler)
 	defer listener.Close()

@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	transportpkg "github.com/parkerpoker/parkerd/internal/transport"
 )
@@ -84,9 +85,10 @@ func (runtime *meshRuntime) exchangePeerTransportV3(peerURL string, peerInfo nat
 }
 
 // exchangePeerTransportAuto attempts v3 if the peer supports it, otherwise uses v2.
-// On retry-worthy v3 errors it refreshes discovery, rebuilds the request, and
-// retries v3 first when the peer still advertises v3 support. Only peers that no
-// longer advertise v3 are downgraded to the v2 one-shot path.
+// On non-timeout v3 session failures it refreshes discovery over the v2 one-shot
+// path, rebuilds the request, and retries v3 first when the peer still advertises
+// v3 support. Plain request timeouts are returned directly so callers are not
+// blocked behind a second synchronous discovery fetch.
 func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildRequest peerTransportRequestBuilder) (transportpkg.TransportEnvelope, string, error) {
 	peerInfo, err := runtime.fetchPeerInfo(peerURL)
 	if err != nil {
@@ -102,7 +104,8 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildReque
 			return resp, requestKey, nil
 		}
 		if shouldRefreshV3Exchange(err) {
-			refreshedPeerInfo, refreshErr := runtime.fetchPeerInfoFresh(peerURL)
+			recoveryTimeout := runtime.v3RecoveryOneShotTimeout()
+			refreshedPeerInfo, refreshErr := runtime.fetchPeerInfoFreshWithTimeout(peerURL, recoveryTimeout)
 			if refreshErr != nil {
 				return transportpkg.TransportEnvelope{}, "", errors.Join(err, fmt.Errorf("refresh peer manifest: %w", refreshErr))
 			}
@@ -128,12 +131,20 @@ func (runtime *meshRuntime) exchangePeerTransportAuto(peerURL string, buildReque
 			if runtime.sessionMetrics != nil {
 				runtime.sessionMetrics.FallbackToV2Count.Add(1)
 			}
-			resp, fallbackErr := runtime.exchangePeerTransport(peerURL, retryRequest)
+			fallbackRequest, fallbackBuildErr := runtime.oneShotTransportEnvelope(retryRequest)
+			if fallbackBuildErr != nil {
+				return transportpkg.TransportEnvelope{}, "", fallbackBuildErr
+			}
+			resp, fallbackErr := runtime.exchangePeerTransportWithTimeout(peerURL, fallbackRequest, recoveryTimeout)
 			if fallbackErr != nil {
 				return transportpkg.TransportEnvelope{}, "", fallbackErr
 			}
 			return resp, retryKey, nil
 		}
+		return transportpkg.TransportEnvelope{}, "", err
+	}
+	request, err = runtime.oneShotTransportEnvelope(request)
+	if err != nil {
 		return transportpkg.TransportEnvelope{}, "", err
 	}
 	resp, err := runtime.exchangePeerTransport(peerURL, request)
@@ -153,7 +164,15 @@ func isRetryableV3SessionErr(err error) bool {
 }
 
 func shouldRefreshV3Exchange(err error) bool {
-	return isRetryableV3SessionErr(err) || transportpkg.IsWireDowngrade(err)
+	return (isRetryableV3SessionErr(err) && !transportpkg.IsTransportTimeout(err)) || transportpkg.IsWireDowngrade(err)
+}
+
+func (runtime *meshRuntime) v3RecoveryOneShotTimeout() time.Duration {
+	cfg := transportpkg.ResolveSessionConfig(runtime.config.UseTor)
+	if cfg.RequestTimeout > 0 && cfg.RequestTimeout < nativeTransportExchangeTimeout {
+		return cfg.RequestTimeout
+	}
+	return nativeTransportExchangeTimeout
 }
 
 // closeSessionManager tears down the session manager if active.

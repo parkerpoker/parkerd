@@ -60,6 +60,8 @@ const (
 	nativeTransportMessageAck                             = "ack"
 	nativeTransportMessageNack                            = "nack"
 
+	nativeTransportOneShotWireVersion = 2
+
 	nativeTransportRequestTTL      = 30 * time.Second
 	nativeTransportReadTimeout     = 10 * time.Second
 	nativeTransportWriteTimeout    = 20 * time.Second
@@ -135,7 +137,11 @@ func (runtime *meshRuntime) handlePeerTransportConnection(connection net.Conn) {
 	var request transportpkg.TransportEnvelope
 	if err := json.Unmarshal([]byte(line), &request); err != nil {
 		_ = connection.SetWriteDeadline(time.Now().Add(nativeTransportWriteTimeout))
-		_ = writeJSONLine(connection, runtime.plainNack("", err))
+		nack := runtime.plainNack("", err)
+		if signed, signErr := runtime.oneShotTransportEnvelope(nack); signErr == nil {
+			nack = signed
+		}
+		_ = writeJSONLine(connection, nack)
 		return
 	}
 
@@ -316,6 +322,10 @@ func (runtime *meshRuntime) handlePeerTransportEnvelope(request transportpkg.Tra
 }
 
 func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	return runtime.exchangePeerTransportWithTimeout(peerURL, request, nativeTransportExchangeTimeout)
+}
+
+func (runtime *meshRuntime) exchangePeerTransportWithTimeout(peerURL string, request transportpkg.TransportEnvelope, timeout time.Duration) (transportpkg.TransportEnvelope, error) {
 	if !runtime.isRunning() {
 		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
 	}
@@ -328,7 +338,7 @@ func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transp
 		return transportpkg.TransportEnvelope{}, errors.New("runtime is closed")
 	}
 
-	_ = connection.SetDeadline(time.Now().Add(nativeTransportExchangeTimeout))
+	_ = connection.SetDeadline(time.Now().Add(timeout))
 	if err := writeJSONLine(connection, request); err != nil {
 		return transportpkg.TransportEnvelope{}, err
 	}
@@ -348,14 +358,18 @@ func (runtime *meshRuntime) exchangePeerTransport(peerURL string, request transp
 }
 
 func (runtime *meshRuntime) fetchPeerInfo(peerURL string) (nativePeerSelf, error) {
-	return runtime.fetchPeerInfoWithCache(peerURL, true)
+	return runtime.fetchPeerInfoWithCache(peerURL, true, nativeTransportExchangeTimeout)
 }
 
 func (runtime *meshRuntime) fetchPeerInfoFresh(peerURL string) (nativePeerSelf, error) {
-	return runtime.fetchPeerInfoWithCache(peerURL, false)
+	return runtime.fetchPeerInfoFreshWithTimeout(peerURL, nativeTransportExchangeTimeout)
 }
 
-func (runtime *meshRuntime) fetchPeerInfoWithCache(peerURL string, allowCached bool) (nativePeerSelf, error) {
+func (runtime *meshRuntime) fetchPeerInfoFreshWithTimeout(peerURL string, timeout time.Duration) (nativePeerSelf, error) {
+	return runtime.fetchPeerInfoWithCache(peerURL, false, timeout)
+}
+
+func (runtime *meshRuntime) fetchPeerInfoWithCache(peerURL string, allowCached bool, timeout time.Duration) (nativePeerSelf, error) {
 	if allowCached {
 		if cached, ok := runtime.cachedPeerInfo(peerURL); ok {
 			return cached, nil
@@ -365,7 +379,11 @@ func (runtime *meshRuntime) fetchPeerInfoWithCache(peerURL string, allowCached b
 	if err != nil {
 		return nativePeerSelf{}, err
 	}
-	response, err := runtime.exchangePeerTransport(peerURL, request)
+	request, err = runtime.oneShotTransportEnvelope(request)
+	if err != nil {
+		return nativePeerSelf{}, err
+	}
+	response, err := runtime.exchangePeerTransportWithTimeout(peerURL, request, timeout)
 	if err != nil {
 		return nativePeerSelf{}, err
 	}
@@ -764,7 +782,14 @@ func (runtime *meshRuntime) nackFromRequest(request transportpkg.TransportEnvelo
 	if nackErr == nil {
 		return envelope
 	}
-	return runtime.plainNack(request.MessageID, err)
+	fallback := runtime.plainNack(request.MessageID, err)
+	if request.TransportWireVersion == 0 {
+		return fallback
+	}
+	if signed, signErr := runtime.signEnvelopeForWireVersion(fallback, request.TransportWireVersion); signErr == nil {
+		return signed
+	}
+	return fallback
 }
 
 func (runtime *meshRuntime) plainNack(retryOf string, err error) transportpkg.TransportEnvelope {
@@ -774,6 +799,10 @@ func (runtime *meshRuntime) plainNack(retryOf string, err error) transportpkg.Tr
 		return transportpkg.TransportEnvelope{MessageType: nativeTransportMessageNack, RetryOf: retryOf}
 	}
 	return envelope
+}
+
+func (runtime *meshRuntime) oneShotTransportEnvelope(envelope transportpkg.TransportEnvelope) (transportpkg.TransportEnvelope, error) {
+	return runtime.signEnvelopeForWireVersion(envelope, nativeTransportOneShotWireVersion)
 }
 
 func (runtime *meshRuntime) newOutboundEnvelope(messageType, channel, tableID, recipientID string, body any, recipientTransportPub string) (transportpkg.TransportEnvelope, string, error) {
@@ -815,8 +844,12 @@ func (runtime *meshRuntime) signEnvelope(envelope transportpkg.TransportEnvelope
 	return envelope, nil
 }
 
+func isSupportedTransportWireVersion(wireVersion int) bool {
+	return wireVersion == nativeTransportOneShotWireVersion || wireVersion == transportpkg.WireVersion
+}
+
 func (runtime *meshRuntime) signEnvelopeForWireVersion(envelope transportpkg.TransportEnvelope, wireVersion int) (transportpkg.TransportEnvelope, error) {
-	if wireVersion != TransportWireVersion && wireVersion != transportpkg.WireVersion {
+	if !isSupportedTransportWireVersion(wireVersion) {
 		return transportpkg.TransportEnvelope{}, fmt.Errorf("unsupported transport wire version %d", wireVersion)
 	}
 	envelope.TransportWireVersion = wireVersion
@@ -863,7 +896,7 @@ func (runtime *meshRuntime) buildEnvelope(messageType, channel, tableID, recipie
 }
 
 func (runtime *meshRuntime) decodeIncomingEnvelope(envelope transportpkg.TransportEnvelope) ([]byte, []byte, error) {
-	if envelope.TransportWireVersion != 2 && envelope.TransportWireVersion != 3 {
+	if !isSupportedTransportWireVersion(envelope.TransportWireVersion) {
 		return nil, nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
@@ -890,7 +923,7 @@ func (runtime *meshRuntime) decodeResponseEnvelope(envelope transportpkg.Transpo
 	if envelope.MessageType == nativeTransportMessageNack && strings.TrimSpace(envelope.Signature) == "" {
 		return nil, errors.New("transport request failed")
 	}
-	if envelope.TransportWireVersion != 2 && envelope.TransportWireVersion != 3 {
+	if !isSupportedTransportWireVersion(envelope.TransportWireVersion) {
 		return nil, fmt.Errorf("unsupported transport wire version %d", envelope.TransportWireVersion)
 	}
 	unsigned := rawJSONMap(envelope)
