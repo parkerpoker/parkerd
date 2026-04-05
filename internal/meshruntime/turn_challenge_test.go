@@ -153,14 +153,17 @@ func waitForPendingTurnChallenge(t *testing.T, runtimes []*meshRuntime, reader *
 	return nativeTableState{}
 }
 
-func waitForPendingTurnMenuWithChallengeEnvelope(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) nativeTableState {
+func waitForLocalTurnBundleCacheWithChallengeEnvelope(t *testing.T, runtimes []*meshRuntime, reader *meshRuntime, tableID string) (nativeTableState, *LocalTurnBundleCache) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		table := mustReadNativeTable(t, reader, tableID)
-		if turnMenuMatchesTable(table, table.PendingTurnMenu) && table.PendingTurnMenu.ChallengeEnvelope != nil {
-			return table
+		if turnMenuMatchesTable(table, table.PendingTurnMenu) {
+			cache, err := reader.loadLocalTurnBundleCache(table)
+			if err == nil && cache != nil && cache.ChallengeEnvelope != nil {
+				return table, cache
+			}
 		}
 		for _, runtime := range runtimes {
 			if runtime != nil {
@@ -170,8 +173,8 @@ func waitForPendingTurnMenuWithChallengeEnvelope(t *testing.T, runtimes []*meshR
 		time.Sleep(25 * time.Millisecond)
 	}
 	_ = mustReadNativeTable(t, reader, tableID)
-	t.Fatalf("timed out waiting for pending turn menu challenge envelope on table %s", tableID)
-	return nativeTableState{}
+	t.Fatalf("timed out waiting for local turn bundle cache challenge envelope on table %s", tableID)
+	return nativeTableState{}, nil
 }
 
 func preferredChallengeResolutionOption(menu *NativePendingTurnMenu) NativeActionMenuOption {
@@ -403,7 +406,7 @@ func TestTurnChallengeTimeoutModeDefaults(t *testing.T) {
 	}
 }
 
-func TestPendingTurnMenuCarriesDeterministicChallengeEnvelope(t *testing.T) {
+func TestPendingTurnMenuKeepsChallengeEnvelopeLocalOnlyBeforeLock(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 	bridgeHostToGuestSync(host, guest)
@@ -411,31 +414,37 @@ func TestPendingTurnMenuCarriesDeterministicChallengeEnvelope(t *testing.T) {
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 
 	hostTable := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	guestTable := waitForPendingTurnMenuWithChallengeEnvelope(t, []*meshRuntime{host, guest}, guest, tableID)
+	_, hostCache := waitForLocalTurnBundleCacheWithChallengeEnvelope(t, []*meshRuntime{host, guest}, host, tableID)
+	guestTable := mustReadNativeTable(t, guest, tableID)
 
 	if turnTimeoutModeForTable(hostTable) != turnTimeoutModeChainChallenge {
 		t.Fatalf("expected started tables to default to %q", turnTimeoutModeChainChallenge)
 	}
-	if !turnMenuMatchesTable(hostTable, hostTable.PendingTurnMenu) || hostTable.PendingTurnMenu.ChallengeEnvelope == nil {
-		t.Fatal("expected host pending turn menu to carry a challenge envelope")
+	if !turnMenuMatchesTable(hostTable, hostTable.PendingTurnMenu) || hostCache == nil || hostCache.ChallengeEnvelope == nil {
+		t.Fatal("expected host to keep the challenge envelope in its local turn bundle cache")
 	}
-	if !turnMenuMatchesTable(guestTable, guestTable.PendingTurnMenu) || guestTable.PendingTurnMenu.ChallengeEnvelope == nil {
-		t.Fatal("expected guest pending turn menu to carry a challenge envelope")
+	if !turnMenuMatchesTable(guestTable, guestTable.PendingTurnMenu) {
+		t.Fatal("expected guest to receive the compact public pending turn menu")
 	}
-
-	hostEnvelope := hostTable.PendingTurnMenu.ChallengeEnvelope
-	guestEnvelope := guestTable.PendingTurnMenu.ChallengeEnvelope
-	if !reflect.DeepEqual(*hostEnvelope, *guestEnvelope) {
-		t.Fatalf("expected peers to converge on the same challenge envelope, host=%+v guest=%+v", *hostEnvelope, *guestEnvelope)
+	if guestTable.PendingTurnMenu.ChallengeEnvelope != nil || guestTable.PendingTurnMenu.TimeoutCandidate != nil {
+		t.Fatalf("expected guest pending turn menu to omit sibling challenge bundles, got %+v", guestTable.PendingTurnMenu)
 	}
+	guestCache, err := guest.loadLocalTurnBundleCache(guestTable)
+	if err != nil {
+		t.Fatalf("load guest local turn bundle cache: %v", err)
+	}
+	if guestCache != nil {
+		t.Fatalf("expected non-acting peer to have no local turn bundle cache before lock, got %+v", guestCache)
+	}
+	hostEnvelope := hostCache.ChallengeEnvelope
 	if hostEnvelope.OpenBundle.Kind != tablecustody.TransitionKindTurnChallengeOpen {
 		t.Fatalf("expected open bundle kind %q, got %q", tablecustody.TransitionKindTurnChallengeOpen, hostEnvelope.OpenBundle.Kind)
 	}
 	if len(hostEnvelope.OpenBundle.SourceRefs) == 0 {
 		t.Fatal("expected open bundle to consume the live turn bankroll refs")
 	}
-	if len(hostEnvelope.OptionResolutionBundles) != len(hostTable.PendingTurnMenu.Candidates) {
-		t.Fatalf("expected %d option bundles, got %d", len(hostTable.PendingTurnMenu.Candidates), len(hostEnvelope.OptionResolutionBundles))
+	if len(hostEnvelope.OptionResolutionBundles) != len(hostCache.Candidates) {
+		t.Fatalf("expected %d option bundles, got %d", len(hostCache.Candidates), len(hostEnvelope.OptionResolutionBundles))
 	}
 	if hostEnvelope.TimeoutResolutionBundle.Kind != tablecustody.TransitionKindTimeout {
 		t.Fatalf("expected timeout resolution bundle kind %q, got %q", tablecustody.TransitionKindTimeout, hostEnvelope.TimeoutResolutionBundle.Kind)
@@ -514,7 +523,7 @@ func TestTurnChallengeBundlesStayPlayerOnlyWhileOrdinaryPotPathKeepsOperator(t *
 	}
 }
 
-func TestAcceptRemoteTableRejectsTamperedChallengeEnvelope(t *testing.T) {
+func TestAcceptRemoteTableStripsReplicatedChallengeEnvelope(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 	bridgeHostToGuestSync(host, guest)
@@ -530,12 +539,16 @@ func TestAcceptRemoteTableRejectsTamperedChallengeEnvelope(t *testing.T) {
 	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.AuthorizedOutputs[0].AmountSats++
 	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.BundleHash = tablecustody.HashCustodyChallengeBundle(tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
 
-	if err := guest.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "challenge") {
-		t.Fatalf("expected tampered challenge envelope to be rejected, got %v", err)
+	if err := guest.acceptRemoteTable(tampered); err != nil {
+		t.Fatalf("expected replicated challenge envelope to be stripped before acceptance, got %v", err)
+	}
+	accepted := mustReadNativeTable(t, guest, tableID)
+	if accepted.PendingTurnMenu == nil || accepted.PendingTurnMenu.ChallengeEnvelope != nil || accepted.PendingTurnMenu.TimeoutCandidate != nil {
+		t.Fatalf("expected guest to persist only the compact public pending turn menu, got %+v", accepted.PendingTurnMenu)
 	}
 }
 
-func TestAcceptRemoteTableRejectsTamperedChallengeBundleKind(t *testing.T) {
+func TestNetworkTableViewStripsChallengeBundlesBeforeLock(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")
 	bridgeHostToGuestSync(host, guest)
@@ -547,12 +560,15 @@ func TestAcceptRemoteTableRejectsTamperedChallengeBundleKind(t *testing.T) {
 		t.Fatal("expected actionable turn menu with challenge envelope")
 	}
 
-	tampered := cloneJSON(table)
-	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.Kind = tablecustody.TransitionKindAction
-	tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle.BundleHash = tablecustody.HashCustodyChallengeBundle(tampered.PendingTurnMenu.ChallengeEnvelope.OpenBundle)
-
-	if err := guest.acceptRemoteTable(tampered); err == nil || !strings.Contains(err.Error(), "kind") {
-		t.Fatalf("expected tampered challenge bundle kind to be rejected, got %v", err)
+	publicView := host.networkTableView(table, guest.walletID.PlayerID)
+	if publicView.PendingTurnMenu == nil {
+		t.Fatal("expected network table view to keep the compact pending turn menu")
+	}
+	if publicView.PendingTurnMenu.ChallengeEnvelope != nil || publicView.PendingTurnMenu.TimeoutCandidate != nil {
+		t.Fatalf("expected network table view to omit sibling challenge bundles, got %+v", publicView.PendingTurnMenu)
+	}
+	if publicView.LocalTurnBundleCache != nil {
+		t.Fatalf("expected non-acting peer network view to omit the local turn bundle cache, got %+v", publicView.LocalTurnBundleCache)
 	}
 }
 
@@ -626,7 +642,11 @@ func TestTurnChallengeOptionResolutionExecutesFromParticipant(t *testing.T) {
 	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
 	originalMenu := cloneJSON(*table.PendingTurnMenu)
 	optionID := preferredChallengeResolutionOption(table.PendingTurnMenu).OptionID
-	expectedBundle, ok := findTurnCandidateByOption(&originalMenu, optionID)
+	cache, err := host.loadLocalTurnBundleCache(table)
+	if err != nil || cache == nil {
+		t.Fatalf("load local turn bundle cache: %v", err)
+	}
+	expectedBundle, ok := findTurnCandidateByOptionFromCache(&originalMenu, cache, optionID)
 	if !ok {
 		t.Fatalf("expected option bundle %s", optionID)
 	}
@@ -674,9 +694,6 @@ func TestTurnChallengeOptionResolutionExecutesInSyntheticRealMode(t *testing.T) 
 	tableID, _ := createStartedTwoPlayerTable(t, host, guest)
 	bridgeHostToGuestSync(host, guest)
 	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
-	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu.ChallengeEnvelope == nil {
-		t.Fatal("expected actionable turn menu with challenge envelope")
-	}
 	option := preferredChallengeResolutionOption(table.PendingTurnMenu)
 
 	waitForTurnActionDeadlineToExpire(t, []*meshRuntime{host, guest}, host, tableID)
@@ -685,7 +702,10 @@ func TestTurnChallengeOptionResolutionExecutesInSyntheticRealMode(t *testing.T) 
 	}
 	waitForPendingTurnChallenge(t, []*meshRuntime{host, guest}, guest, tableID)
 
-	if _, err := guest.ResolveTurnChallenge(tableID, option.OptionID); err != nil {
+	if _, err := guest.ResolveTurnChallenge(tableID, option.OptionID); err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("expected non-acting peer to lack local challenge bundles, got %v", err)
+	}
+	if _, err := host.ResolveTurnChallenge(tableID, option.OptionID); err != nil {
 		t.Fatalf("resolve turn challenge option in synthetic-real mode: %v", err)
 	}
 	table = waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindAction)

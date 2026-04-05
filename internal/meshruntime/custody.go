@@ -236,8 +236,9 @@ func (runtime *meshRuntime) currentCustodyTranscriptBindings(table nativeTableSt
 
 func actionRequestBindingOverrides(request nativeActionRequest) *custodyBindingOverrides {
 	return &custodyBindingOverrides{
-		ChallengeAnchor: request.ChallengeAnchor,
-		TranscriptRoot:  request.TranscriptRoot,
+		ActionDeadlineAt: request.ActionDeadlineAt,
+		ChallengeAnchor:  request.ChallengeAnchor,
+		TranscriptRoot:   request.TranscriptRoot,
 	}
 }
 
@@ -261,16 +262,25 @@ func tableWithTurnDeadline(table nativeTableState, turnDeadlineAt string) native
 		ActionDeadlineAt:     turnDeadlineAt,
 		ActingPlayerID:       seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex),
 		DecisionIndex:        custodyDecisionIndex(&table.ActiveHand.State),
-		Epoch:                table.CurrentEpoch,
+		Epoch:                pendingTurnEpoch(table, table.PendingTurnMenu),
 		HandID:               table.ActiveHand.State.HandID,
 		PrevCustodyStateHash: latestCustodyStateHash(table),
-		TurnAnchorHash:       turnAnchorHash(table),
+		TurnAnchorHash:       pendingTurnAnchorHash(table, table.PendingTurnMenu),
 	}
 	return validation
 }
 
 func actionRequestValidationTable(table nativeTableState, request nativeActionRequest) nativeTableState {
-	return tableWithTurnDeadline(table, request.ActionDeadlineAt)
+	return tableWithTurnDeadline(tableWithEpoch(table, request.Epoch), request.ActionDeadlineAt)
+}
+
+func tableWithEpoch(table nativeTableState, epoch int) nativeTableState {
+	if epoch <= 0 || table.CurrentEpoch == epoch {
+		return table
+	}
+	validation := cloneJSON(table)
+	validation.CurrentEpoch = epoch
+	return validation
 }
 
 func (runtime *meshRuntime) custodyStateBinding(table nativeTableState, kind tablecustody.TransitionKind, hand *game.HoldemState, overrides *custodyBindingOverrides) tablecustody.StateBinding {

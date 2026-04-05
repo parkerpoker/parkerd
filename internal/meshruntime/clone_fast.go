@@ -261,7 +261,9 @@ func clonePendingTurnMenuFast(value NativePendingTurnMenu) NativePendingTurnMenu
 	cloned.Candidates = cloneOptionalTurnCandidateBundlesFast(value.Candidates)
 	cloned.ChallengeEnvelope = cloneChallengeEnvelopePtrFast(value.ChallengeEnvelope)
 	cloned.Options = cloneOptionalActionMenuOptionsFast(value.Options)
-	cloned.TimeoutCandidate = cloneTurnCandidateBundleFast(value.TimeoutCandidate)
+	cloned.SelectedBundle = cloneTurnCandidateBundlePtrFast(value.SelectedBundle)
+	cloned.SelectionAuth = cloneSelectionAuthPtrFast(value.SelectionAuth)
+	cloned.TimeoutCandidate = cloneTurnCandidateBundlePtrFast(value.TimeoutCandidate)
 	return cloned
 }
 
@@ -327,6 +329,22 @@ func cloneTurnCandidateBundleFast(value NativeTurnCandidateBundle) NativeTurnCan
 	cloned.Transition = cloneCustodyTransitionFast(value.Transition)
 	cloned.TreeSignerIDs = cloneOptionalStringSliceFast(value.TreeSignerIDs)
 	return cloned
+}
+
+func cloneTurnCandidateBundlePtrFast(value *NativeTurnCandidateBundle) *NativeTurnCandidateBundle {
+	if value == nil {
+		return nil
+	}
+	cloned := cloneTurnCandidateBundleFast(*value)
+	return &cloned
+}
+
+func cloneSelectionAuthPtrFast(value *tablecustody.SelectionAuth) *tablecustody.SelectionAuth {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func cloneActionRequestPtrFast(value *nativeActionRequest) *nativeActionRequest {

@@ -34,6 +34,7 @@ type nativeTablePrivateState struct {
 	AuditBundlesByHandID map[string]map[string]any         `json:"auditBundlesByHandId"`
 	MyHoleCardsByHandID  map[string][]string               `json:"myHoleCardsByHandId"`
 	SecretsByHandID      map[string]nativeLocalHandSecrets `json:"secretsByHandId"`
+	TurnBundleCaches     map[string]LocalTurnBundleCache   `json:"turnBundleCaches,omitempty"`
 }
 
 func copyOptionalInt(value *int) *int {
@@ -53,6 +54,7 @@ func (runtime *meshRuntime) readTablePrivateState(tableID string) (nativeTablePr
 		AuditBundlesByHandID: map[string]map[string]any{},
 		MyHoleCardsByHandID:  map[string][]string{},
 		SecretsByHandID:      map[string]nativeLocalHandSecrets{},
+		TurnBundleCaches:     map[string]LocalTurnBundleCache{},
 	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
 		return state, nil
@@ -69,6 +71,9 @@ func (runtime *meshRuntime) readTablePrivateState(tableID string) (nativeTablePr
 	if state.SecretsByHandID == nil {
 		state.SecretsByHandID = map[string]nativeLocalHandSecrets{}
 	}
+	if state.TurnBundleCaches == nil {
+		state.TurnBundleCaches = map[string]LocalTurnBundleCache{}
+	}
 	return state, nil
 }
 
@@ -81,6 +86,9 @@ func (runtime *meshRuntime) writeTablePrivateState(tableID string, state nativeT
 	}
 	if state.SecretsByHandID == nil {
 		state.SecretsByHandID = map[string]nativeLocalHandSecrets{}
+	}
+	if state.TurnBundleCaches == nil {
+		state.TurnBundleCaches = map[string]LocalTurnBundleCache{}
 	}
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -1957,7 +1965,7 @@ func (runtime *meshRuntime) advanceHandProtocolLocked(table *nativeTableState) e
 			changed = true
 			continue
 		}
-		if completed, err := runtime.finalizeSelectedTurnCandidateLocked(table); err != nil {
+		if completed, err := runtime.handleLockedActionSettlementTimeoutLocked(table); err != nil {
 			return err
 		} else if completed {
 			changed = true

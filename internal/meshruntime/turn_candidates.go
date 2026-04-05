@@ -33,18 +33,18 @@ func turnMenuSourceStateHash(table nativeTableState) string {
 }
 
 func turnMenuValidationTable(table nativeTableState) nativeTableState {
+	validation := tableWithEpoch(table, pendingTurnEpoch(table, table.PendingTurnMenu))
 	if !turnChallengeMatchesTable(table, table.PendingTurnChallenge) || len(table.CustodyTransitions) == 0 {
-		return table
+		return validation
 	}
 	lastIndex := len(table.CustodyTransitions) - 1
 	if table.CustodyTransitions[lastIndex].Kind != tablecustody.TransitionKindTurnChallengeOpen {
-		return table
+		return validation
 	}
 	previous := previousCustodyStateForTransition(table, lastIndex)
 	if previous == nil {
-		return table
+		return validation
 	}
-	validation := cloneJSON(table)
 	validation.LatestCustodyState = cloneCustodyState(previous)
 	return validation
 }
@@ -53,11 +53,125 @@ func turnMenuMatchesTable(table nativeTableState, menu *NativePendingTurnMenu) b
 	if menu == nil || !tableHasActionableTurn(table) {
 		return false
 	}
-	return menu.TurnAnchorHash == turnAnchorHash(table) &&
+	return menu.TurnAnchorHash == turnAnchorHashForEpoch(table, menu.Epoch) &&
 		menu.PrevCustodyStateHash == turnMenuSourceStateHash(table) &&
 		menu.HandID == table.ActiveHand.State.HandID &&
 		menu.DecisionIndex == custodyDecisionIndex(&table.ActiveHand.State) &&
 		menu.ActingPlayerID == seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex)
+}
+
+func turnBundleCacheKey(tableID string, epoch int, turnAnchorHash string) string {
+	return fmt.Sprintf("%s|%d|%s", strings.TrimSpace(tableID), epoch, strings.TrimSpace(turnAnchorHash))
+}
+
+func turnBundleCacheEpoch(table nativeTableState) int {
+	return pendingTurnEpoch(table, table.PendingTurnMenu)
+}
+
+func turnBundleCacheAnchorHash(table nativeTableState) string {
+	return pendingTurnAnchorHash(table, table.PendingTurnMenu)
+}
+
+func localTurnBundleCacheMatchesTable(table nativeTableState, cache *LocalTurnBundleCache) bool {
+	if cache == nil || !tableHasActionableTurn(table) {
+		return false
+	}
+	expectedDeadline := ""
+	if turnMenuMatchesTable(table, table.PendingTurnMenu) && table.PendingTurnMenu != nil {
+		expectedDeadline = strings.TrimSpace(table.PendingTurnMenu.ActionDeadlineAt)
+	}
+	if expectedDeadline != "" && strings.TrimSpace(cache.ActionDeadlineAt) != expectedDeadline {
+		return false
+	}
+	return strings.TrimSpace(cache.TableID) == table.Config.TableID &&
+		cache.Epoch == turnBundleCacheEpoch(table) &&
+		cache.HandID == table.ActiveHand.State.HandID &&
+		cache.DecisionIndex == custodyDecisionIndex(&table.ActiveHand.State) &&
+		cache.ActingPlayerID == seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex) &&
+		cache.PrevCustodyStateHash == turnMenuSourceStateHash(table) &&
+		cache.TurnAnchorHash == turnBundleCacheAnchorHash(table)
+}
+
+func (runtime *meshRuntime) loadLocalTurnBundleCache(table nativeTableState) (*LocalTurnBundleCache, error) {
+	if table.LocalTurnBundleCache != nil && localTurnBundleCacheMatchesTable(table, table.LocalTurnBundleCache) {
+		cache := cloneJSON(*table.LocalTurnBundleCache)
+		return &cache, nil
+	}
+	privateState, err := runtime.readTablePrivateState(table.Config.TableID)
+	if err != nil {
+		return nil, err
+	}
+	cache, ok := privateState.TurnBundleCaches[turnBundleCacheKey(table.Config.TableID, turnBundleCacheEpoch(table), turnBundleCacheAnchorHash(table))]
+	if !ok || !localTurnBundleCacheMatchesTable(table, &cache) {
+		return nil, nil
+	}
+	cloned := cloneJSON(cache)
+	return &cloned, nil
+}
+
+func (runtime *meshRuntime) storeLocalTurnBundleCache(tableID string, cache *LocalTurnBundleCache) error {
+	privateState, err := runtime.readTablePrivateState(tableID)
+	if err != nil {
+		return err
+	}
+	if privateState.TurnBundleCaches == nil {
+		privateState.TurnBundleCaches = map[string]LocalTurnBundleCache{}
+	}
+	for key, existing := range privateState.TurnBundleCaches {
+		if existing.TableID != tableID {
+			continue
+		}
+		if cache == nil || key != turnBundleCacheKey(tableID, cache.Epoch, cache.TurnAnchorHash) {
+			delete(privateState.TurnBundleCaches, key)
+		}
+	}
+	if cache != nil {
+		privateState.TurnBundleCaches[turnBundleCacheKey(tableID, cache.Epoch, cache.TurnAnchorHash)] = cloneJSON(*cache)
+	}
+	return runtime.writeTablePrivateState(tableID, privateState)
+}
+
+func findTurnCandidateByHashFromCache(menu *NativePendingTurnMenu, cache *LocalTurnBundleCache, candidateHash string) (NativeTurnCandidateBundle, bool) {
+	if cache != nil {
+		for _, candidate := range cache.Candidates {
+			if candidate.CandidateHash == candidateHash {
+				return cloneJSON(candidate), true
+			}
+		}
+		if cache.TimeoutCandidate != nil && cache.TimeoutCandidate.CandidateHash == candidateHash {
+			return cloneJSON(*cache.TimeoutCandidate), true
+		}
+	}
+	return findTurnCandidateByHash(menu, candidateHash)
+}
+
+func findTurnCandidateByOptionFromCache(menu *NativePendingTurnMenu, cache *LocalTurnBundleCache, optionID string) (NativeTurnCandidateBundle, bool) {
+	if cache != nil {
+		for _, candidate := range cache.Candidates {
+			if candidate.OptionID == optionID {
+				return cloneJSON(candidate), true
+			}
+		}
+	}
+	return findTurnCandidateByOption(menu, optionID)
+}
+
+func (runtime *meshRuntime) pendingTurnMenuWithLocalBundles(table nativeTableState) (*NativePendingTurnMenu, error) {
+	if !turnMenuMatchesTable(table, table.PendingTurnMenu) || table.PendingTurnMenu == nil {
+		return nil, nil
+	}
+	menu := cloneJSON(*table.PendingTurnMenu)
+	cache, err := runtime.loadLocalTurnBundleCache(table)
+	if err != nil {
+		return nil, err
+	}
+	if cache == nil {
+		return &menu, nil
+	}
+	menu.Candidates = cloneJSON(cache.Candidates)
+	menu.ChallengeEnvelope = cloneJSON(cache.ChallengeEnvelope)
+	menu.TimeoutCandidate = cloneJSON(cache.TimeoutCandidate)
+	return &menu, nil
 }
 
 func (runtime *meshRuntime) ensurePendingTurnMenuLocked(table *nativeTableState) error {
@@ -70,9 +184,20 @@ func (runtime *meshRuntime) ensurePendingTurnMenuLocked(table *nativeTableState)
 	}
 	if turnMenuMatchesTable(*table, table.PendingTurnMenu) {
 		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err == nil {
-			return nil
+			if cache, cacheErr := runtime.loadLocalTurnBundleCache(*table); cacheErr == nil {
+				table.LocalTurnBundleCache = cache
+				needsHostRebuild := table.CurrentHost.Peer.PeerID == runtime.selfPeerID() &&
+					strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash) == "" &&
+					!turnChallengeMatchesTable(*table, table.PendingTurnChallenge) &&
+					cache == nil
+				if !needsHostRebuild {
+					return nil
+				}
+			}
 		}
 	}
+	table.PendingTurnMenu = nil
+	table.LocalTurnBundleCache = nil
 	if table.CurrentHost.Peer.PeerID == runtime.selfPeerID() {
 		if err := runtime.syncTableToCustodySigners(*table, playerIDsFromSeats(table.Seats)); err != nil {
 			return err
@@ -82,6 +207,26 @@ func (runtime *meshRuntime) ensurePendingTurnMenuLocked(table *nativeTableState)
 	if err != nil {
 		return err
 	}
+	cache := &LocalTurnBundleCache{
+		ActionDeadlineAt:     menu.ActionDeadlineAt,
+		ActingPlayerID:       menu.ActingPlayerID,
+		Candidates:           cloneJSON(menu.Candidates),
+		ChallengeEnvelope:    cloneJSON(menu.ChallengeEnvelope),
+		DecisionIndex:        menu.DecisionIndex,
+		Epoch:                menu.Epoch,
+		HandID:               menu.HandID,
+		PrevCustodyStateHash: menu.PrevCustodyStateHash,
+		TableID:              table.Config.TableID,
+		TurnAnchorHash:       menu.TurnAnchorHash,
+	}
+	if menu.TimeoutCandidate != nil {
+		timeoutCandidate := cloneJSON(*menu.TimeoutCandidate)
+		cache.TimeoutCandidate = &timeoutCandidate
+	}
+	if err := runtime.storeLocalTurnBundleCache(table.Config.TableID, cache); err != nil {
+		return err
+	}
+	table.LocalTurnBundleCache = cache
 	table.PendingTurnMenu = &menu
 	return nil
 }
@@ -165,7 +310,7 @@ func (runtime *meshRuntime) buildPendingTurnMenuForDelivery(table nativeTableSta
 	if err != nil {
 		return NativePendingTurnMenu{}, err
 	}
-	menu.TimeoutCandidate = timeoutCandidate
+	menu.TimeoutCandidate = &timeoutCandidate
 	if turnTimeoutModeForTable(table) == turnTimeoutModeChainChallenge {
 		envelope, err := runtime.buildChallengeEnvelope(buildTable, &menu)
 		if err != nil {
@@ -299,42 +444,75 @@ func (runtime *meshRuntime) validatePendingTurnMenu(table nativeTableState, menu
 	if menu.ActionDeadlineAt != runtime.turnMenuActionDeadlineAt(table, menu.DeliveredAt) {
 		return errors.New("pending turn menu action deadline does not start at menu delivery")
 	}
-	if len(menu.Candidates) != len(expectedOptions) {
-		return errors.New("pending turn menu is missing candidate bundles")
-	}
 	for index := range expectedOptions {
-		candidate, ok := findTurnCandidateByOption(menu, expectedOptions[index].OptionID)
-		if !ok {
-			return fmt.Errorf("pending turn menu is missing candidate %s", expectedOptions[index].OptionID)
-		}
-		if menu.Options[index].CandidateHash != candidate.CandidateHash {
-			return fmt.Errorf("pending turn menu candidate hash mismatch for %s", expectedOptions[index].OptionID)
-		}
-		if err := runtime.validateTurnCandidateBundle(validationTable, menu, candidate, &expectedOptions[index]); err != nil {
-			return fmt.Errorf("pending turn candidate %s is invalid: %w", expectedOptions[index].OptionID, err)
+		if menu.Options[index].CandidateHash == "" {
+			return fmt.Errorf("pending turn menu candidate hash is missing for %s", expectedOptions[index].OptionID)
 		}
 	}
-	if err := runtime.validateTurnCandidateBundle(validationTable, menu, menu.TimeoutCandidate, nil); err != nil {
-		return fmt.Errorf("pending timeout candidate is invalid: %w", err)
+	cache, err := runtime.loadLocalTurnBundleCache(validationTable)
+	if err != nil {
+		return err
 	}
-	if err := runtime.validateChallengeEnvelope(validationTable, menu); err != nil {
+	if cache != nil {
+		if len(cache.Candidates) != len(expectedOptions) {
+			return errors.New("local turn bundle cache is missing candidate bundles")
+		}
+		for index := range expectedOptions {
+			candidate, ok := findTurnCandidateByOptionFromCache(menu, cache, expectedOptions[index].OptionID)
+			if !ok {
+				return fmt.Errorf("local turn bundle cache is missing candidate %s", expectedOptions[index].OptionID)
+			}
+			if menu.Options[index].CandidateHash != candidate.CandidateHash {
+				return fmt.Errorf("pending turn menu candidate hash mismatch for %s", expectedOptions[index].OptionID)
+			}
+			if err := runtime.validateTurnCandidateBundle(validationTable, menu, candidate, &expectedOptions[index]); err != nil {
+				return fmt.Errorf("pending turn candidate %s is invalid: %w", expectedOptions[index].OptionID, err)
+			}
+		}
+		if cache.TimeoutCandidate != nil {
+			if err := runtime.validateTurnCandidateBundle(validationTable, menu, *cache.TimeoutCandidate, nil); err != nil {
+				return fmt.Errorf("pending timeout candidate is invalid: %w", err)
+			}
+		}
+	}
+	if menu.TimeoutCandidate != nil && cache != nil && cache.TimeoutCandidate == nil {
+		return errors.New("pending timeout candidate is unavailable in the local turn bundle cache")
+	}
+	challengeValidationMenu := menu
+	if cache != nil {
+		cloned := cloneJSON(*menu)
+		cloned.Candidates = cloneJSON(cache.Candidates)
+		cloned.ChallengeEnvelope = cloneJSON(cache.ChallengeEnvelope)
+		cloned.TimeoutCandidate = cloneJSON(cache.TimeoutCandidate)
+		challengeValidationMenu = &cloned
+	}
+	if err := runtime.validateChallengeEnvelope(validationTable, challengeValidationMenu); err != nil {
 		return err
 	}
 	if strings.TrimSpace(menu.SelectedCandidateHash) == "" {
-		if menu.AcceptedIntentAck != nil {
-			return errors.New("pending turn menu carries an intent ack without a selected candidate")
-		}
 		return nil
 	}
-	selected, ok := findTurnCandidateByHash(menu, menu.SelectedCandidateHash)
-	if !ok || selected.OptionID == "timeout" {
+	selectedOption, ok := findTurnMenuOptionByCandidateHash(menu, menu.SelectedCandidateHash)
+	if !ok || selectedOption.OptionID == "" {
 		return errors.New("pending turn menu selected candidate is invalid")
 	}
-	if menu.AcceptedIntentAck == nil {
-		return nil
+	if menu.SelectionAuth == nil {
+		return errors.New("pending turn menu is missing selection auth for its locked candidate")
 	}
-	if err := runtime.verifyCandidateIntentAck(validationTable, selected, *menu.AcceptedIntentAck); err != nil {
+	if err := runtime.verifySelectionAuth(validationTable, *menu.SelectionAuth); err != nil {
 		return err
+	}
+	if strings.TrimSpace(menu.LockedAt) == "" {
+		return errors.New("pending turn menu is missing its lock timestamp")
+	}
+	if strings.TrimSpace(menu.SettlementDeadlineAt) == "" {
+		return errors.New("pending turn menu is missing its settlement deadline")
+	}
+	if menu.SelectedBundle == nil {
+		return errors.New("pending turn menu is missing its selected bundle")
+	}
+	if err := runtime.validateTurnCandidateBundle(validationTable, menu, *menu.SelectedBundle, &selectedOption); err != nil {
+		return fmt.Errorf("pending turn menu selected bundle is invalid: %w", err)
 	}
 	return nil
 }
@@ -343,7 +521,51 @@ func (runtime *meshRuntime) validateAcceptedPendingTurnMenu(table nativeTableSta
 	if menu == nil {
 		return nil
 	}
-	return runtime.validatePendingTurnMenu(table, menu)
+	if !tableHasActionableTurn(table) {
+		return nil
+	}
+	if !turnMenuMatchesTable(table, menu) {
+		return errors.New("pending turn menu does not match the current turn")
+	}
+	validationTable := turnMenuValidationTable(table)
+	expectedOptions, err := deriveFiniteMenuOptions(validationTable.ActiveHand.State, validationTable)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(canonicalActionMenuOptions(menu.Options), canonicalActionMenuOptions(expectedOptions)) {
+		return errors.New("pending turn menu options do not match the deterministic finite menu")
+	}
+	if strings.TrimSpace(menu.DeliveredAt) == "" {
+		return errors.New("pending turn menu is missing its delivery timestamp")
+	}
+	if menu.ActionDeadlineAt != runtime.turnMenuActionDeadlineAt(table, menu.DeliveredAt) {
+		return errors.New("pending turn menu action deadline does not start at menu delivery")
+	}
+	for index := range expectedOptions {
+		if strings.TrimSpace(menu.Options[index].CandidateHash) == "" {
+			return fmt.Errorf("pending turn menu candidate hash is missing for %s", expectedOptions[index].OptionID)
+		}
+	}
+	if strings.TrimSpace(menu.SelectedCandidateHash) == "" {
+		return nil
+	}
+	selectedOption, ok := findTurnMenuOptionByCandidateHash(menu, menu.SelectedCandidateHash)
+	if !ok {
+		return errors.New("pending turn menu selected candidate is invalid")
+	}
+	if menu.SelectionAuth == nil {
+		return errors.New("pending turn menu is missing selection auth for its locked candidate")
+	}
+	if err := runtime.verifySelectionAuth(validationTable, *menu.SelectionAuth); err != nil {
+		return err
+	}
+	if strings.TrimSpace(menu.LockedAt) == "" || strings.TrimSpace(menu.SettlementDeadlineAt) == "" {
+		return errors.New("pending turn menu is missing its lock timing")
+	}
+	if menu.SelectedBundle == nil {
+		return errors.New("pending turn menu is missing its selected bundle")
+	}
+	return runtime.validateTurnCandidateBundle(validationTable, menu, *menu.SelectedBundle, &selectedOption)
 }
 
 func (runtime *meshRuntime) signedActionRequestForOption(table nativeTableState, option NativeActionMenuOption) (nativeActionRequest, error) {

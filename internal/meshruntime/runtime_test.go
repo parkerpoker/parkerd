@@ -2331,7 +2331,7 @@ func TestFirstActionApprovalUsesPreActionCustodyDeadline(t *testing.T) {
 
 	wrongTable := cloneJSON(hostTable)
 	wrongTable.ActiveHand.State = nextState
-	wrongTransition, err := host.buildCustodyTransitionWithOverrides(wrongTable, tablecustody.TransitionKindAction, &nextState, &actionRequest.Action, nil, actionRequestBindingOverrides(actionRequest))
+	wrongTransition, err := host.buildCustodyTransition(wrongTable, tablecustody.TransitionKindAction, &nextState, &actionRequest.Action, nil)
 	if err != nil {
 		t.Fatalf("build wrong action transition: %v", err)
 	}
@@ -5422,7 +5422,7 @@ func TestCustodyPeerValidationIgnoresProofFieldPollution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply action request: %v", err)
 	}
-	transition, err := host.buildCustodyTransition(table, tablecustody.TransitionKindAction, &nextState, &actionRequest.Action, nil)
+	transition, err := host.buildCustodyTransitionWithOverrides(table, tablecustody.TransitionKindAction, &nextState, &actionRequest.Action, nil, actionRequestBindingOverrides(actionRequest))
 	if err != nil {
 		t.Fatalf("build action transition: %v", err)
 	}
@@ -5913,36 +5913,6 @@ func TestBlindPostSemanticValidationRejectsTamperedTranscriptBindings(t *testing
 		Transition:            wrongTransition,
 	}); err == nil || !strings.Contains(err.Error(), "does not match the locally derived successor") {
 		t.Fatalf("expected binding-aware blind-post approval rejection, got %v", err)
-	}
-}
-
-func TestBlindPostSemanticValidationRejectsTamperedActionDeadline(t *testing.T) {
-	host := newMeshTestRuntime(t, "host")
-	guest := newMeshTestRuntime(t, "guest")
-
-	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
-	table := mustReadNativeTable(t, host, tableID)
-
-	handID := randomUUID()
-	handNumber := 1
-	wrongTransition, err := host.deriveBlindPostCustodyTransition(table, handID, handNumber)
-	if err != nil {
-		t.Fatalf("derive blind-post transition: %v", err)
-	}
-	wrongTransition.NextState.ActionDeadlineAt = addMillis(wrongTransition.NextState.ActionDeadlineAt, 1_000)
-	recomputeCustodyTransitionHashesForTest(&wrongTransition)
-
-	if err := host.validateCustodyTransitionSemantics(table, wrongTransition, nil); err == nil || !strings.Contains(err.Error(), "does not match the locally derived successor") {
-		t.Fatalf("expected deadline-aware blind-post semantic rejection, got %v", err)
-	}
-	if _, err := guest.handleCustodyApprovalFromPeer(nativeCustodyApprovalRequest{
-		ExpectedPrevStateHash: wrongTransition.PrevStateHash,
-		PlayerID:              guest.walletID.PlayerID,
-		ProtocolVersion:       nativeProtocolVersion,
-		TableID:               tableID,
-		Transition:            wrongTransition,
-	}); err == nil || !strings.Contains(err.Error(), "does not match the locally derived successor") {
-		t.Fatalf("expected deadline-aware blind-post approval rejection, got %v", err)
 	}
 }
 

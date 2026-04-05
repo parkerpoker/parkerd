@@ -213,11 +213,11 @@ func actionMenuOptionsHashForTable(table nativeTableState) string {
 	return actionMenuOptionsHash(options)
 }
 
-func turnAnchorPayload(table nativeTableState) map[string]any {
+func turnAnchorPayloadForEpoch(table nativeTableState, epoch int) map[string]any {
 	payload := map[string]any{
 		"actionMenuPolicy":     normalizeActionMenuPolicy(table.Config.ActionMenuPolicy),
 		"decisionIndex":        0,
-		"epoch":                table.CurrentEpoch,
+		"epoch":                epoch,
 		"handId":               "",
 		"legalActionsHash":     "",
 		"prevCustodyStateHash": turnMenuSourceStateHash(table),
@@ -235,8 +235,30 @@ func turnAnchorPayload(table nativeTableState) map[string]any {
 	return payload
 }
 
+func turnAnchorPayload(table nativeTableState) map[string]any {
+	return turnAnchorPayloadForEpoch(table, table.CurrentEpoch)
+}
+
+func pendingTurnEpoch(table nativeTableState, menu *NativePendingTurnMenu) int {
+	if menu != nil && menu.Epoch > 0 {
+		return menu.Epoch
+	}
+	return table.CurrentEpoch
+}
+
+func pendingTurnAnchorHash(table nativeTableState, menu *NativePendingTurnMenu) string {
+	if menu != nil && strings.TrimSpace(menu.TurnAnchorHash) != "" {
+		return menu.TurnAnchorHash
+	}
+	return turnAnchorHashForEpoch(table, pendingTurnEpoch(table, menu))
+}
+
+func turnAnchorHashForEpoch(table nativeTableState, epoch int) string {
+	return tablecustody.HashValue(turnAnchorPayloadForEpoch(table, epoch))
+}
+
 func turnAnchorHash(table nativeTableState) string {
-	return tablecustody.HashValue(turnAnchorPayload(table))
+	return turnAnchorHashForEpoch(table, table.CurrentEpoch)
 }
 
 func findTurnMenuOptionByID(menu *NativePendingTurnMenu, optionID string) (NativeActionMenuOption, bool) {
@@ -269,6 +291,18 @@ func findTurnMenuOptionByAction(menu *NativePendingTurnMenu, action game.Action)
 	return NativeActionMenuOption{}, false
 }
 
+func findTurnMenuOptionByCandidateHash(menu *NativePendingTurnMenu, candidateHash string) (NativeActionMenuOption, bool) {
+	if menu == nil {
+		return NativeActionMenuOption{}, false
+	}
+	for _, option := range menu.Options {
+		if option.CandidateHash == candidateHash {
+			return option, true
+		}
+	}
+	return NativeActionMenuOption{}, false
+}
+
 func findTurnCandidateByHash(menu *NativePendingTurnMenu, candidateHash string) (NativeTurnCandidateBundle, bool) {
 	if menu == nil {
 		return NativeTurnCandidateBundle{}, false
@@ -278,8 +312,8 @@ func findTurnCandidateByHash(menu *NativePendingTurnMenu, candidateHash string) 
 			return cloneJSON(candidate), true
 		}
 	}
-	if menu.TimeoutCandidate.CandidateHash == candidateHash {
-		return cloneJSON(menu.TimeoutCandidate), true
+	if menu.TimeoutCandidate != nil && menu.TimeoutCandidate.CandidateHash == candidateHash {
+		return cloneJSON(*menu.TimeoutCandidate), true
 	}
 	return NativeTurnCandidateBundle{}, false
 }
@@ -292,6 +326,9 @@ func findTurnCandidateByOption(menu *NativePendingTurnMenu, optionID string) (Na
 		if candidate.OptionID == optionID {
 			return cloneJSON(candidate), true
 		}
+	}
+	if menu.TimeoutCandidate != nil && menu.TimeoutCandidate.OptionID == optionID {
+		return cloneJSON(*menu.TimeoutCandidate), true
 	}
 	return NativeTurnCandidateBundle{}, false
 }

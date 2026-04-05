@@ -121,6 +121,34 @@ type CandidateIntentAck struct {
 	TurnAnchorHash       string `json:"turnAnchorHash,omitempty"`
 }
 
+type SelectionAuth struct {
+	ActionDeadlineAt     string `json:"actionDeadlineAt,omitempty"`
+	CandidateHash        string `json:"candidateHash"`
+	DecisionIndex        int    `json:"decisionIndex"`
+	Epoch                int    `json:"epoch"`
+	HandID               string `json:"handId"`
+	PlayerID             string `json:"playerId"`
+	PrevCustodyStateHash string `json:"prevCustodyStateHash,omitempty"`
+	SignedAt             string `json:"signedAt"`
+	SignatureHex         string `json:"signatureHex"`
+	TableID              string `json:"tableId"`
+	TurnAnchorHash       string `json:"turnAnchorHash,omitempty"`
+}
+
+type ActionLockedAck struct {
+	ActionDeadlineAt     string `json:"actionDeadlineAt,omitempty"`
+	CandidateHash        string `json:"candidateHash"`
+	DecisionIndex        int    `json:"decisionIndex"`
+	Epoch                int    `json:"epoch"`
+	HandID               string `json:"handId"`
+	HostPeerID           string `json:"hostPeerId,omitempty"`
+	LockedAt             string `json:"lockedAt"`
+	PrevCustodyStateHash string `json:"prevCustodyStateHash,omitempty"`
+	SignatureHex         string `json:"signatureHex"`
+	TableID              string `json:"tableId"`
+	TurnAnchorHash       string `json:"turnAnchorHash,omitempty"`
+}
+
 type CustodyRecoveryOutput struct {
 	AmountSats    int      `json:"amountSats"`
 	OwnerPlayerID string   `json:"ownerPlayerId,omitempty"`
