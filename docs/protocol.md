@@ -307,8 +307,9 @@ Turn state is split into a replicated public layer and a local pre-signed bundle
 - acting player, epoch, hand id, and decision index
 - previous custody state hash and turn anchor hash
 - compact option descriptors plus candidate hashes
-- action deadline
+- action deadline while the turn is still unlocked
 - after lock, `selectedCandidateHash`, `SelectionAuth`, `lockedAt`, `settlementDeadlineAt`, and the single `selectedBundle`
+- after settlement but before publication, that same locked object also carries the exact persisted `settledRequest`
 
 `LocalTurnBundleCache` stays local to the acting player and current host before lock. It carries:
 
@@ -324,6 +325,13 @@ Ordinary turn resolution has four explicit steps:
 2. The host validates `SelectionAuth`, locks that exact candidate, persists the public lock state, replicates exactly one selected bundle, and replies with `ActionLockedAck`.
 3. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material.
 4. The host validates that signed settled transition against the locked bundle, persists the exact settled request in pending-turn state until publication, and publishes the accepted `action` transition.
+
+`meshSendAction` drives those two action stages explicitly:
+
+- stage A locks the acting player's chosen candidate
+- stage B publishes the exact settled locked transition
+- after retryable stale-state or host-liveness failures, the actor refreshes accepted state from the current host and known participants before deciding whether failover is eligible
+- the call stops as soon as accepted history already contains the exact lock, the exact published transition, or a newer accepted turn state makes the request stale
 
 `SelectionAuth` binds:
 
@@ -370,6 +378,16 @@ After ordinary action lock, recovery does not switch to timeout fold/check subst
 
 - if the host disappears after lock and the acting player already settled, failover publishes that exact persisted settled transition
 - if the acting player disappears after lock and before settlement, the current host or a successor host can settle the replicated selected bundle after `settlementDeadlineAt`
+- before `settlementDeadlineAt`, a successor host preserves the locked turn and waits; it does not reopen challenge or substitute the ordinary timeout path
+
+Successor-host locked-turn ordering is a protocol invariant:
+
+1. publish the persisted `settledRequest` when it already exists
+2. otherwise, if `settlementDeadlineAt` has expired, settle the locked `selectedBundle`
+3. only still-unlocked turns may open challenge or use the deterministic ordinary timeout successor
+4. when an unlocked acting player disappears, that deterministic timeout successor remains the existing `fold-or-check` rule rather than an always-fold rule
+
+That publication/settlement work happens before ordinary continuation work such as rebuilding the next turn menu or advancing the next protocol phase. A successor host never needs sibling candidate bundles to finish a locked action.
 
 Escape maturity depends on the CSV type:
 

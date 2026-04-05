@@ -356,11 +356,12 @@ The repository exercises these local shapes:
 2. For each actionable turn, the host builds the full finite menu locally, replicates only `PendingTurnMenuPublic`, and stores the full `LocalTurnBundleCache` only on the acting player and current host.
 3. The acting player chooses a candidate by sending `ActionChooseRequest` with `candidateHash` plus `SelectionAuth`.
 4. The host validates the signed binding, locks that exact candidate, persists the public lock state, replicates exactly one selected bundle, and replies with `ActionLockedAck`.
-5. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material. The host validates it against the locked bundle, persists that exact settled request until publication, publishes the accepted `action` transition, then appends `PlayerAction`.
-6. If the turn remains unlocked through the action deadline and the table uses `chain-challenge`, the host or a successor opens the precomputed challenge path. If the turn is locked but settlement stalls past `settlementDeadlineAt`, the current host or successor settles the replicated selected bundle instead.
-7. Each receiving daemon verifies the accepted hand transcript, public replay, custody history, approval signatures, and Ark-linked proof material before persisting the replicated table.
-8. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
-9. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
+5. The acting player settles the locked bundle locally and sends a signed `ActionSettlementRequest` carrying the fully settled transition and witness material. The host validates it against the locked bundle, persists that exact settled request until publication, publishes the accepted `action` transition, and then appends `PlayerAction`.
+6. `meshSendAction` keeps retrying through accepted-state refresh, host resync, and eligible failover until either the lock/publication is already present in accepted history, the turn has advanced past the request, or the current host actually completes the stage.
+7. If the turn remains unlocked through the action deadline and the table uses `chain-challenge`, the host or a successor opens the precomputed challenge path. If the turn is locked but settlement stalls past `settlementDeadlineAt`, the current host or successor settles the replicated selected bundle instead.
+8. Each receiving daemon verifies the accepted hand transcript, public replay, custody history, approval signatures, and Ark-linked proof material before persisting the replicated table.
+9. When the hand settles, the host finalizes payout custody if the latest custody state does not already match the settled public money state, then appends `HandResult`, builds a snapshot, and schedules the next hand.
+10. Cash-out and emergency-exit requests finalize custody first and then append a derived local `arkade-table-funds/v1` receipt for wallet availability and operator/debug surfaces.
 
 ### Chain-challenge flow
 
@@ -408,9 +409,11 @@ If the host disappears during an active hand:
 - the failover daemon appends `HostRotated`
 - it syncs the best known accepted table and replays custody, transcript, and public state to decide whether the hand can continue
 - if the turn is unlocked, it resumes from the compact public menu and can continue locking the action or open `turn-challenge-open` after the action deadline
-- if the turn is locked, it continues from the replicated selected bundle and lock metadata
-- if the acting player already settled, it publishes that exact settled transition
-- if the acting player disappears before settlement, it can settle the replicated selected bundle after `settlementDeadlineAt`
+- if the turn is locked, it continues from the replicated selected bundle and lock metadata without requiring sibling bundles
+- if the acting player already settled, it first publishes that exact persisted settled transition
+- if the acting player disappears before settlement, it waits until `settlementDeadlineAt` and then settles the replicated selected bundle
+- that locked-action publication or settlement is persisted before later continuation work such as rebuilding the next turn menu
+- a locked turn never falls back to the ordinary timeout substitution path; only an unlocked turn can still resolve through the deterministic `fold-or-check` timeout successor
 - if required protocol records are missing or invalid, it appends `HandAbort`
 - it returns to the latest replay-valid custody-backed table state when abort is required
 

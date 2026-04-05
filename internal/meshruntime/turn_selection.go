@@ -745,9 +745,6 @@ func (runtime *meshRuntime) publishLockedActionTransitionLocked(table *nativeTab
 			return false, err
 		}
 	}
-	if err := runtime.advanceHandProtocolLocked(table); err != nil {
-		return false, err
-	}
 	return true, nil
 }
 
@@ -767,6 +764,10 @@ func (runtime *meshRuntime) handlePersistedLockedActionSettlementLocked(table *n
 	}
 	if err := runtime.validateLockedActionSettlement(*table, *menu.SelectedBundle, menu.SettledRequest.Transition); err != nil {
 		return false, err
+	}
+	if table.CurrentEpoch > menu.Epoch {
+		emitMeshTiming(actionMetricFields("action_successor_publish_total", sendActionStageSettlement, *table, menu.SelectedCandidateHash, "persisted_settled_request"), 0, nil)
+		debugMeshf("successor host publishing persisted settled request table=%s epoch=%d lock_epoch=%d turn_anchor=%s candidate=%s", table.Config.TableID, table.CurrentEpoch, menu.Epoch, menu.TurnAnchorHash, menu.SelectedCandidateHash)
 	}
 	return runtime.publishLockedActionTransitionLocked(table, *menu.SelectedBundle, menu.SettledRequest.Transition)
 }
@@ -788,6 +789,10 @@ func (runtime *meshRuntime) handleLockedActionSettlementTimeoutLocked(table *nat
 	transition, _, err := runtime.settleTurnCandidateTransition(*table, *menu.SelectedBundle)
 	if err != nil {
 		return false, err
+	}
+	if table.CurrentEpoch > menu.Epoch {
+		emitMeshTiming(actionMetricFields("action_successor_settlement_total", sendActionStageSettlement, *table, menu.SelectedCandidateHash, "settlement_deadline_expired"), 0, nil)
+		debugMeshf("successor host settling locked action after settlement deadline table=%s epoch=%d lock_epoch=%d turn_anchor=%s candidate=%s deadline=%s", table.Config.TableID, table.CurrentEpoch, menu.Epoch, menu.TurnAnchorHash, menu.SelectedCandidateHash, menu.SettlementDeadlineAt)
 	}
 	return runtime.publishLockedActionTransitionLocked(table, *menu.SelectedBundle, transition)
 }
@@ -852,17 +857,40 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionCh
 		if turnChallengeMatchesTable(*table, table.PendingTurnChallenge) {
 			return errors.New("turn challenge is open for this turn")
 		}
-		if err := runtime.ensurePendingTurnMenuLocked(table); err != nil {
-			return err
-		}
-		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
-			return errors.New("turn menu is unavailable for the current table state")
-		}
 		if request.CandidateHash != request.SelectionAuth.CandidateHash {
 			return errors.New("selection auth candidate does not match the requested candidate")
 		}
 		if err := runtime.verifySelectionAuth(*table, request.SelectionAuth); err != nil {
 			return err
+		}
+		if strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash) != "" {
+			if table.PendingTurnMenu.SelectedCandidateHash != request.CandidateHash {
+				return errors.New("a sibling candidate for this turn is already selected")
+			}
+			if err := validateLockedCandidateBinding(table.PendingTurnMenu); err != nil {
+				return err
+			}
+			if table.PendingTurnMenu.SelectionAuth == nil ||
+				strings.TrimSpace(table.PendingTurnMenu.LockedAt) == "" ||
+				strings.TrimSpace(table.PendingTurnMenu.SettlementDeadlineAt) == "" ||
+				table.PendingTurnMenu.SelectedBundle == nil {
+				return errors.New("locked action state is incomplete")
+			}
+			ack, err := runtime.buildActionLockedAck(*table, *table.PendingTurnMenu.SelectionAuth, table.PendingTurnMenu.LockedAt)
+			if err != nil {
+				return err
+			}
+			updated = nativeActionChooseResponse{
+				LockedAck: ack,
+				Table:     runtime.networkTableView(*table, table.PendingTurnMenu.SelectionAuth.PlayerID),
+			}
+			return nil
+		}
+		if err := runtime.ensurePendingTurnMenuLocked(table); err != nil {
+			return err
+		}
+		if err := runtime.validatePendingTurnMenu(*table, table.PendingTurnMenu); err != nil {
+			return errors.New("turn menu is unavailable for the current table state")
 		}
 		cache, err := runtime.loadLocalTurnBundleCache(*table)
 		if err != nil {
@@ -871,9 +899,6 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionCh
 		expected, ok := findTurnCandidateByHashFromCache(table.PendingTurnMenu, cache, request.CandidateHash)
 		if !ok {
 			return errors.New("selected candidate is not part of the current turn menu")
-		}
-		if strings.TrimSpace(table.PendingTurnMenu.SelectedCandidateHash) != "" && table.PendingTurnMenu.SelectedCandidateHash != expected.CandidateHash {
-			return errors.New("a sibling candidate for this turn is already selected")
 		}
 		lockedAt := nowISO()
 		ack, err := runtime.buildActionLockedAck(*table, request.SelectionAuth, lockedAt)
@@ -893,6 +918,11 @@ func (runtime *meshRuntime) handleActionSelectionFromPeer(request nativeActionCh
 		}
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
+		}
+		if runtime.afterActionSelectionPersistHook != nil {
+			if hookErr := runtime.afterActionSelectionPersistHook(cloneJSON(*table), request); hookErr != nil {
+				return hookErr
+			}
 		}
 		updated = nativeActionChooseResponse{
 			LockedAck: ack,
@@ -957,21 +987,32 @@ func (runtime *meshRuntime) handleActionSettlementFromPeer(request nativeActionS
 		if err := runtime.validateLockedActionSettlement(*table, *table.PendingTurnMenu.SelectedBundle, request.Transition); err != nil {
 			return err
 		}
+		persistedRequest := request
 		if existing := table.PendingTurnMenu.SettledRequest; existing != nil {
 			if actionSettlementTransitionHash(*existing) != actionSettlementTransitionHash(request) {
 				return errors.New("locked action already has a different persisted settled transition")
 			}
+			persistedRequest = cloneJSON(*existing)
+		} else {
+			table.PendingTurnMenu.SettledRequest = cloneJSON(&request)
+			if err := runtime.persistAndReplicate(table, true); err != nil {
+				return err
+			}
+			if runtime.afterActionSettlementPersistHook != nil {
+				if hookErr := runtime.afterActionSettlementPersistHook(cloneJSON(*table), persistedRequest); hookErr != nil {
+					return hookErr
+				}
+			}
 		}
-		table.PendingTurnMenu.SettledRequest = cloneJSON(&request)
-		if err := runtime.persistAndReplicate(table, true); err != nil {
-			return err
-		}
-		published, err := runtime.publishLockedActionTransitionLocked(table, *table.PendingTurnMenu.SelectedBundle, request.Transition)
+		published, err := runtime.publishLockedActionTransitionLocked(table, *table.PendingTurnMenu.SelectedBundle, persistedRequest.Transition)
 		if err != nil {
 			return err
 		}
 		if !published {
 			return errors.New("locked action settlement did not publish")
+		}
+		if err := runtime.advanceHandProtocolLocked(table); err != nil {
+			return err
 		}
 		if err := runtime.persistAndReplicate(table, true); err != nil {
 			return err
