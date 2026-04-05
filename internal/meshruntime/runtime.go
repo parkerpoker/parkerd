@@ -920,7 +920,11 @@ func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, e
 	if err := runtime.Start(); err != nil {
 		return nil, err
 	}
-	if requestedSeatCount := intFromMap(input, "seatCount", 2); requestedSeatCount > 2 {
+	requestedSeatCount := intFromMap(input, "seatCount", 2)
+	if requestedSeatCount <= 0 {
+		requestedSeatCount = 2
+	}
+	if requestedSeatCount > 2 {
 		return nil, errors.New("dealerless Ark custody tables currently support at most 2 seats")
 	}
 	tableID := randomUUID()
@@ -942,24 +946,36 @@ func (runtime *meshRuntime) CreateTable(input map[string]any) (map[string]any, e
 		minOffchainSats = int(arkConfig.DustSats)
 	}
 	defaultSmallBlind, defaultBigBlind := defaultDealerlessBlinds(minOffchainSats, input)
+	actionTimeoutMS := intFromMap(input, "actionTimeoutMs", runtime.actionTimeoutMS())
+	if actionTimeoutMS <= 0 {
+		actionTimeoutMS = runtime.actionTimeoutMS()
+	}
+	handProtocolTimeoutMS := intFromMap(input, "handProtocolTimeoutMs", runtime.handProtocolTimeoutMS())
+	if handProtocolTimeoutMS <= 0 {
+		handProtocolTimeoutMS = runtime.handProtocolTimeoutMS()
+	}
+	nextHandDelayMS := intFromMap(input, "nextHandDelayMs", nativeNextHandDelayMS)
+	if nextHandDelayMS <= 0 {
+		nextHandDelayMS = nativeNextHandDelayMS
+	}
 	config := NativeMeshTableConfig{
 		ActionMenuPolicy:          actionMenuPolicyFromCreateInput(input),
-		ActionTimeoutMS:           runtime.actionTimeoutMS(),
+		ActionTimeoutMS:           actionTimeoutMS,
 		BigBlindSats:              intFromMap(input, "bigBlindSats", defaultBigBlind),
 		BuyInMaxSats:              intFromMap(input, "buyInMaxSats", 4000),
 		BuyInMinSats:              intFromMap(input, "buyInMinSats", 4000),
 		CreatedAt:                 now,
 		DealerMode:                nativeDealerMode,
-		HandProtocolTimeoutMS:     runtime.handProtocolTimeoutMS(),
+		HandProtocolTimeoutMS:     handProtocolTimeoutMS,
 		HostPeerID:                runtime.selfPeerID(),
 		HostPlaysAllowed:          true,
 		Name:                      stringFromMap(input, "name", "Parker Table"),
 		NetworkID:                 runtime.config.Network,
-		NextHandDelayMS:           nativeNextHandDelayMS,
+		NextHandDelayMS:           nextHandDelayMS,
 		OccupiedSeats:             0,
 		ProtocolVersion:           nativeProtocolVersion,
 		PublicSpectatorDelayHands: 1,
-		SeatCount:                 2,
+		SeatCount:                 requestedSeatCount,
 		SmallBlindSats:            intFromMap(input, "smallBlindSats", defaultSmallBlind),
 		SpectatorsAllowed:         boolFromMapDefault(input, "spectatorsAllowed", true),
 		Status:                    "announced",
@@ -1475,6 +1491,88 @@ func (runtime *meshRuntime) RotateHost(tableID string) (NativeMeshTableView, err
 	return runtime.localTableView(*table), nil
 }
 
+func (runtime *meshRuntime) StartNextHand(tableID string) (NativeMeshTableView, error) {
+	if err := runtime.Start(); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	if tableID == "" {
+		tableID = runtime.currentTableID()
+	}
+	if tableID == "" {
+		return NativeMeshTableView{}, errors.New("table id is required")
+	}
+	if _, err := runtime.refreshLocalTable(tableID); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	err := runtime.store.withTableLock(tableID, func() error {
+		table, err := runtime.store.readTable(tableID)
+		if err != nil || table == nil {
+			return fmt.Errorf("table %s not found", tableID)
+		}
+		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
+			return errors.New("only the current host can start the next hand")
+		}
+		if table.ActiveHand != nil &&
+			table.ActiveHand.State.Phase != game.StreetSettled &&
+			table.ActiveHand.State.Phase != game.StreetAborted {
+			return nil
+		}
+		table.LastHostHeartbeatAt = nowISO()
+		table.NextHandAt = addMillis(nowISO(), -1)
+		if err := runtime.startNextHandLocked(table); err != nil {
+			return err
+		}
+		return runtime.persistAndReplicate(table, true)
+	})
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	accepted, err := runtime.requireLocalTable(tableID)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	return runtime.localTableView(*accepted), nil
+}
+
+func (runtime *meshRuntime) AbortHand(tableID string) (NativeMeshTableView, error) {
+	if err := runtime.Start(); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	if tableID == "" {
+		tableID = runtime.currentTableID()
+	}
+	if tableID == "" {
+		return NativeMeshTableView{}, errors.New("table id is required")
+	}
+	if _, err := runtime.refreshLocalTable(tableID); err != nil {
+		return NativeMeshTableView{}, err
+	}
+	err := runtime.store.withTableLock(tableID, func() error {
+		table, err := runtime.store.readTable(tableID)
+		if err != nil || table == nil {
+			return fmt.Errorf("table %s not found", tableID)
+		}
+		if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
+			return errors.New("only the current host can abort the active hand")
+		}
+		if table.ActiveHand == nil {
+			return errors.New("no active hand to abort")
+		}
+		if err := runtime.abortActiveHandLocked(table, "manual aborted-hand regtest hook", nil); err != nil {
+			return err
+		}
+		return runtime.persistAndReplicate(table, true)
+	})
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	accepted, err := runtime.requireLocalTable(tableID)
+	if err != nil {
+		return NativeMeshTableView{}, err
+	}
+	return runtime.localTableView(*accepted), nil
+}
+
 func (runtime *meshRuntime) PublicTables() ([]NativePublicTableView, error) {
 	if runtime.config.IndexerURL != "" {
 		indexerURL := strings.TrimSuffix(runtime.config.IndexerURL, "/") + "/api/public/tables"
@@ -1716,8 +1814,8 @@ func (runtime *meshRuntime) completeEmergencyExit(tableID, finalStatus string) (
 		}
 		request = &signedRequest
 	} else if request.ExitExecution != nil &&
-		request.PrevCustodyStateHash == latestCustodyStateHash(*table) &&
-		request.Epoch != table.CurrentEpoch {
+		(request.PrevCustodyStateHash != latestCustodyStateHash(*table) ||
+			request.Epoch != table.CurrentEpoch) {
 		resignedRequest, err := runtime.buildSignedFundsRequest(*table, string(tablecustody.TransitionKindEmergencyExit), request.ExitExecution)
 		if err != nil {
 			return nil, err
@@ -1744,6 +1842,7 @@ func (runtime *meshRuntime) completeEmergencyExit(tableID, finalStatus string) (
 			"receipt":       rawJSONMap(operation),
 			"settledArkTx":  operation.ArkTxID,
 			"status":        operation.Status,
+			"pendingError":  err.Error(),
 		}, nil
 	}
 
@@ -2289,6 +2388,10 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 			return nativeFundsSettlement{}, err
 		}
 	} else if transitionKind == tablecustody.TransitionKindCashOut {
+		_, signingPlan, err := runtime.normalizedCustodySigningTransition(*table, transition)
+		if err != nil {
+			return nativeFundsSettlement{}, err
+		}
 		approvals, err := runtime.collectCustodyApprovals(*table, approvalTransition, authorizer, runtime.requiredCustodySigners(*table, approvalTransition))
 		if err != nil {
 			return nativeFundsSettlement{}, err
@@ -2301,8 +2404,11 @@ func (runtime *meshRuntime) applyFundsRequestLocked(table *nativeTableState, req
 		receiptIntentID = result.IntentID
 		receiptArkTxID = result.ArkTxID
 		receiptRefs = append(receiptRefs, result.OutputRefs["wallet-return"]...)
+		applyTransitionSettlementPlan(&transition, signingPlan, result.OutputRefs)
 		transition.ArkIntentID = result.IntentID
 		transition.ArkTxID = result.ArkTxID
+		transition.NextState.StateHash = tablecustody.HashCustodyState(transition.NextState)
+		transition.NextStateHash = transition.NextState.StateHash
 		transition.Approvals = append([]tablecustody.CustodySignature(nil), approvals...)
 		transition.Proof = tablecustody.CustodyProof{
 			ArkIntentID:       result.IntentID,
@@ -2441,6 +2547,14 @@ func (runtime *meshRuntime) refreshLocalTable(tableID string) (*nativeTableState
 	table, err := runtime.store.readTable(tableID)
 	if err != nil || table == nil {
 		return table, err
+	}
+	if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() &&
+		elapsedMillis(table.LastHostHeartbeatAt) > int64(runtime.hostFailureTimeoutMS()) {
+		runtime.syncTableFromKnownParticipants(tableID)
+		table, err = runtime.store.readTable(tableID)
+		if err != nil || table == nil {
+			return table, err
+		}
 	}
 	if table.CurrentHost.Peer.PeerID != runtime.selfPeerID() && runtime.shouldPollHost(tableID) && table.CurrentHost.Peer.PeerURL != "" {
 		remote, err := runtime.fetchRemoteTable(table.CurrentHost.Peer.PeerURL, tableID)
@@ -2798,9 +2912,13 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	if table.NextHandAt != "" && elapsedMillis(table.NextHandAt) < 0 {
 		return nil
 	}
-	if table.ActiveHand != nil {
+	if table.ActiveHand != nil &&
+		table.ActiveHand.State.Phase != game.StreetSettled &&
+		table.ActiveHand.State.Phase != game.StreetAborted {
 		return nil
 	}
+	runtime.releaseCompletedActiveHandForNextStart(table)
+	runtime.reactivateContinuingSeatsForNextHand(table)
 	if len(table.Seats) < 2 || activeCustodySeatCount(*table) < 2 {
 		return nil
 	}
@@ -2819,10 +2937,7 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 			chips[seat.PlayerID] = seat.BuyInSats
 		}
 	}
-	handNumber := 1
-	if table.PublicState != nil {
-		handNumber = table.PublicState.HandNumber + 1
-	}
+	handNumber := latestCommittedHandNumber(*table) + 1
 	dealerSeat := (handNumber - 1) % 2
 	hand, err := game.CreateHoldemHand(game.HoldemHandConfig{
 		BigBlindSats:    table.Config.BigBlindSats,
@@ -2877,6 +2992,74 @@ func (runtime *meshRuntime) startNextHandLocked(table *nativeTableState) error {
 	return runtime.advanceHandProtocolLocked(table)
 }
 
+func (runtime *meshRuntime) releaseCompletedActiveHandForNextStart(table *nativeTableState) {
+	if table == nil || table.ActiveHand == nil {
+		return
+	}
+	if table.ActiveHand.State.Phase != game.StreetSettled && table.ActiveHand.State.Phase != game.StreetAborted {
+		return
+	}
+	table.ActiveHand = nil
+	table.ActiveHandStartAt = ""
+}
+
+func (runtime *meshRuntime) reactivateContinuingSeatsForNextHand(table *nativeTableState) {
+	if table == nil {
+		return
+	}
+	activeByPlayerID := map[string]bool{}
+	if table.LatestCustodyState != nil {
+		for _, claim := range table.LatestCustodyState.StackClaims {
+			if claim.AmountSats <= 0 || terminalCustodySeatStatus(claim.Status) {
+				continue
+			}
+			activeByPlayerID[claim.PlayerID] = true
+		}
+	}
+	for index := range table.Seats {
+		if terminalCustodySeatStatus(table.Seats[index].Status) {
+			continue
+		}
+		if table.LatestCustodyState != nil {
+			if !activeByPlayerID[table.Seats[index].PlayerID] {
+				continue
+			}
+		}
+		table.Seats[index].Status = "active"
+		table.Seats[index].NativeSeatedPlayer.Status = "active"
+	}
+}
+
+func latestCommittedHandNumber(table nativeTableState) int {
+	latest := 0
+	update := func(candidate int) {
+		if candidate > latest {
+			latest = candidate
+		}
+	}
+
+	if table.ActiveHand != nil {
+		update(table.ActiveHand.State.HandNumber)
+	}
+	if table.PublicState != nil {
+		update(table.PublicState.HandNumber)
+	}
+	if table.LatestCustodyState != nil {
+		update(table.LatestCustodyState.HandNumber)
+	}
+	if table.LatestSnapshot != nil {
+		update(table.LatestSnapshot.HandNumber)
+	}
+	if table.LatestFullySignedSnapshot != nil {
+		update(table.LatestFullySignedSnapshot.HandNumber)
+	}
+	for _, event := range table.Events {
+		update(intFromMap(event.Body, "handNumber", 0))
+	}
+
+	return latest
+}
+
 func (runtime *meshRuntime) syncTableFromKnownParticipants(tableID string) {
 	table, err := runtime.store.readTable(tableID)
 	if err != nil || table == nil {
@@ -2918,6 +3101,8 @@ func (runtime *meshRuntime) syncTableBeforeFailover(tableID string) {
 
 func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostFailure bool, resetProtocolDeadline bool) error {
 	observedHostFailure := false
+	var rotatedTable *nativeTableState
+	var previousHost nativeKnownParticipant
 	if requireHostFailure {
 		if table, err := runtime.store.readTable(tableID); err == nil && table != nil {
 			observedHostFailure = elapsedMillis(table.LastHostHeartbeatAt) > int64(runtime.hostFailureTimeoutMS())
@@ -2925,7 +3110,7 @@ func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostF
 	}
 	debugMeshf("rotate host start table=%s reason=%s requireHostFailure=%t observedHostFailure=%t", tableID, reason, requireHostFailure, observedHostFailure)
 	runtime.syncTableBeforeFailover(tableID)
-	return runtime.store.withTableLock(tableID, func() error {
+	err := runtime.store.withTableLock(tableID, func() error {
 		table, err := runtime.store.readTable(tableID)
 		if err != nil || table == nil {
 			return err
@@ -2938,7 +3123,7 @@ func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostF
 			debugMeshf("rotate host skipped table=%s reason=%s handler=false host=%s", tableID, reason, table.CurrentHost.Peer.PeerID)
 			return nil
 		}
-		previousHost := table.CurrentHost
+		previousHost = table.CurrentHost
 		table.CurrentEpoch++
 		table.CurrentHost = nativeKnownParticipant{ProfileName: runtime.profileName, Peer: runtime.self.Peer}
 		table.Config.HostPeerID = runtime.selfPeerID()
@@ -2984,8 +3169,18 @@ func (runtime *meshRuntime) rotateHostTable(tableID, reason string, requireHostF
 			}
 			return table.ActiveHand.State.Phase
 		}())
-		return runtime.persistAndReplicate(table, true)
+		if err := runtime.persistAndReplicate(table, true); err != nil {
+			return err
+		}
+		clone := cloneJSON(*table)
+		rotatedTable = &clone
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	runtime.syncRotatedTableToPreviousHost(rotatedTable, previousHost)
+	return nil
 }
 
 func (runtime *meshRuntime) failoverTable(tableID, reason string) error {
@@ -3112,24 +3307,51 @@ func (runtime *meshRuntime) replicateTable(table nativeTableState) {
 	}
 	var waitGroup sync.WaitGroup
 	for peerURL, visiblePlayerID := range targets {
-		syncRequest, err := runtime.buildTableSyncRequest(runtime.networkTableView(table, visiblePlayerID))
-		if err != nil {
-			continue
-		}
 		waitGroup.Add(1)
-		go func(peerURL string, syncRequest nativeTableSyncRequest) {
+		go func(peerURL, visiblePlayerID string) {
 			defer waitGroup.Done()
 			if !runtime.isRunning() {
 				return
 			}
-			if runtime.tableSyncSender != nil {
-				_ = runtime.tableSyncSender(peerURL, syncRequest)
-				return
-			}
-			_ = runtime.sendTableSync(peerURL, syncRequest)
-		}(peerURL, syncRequest)
+			_ = runtime.syncTableToPeerURL(peerURL, table, visiblePlayerID)
+		}(peerURL, visiblePlayerID)
 	}
 	waitGroup.Wait()
+}
+
+func (runtime *meshRuntime) syncTableToPeerURL(peerURL string, table nativeTableState, visiblePlayerID string) error {
+	peerURL = strings.TrimSpace(peerURL)
+	if peerURL == "" || peerURL == runtime.selfPeerURL() {
+		return nil
+	}
+	syncRequest, err := runtime.buildTableSyncRequest(runtime.networkTableView(table, visiblePlayerID))
+	if err != nil {
+		return err
+	}
+	if runtime.tableSyncSender != nil {
+		return runtime.tableSyncSender(peerURL, syncRequest)
+	}
+	return runtime.sendTableSync(peerURL, syncRequest)
+}
+
+func (runtime *meshRuntime) syncRotatedTableToPreviousHost(table *nativeTableState, previousHost nativeKnownParticipant) {
+	if table == nil || previousHost.Peer.PeerID == "" || previousHost.Peer.PeerID == runtime.selfPeerID() {
+		return
+	}
+	peerURL := firstNonEmptyString(previousHost.Peer.PeerURL, runtime.knownPeerURL(previousHost.Peer.PeerID))
+	if peerURL == "" {
+		return
+	}
+	visiblePlayerID := ""
+	for _, seat := range table.Seats {
+		if seat.PeerID == previousHost.Peer.PeerID {
+			visiblePlayerID = seat.PlayerID
+			break
+		}
+	}
+	if err := runtime.syncTableToPeerURL(peerURL, *table, visiblePlayerID); err != nil {
+		debugMeshf("rotate host explicit sync to previous host failed table=%s previous_host=%s err=%v", table.Config.TableID, previousHost.Peer.PeerID, err)
+	}
 }
 
 func (runtime *meshRuntime) publishPublicState(table nativeTableState) error {
@@ -3434,7 +3656,18 @@ func comparableSnapshotForRollbackAnchor(snapshot *NativeCooperativeTableSnapsho
 }
 
 func comparableSignedEvent(event NativeSignedTableEvent) NativeSignedTableEvent {
-	return cloneJSON(event)
+	comparable := cloneJSON(event)
+	if stringValue(comparable.Body["type"]) == "TurnChallengeOpened" {
+		comparable.SenderPeerID = ""
+		comparable.SenderProtocolPubkeyHex = ""
+		comparable.SenderRole = ""
+		comparable.Signature = ""
+		comparable.Timestamp = ""
+		delete(comparable.Body, "escapeEligibleAt")
+		delete(comparable.Body, "openedAt")
+		delete(comparable.Body, "transitionHash")
+	}
+	return comparable
 }
 
 func unsignedSignedTableEvent(event NativeSignedTableEvent) map[string]any {
@@ -3621,11 +3854,27 @@ func (runtime *meshRuntime) validateAcceptedEventAnchors(table nativeTableState,
 			if strings.TrimSpace(stringValue(table.PublicState.LatestEventHash)) != history.LastHash {
 				return errors.New("ready public state latest event hash does not match accepted event history")
 			}
+		} else if runtime.readyPublicStateMatchesLatestSnapshot(table, history.LastHash) {
+			// A no-blame abort can restore the last settled snapshot while advancing the
+			// accepted event history with a HandAbort marker before the next hand starts.
 		} else if strings.TrimSpace(stringValue(table.PublicState.LatestEventHash)) != strings.TrimSpace(stringValue(table.LatestSnapshot.LatestEventHash)) {
 			return errors.New("public state latest event hash does not match latest snapshot")
 		}
 	}
 	return nil
+}
+
+func (runtime *meshRuntime) readyPublicStateMatchesLatestSnapshot(table nativeTableState, latestEventHash string) bool {
+	if table.PublicState == nil || table.LatestSnapshot == nil || table.ActiveHand != nil {
+		return false
+	}
+	if strings.TrimSpace(table.Config.Status) != "ready" {
+		return false
+	}
+
+	expected := runtime.publicStateFromSnapshot(table, *table.LatestSnapshot)
+	expected.LatestEventHash = latestEventHash
+	return reflect.DeepEqual(comparablePublicState(table.PublicState), comparablePublicState(&expected))
 }
 
 func (runtime *meshRuntime) validateAcceptedSnapshotHistory(table nativeTableState, history nativeAcceptedEventHistory) error {
@@ -3806,11 +4055,29 @@ func (runtime *meshRuntime) validateAcceptedCustodyHistory(existing *nativeTable
 		return errors.New("accepted history would roll back custody transitions")
 	}
 	for index := range existing.CustodyTransitions {
-		if !reflect.DeepEqual(cloneCustodyTransitionFast(existing.CustodyTransitions[index]), cloneCustodyTransitionFast(incoming.CustodyTransitions[index])) {
+		if !reflect.DeepEqual(
+			acceptedCustodyTransitionComparable(existing.CustodyTransitions[index]),
+			acceptedCustodyTransitionComparable(incoming.CustodyTransitions[index]),
+		) {
 			return fmt.Errorf("historical custody transition %d was rewritten", index)
 		}
 	}
 	return nil
+}
+
+func acceptedCustodyTransitionComparable(transition tablecustody.CustodyTransition) tablecustody.CustodyTransition {
+	comparable := cloneCustodyTransitionFast(transition)
+	if comparable.Proof.ChallengeWitness != nil {
+		// Challenge bundle execution can be observed and rebroadcast by different peers at slightly
+		// different wall-clock times and through different intermediary broadcasts. The executed txid
+		// and bundle hash define the immutable witness identity; local rebroadcast metadata should not
+		// force a historical rewrite.
+		comparable.Proof.ChallengeWitness.BroadcastTxIDs = nil
+		comparable.Proof.ChallengeWitness.ExecutedAt = ""
+		comparable.Proof.FinalizedAt = ""
+		comparable.Proof.TransitionHash = ""
+	}
+	return comparable
 }
 
 func custodyStateRefsForPlayer(state *tablecustody.CustodyState, playerID string) []tablecustody.VTXORef {
@@ -3892,6 +4159,9 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	requireArkSettlement := !runtime.config.UseMockSettlement &&
 		custodyTransitionRequiresArkSettlement(previous, transition) &&
 		!custodyTransitionUsesMockSettlement(transition)
+	validationTable := cloneJSON(table)
+	validationTable.LatestCustodyState = previous
+	restoreAcceptedSeatStatusesFromCustodyState(&validationTable, previous)
 	if transition.Proof.StateHash != transition.NextStateHash {
 		return errors.New("custody proof state hash mismatch")
 	}
@@ -3919,9 +4189,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		(strings.TrimSpace(transition.ArkIntentID) == "" || strings.TrimSpace(transition.ArkTxID) == "") {
 		return errors.New("custody proof is missing Ark settlement ids")
 	}
-	baseTable := cloneJSON(table)
-	baseTable.LatestCustodyState = previous
-	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(baseTable, transition)
+	approvalTransition, _, err := runtime.normalizedCustodyApprovalTransition(validationTable, transition)
 	if err != nil {
 		return err
 	}
@@ -3933,13 +4201,13 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		if !sameCanonicalVTXORefs(bundle.SourcePotRefs, expectedRecoverySourceRefs) {
 			return fmt.Errorf("custody recovery bundle %d source refs do not match the accepted transition", index)
 		}
-		if err := runtime.validateStoredRecoveryBundle(table, bundle); err != nil {
+		if err := runtime.validateStoredRecoveryBundle(validationTable, bundle); err != nil {
 			return fmt.Errorf("custody recovery bundle %d is invalid: %w", index, err)
 		}
 	}
-	required := runtime.requiredCustodySigners(table, transition)
+	required := runtime.requiredCustodySigners(validationTable, transition)
 	if !(hasChallengeWitness && transition.Kind == tablecustody.TransitionKindTurnChallengeEscape) && !hasRecoveryWitness {
-		if err := runtime.validateCustodyApprovals(table, transition, required); err != nil {
+		if err := runtime.validateCustodyApprovals(validationTable, transition, required); err != nil {
 			return err
 		}
 	}
@@ -3949,10 +4217,10 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 		}
 	}
 	if hasChallengeWitness {
-		return runtime.validateAcceptedCustodyChallengeWitness(table, previous, transition)
+		return runtime.validateAcceptedCustodyChallengeWitness(validationTable, previous, transition)
 	}
 	if hasRecoveryWitness {
-		return runtime.validateAcceptedCustodyRecoveryWitness(table, previous, transition)
+		return runtime.validateAcceptedCustodyRecoveryWitness(validationTable, previous, transition)
 	}
 	if transition.Kind == tablecustody.TransitionKindEmergencyExit {
 		_, err := runtime.validateAcceptedCustodyExitWitness(previous, transition)
@@ -3961,7 +4229,7 @@ func (runtime *meshRuntime) validateAcceptedCustodyTransition(table nativeTableS
 	if !requireArkSettlement {
 		return nil
 	}
-	return runtime.validateAcceptedCustodySettlementWitness(table, previous, transition)
+	return runtime.validateAcceptedCustodySettlementWitness(validationTable, previous, transition)
 }
 
 func (runtime *meshRuntime) validateCustodyApprovals(table nativeTableState, transition tablecustody.CustodyTransition, required []string) error {
@@ -5248,7 +5516,7 @@ func (runtime *meshRuntime) tableViewerPlayerID(request *http.Request, table nat
 }
 
 func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, incoming nativeTableState, senderPeerID string) error {
-	if !runtime.isLocalTableParticipant(incoming) {
+	if !runtime.isLocalTableParticipant(incoming) && !runtime.canAcceptIncomingTableAsPreviousHost(existing, incoming) {
 		return errors.New("sync request does not target this daemon")
 	}
 	if err := validateAcceptedTableProtocolVersion(incoming); err != nil {
@@ -5298,7 +5566,7 @@ func (runtime *meshRuntime) validateSyncTransition(existing *nativeTableState, i
 }
 
 func (runtime *meshRuntime) validateAcceptedRemoteTable(existing *nativeTableState, incoming nativeTableState) error {
-	if !runtime.isLocalTableParticipant(incoming) {
+	if !runtime.isLocalTableParticipant(incoming) && !runtime.canAcceptIncomingTableAsPreviousHost(existing, incoming) {
 		return errors.New("remote table does not target this daemon")
 	}
 	if err := validateAcceptedTableProtocolVersion(incoming); err != nil {
@@ -5387,6 +5655,16 @@ func (runtime *meshRuntime) isLocalTableParticipant(table nativeTableState) bool
 		}
 	}
 	return runtime.seatIndexForPlayer(table) >= 0
+}
+
+func (runtime *meshRuntime) canAcceptIncomingTableAsPreviousHost(existing *nativeTableState, incoming nativeTableState) bool {
+	if existing == nil {
+		return false
+	}
+	if existing.CurrentHost.Peer.PeerID != runtime.selfPeerID() {
+		return false
+	}
+	return incoming.CurrentEpoch > existing.CurrentEpoch
 }
 
 func (runtime *meshRuntime) isAuthorizedRemoteHost(table *nativeTableState, candidatePeerID string) bool {

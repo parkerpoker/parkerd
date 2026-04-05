@@ -979,6 +979,68 @@ func TestAcceptedTurnChallengeEscapeReplayRejectsMissingChainStatus(t *testing.T
 	}
 }
 
+func TestAcceptedCustodyHistoryAllowsChallengeWitnessTimingDrift(t *testing.T) {
+	_, host, _, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	existing := cloneJSON(prepared.table)
+	incoming := cloneJSON(prepared.table)
+	last := len(incoming.CustodyTransitions) - 1
+	witness := incoming.CustodyTransitions[last].Proof.ChallengeWitness
+	if witness == nil {
+		t.Fatal("expected turn challenge open witness")
+	}
+	witness.ExecutedAt = addMillis(witness.ExecutedAt, 1500)
+	witness.BroadcastTxIDs = []string{witness.TransactionID, witness.TransactionID}
+	incoming.CustodyTransitions[last].Proof.ChallengeWitness = witness
+	incoming.CustodyTransitions[last].Proof.FinalizedAt = witness.ExecutedAt
+	incoming.CustodyTransitions[last].Proof.TransitionHash = tablecustody.HashCustodyTransition(incoming.CustodyTransitions[last])
+	if incoming.PendingTurnChallenge == nil {
+		t.Fatal("expected pending turn challenge")
+	}
+	incoming.PendingTurnChallenge.OpenedAt = witness.ExecutedAt
+
+	if err := host.validateAcceptedCustodyHistory(&existing, incoming); err != nil {
+		t.Fatalf("expected accepted custody history to tolerate challenge witness timing drift, got %v", err)
+	}
+}
+
+func TestAcceptedHistoricalLedgerAllowsTurnChallengeOpenAuthorDrift(t *testing.T) {
+	_, host, guest, prepared := prepareBlockBasedTurnChallengeEscape(t)
+
+	existing := cloneJSON(prepared.table)
+	incoming := cloneJSON(prepared.table)
+	last := len(existing.Events) - 1
+	if got := stringValue(existing.Events[last].Body["type"]); got != "TurnChallengeOpened" {
+		t.Fatalf("expected last event type TurnChallengeOpened, got %q", got)
+	}
+
+	existing.Events[last].SenderPeerID = guest.selfPeerID()
+	existing.Events[last].SenderProtocolPubkeyHex = guest.protocolIdentity.PublicKeyHex
+	existing.Events[last].SenderRole = "player"
+	existing.Events[last].Timestamp = addMillis(existing.Events[last].Timestamp, -14_000)
+	existing.Events[last].Body["openedAt"] = addMillis(stringValue(existing.Events[last].Body["openedAt"]), -14_000)
+	if existing.PendingTurnChallenge == nil {
+		t.Fatal("expected pending turn challenge")
+	}
+	existing.PendingTurnChallenge.OpenedAt = stringValue(existing.Events[last].Body["openedAt"])
+	if escapeEligibleAt := strings.TrimSpace(stringValue(existing.Events[last].Body["escapeEligibleAt"])); escapeEligibleAt != "" {
+		existing.Events[last].Body["escapeEligibleAt"] = addMillis(escapeEligibleAt, -14_000)
+		existing.PendingTurnChallenge.EscapeEligibleAt = stringValue(existing.Events[last].Body["escapeEligibleAt"])
+	}
+	existing.Events[last].Body["transitionHash"] = strings.Repeat("0", 64)
+
+	var lastEventHash string
+	existing.Events, lastEventHash = resignHistoricalEventsForTest(t, existing.Events, host, guest)
+	existing.LastEventHash = lastEventHash
+	if existing.PublicState != nil {
+		existing.PublicState.LatestEventHash = lastEventHash
+	}
+
+	if err := host.validateAcceptedHistoricalLedger(&existing, incoming); err != nil {
+		t.Fatalf("expected accepted event history to tolerate turn challenge open author drift, got %v", err)
+	}
+}
+
 func TestTurnChallengeOpenBundleBecomesStaleAfterOrdinaryCandidateFinalizesFirst(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	guest := newMeshTestRuntime(t, "guest")

@@ -623,10 +623,13 @@ func (runtime *meshRuntime) stackClaimRefsReusableForTransition(table nativeTabl
 	if transition.Kind == tablecustody.TransitionKindAction {
 		return false
 	}
-	if !reflect.DeepEqual(comparableStackClaim(previous), comparableStackClaim(next)) {
+	if len(previous.VTXORefs) != 1 {
 		return false
 	}
-	if len(previous.VTXORefs) != 1 {
+	if previous.PlayerID != next.PlayerID || previous.SeatIndex != next.SeatIndex {
+		return false
+	}
+	if stackClaimRefAmount(previous) != stackClaimRefAmount(next) {
 		return false
 	}
 	spec, err := runtime.stackOutputSpecForTransition(table, &transition, next.PlayerID, stackClaimRefAmount(next))

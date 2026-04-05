@@ -514,6 +514,94 @@ func TestShowdownRevealRecoveryMatchesCooperativePayoutSuccessor(t *testing.T) {
 	}
 }
 
+func TestSettledShowdownRecoveryReusesEquivalentShowdownRevealBundle(t *testing.T) {
+	t.Parallel()
+
+	host, guest, tableID := createSyntheticRealStartedTableForRecoveryTest(t)
+
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, game.Action{Type: game.ActionCall}); err != nil {
+		t.Fatalf("host send preflop call: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, guest, tableID)
+	if _, err := guest.SendAction(tableID, aggressiveActionForTable(t, mustReadNativeTable(t, guest, tableID))); err != nil {
+		t.Fatalf("guest send preflop bet: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	if _, err := host.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, host, tableID))); err != nil {
+		t.Fatalf("host send preflop call to showdown line: %v", err)
+	}
+	for index, actor := range []*meshRuntime{guest, host, guest, host, guest, host} {
+		waitForLocalCanAct(t, []*meshRuntime{host, guest}, actor, tableID)
+		if _, err := actor.SendAction(tableID, game.Action{Type: game.ActionCheck}); err != nil {
+			t.Fatalf("send river-line check %d: %v", index, err)
+		}
+	}
+
+	showdownReveal := waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetShowdownReveal)
+	showdownReveal = withLatestRecoveryBundlesForTest(t, host, showdownReveal, showdownReveal.ActiveHand.State)
+	lastIndex := len(showdownReveal.CustodyTransitions) - 1
+	if len(showdownReveal.CustodyTransitions[lastIndex].Proof.RecoveryBundles) == 0 {
+		t.Fatal("expected showdown-reveal source transition to store recovery bundles")
+	}
+
+	settled := waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	if settled.ActiveHand == nil || settled.ActiveHand.State.Phase != game.StreetSettled {
+		t.Fatal("expected settled hand")
+	}
+	settled.CustodyTransitions = cloneJSON(showdownReveal.CustodyTransitions)
+	if showdownReveal.LatestCustodyState == nil {
+		t.Fatal("expected showdown-reveal custody state")
+	}
+	latestCustodyState := cloneJSON(*showdownReveal.LatestCustodyState)
+	settled.LatestCustodyState = &latestCustodyState
+	lastIndex = len(settled.CustodyTransitions) - 1
+	for index := range settled.CustodyTransitions[lastIndex].Proof.RecoveryBundles {
+		settled.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].EarliestExecuteAt = addMillis(nowISO(), -1)
+		settled.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index].BundleHash = tablecustody.HashCustodyRecoveryBundle(settled.CustodyTransitions[lastIndex].Proof.RecoveryBundles[index])
+	}
+	if settled.LatestCustodyState == nil {
+		t.Fatal("expected latest custody state")
+	}
+	settled.LatestCustodyState.ActionDeadlineAt = addMillis(nowISO(), -1)
+	settled.LatestCustodyState.PublicStateHash = host.publicMoneyStateHash(settled, &settled.ActiveHand.State)
+
+	timeoutResolution := latestTimeoutResolutionForHand(settled)
+	overrides := (*custodyBindingOverrides)(nil)
+	if derived := host.showdownPayoutTimeoutResolution(settled, timeoutResolution); derived != nil {
+		timeoutResolution = derived
+		overrides = &custodyBindingOverrides{
+			ActionDeadlineAt: settled.LatestCustodyState.ActionDeadlineAt,
+		}
+	}
+	expectedTransition, err := host.buildCustodyTransitionWithOverrides(settled, tablecustody.TransitionKindShowdownPayout, &settled.ActiveHand.State, nil, timeoutResolution, overrides)
+	if err != nil {
+		t.Fatalf("build settled showdown payout transition: %v", err)
+	}
+	if matchedBundle, _, err := host.matchingStoredRecoveryBundle(settled, expectedTransition); err != nil {
+		t.Fatalf("match settled showdown recovery bundle: %v", err)
+	} else if matchedBundle == nil {
+		t.Fatal("expected settled showdown bundle match")
+	}
+
+	recoveredTransition := cloneJSON(expectedTransition)
+	recoveredTable := cloneJSON(settled)
+	if handled, err := host.finalizeCustodyRecoveryTransition(&recoveredTable, &recoveredTransition, nil); err != nil {
+		t.Fatalf("finalize settled showdown recovery: %v", err)
+	} else if !handled {
+		t.Fatal("expected settled showdown recovery to reuse the stored showdown-reveal bundle")
+	}
+	if recoveredTransition.Proof.SettlementWitness != nil {
+		t.Fatal("expected settled showdown recovery to avoid settlement witness")
+	}
+	if recoveredTransition.Proof.RecoveryWitness == nil {
+		t.Fatal("expected settled showdown recovery witness")
+	}
+	if !reflect.DeepEqual(comparableSemanticCustodyTransition(recoveredTransition), comparableSemanticCustodyTransition(expectedTransition)) {
+		t.Fatalf("expected settled recovered showdown payout to match cooperative semantics")
+	}
+}
+
 func TestAcceptedCustodyHistoryReplaysRecoveryWitnessOfflineAndRejectsTampering(t *testing.T) {
 	host, guest, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
 	before = withLatestRecoveryBundlesForTest(t, host, before, before.ActiveHand.State)
@@ -588,5 +676,62 @@ func TestAcceptedCustodyHistoryReplaysRecoveryWitnessOfflineAndRejectsTampering(
 	})
 	if err := host.validateAcceptedCustodyHistory(nil, tamperedWitness); err == nil || !strings.Contains(strings.ToLower(err.Error()), "txid") {
 		t.Fatalf("expected tampered recovery witness to be rejected, got %v", err)
+	}
+}
+
+func TestArkRecoversAfterRecoveryBundleStarts(t *testing.T) {
+	host, _, before, _, _ := manualBlindTransitionSourceForRecoveryTest(t)
+	before = withLatestRecoveryBundlesForTest(t, host, before, before.ActiveHand.State)
+	before.LatestCustodyState.ActionDeadlineAt = addMillis(nowISO(), -1)
+	before.LatestCustodyState.PublicStateHash = host.publicMoneyStateHash(before, &before.ActiveHand.State)
+
+	actingSeatIndex := *before.ActiveHand.State.ActingSeatIndex
+	actingPlayerID := seatPlayerID(before, actingSeatIndex)
+	legalActions := game.GetLegalActions(before.ActiveHand.State, before.ActiveHand.State.ActingSeatIndex)
+	actionTypes := make([]string, 0, len(legalActions))
+	for _, legalAction := range legalActions {
+		actionTypes = append(actionTypes, string(legalAction.Type))
+	}
+	resolution := tablecustody.BuildTimeoutResolution(defaultCustodyTimeoutPolicy, actingPlayerID, actionTypes, []string{actingPlayerID})
+	action := game.Action{Type: game.ActionFold}
+	nextState, err := game.ApplyHoldemAction(before.ActiveHand.State, actingSeatIndex, action)
+	if err != nil {
+		t.Fatalf("apply timeout fold: %v", err)
+	}
+	recoveredTransition, err := host.buildCustodyTransition(before, tablecustody.TransitionKindTimeout, &nextState, &action, &resolution)
+	if err != nil {
+		t.Fatalf("build timeout transition: %v", err)
+	}
+
+	recovered := cloneJSON(before)
+	if handled, err := host.finalizeCustodyRecoveryTransition(&recovered, &recoveredTransition, nil); err != nil {
+		t.Fatalf("finalize recovery transition: %v", err)
+	} else if !handled {
+		t.Fatal("expected recovery bundle to finalize")
+	}
+	recovered.CustodyTransitions = append(recovered.CustodyTransitions, recoveredTransition)
+	recovered.ActiveHand.State = nextState
+	publicState := host.publicStateFromHand(recovered, nextState)
+	recovered.PublicState = &publicState
+	latest := cloneJSON(recoveredTransition.NextState)
+	recovered.LatestCustodyState = &latest
+
+	arkVerifyCalls := 0
+	host.custodyArkVerify = func(refs []tablecustody.VTXORef, requireSpendable bool) error {
+		arkVerifyCalls++
+		return nil
+	}
+	if err := host.validateAcceptedCustodyHistory(nil, recovered); err != nil {
+		t.Fatalf("expected recovery-backed history to remain valid after Ark recovers, got %v", err)
+	}
+	latestTransition := recovered.CustodyTransitions[len(recovered.CustodyTransitions)-1]
+	if latestTransition.Proof.RecoveryWitness == nil {
+		t.Fatal("expected recovered transition to keep its recovery witness after Ark recovers")
+	}
+	if latestTransition.Proof.SettlementWitness != nil {
+		t.Fatal("did not expect Ark recovery to retrofit a settlement witness onto a recovered transition")
+	}
+	if arkVerifyCalls != 0 {
+		t.Fatalf("expected recovery-backed replay to avoid live Ark verification after recovery starts, got %d calls", arkVerifyCalls)
 	}
 }

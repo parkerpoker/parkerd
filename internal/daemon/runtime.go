@@ -30,6 +30,8 @@ type daemonRuntime interface {
 	OpenTurnChallenge(tableID string) (any, error)
 	ResolveTurnChallenge(tableID, optionID string) (any, error)
 	RotateHost(tableID string) (any, error)
+	StartNextHand(tableID string) (any, error)
+	AbortHand(tableID string) (any, error)
 	PublicTables() (any, error)
 	CashOut(tableID string) (any, error)
 	Renew(tableID string) (any, error)

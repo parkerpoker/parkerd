@@ -1739,6 +1739,8 @@ func (runtime *meshRuntime) abortActiveHandLocked(table *nativeTableState, reaso
 		return nil
 	}
 	debugMeshf("abort hand table=%s reason=%s offendingSeat=%v", table.Config.TableID, reason, offendingSeatIndex)
+	table.PendingTurnChallenge = nil
+	table.PendingTurnMenu = nil
 	if err := runtime.appendEvent(table, map[string]any{
 		"handId":         table.ActiveHand.State.HandID,
 		"reason":         reason,
@@ -1782,13 +1784,6 @@ func (runtime *meshRuntime) abortActiveHandLocked(table *nativeTableState, reaso
 	table.ActiveHandStartAt = ""
 	table.Config.Status = "ready"
 	table.NextHandAt = addMillis(nowISO(), runtime.nextHandDelayMSForTable(*table))
-	snapshot, err := runtime.buildSnapshot(*table, restored)
-	if err != nil {
-		return err
-	}
-	table.LatestSnapshot = &snapshot
-	table.LatestFullySignedSnapshot = &snapshot
-	table.Snapshots = append(table.Snapshots, snapshot)
 	return nil
 }
 

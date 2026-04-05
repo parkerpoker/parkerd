@@ -225,6 +225,14 @@ func (runtime *daemonRuntimeAdapter) RotateHost(tableID string) (any, error) {
 	return runtime.inner.RotateHost(tableID)
 }
 
+func (runtime *daemonRuntimeAdapter) StartNextHand(tableID string) (any, error) {
+	return runtime.inner.StartNextHand(tableID)
+}
+
+func (runtime *daemonRuntimeAdapter) AbortHand(tableID string) (any, error) {
+	return runtime.inner.AbortHand(tableID)
+}
+
 func (runtime *daemonRuntimeAdapter) PublicTables() (any, error) {
 	return runtime.inner.PublicTables()
 }

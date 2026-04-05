@@ -1,0 +1,25 @@
+name: Nightly Tor Regtest
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  tor-regtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      USE_TOR: "true"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run Tor-backed regtest integration suite
+        run: make test-integration-tor

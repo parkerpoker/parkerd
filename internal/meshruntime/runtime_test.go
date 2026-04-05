@@ -1137,6 +1137,779 @@ func TestMissingRevealTimeoutAwardsPotAndAppendsAbort(t *testing.T) {
 	t.Fatal("timed out waiting for missing reveal timeout to settle the hand")
 }
 
+func TestAcceptRemoteTableAfterNoBlameAbortKeepsReadySnapshotAnchor(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetCommitment)
+
+	beforeAbort := mustReadNativeTable(t, host, tableID)
+	if beforeAbort.LatestSnapshot == nil || beforeAbort.LatestFullySignedSnapshot == nil {
+		t.Fatal("expected ready snapshot before abort")
+	}
+	if len(beforeAbort.Snapshots) != 1 {
+		t.Fatalf("expected single ready snapshot before abort, got %d", len(beforeAbort.Snapshots))
+	}
+	readySnapshotID := beforeAbort.LatestSnapshot.SnapshotID
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil {
+			return err
+		}
+		if table == nil {
+			t.Fatal("expected table to abort")
+		}
+		if err := host.abortActiveHandLocked(table, "protocol timeout during commitment", nil); err != nil {
+			return err
+		}
+		return host.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("abort active hand: %v", err)
+	}
+
+	aborted := mustReadNativeTable(t, host, tableID)
+	if !tableHasEventType(aborted, "HandAbort") {
+		t.Fatal("expected HandAbort event after abort")
+	}
+	if aborted.ActiveHand != nil {
+		t.Fatalf("expected no active hand after abort, got %+v", aborted.ActiveHand)
+	}
+	if got := len(aborted.Snapshots); got != 1 {
+		t.Fatalf("expected abort to preserve single ready snapshot, got %d", got)
+	}
+	if aborted.LatestSnapshot == nil || aborted.LatestFullySignedSnapshot == nil {
+		t.Fatal("expected ready snapshot pointers after abort")
+	}
+	if aborted.LatestSnapshot.SnapshotID != readySnapshotID {
+		t.Fatalf("expected latest snapshot %q after abort, got %q", readySnapshotID, aborted.LatestSnapshot.SnapshotID)
+	}
+	if aborted.LatestFullySignedSnapshot.SnapshotID != readySnapshotID {
+		t.Fatalf("expected latest fully signed snapshot %q after abort, got %q", readySnapshotID, aborted.LatestFullySignedSnapshot.SnapshotID)
+	}
+	if aborted.PublicState == nil {
+		t.Fatal("expected public state after abort")
+	}
+	if got := aborted.PublicState.HandNumber; got != 0 {
+		t.Fatalf("expected ready public state hand number 0 after abort, got %d", got)
+	}
+	if stringValue(aborted.PublicState.HandID) != "" {
+		t.Fatalf("expected ready public state hand id to be cleared, got %q", stringValue(aborted.PublicState.HandID))
+	}
+	if strings.TrimSpace(stringValue(aborted.PublicState.LatestEventHash)) != strings.TrimSpace(aborted.LastEventHash) {
+		t.Fatalf("expected ready public state latest event hash %q, got %q", aborted.LastEventHash, stringValue(aborted.PublicState.LatestEventHash))
+	}
+
+	if err := guest.acceptRemoteTable(aborted); err != nil {
+		t.Fatalf("accept aborted remote table: %v", err)
+	}
+
+	accepted := mustReadNativeTable(t, guest, tableID)
+	if got := len(accepted.Snapshots); got != 1 {
+		t.Fatalf("expected guest to accept single ready snapshot after abort, got %d", got)
+	}
+	if accepted.LatestSnapshot == nil || accepted.LatestFullySignedSnapshot == nil {
+		t.Fatal("expected guest latest snapshot pointers after abort")
+	}
+	if accepted.LatestSnapshot.SnapshotID != readySnapshotID {
+		t.Fatalf("expected guest latest snapshot %q after abort, got %q", readySnapshotID, accepted.LatestSnapshot.SnapshotID)
+	}
+	if accepted.LatestFullySignedSnapshot.SnapshotID != readySnapshotID {
+		t.Fatalf("expected guest latest fully signed snapshot %q after abort, got %q", readySnapshotID, accepted.LatestFullySignedSnapshot.SnapshotID)
+	}
+}
+
+func TestGetTableAfterPostSettledNoBlameAbortKeepsReadySnapshotAnchor(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	current := mustReadNativeTable(t, host, tableID)
+	if current.ActiveHand == nil || current.ActiveHand.State.ActingSeatIndex == nil {
+		t.Fatalf("expected actionable hand before settling, got %+v", current.ActiveHand)
+	}
+
+	folder := host
+	if seatPlayerID(current, *current.ActiveHand.State.ActingSeatIndex) != host.walletID.PlayerID {
+		folder = guest
+	}
+	if _, err := folder.SendAction(tableID, game.Action{Type: game.ActionFold}); err != nil {
+		t.Fatalf("fold to settle hand: %v", err)
+	}
+
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetCommitment)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil {
+			return err
+		}
+		if table == nil {
+			t.Fatal("expected table to abort")
+		}
+		if err := host.abortActiveHandLocked(table, "manual post-settled abort", nil); err != nil {
+			return err
+		}
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("replicate no-blame abort after settled hand: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		host.Tick()
+		guest.Tick()
+		if tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+		t.Fatal("expected guest to accept the post-settled no-blame abort")
+	}
+
+	view, err := guest.GetTable(tableID)
+	if err != nil {
+		t.Fatalf("guest get table after post-settled no-blame abort: %v", err)
+	}
+	if view.Config.Status != "ready" {
+		t.Fatalf("expected ready status after post-settled abort, got %q", view.Config.Status)
+	}
+	if view.PublicState == nil {
+		t.Fatal("expected public state after post-settled abort")
+	}
+	if view.LatestSnapshot == nil {
+		t.Fatal("expected latest snapshot after post-settled abort")
+	}
+	if stringValue(view.PublicState.Phase) != string(game.StreetSettled) {
+		t.Fatalf("expected ready public state to restore the settled snapshot, got phase=%q", stringValue(view.PublicState.Phase))
+	}
+	if view.PublicState.HandNumber != view.LatestSnapshot.HandNumber {
+		t.Fatalf("expected public state hand number %d to match latest snapshot, got %d", view.LatestSnapshot.HandNumber, view.PublicState.HandNumber)
+	}
+	if strings.TrimSpace(stringValue(view.PublicState.LatestEventHash)) == strings.TrimSpace(stringValue(view.LatestSnapshot.LatestEventHash)) {
+		t.Fatal("expected post-settled abort to advance the public-state event hash beyond the latest snapshot anchor")
+	}
+}
+
+func TestNoBlameAbortStartsFreshNextHandNumber(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetCommitment)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil {
+			return err
+		}
+		if table == nil {
+			t.Fatal("expected table to abort")
+		}
+		if err := host.abortActiveHandLocked(table, "protocol timeout during commitment", nil); err != nil {
+			return err
+		}
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("replicate no-blame abort: %v", err)
+	}
+
+	aborted := mustReadNativeTable(t, host, tableID)
+	if aborted.NextHandAt == "" {
+		t.Fatal("expected no-blame abort to schedule a follow-up hand")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		host.Tick()
+		guest.Tick()
+		table := mustReadNativeTable(t, guest, tableID)
+		if tableHasEventType(table, "HandAbort") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+		t.Fatal("expected guest to accept the no-blame abort before restarting the next hand")
+	}
+
+	startNextHandForTest(t, host, tableID)
+	started := mustReadNativeTable(t, host, tableID)
+	if started.ActiveHand == nil {
+		t.Fatalf("expected active hand after no-blame abort restart, got status=%q", started.Config.Status)
+	}
+	if got := started.ActiveHand.State.HandNumber; got != 2 {
+		t.Fatalf("expected restarted hand number 2 after aborting hand 1, got %d", got)
+	}
+	if countTableEventsByType(started, "HandStart") != 2 {
+		t.Fatalf("expected two HandStart events after restarting post-abort, got %d", countTableEventsByType(started, "HandStart"))
+	}
+}
+
+func TestStartNextHandAfterPrivateDeliveryAbort(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPrivateDelivery)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil {
+			return err
+		}
+		if table == nil {
+			t.Fatal("expected table to abort")
+		}
+		offendingSeatIndex := 1
+		if err := host.abortActiveHandLocked(table, "protocol timeout during private-delivery", &offendingSeatIndex); err != nil {
+			return err
+		}
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("replicate blamed abort: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		host.Tick()
+		guest.Tick()
+		if tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+		t.Fatal("expected guest to accept the blamed abort before restarting the next hand")
+	}
+
+	if _, err := host.StartNextHand(tableID); err != nil {
+		t.Fatalf("start next hand after private-delivery abort: %v", err)
+	}
+
+	started := mustReadNativeTable(t, host, tableID)
+	if started.ActiveHand == nil {
+		t.Fatalf("expected active hand after blamed abort restart, got status=%q", started.Config.Status)
+	}
+	if got := started.ActiveHand.State.HandNumber; got != 2 {
+		t.Fatalf("expected restarted hand number 2 after aborting hand 1, got %d", got)
+	}
+}
+
+func TestStartNextHandAfterPrivateDeliveryAbortSyntheticRealMode(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	enableSyntheticRealMode(host, guest)
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPrivateDelivery)
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil {
+			return err
+		}
+		if table == nil {
+			t.Fatal("expected table to abort")
+		}
+		offendingSeatIndex := 1
+		if err := host.abortActiveHandLocked(table, "protocol timeout during private-delivery", &offendingSeatIndex); err != nil {
+			return err
+		}
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("replicate synthetic real blamed abort: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		host.Tick()
+		guest.Tick()
+		if tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+		t.Fatal("expected guest to accept the blamed abort before restarting the next hand in synthetic real mode")
+	}
+
+	if _, err := host.StartNextHand(tableID); err != nil {
+		t.Fatalf("start next hand after private-delivery abort in synthetic real mode: %v", err)
+	}
+
+	started := mustReadNativeTable(t, host, tableID)
+	if started.ActiveHand == nil {
+		t.Fatalf("expected active hand after synthetic real blamed abort restart, got status=%q", started.Config.Status)
+	}
+	if got := started.ActiveHand.State.HandNumber; got != 2 {
+		t.Fatalf("expected restarted hand number 2 after aborting hand 1 in synthetic real mode, got %d", got)
+	}
+}
+
+func TestNoBlameAbortClearsPendingTurnMenuForReplicas(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetPreflop)
+
+	deadline := time.Now().Add(3 * time.Second)
+	preAbortMenuObserved := false
+	for time.Now().Before(deadline) {
+		host.Tick()
+		guest.Tick()
+		view, err := guest.GetTable(tableID)
+		if err == nil && view.PendingTurnMenu != nil {
+			preAbortMenuObserved = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !preAbortMenuObserved {
+		t.Fatal("expected guest to observe a pending turn menu before the no-blame abort")
+	}
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil {
+			return err
+		}
+		if table == nil {
+			t.Fatal("expected table to abort")
+		}
+		if err := host.abortActiveHandLocked(table, "operator abort during actionable turn", nil); err != nil {
+			return err
+		}
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("replicate actionable no-blame abort: %v", err)
+	}
+
+	deadline = time.Now().Add(3 * time.Second)
+	abortVisibleOnGuest := false
+	for time.Now().Before(deadline) {
+		host.Tick()
+		guest.Tick()
+		view, err := guest.GetTable(tableID)
+		if err == nil && view.PendingTurnMenu == nil && view.PendingTurnChallenge == nil && tableHasEventType(mustReadNativeTable(t, guest, tableID), "HandAbort") {
+			abortVisibleOnGuest = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !abortVisibleOnGuest {
+		t.Fatal("expected guest GetTable to recover after no-blame abort and clear pending turn state")
+	}
+
+	if _, err := host.StartNextHand(tableID); err != nil {
+		t.Fatalf("start next hand after actionable no-blame abort: %v", err)
+	}
+}
+
+func TestStartNextHandPrefersExplicitNextHandTimerOverHistoricalCustodyTimestamp(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+
+	var actionDeadlineAt string
+	var phaseDeadlineAt string
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		staleCreatedAt := addMillis(nowISO(), -10_000)
+		table.NextHandAt = addMillis(nowISO(), -1)
+		table.LatestCustodyState.CreatedAt = staleCreatedAt
+		if len(table.CustodyTransitions) > 0 {
+			table.CustodyTransitions[len(table.CustodyTransitions)-1].NextState.CreatedAt = staleCreatedAt
+		}
+		return host.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("prepare host explicit next-hand timer: %v", err)
+	}
+	if err := guest.store.withTableLock(tableID, func() error {
+		table, err := guest.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		table.NextHandAt = addMillis(nowISO(), -1)
+		return guest.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("prepare guest explicit next-hand timer: %v", err)
+	}
+
+	if err := host.store.withTableLock(tableID, func() error {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		if err := host.startNextHandLocked(table); err != nil {
+			return err
+		}
+		return host.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("start next hand with explicit timer: %v", err)
+	}
+
+	started := mustReadNativeTable(t, host, tableID)
+	if started.ActiveHand == nil {
+		t.Fatal("expected active hand after explicit next-hand restart")
+	}
+	if started.LatestCustodyState == nil {
+		t.Fatal("expected blind-post custody state after restart")
+	}
+	actionDeadlineAt = started.LatestCustodyState.ActionDeadlineAt
+	phaseDeadlineAt = started.ActiveHand.Cards.PhaseDeadlineAt
+
+	if actionDeadlineAt == "" {
+		t.Fatal("expected action deadline after restart")
+	}
+	if elapsedMillis(actionDeadlineAt) >= 0 {
+		t.Fatalf("expected action deadline %q to remain in the future", actionDeadlineAt)
+	}
+	if phaseDeadlineAt == "" {
+		t.Fatal("expected protocol deadline after restart")
+	}
+	if elapsedMillis(phaseDeadlineAt) >= 0 {
+		t.Fatalf("expected phase deadline %q to remain in the future", phaseDeadlineAt)
+	}
+}
+
+func TestStartNextHandReleasesSettledActiveHandState(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	startNextHandForTest(t, host, tableID)
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	current := mustReadNativeTable(t, host, tableID)
+	if current.ActiveHand == nil || current.ActiveHand.State.ActingSeatIndex == nil {
+		t.Fatalf("expected actionable hand before settling, got %+v", current.ActiveHand)
+	}
+
+	folder := host
+	if seatPlayerID(current, *current.ActiveHand.State.ActingSeatIndex) != host.walletID.PlayerID {
+		folder = guest
+	}
+	if _, err := folder.SendAction(tableID, game.Action{Type: game.ActionFold}); err != nil {
+		t.Fatalf("fold to settle hand: %v", err)
+	}
+
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	settled := mustReadNativeTable(t, host, tableID)
+	if settled.ActiveHand == nil || settled.ActiveHand.State.Phase != game.StreetSettled {
+		t.Fatalf("expected settled active hand state before restart, got %+v", settled.ActiveHand)
+	}
+
+	view, err := host.StartNextHand(tableID)
+	if err != nil {
+		t.Fatalf("start next hand after settled hand: %v", err)
+	}
+	if view.PublicState == nil {
+		t.Fatalf("expected new active hand view after restart, got status=%q", view.Config.Status)
+	}
+	if stringValue(view.PublicState.Phase) == string(game.StreetSettled) {
+		t.Fatalf("expected restarted public phase to leave settled state, got %+v", view.PublicState)
+	}
+	if view.PublicState.HandNumber != 2 {
+		t.Fatalf("expected restarted hand number 2, got %d", view.PublicState.HandNumber)
+	}
+
+	started := mustReadNativeTable(t, host, tableID)
+	if started.ActiveHand == nil {
+		t.Fatalf("expected persisted active hand after settled restart, got status=%q", started.Config.Status)
+	}
+	if started.ActiveHand.State.HandNumber != 2 {
+		t.Fatalf("expected persisted restarted hand number 2, got %d", started.ActiveHand.State.HandNumber)
+	}
+}
+
+func TestRefreshLocalTableSyncsFromKnownParticipantsAfterHostRotation(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+
+	staleGuest := mustReadNativeTable(t, guest, tableID)
+	for _, runtime := range []*meshRuntime{host, guest, witness} {
+		if err := runtime.store.withTableLock(tableID, func() error {
+			table, err := runtime.store.readTable(tableID)
+			if err != nil || table == nil {
+				return err
+			}
+			table.LastHostHeartbeatAt = addMillis(nowISO(), -(runtime.hostFailureTimeoutMS() + 500))
+			return runtime.persistLocalTable(table, false)
+		}); err != nil {
+			t.Fatalf("mark stale heartbeat for %s: %v", runtime.profileName, err)
+		}
+	}
+
+	if err := witness.failoverTable(tableID, "test host rotation discovery"); err != nil {
+		t.Fatalf("witness failover: %v", err)
+	}
+
+	if err := guest.persistLocalTable(&staleGuest, false); err != nil {
+		t.Fatalf("restore stale guest table: %v", err)
+	}
+
+	refreshed, err := guest.refreshLocalTable(tableID)
+	if err != nil {
+		t.Fatalf("refresh guest table after host rotation: %v", err)
+	}
+	if refreshed == nil {
+		t.Fatal("expected refreshed guest table after host rotation")
+	}
+	if refreshed.CurrentEpoch != 2 {
+		t.Fatalf("expected refreshed guest epoch 2, got %d", refreshed.CurrentEpoch)
+	}
+	if refreshed.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected refreshed guest host %s, got %s", witness.selfPeerID(), refreshed.CurrentHost.Peer.PeerID)
+	}
+	if !tableHasEventType(*refreshed, "HostRotated") {
+		t.Fatal("expected refreshed guest table to include HostRotated")
+	}
+}
+
+func TestOldHostAcceptsRotatedEpochFromNewHost(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	tableID, _ := createStartedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+
+	staleHost := mustReadNativeTable(t, host, tableID)
+	if staleHost.CurrentHost.Peer.PeerID != host.selfPeerID() {
+		t.Fatalf("expected original host %s before failover, got %s", host.selfPeerID(), staleHost.CurrentHost.Peer.PeerID)
+	}
+
+	if err := witness.forceProtocolFailover(tableID, "test old host resync"); err != nil {
+		t.Fatalf("force protocol failover: %v", err)
+	}
+	rotated := mustReadNativeTable(t, witness, tableID)
+	if rotated.CurrentEpoch != staleHost.CurrentEpoch+1 {
+		t.Fatalf("expected rotated epoch %d, got %d", staleHost.CurrentEpoch+1, rotated.CurrentEpoch)
+	}
+	if rotated.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness host %s after failover, got %s", witness.selfPeerID(), rotated.CurrentHost.Peer.PeerID)
+	}
+
+	if err := host.persistLocalTable(&staleHost, false); err != nil {
+		t.Fatalf("restore stale host table: %v", err)
+	}
+	if err := host.acceptRemoteTable(rotated); err != nil {
+		t.Fatalf("accept rotated table on stale old host: %v", err)
+	}
+
+	accepted := mustReadNativeTable(t, host, tableID)
+	if accepted.CurrentEpoch != rotated.CurrentEpoch {
+		t.Fatalf("expected old host epoch %d after acceptance, got %d", rotated.CurrentEpoch, accepted.CurrentEpoch)
+	}
+	if accepted.CurrentHost.Peer.PeerID != rotated.CurrentHost.Peer.PeerID {
+		t.Fatalf("expected old host to adopt new host %s, got %s", rotated.CurrentHost.Peer.PeerID, accepted.CurrentHost.Peer.PeerID)
+	}
+	if !tableHasEventType(accepted, "HostRotated") {
+		t.Fatal("expected accepted rotated table to include HostRotated")
+	}
+}
+
+func TestFailoverDuringCustodySettlement(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+	witness := newMeshTestRuntime(t, "witness")
+
+	if _, err := host.BootstrapPeer(witness.selfPeerURL(), "", nil); err != nil {
+		t.Fatalf("bootstrap witness peer: %v", err)
+	}
+	enableSyntheticRealMode(host, guest, witness)
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest, witness.selfPeerID())
+	startNextHandForTest(t, host, tableID)
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+
+	base := mustReadNativeTable(t, host, tableID)
+	if base.ActiveHand == nil || base.ActiveHand.State.ActingSeatIndex == nil {
+		t.Fatalf("expected actionable hand before settlement failover test, got %+v", base.ActiveHand)
+	}
+	settledState, err := game.ForceFoldSeat(base.ActiveHand.State, *base.ActiveHand.State.ActingSeatIndex)
+	if err != nil {
+		t.Fatalf("force fold to settled hand: %v", err)
+	}
+	prepared := cloneJSON(base)
+	prepared.ActiveHand.State = settledState
+	publicState := host.publicStateFromHand(prepared, settledState)
+	prepared.PublicState = &publicState
+	prepared.ActiveHand.Cards.PhaseDeadlineAt = ""
+	prepared.NextHandAt = ""
+
+	for _, runtime := range []*meshRuntime{host, guest, witness} {
+		cloned := cloneJSON(prepared)
+		if err := runtime.persistLocalTable(&cloned, false); err != nil {
+			t.Fatalf("persist prepared settled table for %s: %v", runtime.profileName, err)
+		}
+	}
+
+	transition, err := host.buildCustodyTransition(prepared, tablecustody.TransitionKindShowdownPayout, &settledState, nil, nil)
+	if err != nil {
+		t.Fatalf("build payout transition for custody settlement failover: %v", err)
+	}
+	plan, err := host.buildCustodySettlementPlan(prepared, transition)
+	if err != nil {
+		t.Fatalf("build payout settlement plan for custody settlement failover: %v", err)
+	}
+	if len(plan.Inputs) == 0 {
+		t.Fatal("expected failover settlement plan to consume Ark custody inputs")
+	}
+
+	batchStarted := make(chan struct{})
+	releaseBatch := make(chan struct{})
+	host.custodyBatchExecute = func(table nativeTableState, prevStateHash, transitionHash string, inputs []custodyInputSpec, proofSignerIDs, treeSignerIDs []string, outputs []custodyBatchOutput) (*custodyBatchResult, error) {
+		select {
+		case <-batchStarted:
+		default:
+			close(batchStarted)
+		}
+		<-releaseBatch
+		return buildSyntheticCustodyBatchResultForTest(host, table, transitionHash, inputs, proofSignerIDs, treeSignerIDs, outputs)
+	}
+
+	finalizeDone := make(chan error, 1)
+	go func() {
+		table, err := host.store.readTable(tableID)
+		if err != nil || table == nil {
+			finalizeDone <- err
+			return
+		}
+		pending := cloneJSON(transition)
+		finalizeDone <- host.finalizeCustodyTransition(table, &pending, nil)
+	}()
+
+	select {
+	case <-batchStarted:
+	case err := <-finalizeDone:
+		if err != nil {
+			t.Fatalf("host custody finalize before batch block: %v", err)
+		}
+		t.Fatal("expected host custody finalize to block inside Ark batch execution")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for host settlement batch to start")
+	}
+
+	if err := witness.store.withTableLock(tableID, func() error {
+		table, err := witness.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		previousHost := table.CurrentHost
+		table.CurrentEpoch++
+		table.CurrentHost = nativeKnownParticipant{ProfileName: witness.profileName, Peer: witness.self.Peer}
+		table.Config.HostPeerID = witness.selfPeerID()
+		table.LastHostHeartbeatAt = nowISO()
+		table.PendingTurnMenu = nil
+		lease := map[string]any{
+			"epoch":       table.CurrentEpoch,
+			"hostPeerId":  table.CurrentHost.Peer.PeerID,
+			"leaseExpiry": addMillis(nowISO(), witness.hostFailureTimeoutMS()),
+			"leaseStart":  nowISO(),
+			"signatures":  []map[string]any{},
+			"tableId":     table.Config.TableID,
+			"witnessSet":  peerIDsFromParticipants(table.Witnesses),
+		}
+		if err := witness.appendEvent(table, map[string]any{
+			"type":               "HostRotated",
+			"lease":              lease,
+			"newEpoch":           table.CurrentEpoch,
+			"newHostPeerId":      table.CurrentHost.Peer.PeerID,
+			"previousHostPeerId": previousHost.Peer.PeerID,
+		}); err != nil {
+			return err
+		}
+		if err := witness.advanceHandProtocolLocked(table); err != nil {
+			return err
+		}
+		return witness.persistAndReplicate(table, true)
+	}); err != nil {
+		t.Fatalf("apply local failover during custody settlement: %v", err)
+	}
+	rotated := mustReadNativeTable(t, witness, tableID)
+	if rotated.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness to become host during custody settlement failover, got %q", rotated.CurrentHost.Peer.PeerID)
+	}
+	if rotated.ActiveHand == nil || rotated.ActiveHand.State.Phase != game.StreetSettled {
+		t.Fatalf("expected settled active hand to survive custody settlement failover, got %+v", rotated.ActiveHand)
+	}
+	if !tableHasEventType(rotated, "HostRotated") {
+		t.Fatal("expected HostRotated event during custody settlement failover")
+	}
+	if tableHasEventType(rotated, "HandAbort") {
+		t.Fatal("did not expect custody settlement failover to abort the settled hand")
+	}
+
+	close(releaseBatch)
+	select {
+	case err := <-finalizeDone:
+		if err != nil {
+			t.Fatalf("host finalize after settlement failover: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for blocked host settlement finalize to return")
+	}
+
+	afterRelease := mustReadNativeTable(t, witness, tableID)
+	if afterRelease.CurrentHost.Peer.PeerID != witness.selfPeerID() {
+		t.Fatalf("expected witness to remain host after settlement batch release, got %q", afterRelease.CurrentHost.Peer.PeerID)
+	}
+	if afterRelease.ActiveHand == nil || afterRelease.ActiveHand.State.Phase != game.StreetSettled {
+		t.Fatalf("expected settled hand to remain intact after settlement batch release, got %+v", afterRelease.ActiveHand)
+	}
+}
+
 func TestSyntheticRealModeMissingShowdownRevealTimeoutSettles(t *testing.T) {
 	t.Parallel()
 
@@ -3279,6 +4052,17 @@ func TestJoinTableSyncsExistingSeatsBeforeRemoteSignerPrepare(t *testing.T) {
 	}
 }
 
+func TestCreateTableRejectsSeatCountAboveTwo(t *testing.T) {
+	host := newMeshTestRuntime(t, "host")
+
+	if _, err := host.CreateTable(map[string]any{
+		"name":      "Unsupported Three Seat Table",
+		"seatCount": 3,
+	}); err == nil || !strings.Contains(err.Error(), "at most 2 seats") {
+		t.Fatalf("expected seat-count rejection for >2 seats, got %v", err)
+	}
+}
+
 func TestCustodySignerPrepareAcceptsBuyInLockWhenJoinerSeatMaterialIsStale(t *testing.T) {
 	host := newMeshTestRuntime(t, "host")
 	alice := newMeshTestRuntime(t, "alice")
@@ -3878,6 +4662,141 @@ func TestSyntheticRealModeGuestEmergencyExitRetriesAfterFailoverWithoutRerunning
 	}
 }
 
+func TestSyntheticRealModeGuestEmergencyExitResignsPendingRequestWhenCustodyHashAdvances(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createJoinedTwoPlayerTable(t, host, guest)
+	enableSyntheticRealMode(host, guest)
+
+	guestTable := mustReadNativeTable(t, guest, tableID)
+	expectedRefs := canonicalVTXORefs(guest.currentCustodyRefsByPlayer(guestTable)[guest.walletID.PlayerID])
+	if len(expectedRefs) == 0 {
+		t.Fatal("expected guest custody refs before emergency exit")
+	}
+	exitResult := buildSyntheticExitResultForTest(t, expectedRefs, true)
+	approveExpectedExitExecution := func(profileName string, execution nativeFundsExitExecution) error {
+		if !sameCanonicalVTXORefs(execution.SourceRefs, expectedRefs) {
+			return errors.New("unexpected exit execution refs")
+		}
+		if !reflect.DeepEqual(uniqueNonEmptyStrings(execution.BroadcastTxIDs), uniqueNonEmptyStrings(exitResult.BroadcastTxIDs)) {
+			return errors.New("unexpected exit execution broadcast txids")
+		}
+		if execution.SweepTxID != exitResult.SweepTxID {
+			return errors.New("unexpected exit execution sweep txid")
+		}
+		return nil
+	}
+	guest.custodyExitVerify = approveExpectedExitExecution
+
+	exitCalls := 0
+	guest.custodyExitExecute = func(profileName string, refs []tablecustody.VTXORef, destination string) (walletpkg.CustodyExitResult, error) {
+		exitCalls++
+		return buildSyntheticExitResultForTest(t, refs, true), nil
+	}
+
+	firstSubmission := true
+	guest.fundsSenderHook = func(peerURL string, input nativeFundsRequest) (nativeFundsResponse, error) {
+		if firstSubmission {
+			firstSubmission = false
+			return nativeFundsResponse{}, errors.New("simulated host submission failure")
+		}
+		return nativeFundsResponse{}, errors.New("unexpected remote submission after local retry")
+	}
+
+	result, err := guest.Exit(tableID)
+	if err != nil {
+		t.Fatalf("guest emergency exit with simulated submission failure: %v", err)
+	}
+	if stringValue(result["status"]) != "pending-exit" {
+		t.Fatalf("expected pending exit result after submission failure, got %+v", result)
+	}
+	if exitCalls != 1 {
+		t.Fatalf("expected one local exit execution before retry, got %d", exitCalls)
+	}
+
+	pendingOperation, pendingRequest, err := guest.pendingEmergencyExitOperation(tableID)
+	if err != nil {
+		t.Fatalf("read pending emergency exit operation: %v", err)
+	}
+	if pendingOperation == nil || pendingRequest == nil {
+		t.Fatal("expected pending emergency exit request to be persisted")
+	}
+	savedRequest := cloneJSON(*pendingRequest)
+
+	const advancedStateHash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if err := guest.store.withTableLock(tableID, func() error {
+		table, err := guest.store.readTable(tableID)
+		if err != nil || table == nil {
+			return err
+		}
+		if table.LatestCustodyState == nil {
+			return errors.New("expected latest custody state before stale pending exit replay")
+		}
+		advanced := cloneJSON(*table.LatestCustodyState)
+		advanced.StateHash = advancedStateHash
+		advanced.CreatedAt = nowISO()
+		table.LatestCustodyState = &advanced
+		table.CurrentHost = nativeKnownParticipant{ProfileName: guest.profileName, Peer: guest.self.Peer}
+		table.LastHostHeartbeatAt = nowISO()
+		return guest.store.writeTable(table)
+	}); err != nil {
+		t.Fatalf("advance guest custody hash before retry: %v", err)
+	}
+	guest.tableSyncSender = func(peerURL string, input nativeTableSyncRequest) error {
+		return nil
+	}
+
+	result, err = guest.Exit(tableID)
+	if err != nil {
+		t.Fatalf("guest emergency exit after custody-hash advancement: %v", err)
+	}
+	if stringValue(result["status"]) != "exited" {
+		t.Fatalf("expected exited status after stale pending replay, got %+v", result)
+	}
+	if exitCalls != 1 {
+		t.Fatalf("expected retry to reuse existing execution proof, got %d exit executions", exitCalls)
+	}
+	if _, request, err := guest.pendingEmergencyExitOperation(tableID); err != nil {
+		t.Fatalf("read pending emergency exit after custody-hash retry: %v", err)
+	} else if request != nil {
+		t.Fatal("expected pending emergency exit receipt to clear after custody-hash retry succeeds")
+	}
+
+	acceptedTable := mustReadNativeTable(t, guest, tableID)
+	if !tableHasEventType(acceptedTable, "EmergencyExit") {
+		t.Fatal("expected local host retry to append EmergencyExit event")
+	}
+	eventIndex := findEventIndexByType(acceptedTable, "EmergencyExit")
+	request, hasRequest, err := fundsRequestFromEvent(acceptedTable.Events[eventIndex])
+	if err != nil {
+		t.Fatalf("decode retried emergency exit request from event: %v", err)
+	}
+	if !hasRequest || request == nil || request.ExitExecution == nil {
+		t.Fatal("expected accepted emergency exit request after custody-hash retry")
+	}
+	if request.PrevCustodyStateHash != advancedStateHash {
+		t.Fatalf("expected retried request to re-sign for custody hash %q, got %q", advancedStateHash, request.PrevCustodyStateHash)
+	}
+	if request.PrevCustodyStateHash == savedRequest.PrevCustodyStateHash {
+		t.Fatal("expected retried request to replace the stale custody hash")
+	}
+	if request.Epoch != savedRequest.Epoch {
+		t.Fatalf("expected custody-hash retry to preserve epoch %d, got %d", savedRequest.Epoch, request.Epoch)
+	}
+	if request.SignatureHex == savedRequest.SignatureHex {
+		t.Fatal("expected custody-hash retry to re-sign the pending emergency exit request")
+	}
+	if !sameCanonicalVTXORefs(request.ExitExecution.SourceRefs, savedRequest.ExitExecution.SourceRefs) {
+		t.Fatalf("expected custody-hash retry to preserve source refs %+v, got %+v", savedRequest.ExitExecution.SourceRefs, request.ExitExecution.SourceRefs)
+	}
+	if request.ExitExecution.SweepTxID != savedRequest.ExitExecution.SweepTxID {
+		t.Fatalf("expected custody-hash retry to preserve sweep txid %q, got %q", savedRequest.ExitExecution.SweepTxID, request.ExitExecution.SweepTxID)
+	}
+}
+
 func TestGuestCashOutCancelsPendingNextHandStart(t *testing.T) {
 	t.Parallel()
 
@@ -4361,6 +5280,126 @@ func TestSettledHandCashOutSignerPrepareAcceptsNormalizedTransition(t *testing.T
 		Transition:              signingTransition,
 	}); err != nil {
 		t.Fatalf("prepare normalized settled-hand guest cash-out signer: %v", err)
+	}
+}
+
+func TestSettledHandCashOutKeepsUntouchedAllInRefReusable(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
+
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	allInActor := host
+	allInCaller := guest
+	if seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex) == guest.walletID.PlayerID {
+		allInActor = guest
+		allInCaller = host
+	}
+	if _, err := allInActor.SendAction(tableID, allInActionForTable(t, mustReadNativeTable(t, allInActor, tableID))); err != nil {
+		t.Fatalf("send all-in action: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, allInCaller, tableID)
+	if _, err := allInCaller.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, allInCaller, tableID))); err != nil {
+		t.Fatalf("call all-in action: %v", err)
+	}
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	table = mustReadNativeTable(t, host, tableID)
+	var winnerID string
+	var loserID string
+	for _, claim := range table.LatestCustodyState.StackClaims {
+		if claim.AmountSats > 0 {
+			winnerID = claim.PlayerID
+			continue
+		}
+		loserID = claim.PlayerID
+	}
+	if winnerID == "" || loserID == "" {
+		t.Fatalf("expected winner and loser claims after all-in settlement, got %+v", table.LatestCustodyState.StackClaims)
+	}
+	loserClaim, ok := latestStackClaimForPlayer(table.LatestCustodyState, loserID)
+	if !ok || len(loserClaim.VTXORefs) != 1 {
+		t.Fatalf("expected untouched loser claim ref, got %+v", loserClaim)
+	}
+
+	transition, err := host.buildFundsCustodyTransitionForPlayer(table, winnerID, tablecustody.TransitionKindCashOut, "completed")
+	if err != nil {
+		t.Fatalf("build winner cash-out transition: %v", err)
+	}
+	normalized, plan, err := host.normalizedCustodySigningTransition(table, transition)
+	if err != nil {
+		t.Fatalf("normalize winner cash-out transition: %v", err)
+	}
+	if len(plan.Outputs) != 0 {
+		t.Fatalf("expected untouched loser claim to be reused instead of reminted, got plan outputs %+v", plan.Outputs)
+	}
+	reusedLoser, ok := latestStackClaimForPlayer(&normalized.NextState, loserID)
+	if !ok || len(reusedLoser.VTXORefs) != 1 || fundingRefKey(reusedLoser.VTXORefs[0]) != fundingRefKey(loserClaim.VTXORefs[0]) {
+		t.Fatalf("expected normalized cash-out transition to preserve untouched loser ref, got %+v want %+v", reusedLoser.VTXORefs, loserClaim.VTXORefs)
+	}
+	if reusedLoser.Status != string(game.PlayerStatusAllIn) {
+		t.Fatalf("expected untouched loser status to remain all-in during cash-out replay, got %q", reusedLoser.Status)
+	}
+}
+
+func TestSyntheticRealModeWinnerCashOutAfterSettledAllInHand(t *testing.T) {
+	t.Parallel()
+
+	host := newMeshTestRuntime(t, "host")
+	guest := newMeshTestRuntime(t, "guest")
+
+	tableID, _ := createStartedTwoPlayerTableInSyntheticRealMode(t, host, guest)
+
+	table := waitForLocalCanAct(t, []*meshRuntime{host, guest}, host, tableID)
+	allInActor := host
+	allInCaller := guest
+	if seatPlayerID(table, *table.ActiveHand.State.ActingSeatIndex) == guest.walletID.PlayerID {
+		allInActor = guest
+		allInCaller = host
+	}
+	if _, err := allInActor.SendAction(tableID, allInActionForTable(t, mustReadNativeTable(t, allInActor, tableID))); err != nil {
+		t.Fatalf("send all-in action in synthetic real mode: %v", err)
+	}
+	waitForLocalCanAct(t, []*meshRuntime{host, guest}, allInCaller, tableID)
+	if _, err := allInCaller.SendAction(tableID, passiveActionForTable(t, mustReadNativeTable(t, allInCaller, tableID))); err != nil {
+		t.Fatalf("call all-in action in synthetic real mode: %v", err)
+	}
+	waitForHandPhase(t, []*meshRuntime{host, guest}, host, tableID, game.StreetSettled)
+	waitForHandPhase(t, []*meshRuntime{host, guest}, guest, tableID, game.StreetSettled)
+	waitForCustodySync(t, []*meshRuntime{host, guest}, host, guest, tableID)
+
+	table = mustReadNativeTable(t, host, tableID)
+	winnerID := ""
+	for _, claim := range table.LatestCustodyState.StackClaims {
+		if claim.AmountSats > 0 {
+			winnerID = claim.PlayerID
+			break
+		}
+	}
+	if winnerID == "" {
+		t.Fatalf("expected a winner after the all-in hand, got %+v", table.LatestCustodyState.StackClaims)
+	}
+
+	cashoutRuntime := host
+	if winnerID == guest.walletID.PlayerID {
+		cashoutRuntime = guest
+	}
+	if _, err := cashoutRuntime.CashOut(tableID); err != nil {
+		t.Fatalf("winner cash out after settled all-in synthetic real hand: %v", err)
+	}
+
+	hostTable := waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, host, tableID, tablecustody.TransitionKindCashOut)
+	guestTable := waitForLatestCustodyTransitionKind(t, []*meshRuntime{host, guest}, guest, tableID, tablecustody.TransitionKindCashOut)
+	if latestStackAmount(hostTable.LatestCustodyState, winnerID) != 0 {
+		t.Fatalf("expected winner stack to be zero after host accepted all-in cash-out, got %d", latestStackAmount(hostTable.LatestCustodyState, winnerID))
+	}
+	if latestStackAmount(guestTable.LatestCustodyState, winnerID) != 0 {
+		t.Fatalf("expected winner stack to be zero after guest accepted all-in cash-out, got %d", latestStackAmount(guestTable.LatestCustodyState, winnerID))
 	}
 }
 
@@ -5827,6 +6866,30 @@ func aggressiveActionForTable(t *testing.T, table nativeTableState) game.Action 
 	return game.Action{}
 }
 
+func allInActionForTable(t *testing.T, table nativeTableState) game.Action {
+	t.Helper()
+
+	var fallback *game.Action
+	for _, option := range finiteMenuOptionsForTable(t, table) {
+		switch option.Action.Type {
+		case game.ActionBet, game.ActionRaise:
+			action := option.Action
+			if strings.Contains(option.OptionID, "all-in") {
+				return action
+			}
+			if fallback == nil || action.TotalSats > fallback.TotalSats {
+				candidate := action
+				fallback = &candidate
+			}
+		}
+	}
+	if fallback != nil {
+		return *fallback
+	}
+	t.Fatalf("expected all-in finite-menu action, got %+v", finiteMenuOptionsForTable(t, table))
+	return game.Action{}
+}
+
 func advanceTableByPassiveActionsToPhase(t *testing.T, host, guest *meshRuntime, tableID string, phase game.Street) nativeTableState {
 	t.Helper()
 
@@ -6806,4 +7869,14 @@ func tableHasEventType(table nativeTableState, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func countTableEventsByType(table nativeTableState, eventType string) int {
+	count := 0
+	for _, event := range table.Events {
+		if stringValue(event.Body["type"]) == eventType {
+			count++
+		}
+	}
+	return count
 }

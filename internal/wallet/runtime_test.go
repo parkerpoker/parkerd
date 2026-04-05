@@ -3,6 +3,7 @@ package wallet
 import (
 	"encoding/hex"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil/bech32"
@@ -212,6 +213,28 @@ func TestBootstrapRejectsDifferentWalletNsecForExistingProfile(t *testing.T) {
 	}
 	if loaded.WalletPrivateKeyHex != firstWalletHex {
 		t.Fatalf("expected stored wallet key to remain %q, received %q", firstWalletHex, loaded.WalletPrivateKeyHex)
+	}
+}
+
+func TestBuyInWithInsufficientFunds(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	runtime := NewRuntime(RuntimeConfig{
+		ArkServerURL:      "http://127.0.0.1:7070",
+		Network:           "regtest",
+		ProfileDir:        filepath.Join(baseDir, "profiles"),
+		RunDir:            filepath.Join(baseDir, "runs"),
+		UseMockSettlement: true,
+	})
+
+	if _, err := runtime.Bootstrap("alice", "Alice", ""); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	_, err := runtime.BuildBuyInFundingBundle("alice", 60_000)
+	if err == nil || !strings.Contains(err.Error(), "insufficient spendable vtxos") {
+		t.Fatalf("expected insufficient-funds buy-in error, got %v", err)
 	}
 }
 
