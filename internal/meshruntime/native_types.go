@@ -428,13 +428,14 @@ type PendingTurnMenuPublic struct {
 type NativePendingTurnMenu = PendingTurnMenuPublic
 
 type nativePeerSelf struct {
-	Alias              string            `json:"alias"`
-	Mode               string            `json:"mode"`
-	Peer               NativePeerAddress `json:"peer"`
-	ProfileName        string            `json:"profileName"`
-	ProtocolID         string            `json:"protocolId"`
-	TransportPubkeyHex string            `json:"transportPubkeyHex,omitempty"`
-	WalletPlayerID     string            `json:"walletPlayerId"`
+	Alias                string            `json:"alias"`
+	Mode                 string            `json:"mode"`
+	Peer                 NativePeerAddress `json:"peer"`
+	ProfileName          string            `json:"profileName"`
+	ProtocolID           string            `json:"protocolId"`
+	TransportPubkeyHex   string            `json:"transportPubkeyHex,omitempty"`
+	TransportWireVersion int               `json:"transportWireVersion,omitempty"`
+	WalletPlayerID       string            `json:"walletPlayerId"`
 }
 
 type nativeCachedPeerInfo struct {

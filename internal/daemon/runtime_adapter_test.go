@@ -43,6 +43,17 @@ func TestTransportBootstrapAndState(t *testing.T) {
 	if normalizeStateMap(state["transport"])["transportWireVersion"] != float64(meshruntime.TransportWireVersion) {
 		t.Fatalf("expected transport wire version %d", meshruntime.TransportWireVersion)
 	}
+
+	manifest, err := runtime.store.ReadManifest()
+	if err != nil {
+		t.Fatalf("read manifest: %v", err)
+	}
+	if manifest == nil {
+		t.Fatal("expected transport manifest after bootstrap")
+	}
+	if manifest.TransportWireVersion != transportpkg.WireVersion {
+		t.Fatalf("expected manifest transport wire version %d, got %d", transportpkg.WireVersion, manifest.TransportWireVersion)
+	}
 }
 
 func TestTransportBootstrapPeerPersistsEndpoint(t *testing.T) {
